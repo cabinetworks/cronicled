@@ -1,11 +1,13 @@
 """The guard is the project's load-bearing safety mechanism and has failed three
 times in ways code review missed. These tests exercise it as a black box."""
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
 
 GUARD = os.path.abspath("scripts/check_leaks.sh")
+EXT_LIST_NAMES = ("data-extensions.txt", "media-extensions.txt")
 
 
 def _repo(patterns, files, subdir=None):
@@ -36,13 +38,35 @@ def _repo(patterns, files, subdir=None):
     return d
 
 
-def _run(cwd, env=None, args=None):
+def _run(cwd, env=None, args=None, guard=GUARD):
     e = dict(os.environ)
     e.pop("LEAK_PATTERNS", None)
     e.update(env or {})
-    p = subprocess.run([GUARD] + (args or []), cwd=cwd, env=e,
+    p = subprocess.run([guard] + (args or []), cwd=cwd, env=e,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     return p.returncode, p.stdout.decode("utf-8", "replace")
+
+
+def _guard_with_ext_lists(missing=(), empty=()):
+    """Copy the real guard script and its two extension lists into a fresh
+    directory, then delete or empty specific list(s), and return the path to
+    the copy. The guard resolves scripts/*-extensions.txt relative to its
+    OWN location (not the repo it is scanning), so a test that wants to
+    exercise a missing or empty list must not touch the real checkout - it
+    must run a copy of the script from a directory it controls instead."""
+    d = tempfile.mkdtemp()
+    shutil.copy(GUARD, os.path.join(d, "check_leaks.sh"))
+    src_dir = os.path.dirname(GUARD)
+    for name in EXT_LIST_NAMES:
+        if name in missing:
+            continue  # do not copy: simulates a deleted/renamed list
+        dst = os.path.join(d, name)
+        if name in empty:
+            with open(dst, "w") as fh:
+                fh.write("# only a comment\n\n")
+            continue
+        shutil.copy(os.path.join(src_dir, name), dst)
+    return os.path.join(d, "check_leaks.sh")
 
 
 class OutputDiscipline(unittest.TestCase):
@@ -162,6 +186,67 @@ class RedactionBySource(unittest.TestCase):
         code, out = _run(d, args=["--redact"])
         self.assertEqual(code, 1, out)
         self.assertNotIn("zzsecretzz", out)
+
+
+class ExtensionListFailClosed(unittest.TestCase):
+    """Extracting the extension lists to scripts/*.txt (round 2) introduced a
+    new instance of this file's recurring defect class: a failure to load
+    external configuration must abort, not continue. A missing or unreadable
+    list previously printed a shell error to stderr and execution continued
+    straight to `check_leaks: clean`, exit 0 - with a tracked .env file
+    sitting right there. Loading these lists is now held to the same
+    standard as loading the pattern list."""
+
+    def test_missing_data_extensions_file_is_a_failure(self):
+        guard = _guard_with_ext_lists(missing=("data-extensions.txt",))
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n"})
+        code, out = _run(d, env={"LEAK_PATTERNS": "zzsecretzz"}, guard=guard)
+        self.assertNotEqual(code, 0, out)
+
+    def test_missing_media_extensions_file_is_a_failure(self):
+        guard = _guard_with_ext_lists(missing=("media-extensions.txt",))
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n"})
+        code, out = _run(d, env={"LEAK_PATTERNS": "zzsecretzz"}, guard=guard)
+        self.assertNotEqual(code, 0, out)
+
+    def test_a_comments_and_blanks_only_list_is_a_failure(self):
+        # Present and readable is not enough: zero usable entries is not a
+        # legitimately empty ruleset, it is a sign the file lost its content.
+        guard = _guard_with_ext_lists(empty=("data-extensions.txt",))
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n"})
+        code, out = _run(d, env={"LEAK_PATTERNS": "zzsecretzz"}, guard=guard)
+        self.assertNotEqual(code, 0, out)
+
+    def test_file_types_only_mode_fails_closed_on_a_missing_list_too(self):
+        # This mode exists because patterns are legitimately absent on a
+        # fork PR; the extension lists are never legitimately absent, and
+        # the extension check is the ONLY thing this mode runs. If its one
+        # check cannot load, exiting 0 would silence the entire run.
+        guard = _guard_with_ext_lists(missing=("data-extensions.txt",))
+        d = _repo(None, {"a.md": "harmless\n"})
+        code, out = _run(d, args=["--file-types-only"], guard=guard)
+        self.assertNotEqual(code, 0, out)
+
+    def test_the_reviewers_exact_repro_now_fails(self):
+        # Patterns that match nothing, a tracked .env planted, and the data
+        # extension list deleted. Before this fix: "check_leaks: clean", 0.
+        guard = _guard_with_ext_lists(missing=("data-extensions.txt",))
+        d = _repo(["zzpatternmatchesnothingzz"], {"a.md": "harmless\n"})
+        with open(os.path.join(d, "secrets.env"), "w") as fh:
+            fh.write("X=1\n")
+        subprocess.check_call(["git", "add", "-f", "secrets.env"], cwd=d)
+        subprocess.check_call(["git", "commit", "-q", "-m", "add data file"], cwd=d)
+        code, out = _run(d, env={"LEAK_PATTERNS": "zzpatternmatchesnothingzz"}, guard=guard)
+        self.assertNotEqual(code, 0, out)
+        self.assertNotIn("clean", out)
+
+    def test_both_lists_present_and_a_clean_repo_still_exits_zero(self):
+        # Regression guard on the copy-and-mutate machinery itself: nothing
+        # missing must not itself become a false failure.
+        guard = _guard_with_ext_lists()
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n"})
+        code, out = _run(d, env={"LEAK_PATTERNS": "zzsecretzz"}, guard=guard)
+        self.assertEqual(code, 0, out)
 
 
 class ExtensionListsAgree(unittest.TestCase):

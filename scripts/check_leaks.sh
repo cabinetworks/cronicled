@@ -42,10 +42,19 @@
 # LEAK_PATTERNS secret. Every other invocation keeps failing closed.
 set -u
 
-# The extension list ships alongside this script, not inside whatever repo is
+# The extension lists ship alongside this script, not inside whatever repo is
 # being scanned - resolve it from $0's own location before anything below
-# changes directory.
-script_dir=$(cd "$(dirname "$0")" && pwd)
+# changes directory. Checked, not assumed: if this fails (the script's own
+# directory vanished, a permission error, ...), continuing would send later
+# reads of $script_dir/*.txt somewhere unintended rather than aborting.
+script_dir=$(cd "$(dirname "$0")" && pwd) || {
+	echo "check_leaks: could not resolve this script's own directory from '$0'" >&2
+	exit 2
+}
+if [ -z "$script_dir" ]; then
+	echo "check_leaks: this script's own directory resolved to an empty path" >&2
+	exit 2
+fi
 
 # Resolve everything else from the repository root: the pattern file and the
 # scan scope must not depend on where the script was invoked from.
@@ -161,13 +170,31 @@ fi
 # with no commits yet has an empty list here; history scanning is then
 # skipped rather than letting a revision-less `git grep` fall back to the
 # working tree and double up (or misreport) step (a).
-all_revs=$(git rev-list --all 2>/dev/null || true)
+#
+# git's own exit status is checked explicitly rather than folded into a
+# blanket `|| true`: a genuinely commit-less repo exits 0 with empty output
+# (verified), so that case is still handled below, but a real git failure
+# (a corrupt object database, for instance) must abort rather than be read
+# as "no history to scan" and silently skip checks 3 and 4 entirely.
+all_revs=$(git rev-list --all 2>&1)
+rev_rc=$?
+if [ "$rev_rc" -ne 0 ]; then
+	echo "check_leaks: FAILED - git rev-list --all failed (exit $rev_rc): $all_revs" >&2
+	echo "  Refusing to run without knowing whether history scanning is possible." >&2
+	exit 2
+fi
 if [ -n "$all_revs" ]; then
 	rev_count=$(printf '%s\n' "$all_revs" | grep -a -c '^')
 	echo "check_leaks: scanning full history ($rev_count commit(s)) - this can be slow on a large repo." >&2
 fi
 
-commit_shas=$(git log --all --format=%H 2>/dev/null || true)
+commit_shas=$(git log --all --format=%H 2>&1)
+log_rc=$?
+if [ "$log_rc" -ne 0 ]; then
+	echo "check_leaks: FAILED - git log --all failed (exit $log_rc): $commit_shas" >&2
+	echo "  Refusing to run without knowing whether commit messages can be scanned." >&2
+	exit 2
+fi
 
 while IFS= read -r pat; do
 	[ -n "$pat" ] || continue
@@ -316,47 +343,71 @@ fi # mode = full
 #    directions - an extension .gitignore excludes but this list does not
 #    know about would be invisible to this check, so a `git add -f` of that
 #    extension would slip past entirely.
-data_exts=()
-while IFS= read -r ext; do
-	[ -n "$ext" ] || continue
-	case "$ext" in \#*) continue ;; esac
-	data_exts+=("$ext")
-done < "$script_dir/data-extensions.txt"
+#
+#    Loading either list is held to the same standard as loading the pattern
+#    list: a missing file, an unreadable one, or one that yields zero usable
+#    entries after comment/blank stripping must abort the run rather than
+#    silently checking nothing. This was previously unchecked - a deleted or
+#    typo'd path here printed a "No such file or directory" error but let the
+#    script continue past it and report clean, exactly the failure-to-load
+#    silently disables a check defect this file has now had three times.
+#    This also runs unconditionally (not only in `mode = full`): on a fork
+#    PR, --file-types-only's extension check is the *only* thing that runs,
+#    so if it cannot load, the run must not exit 0 either.
+#
+#    load_ext_list is called directly, never through a pipe or $(...): a
+#    subshell would let its `exit` end only the subshell, silently leaving
+#    the caller's array empty and letting the script continue regardless.
+load_ext_list() {
+	# $1: path to read  $2: human name for messages. Populates the global
+	# array `loaded_exts` (bash 3.2 has no namerefs to return one directly).
+	loaded_exts=()
+	if [ ! -f "$1" ] || [ ! -r "$1" ]; then
+		echo "check_leaks: FAILED - $2 extension list is missing or unreadable: $1" >&2
+		echo "  Refusing to run with an unknown set of guarded extensions." >&2
+		exit 2
+	fi
+	while IFS= read -r ext; do
+		[ -n "$ext" ] || continue
+		case "$ext" in \#*) continue ;; esac
+		loaded_exts+=("$ext")
+	done < "$1"
+	if [ "${#loaded_exts[@]}" -eq 0 ]; then
+		echo "check_leaks: FAILED - $2 extension list has no usable entries: $1" >&2
+		echo "  Refusing to run with an unknown set of guarded extensions." >&2
+		exit 2
+	fi
+}
 
-media_exts=()
-while IFS= read -r ext; do
-	[ -n "$ext" ] || continue
-	case "$ext" in \#*) continue ;; esac
-	media_exts+=("$ext")
-done < "$script_dir/media-extensions.txt"
+load_ext_list "$script_dir/data-extensions.txt" "data"
+data_exts=("${loaded_exts[@]}")
+
+load_ext_list "$script_dir/media-extensions.txt" "media"
+media_exts=("${loaded_exts[@]}")
 
 while IFS= read -r -d '' f; do
 	case "$f" in
 	*.example.json | .github/workflows/*.yml | .github/workflows/*.yaml) continue ;;
 	esac
 	is_data=0
-	# Guard the expansion itself, not just the loop body: under `set -u`,
-	# bash 3.2 (the version macOS ships) treats "${arr[@]}" on a genuinely
-	# empty array as an unbound-variable error rather than zero words.
-	if [ "${#data_exts[@]}" -gt 0 ]; then
-		for ext in "${data_exts[@]}"; do
-			case "$f" in
-			$ext) is_data=1; break ;;
-			esac
-		done
-	fi
+	# data_exts is guaranteed non-empty here (load_ext_list aborts otherwise),
+	# so this expansion is safe even under bash 3.2's `set -u` handling of it.
+	for ext in "${data_exts[@]}"; do
+		case "$f" in
+		$ext) is_data=1; break ;;
+		esac
+	done
 	if [ "$is_data" -eq 1 ]; then
 		fail "tracked data file: $f"
 		continue
 	fi
 	is_media=0
-	if [ "${#media_exts[@]}" -gt 0 ]; then
-		for ext in "${media_exts[@]}"; do
-			case "$f" in
-			$ext) is_media=1; break ;;
-			esac
-		done
-	fi
+	# media_exts is likewise guaranteed non-empty.
+	for ext in "${media_exts[@]}"; do
+		case "$f" in
+		$ext) is_media=1; break ;;
+		esac
+	done
 	if [ "$is_media" -eq 1 ]; then
 		fail "tracked media file: $f"
 	fi
