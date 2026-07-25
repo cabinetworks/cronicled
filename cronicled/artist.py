@@ -72,15 +72,21 @@ def creator_folder(path, max_up=4):
     stripped.
 
     Walks up at most `max_up` ancestor directories from the file, skipping
-    any whose `clean_folder`-ed, lowercased name is in CONTAINER_NAMES, and
-    returns the first that is not. If every ancestor checked is a
-    container -- or there simply is no such ancestor -- falls back to the
-    immediate parent, also stripped, rather than continuing to walk toward
-    the filesystem root.
+    any whose `clean_folder`-ed, lowercased name is in CONTAINER_NAMES -- and
+    any that `clean_folder` empties entirely, a directory that is nothing but
+    a qualifier -- and returns the first that is neither. If every ancestor
+    checked is skipped that way -- or there simply is no such ancestor --
+    falls back to the immediate parent, also stripped, rather than continuing
+    to walk toward the filesystem root.
 
     `path` is treated purely as a string, split with `posixpath`. This
     never touches the filesystem: no ``os.path.exists``, no stat, no
-    resolving of ``..`` or symlinks.
+    resolving of ``..`` or symlinks. One consequence worth stating: a
+    Windows-style path ("C:\\lib\\Velvet Crane\\clip.mp4") has no posix
+    separator, so it has no parent directory here and yields "". Splitting
+    posix-style is deliberate -- library paths reach this module already
+    normalised -- so that is a limit, not a bug, but it is silent, hence
+    the note and the test.
     """
     directory = posixpath.dirname(path)
     if not directory or directory == "/":
@@ -94,8 +100,14 @@ def creator_folder(path, max_up=4):
         name = posixpath.basename(ancestor)
         if immediate_parent is None:
             immediate_parent = name
-        if _container_name(name) not in CONTAINER_NAMES:
-            return clean_folder(name)
+        cleaned = clean_folder(name)
+        # A directory that is nothing but a qualifier -- "[2024]", "(h265)" --
+        # cleans away to nothing. It names no creator, so it is a container by
+        # the same reasoning as "Clips" and the walk continues past it.
+        # Returning it would hand back "" and strand every file beneath a
+        # bracketed-year subfolder with no folder attribution at all.
+        if cleaned and _container_name(name) not in CONTAINER_NAMES:
+            return cleaned
         ancestor = posixpath.dirname(ancestor)
 
     return clean_folder(immediate_parent) if immediate_parent is not None else ""

@@ -31,13 +31,42 @@ class CreatorFolder(unittest.TestCase):
             creator_folder("/lib/Velvet Crane/Clips [2024]/clip01.mp4"),
             "Velvet Crane")
 
+    def test_a_qualifier_only_directory_is_walked_past(self):
+        # "[2024]" cleans to nothing, so it names no creator -- a container by
+        # the same logic as "Clips". Returning it would strand every file
+        # under a bracketed-year subfolder with no folder attribution at all.
+        self.assertEqual(
+            creator_folder("/lib/Velvet Crane/[2024]/Clips/clip01.mp4"),
+            "Velvet Crane")
+
+    def test_an_encode_tag_only_directory_is_walked_past(self):
+        self.assertEqual(
+            creator_folder("/lib/Velvet Crane/(h265)/clip01.mp4"),
+            "Velvet Crane")
+
     def test_the_walk_is_bounded(self):
-        # all containers to the root: fall back rather than walking to "/"
+        # the bound has to be the only thing deciding this, so the path is one
+        # where a bounded and an unbounded walk differ: four containers stop
+        # the walk short, and a fifth step would have reached the creator
+        path = "/lib/Velvet Crane/Clips/Videos/Media/Downloads/clip01.mp4"
+        self.assertEqual(creator_folder(path), "Downloads")
+        self.assertEqual(creator_folder(path, max_up=99), "Velvet Crane")
+
+    def test_all_containers_to_the_root_falls_back_to_the_parent(self):
+        # a real case, but not a test of the bound: an unbounded walk gives
+        # the same answer, because there is nothing above but containers
         got = creator_folder("/Videos/Clips/Media/Downloads/Uploads/clip01.mp4")
         self.assertEqual(got, "Uploads")
 
     def test_a_file_with_no_parent_yields_empty(self):
         self.assertEqual(creator_folder("clip01.mp4"), "")
+
+    def test_a_windows_style_path_yields_nothing(self):
+        # paths are split posix-style, as strings; a backslash is an ordinary
+        # filename character, so this has no parent directory to walk. Stated
+        # as a test because it is a deliberate limit, not an oversight.
+        self.assertEqual(
+            creator_folder("C:\\lib\\Velvet Crane\\clip01.mp4"), "")
 
     def test_container_matching_ignores_case(self):
         self.assertEqual(creator_folder("/lib/Velvet Crane/CLIPS/clip01.mp4"),
