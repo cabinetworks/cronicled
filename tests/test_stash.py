@@ -52,3 +52,141 @@ class Transience(unittest.TestCase):
 
     def test_a_permanent_error_is_not(self):
         self.assertFalse(StashError("bad name").transient)
+
+
+class _SceneTransport:
+    """Fake transport for apply_scene tests. apply_scene issues a variable
+    number of calls depending on what's in `match` (a find per studio/
+    performer/tag, a create for any not found, then one sceneUpdate), so this
+    routes each call by operation name rather than by call order.
+
+    `existing` is the dict returned for the findScene read (the scene's
+    current metadata). `found` maps kind -> {name: id} for entities the fake
+    server already has, so _find_first resolves them without a create call.
+    A name absent from `found[kind]` falls through to a create mutation,
+    whose outcome is looked up in `create` by (kind, name): an id (the create
+    succeeds), or an exception instance the create call raises instead (used
+    to simulate the server refusing the name, permanently or transiently).
+    """
+
+    _FIND = {"studio": ("findStudios", "studios", "aliases"),
+             "performer": ("findPerformers", "performers", "alias_list"),
+             "tag": ("findTags", "tags", "aliases")}
+    _CREATE_MUTATION = {"studio": "studioCreate", "performer": "performerCreate",
+                        "tag": "tagCreate"}
+
+    def __init__(self, existing, found=None, create=None):
+        self.existing = existing
+        self.found = found or {}
+        self.create = create or {}
+        self.scene_update_input = None
+
+    def __call__(self, body, timeout):
+        q = body["query"]
+        if "findScene(" in q:
+            return {"data": {"findScene": self.existing}}
+        for kind, (fn, field, alias_field) in self._FIND.items():
+            if fn + "(" in q:
+                return self._find(kind, fn, field, alias_field, body)
+        for kind, mut in self._CREATE_MUTATION.items():
+            if mut in q:
+                return self._create(kind, mut, body)
+        if "sceneUpdate" in q:
+            self.scene_update_input = body["variables"]["in"]
+            return {"data": {"sceneUpdate": {"id": self.scene_update_input["id"]}}}
+        raise AssertionError("test transport does not recognize query: %s" % q)
+
+    def _find(self, kind, fn, field, alias_field, body):
+        name = body["variables"]["f"]["q"]
+        entity_id = self.found.get(kind, {}).get(name)
+        if entity_id is None:
+            return {"data": {fn: {"count": 0, field: []}}}
+        return {"data": {fn: {"count": 1,
+                              field: [{"id": entity_id, "name": name, alias_field: []}]}}}
+
+    def _create(self, kind, mut, body):
+        name = body["variables"]["in"]["name"]
+        outcome = self.create.get((kind, name))
+        if isinstance(outcome, Exception):
+            raise outcome
+        return {"data": {mut: {"id": outcome}}}
+
+
+class ApplyScene(unittest.TestCase):
+    def test_performers_and_tags_are_unioned_not_replaced(self):
+        existing = {"id": "1", "studio": None,
+                    "performers": [{"id": "1", "name": "Harbor Fox"}],
+                    "tags": [{"id": "10", "name": "Existing Tag"}]}
+        t = _SceneTransport(existing, found={"performer": {"Quiet Otter": "2"},
+                                             "tag": {"New Tag": "20"}})
+        match = {"performers": [{"name": "Quiet Otter"}], "tags": [{"name": "New Tag"}]}
+        Stash("http://example.test", "k", transport=t).apply_scene("1", match)
+        self.assertEqual(t.scene_update_input["performer_ids"], ["1", "2"])
+        self.assertEqual(t.scene_update_input["tag_ids"], ["10", "20"])
+
+    def test_drop_tag_ids_removes_a_tag_and_still_writes_with_nothing_new(self):
+        existing = {"id": "1", "studio": None, "performers": [],
+                    "tags": [{"id": "10", "name": "Keep"}, {"id": "99", "name": "Cohort"}]}
+        t = _SceneTransport(existing)
+        Stash("http://example.test", "k", transport=t).apply_scene("1", {}, drop_tag_ids=["99"])
+        self.assertEqual(t.scene_update_input["tag_ids"], ["10"])
+
+    def test_studio_is_set_when_the_scene_has_none(self):
+        existing = {"id": "1", "studio": None, "performers": [], "tags": []}
+        t = _SceneTransport(existing, found={"studio": {"New Studio": "6"}})
+        result = Stash("http://example.test", "k", transport=t).apply_scene(
+            "1", {"studio": {"name": "New Studio"}})
+        self.assertEqual(t.scene_update_input["studio_id"], "6")
+        self.assertEqual(result["studio_id"], "6")
+
+    def test_studio_is_not_overwritten_by_default(self):
+        existing = {"id": "1", "studio": {"id": "5", "name": "Old Studio"},
+                    "performers": [], "tags": []}
+        t = _SceneTransport(existing, found={"studio": {"New Studio": "6"}})
+        result = Stash("http://example.test", "k", transport=t).apply_scene(
+            "1", {"studio": {"name": "New Studio"}})
+        self.assertNotIn("studio_id", t.scene_update_input)
+        self.assertEqual(result["studio_id"], "5")
+
+    def test_studio_is_overwritten_when_asked(self):
+        existing = {"id": "1", "studio": {"id": "5", "name": "Old Studio"},
+                    "performers": [], "tags": []}
+        t = _SceneTransport(existing, found={"studio": {"New Studio": "6"}})
+        result = Stash("http://example.test", "k", transport=t).apply_scene(
+            "1", {"studio": {"name": "New Studio"}}, overwrite_studio=True)
+        self.assertEqual(t.scene_update_input["studio_id"], "6")
+        self.assertEqual(result["studio_id"], "6")
+
+    def test_a_permanently_refused_name_is_skipped_and_the_rest_still_lands(self):
+        existing = {"id": "1", "studio": None, "performers": [], "tags": []}
+        t = _SceneTransport(existing,
+                            found={"performer": {"Harbor Fox": "2"}},
+                            create={("performer", "Bad Name"):
+                                    StashError("name 'Bad Name' is not allowed")})
+        match = {"title": "A Title",
+                 "performers": [{"name": "Harbor Fox"}, {"name": "Bad Name"}]}
+        result = Stash("http://example.test", "k", transport=t).apply_scene("1", match)
+        self.assertEqual([s["name"] for s in result["skipped"]], ["Bad Name"])
+        self.assertEqual(t.scene_update_input["performer_ids"], ["2"])
+        self.assertEqual(t.scene_update_input["title"], "A Title")
+
+    def test_raises_when_every_name_is_refused(self):
+        existing = {"id": "1", "studio": None, "performers": [], "tags": []}
+        t = _SceneTransport(existing,
+                            create={("performer", "Bad Name"):
+                                    StashError("name 'Bad Name' is not allowed")})
+        match = {"performers": [{"name": "Bad Name"}]}
+        with self.assertRaises(StashError):
+            Stash("http://example.test", "k", transport=t).apply_scene("1", match)
+        self.assertIsNone(t.scene_update_input)  # no partial write
+
+    def test_a_transient_failure_raises_rather_than_being_swallowed(self):
+        existing = {"id": "1", "studio": None, "performers": [], "tags": []}
+        t = _SceneTransport(existing,
+                            create={("performer", "Wedged Name"):
+                                    StashError("timeout", transient=True)})
+        match = {"performers": [{"name": "Wedged Name"}]}
+        with self.assertRaises(StashError) as ctx:
+            Stash("http://example.test", "k", transport=t).apply_scene("1", match)
+        self.assertTrue(ctx.exception.transient)
+        self.assertIsNone(t.scene_update_input)  # no partial write

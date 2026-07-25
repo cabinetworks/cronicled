@@ -21,9 +21,12 @@ import urllib.request
 
 from cronicled.text import strip_html
 
-# Calls here are plain reads/writes against the server's own database, not a
-# scrape through a headless browser, so they don't need a scraper's patience.
-DEFAULT_TIMEOUT = 30
+# Generous on purpose: some calls here page through everything the server
+# holds (unorganized_scenes(limit=None), all_tags()), and a real library can
+# hold thousands of scenes under a single tag — a tight default would abandon
+# a slow-but-healthy read via the hard deadline (see HARD_DEADLINE_SLACK)
+# before it ever gets the chance to finish.
+DEFAULT_TIMEOUT = 180
 
 
 class StashError(Exception):
