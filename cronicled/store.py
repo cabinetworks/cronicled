@@ -208,7 +208,16 @@ class Store:
 
     def dismiss(self, fp, reason=None, now=None):
         """Reject THIS proposal by fingerprint. A better proposal for the
-        same subject may still arrive tomorrow and is not affected."""
+        same subject may still arrive tomorrow and is not affected.
+
+        `dismissed` is a state, not a deletion: the row (summary, payload,
+        confidence and all) stays in `item` so a reviewer can see what they
+        rejected and why, it's just excluded from the default `items()`/
+        `counts()` view. The `dismissal` table is the durable record that
+        makes the rejection stick — it is never pruned, so re-recording the
+        same fingerprint can never resurrect it, with or without a matching
+        `item` row.
+        """
         when = now if now is not None else _utcnow()
         with self._lock:
             self._conn.execute(
@@ -217,13 +226,23 @@ class Store:
                 (fp, reason, when),
             )
             self._conn.execute(
-                "DELETE FROM item WHERE fingerprint = ?", (fp,)
+                "UPDATE item SET state = 'dismissed', resolved_at = ? "
+                "WHERE fingerprint = ?",
+                (when, fp),
             )
             self._conn.commit()
 
     def mute(self, subject_type, subject_id, reason=None, now=None):
         """Reject ANYTHING about a subject — for a subject that will never
-        be identifiable. Outlives any single proposal."""
+        be identifiable. Outlives any single proposal.
+
+        Like `dismiss`, `muted` is a state on any existing `item` row(s) for
+        the subject, not a deletion. The `mute` table is what actually does
+        the blocking in `record()`, keyed by `(subject_type, subject_id)`
+        rather than by fingerprint — so it works even for a subject with no
+        `item` row yet, which is the whole point of muting ahead of a
+        proposal ever arriving.
+        """
         when = now if now is not None else _utcnow()
         subject_id = str(subject_id)
         with self._lock:
@@ -233,18 +252,24 @@ class Store:
                 (subject_type, subject_id, reason, when),
             )
             self._conn.execute(
-                "DELETE FROM item WHERE subject_type = ? AND subject_id = ?",
-                (subject_type, subject_id),
+                "UPDATE item SET state = 'muted', resolved_at = ? "
+                "WHERE subject_type = ? AND subject_id = ?",
+                (when, subject_type, subject_id),
             )
             self._conn.commit()
 
+    _HIDDEN_STATES = ("dismissed", "muted")
+
     def items(self, folder=None, state=None, limit=None, offset=0):
-        """Proposals currently in the store, as dicts with `payload` (and
+        """Proposals in the store, as dicts with `payload` (and
         `prior_state`, when present) decoded back into the Python object
         that was originally recorded.
 
         Optionally filtered by `folder` and/or `state`, and paginated with
-        `limit`/`offset`.
+        `limit`/`offset`. With no `state` given, `dismissed` and `muted`
+        rows are excluded — the inbox stays clean of a reviewer's own
+        rejections. Ask for them explicitly with `items(state="dismissed")`
+        or `items(state="muted")`.
         """
         query = (
             "SELECT fingerprint, folder, subject_type, subject_id, "
@@ -260,6 +285,10 @@ class Store:
         if state is not None:
             clauses.append("state = ?")
             params.append(state)
+        else:
+            placeholders = ", ".join("?" for _ in self._HIDDEN_STATES)
+            clauses.append(f"state NOT IN ({placeholders})")
+            params.extend(self._HIDDEN_STATES)
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY created_at, fingerprint"
@@ -280,11 +309,17 @@ class Store:
         return result
 
     def counts(self, folder=None):
-        """Number of proposals in each state, optionally scoped to a folder."""
-        query = "SELECT state, COUNT(*) FROM item"
-        params = []
+        """Number of proposals in each state, optionally scoped to a folder.
+
+        Excludes `dismissed` and `muted` rows, same as `items()`'s default —
+        a badge counting a reviewer's own rejections as outstanding work
+        would be wrong.
+        """
+        placeholders = ", ".join("?" for _ in self._HIDDEN_STATES)
+        query = f"SELECT state, COUNT(*) FROM item WHERE state NOT IN ({placeholders})"
+        params = list(self._HIDDEN_STATES)
         if folder is not None:
-            query += " WHERE folder = ?"
+            query += " AND folder = ?"
             params.append(folder)
         query += " GROUP BY state"
         with self._lock:

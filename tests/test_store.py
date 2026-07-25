@@ -122,6 +122,49 @@ class ReviewerDecisionsSurvive(_StoreCase):
         self.assertEqual(len(self.store.items()), 1)
 
 
+class RejectedRowsPersist(_StoreCase):
+    # dismissed/muted are STATES, not deletions: a reviewer needs to see
+    # what they rejected, undo it, or audit it later
+    def test_a_dismissed_proposal_is_still_retrievable_with_its_content(self):
+        fp = self._record(payload={"title": "Copper Kettle"})
+        self.store.dismiss(fp, reason="wrong match")
+        items = self.store.items(state="dismissed")
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["fingerprint"], fp)
+        self.assertEqual(items[0]["summary"], "a proposal")
+        self.assertEqual(items[0]["payload"], {"title": "Copper Kettle"})
+
+    def test_items_with_no_filter_excludes_dismissed_and_muted(self):
+        dismissed_fp = self._record(subject_id="1")
+        self.store.dismiss(dismissed_fp)
+        self._record(subject_id="2")
+        self.store.mute("scene", "2")          # marks the existing row muted
+        self.assertEqual(self.store.items(), [])
+
+    def test_counts_excludes_dismissed_and_muted(self):
+        dismissed_fp = self._record(subject_id="1")
+        self.store.dismiss(dismissed_fp)
+        self._record(subject_id="2")
+        self.assertEqual(self.store.counts(), {"new": 1})
+
+    def test_muting_a_subject_with_no_existing_item_still_blocks_future_records(self):
+        # proves the mute table blocks by itself, independent of any row state
+        self.store.mute("scene", "99", reason="never identifiable")
+        self._record(subject_id="99")
+        self.assertEqual(self.store.items(), [])
+        self.assertEqual(self.store.counts(), {})
+
+    def test_rerecording_a_dismissed_proposal_does_not_resurrect_or_reset_state(self):
+        fp = self._record()
+        self.store.dismiss(fp, reason="wrong match")
+        self._record()                      # the producer offers it again
+        self.assertEqual(self.store.items(), [])
+        dismissed = self.store.items(state="dismissed")
+        self.assertEqual(len(dismissed), 1)
+        self.assertEqual(dismissed[0]["fingerprint"], fp)
+        self.assertEqual(dismissed[0]["state"], "dismissed")
+
+
 class States(_StoreCase):
     def test_applied_records_the_undo_snapshot_and_a_resolution_time(self):
         fp = self._record()
