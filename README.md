@@ -13,9 +13,8 @@ Early. The foundation layer is in place; the service itself is being built.
 
 ## Running it
 
-The pinned runtime is Python 3.12, declared in exactly one place: the
-[`.python-version`](.python-version) file. The `Dockerfile` and CI both read
-that file rather than repeating the version, so the two cannot drift apart.
+The runtime version is pinned in [`.python-version`](.python-version), which the
+container build and CI both read. That file is the only place it is declared.
 
 The service has zero runtime dependencies — standard library only — so a local
 checkout runs with nothing installed beyond a matching Python:
@@ -47,8 +46,9 @@ varies between installs is mounted, not copied in:
 
 - `/config` — server and adapter configuration (see "Site adapters" below)
 - `/var/lib/cronicled` — the database
-- `/media` — the library itself, mounted read-only, only needed for metadata
-  enrichment
+
+A read-only mount for the library itself will be documented here once the
+metadata-enrichment path that needs it exists.
 
 ## Site adapters
 

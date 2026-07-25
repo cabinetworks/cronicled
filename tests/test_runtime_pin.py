@@ -33,4 +33,13 @@ class RuntimePin(unittest.TestCase):
         with open(".github/workflows/ci.yml") as fh:
             body = fh.read()
         self.assertIn("python-version-file", body)
-        self.assertNotRegex(body, r'python-version:\s*"\d')
+        # Catch a hardcoded version regardless of quote style, or none at all
+        # (e.g. python-version: "3.11", python-version: '3.11', python-version: 3.11).
+        self.assertNotRegex(body, r'python-version:\s*[\'"]?\d')
+
+    def test_readme_does_not_repeat_the_version(self):
+        # prose is the easiest place for a second copy to hide, because it
+        # looks like documentation rather than configuration
+        with open("README.md") as fh:
+            body = fh.read()
+        self.assertNotRegex(body, r"\bPython\s+3\.\d+\b")

@@ -13,7 +13,8 @@ COPY cronicled/ ./cronicled/
 # nothing specific to any one installation.
 #   /config  server + adapter configuration
 #   /var/lib/cronicled  the database
-#   /media   the library, read-only, only needed for metadata enrichment
+# A read-only library mount for metadata enrichment will be added here once the
+# code path that uses it exists; declaring it ahead of that would be speculative.
 VOLUME ["/config", "/var/lib/cronicled"]
 
 ENV CRONICLED_CONFIG_DIR=/config
