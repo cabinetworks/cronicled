@@ -4,7 +4,7 @@ when one component is > 12, else by the configured day/month order."""
 import re
 from datetime import date
 
-from cronicled.text import strip_ext
+from cronicled.text import clean_folder, strip_ext
 
 # Whole-string date shapes — used to reject a date that sits where a performer
 # name would otherwise be parsed (e.g. '2023 September 11 - Title'; a
@@ -112,12 +112,9 @@ def date_prefix_title(text):
 
 def has_date_prefix(basename, folder):
     """True when the filename or folder is a 'DATE - Title' shape (no
-    performer to attribute; the right side is the real title). Stripping
-    bracketed qualifiers from `folder` (e.g. a trailing '(1080p)') is a
-    separate concern that lives with the folder-name helpers, not here, so
-    the folder text is read as given."""
+    performer to attribute; the right side is the real title)."""
     return any(date_prefix_title(src) is not None
-               for src in (folder or "", strip_ext(basename or "")))
+               for src in (clean_folder(folder), strip_ext(basename or "")))
 
 
 def date_prefix_date(text, order=None):
@@ -134,7 +131,7 @@ def unparsed_date_prefix(basename, folder):
     data-loss case — the prefix is confidently stripped off the title, so it
     must not also vanish without a word; callers should state it in whatever
     they report back."""
-    for src in (folder or "", strip_ext(basename or "")):
+    for src in (clean_folder(folder), strip_ext(basename or "")):
         parts = date_prefix_parts(src)
         if parts and not parse_date(parts[0]):
             return parts[0]

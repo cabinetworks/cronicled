@@ -48,6 +48,16 @@ def strip_ext(name):
     return root if ext.lower() in VIDEO_EXTS else name
 
 
+_QUALIFIER_RE = re.compile(r"[\(\[\{][^\)\]\}]*[\)\]\}]")
+
+
+def clean_folder(name):
+    """Strip a parenthesised or bracketed qualifier from a folder name, so a
+    quality/encoding tag tacked onto the end doesn't stop the rest of the name
+    from being read as-is ('Velvet Crane (h265)' -> 'Velvet Crane')."""
+    return re.sub(r"\s+", " ", _QUALIFIER_RE.sub(" ", name or "")).strip()
+
+
 def normalize(s):
     """Lowercase, fold combining-mark accents to their base letter, reduce
     every other non-alphanumeric character to a single space.

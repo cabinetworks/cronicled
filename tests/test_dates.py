@@ -210,6 +210,16 @@ class HasDatePrefix(DateOrderIsolated):
     def test_no_date_at_all(self):
         self.assertFalse(has_date_prefix("%s.mp4" % TITLES["unrelated"], ""))
 
+    def test_date_prefixed_folder_with_a_bracketed_qualifier(self):
+        # A quality/encoding tag routinely sits between the date and the
+        # ' - ' delimiter in a real folder name; the qualifier must be
+        # stripped before the date-prefix shape is tested, or the exact
+        # match on the head silently fails.
+        self.assertTrue(has_date_prefix(
+            "%s.mp4" % TITLES["unrelated"], "2023-09-11 (1080p) - Clips"))
+        self.assertTrue(has_date_prefix(
+            "%s.mp4" % TITLES["unrelated"], "2023 September 11 (h265) - Clips"))
+
 
 class UnparsedDatePrefix(DateOrderIsolated):
     """The date-shaped prefix is confidently stripped off the title even when
@@ -225,6 +235,14 @@ class UnparsedDatePrefix(DateOrderIsolated):
 
     def test_none_when_there_is_no_date_prefix_at_all(self):
         self.assertIsNone(unparsed_date_prefix("%s.mp4" % TITLES["unrelated"], ""))
+
+    def test_date_looking_folder_qualifier_stripped_before_reporting(self):
+        # Same bracketed-qualifier shape as above, but in the folder and
+        # carrying a calendar-invalid date, so the report path is covered too.
+        folder = "2021-02-30 (1080p) - Clips"
+        self.assertEqual(
+            unparsed_date_prefix("%s.mp4" % TITLES["unrelated"], folder),
+            "2021-02-30")
 
 
 if __name__ == "__main__":

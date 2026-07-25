@@ -1,7 +1,7 @@
 import unittest
 
 from cronicled.text import (normalize, spaceless, strip_html, strip_ext,
-                            tokens, slug_match)
+                            clean_folder, tokens, slug_match)
 from tests.fixtures.cast import PERFORMERS, TITLES
 
 
@@ -58,6 +58,24 @@ class StripExt(unittest.TestCase):
 
     def test_keeps_a_non_video_suffix(self):
         self.assertEqual(strip_ext("Copper Kettle Vol.2"), "Copper Kettle Vol.2")
+
+
+class CleanFolder(unittest.TestCase):
+    def test_strips_a_parenthesised_qualifier(self):
+        self.assertEqual(clean_folder("%s (h265)" % PERFORMERS["two_word"]),
+                         PERFORMERS["two_word"])
+
+    def test_strips_a_bracketed_qualifier(self):
+        self.assertEqual(clean_folder("%s [1080p]" % PERFORMERS["two_word"]),
+                         PERFORMERS["two_word"])
+
+    def test_leaves_an_unqualified_name_alone(self):
+        self.assertEqual(clean_folder(PERFORMERS["two_word"]),
+                         PERFORMERS["two_word"])
+
+    def test_empty_and_none_are_empty(self):
+        self.assertEqual(clean_folder(""), "")
+        self.assertEqual(clean_folder(None), "")
 
 
 class SlugMatchPolicy(unittest.TestCase):
