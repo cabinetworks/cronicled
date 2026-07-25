@@ -1,0 +1,4 @@
+{
+  "url": "http://media-server.example.test:9999",
+  "api_key": "paste the API key from your media server's security settings"
+}
