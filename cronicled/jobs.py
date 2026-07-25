@@ -53,7 +53,14 @@ class Job:
     """A snapshot of a job's state at the moment it was asked for, not a live
     handle onto the runner's bookkeeping. `JobRunner.job()` builds one while
     holding the runner's lock, so a caller can never see recorded/skipped/
-    message update mid-write relative to each other."""
+    message update mid-write relative to each other.
+
+    `recorded` and `skipped` count yields the store kept or declined, not
+    distinct rows: a producer that yields the same proposal twice in one run
+    reports `recorded=2` even though the store holds a single row for it.
+    See `JobRunner._record` for the further wrinkle that `skipped` describes
+    the store's eventual state, not necessarily the state at the instant the
+    yield was recorded."""
 
     id: str
     producer: str
@@ -175,11 +182,30 @@ class JobRunner:
             running[job_id] = producer.name
             self._jobs[job_id] = state
             self._done[job_id] = done
+            thread = threading.Thread(
+                target=self._run, args=(producer, state, done), daemon=True
+            )
+            try:
+                # Started inside the same locked region that made the
+                # reservation above, so reservation and start succeed or
+                # fail together. This is safe: `Thread.start()` returns once
+                # the new thread is running, it does not wait for the
+                # worker to do anything, so a worker that immediately wants
+                # `_lock` (in `_log`/`_record`) just blocks for the rest of
+                # this `with` block.
+                thread.start()
+            except BaseException:
+                # Thread.start() failed (OS resource exhaustion is the
+                # realistic cause) - the thread never ran, so `_run`'s
+                # `finally` will never execute to release what was just
+                # reserved. Roll it back here, or every later `start()` for
+                # this cost class would be refused forever, citing a job
+                # whose thread never began.
+                running.pop(job_id, None)
+                self._jobs.pop(job_id, None)
+                self._done.pop(job_id, None)
+                raise
             snapshot = state.snapshot()
-        thread = threading.Thread(
-            target=self._run, args=(producer, state, done), daemon=True
-        )
-        thread.start()
         return snapshot
 
     def _run(self, producer, state, done):
@@ -240,6 +266,14 @@ class JobRunner:
         entirely). That presence is exactly the "did a reviewer's own
         decision suppress this" signal a user needs to tell a quiet
         producer from a broken one.
+
+        `store.record()` and `store.has()` are two separate lock
+        acquisitions on the store, not one atomic check-and-record: a
+        reviewer who dismisses the item in the gap between them makes this
+        yield count as `skipped` even though it was `recorded` at the
+        instant `store.record()` ran. The count describes the store's
+        eventual state as observed here, not a guarantee about the instant
+        of the yield.
         """
         fp = self._store.record(
             folder=proposal["folder"],

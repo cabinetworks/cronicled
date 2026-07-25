@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 from cronicled.jobs import JobRunner, JobRejected
 from cronicled.store import Store
@@ -183,6 +184,25 @@ class CostClasses(_RunnerCase):
     def test_an_unknown_cost_class_is_refused_at_registration(self):
         with self.assertRaises(ValueError):
             self.runner.register(_Producer(cost="freeform"))
+
+    def test_a_failed_thread_start_does_not_wedge_the_cost_class(self):
+        # If Thread.start() itself raises (OS resource exhaustion is the
+        # realistic cause), the thread never ran, so _run's `finally` never
+        # executes to release the reservation. A rollback-free start() would
+        # refuse every later start() for this class forever, citing a job
+        # whose thread never began.
+        self.runner.register(_Producer(name="scan", cost="scraping", count=1))
+        with mock.patch(
+            "threading.Thread.start", side_effect=OSError("thread start failed")
+        ):
+            with self.assertRaises(OSError):
+                self.runner.start("scan")
+
+        # the class must not be wedged: a following start() must be allowed
+        # through and must run to completion, not be refused as saturated.
+        second = self.runner.start("scan")
+        self.assertTrue(self.runner.wait(second.id, timeout=5))
+        self.assertEqual(self.runner.job(second.id).state, "done")
 
     def test_a_race_of_starts_never_lets_two_scraping_jobs_through(self):
         # a check-then-start that is not atomic would pass the single-
