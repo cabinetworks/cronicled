@@ -276,13 +276,63 @@ def _filename_candidate(name):
     return _featured_name(text)
 
 
+def _alias_index(aliases):
+    """`aliases` re-keyed by the normalised spaceless form of each key, with
+    the wiring mistakes refused rather than resolved by luck.
+
+    Three are refused, each with a `ValueError` naming the key or keys at
+    fault:
+
+    * **two keys that normalise alike** -- "vcrane" and "v crane" are the
+      same lookup, and a linear scan returned whichever the dict happened to
+      yield first. That is the legacy anti-pattern this rewrite exists to
+      remove ("where two owners tie it takes max(), which returns whichever
+      came first in iteration order") reappearing in the alias path: an
+      operator's duplicated line would attribute files by authoring accident.
+      Refused even when the two agree on a name, because the rule an operator
+      can hold in their head is one key per normalised form;
+    * **a key that normalises to nothing** -- it can never match, so it sits
+      in the map looking like coverage that does not exist;
+    * **an empty or non-string value** -- not a name to attribute work to.
+      Letting it through gives either `name=''` with `source='alias'`, which
+      is incoherent, or (for None) a fall-through in which the folder itself
+      is resolved as a creator, so a half-written line quietly becomes an
+      attribution.
+
+    Validation runs over the whole map on every call, not just the key being
+    looked up, so a bad map fails whichever file is being resolved -- the
+    point is to fail where the mistake was made, not months later in a report
+    nobody re-checks. This is the same full pass the old linear scan already
+    made in the miss case, so it costs no more.
+    """
+    index = {}
+    keys = {}
+    for key, full in (aliases or {}).items():
+        slug = spaceless(key)
+        if not slug:
+            raise ValueError(
+                "alias key %r normalises to nothing, so it can never match"
+                % (key,))
+        if slug in index:
+            raise ValueError(
+                "alias keys %r and %r both normalise to %r; keep one"
+                % (keys[slug], key, slug))
+        if not isinstance(full, str) or not full.strip():
+            raise ValueError(
+                "alias %r must map to a non-empty name, got %r" % (key, full))
+        index[slug] = full
+        keys[slug] = key
+    return index
+
+
 def _alias_name(folder, aliases):
     """The full name `folder` is an operator-registered alias for, else None.
 
     Matching is exact on the normalised, spaceless form, so "V-Crane",
-    "v crane" and "vcrane" all reach the same entry -- that much is just
-    spelling. Nothing further: no prefix matching, no edit distance, no
-    deriving initials. "vc" does not become "Velvet Crane".
+    "v crane" and "vcrane" all reach the same entry whichever side wrote
+    which -- that much is just spelling. Nothing further: no prefix matching,
+    no edit distance, no deriving initials. "vc" does not become "Velvet
+    Crane".
 
     Guessing what an abbreviation stands for is how files end up attributed
     to the wrong person, and the guess is invisible once made -- two
@@ -291,19 +341,16 @@ def _alias_name(folder, aliases):
     is a decision someone actually made. So an unlisted abbreviation
     resolves to nothing, on purpose.
 
-    The mapped value is returned as written and is not put through
-    `_is_name`: the operator wrote it deliberately, and a real name that
-    happens to be two characters long is theirs to declare.
+    A value that survives `_alias_index` is returned as written and is not
+    put through `_is_name`: the operator wrote it deliberately, and a real
+    name that happens to be two characters long is theirs to declare. The
+    guards judge names the code inferred, not names a human supplied.
     """
-    if not aliases:
-        return None
+    index = _alias_index(aliases)
     key = spaceless(folder)
     if not key:
         return None
-    for alias, full in aliases.items():
-        if spaceless(alias) == key:
-            return full
-    return None
+    return index.get(key)
 
 
 def resolve(name, folder, aliases=None):
@@ -311,7 +358,8 @@ def resolve(name, folder, aliases=None):
 
     `folder` is a folder *name* -- normally whatever `creator_folder`
     returned for the file's path -- not a path, and may be empty. `aliases`
-    maps an as-filed folder name to the full name it stands for.
+    maps an as-filed folder name to the full name it stands for; a malformed
+    one raises `ValueError` (see `_alias_index`) rather than resolving.
 
     Tried in order: an alias on the folder, the folder itself, then the
     filename. The folder beats the filename because someone chose to file

@@ -255,8 +255,58 @@ class Aliases(unittest.TestCase):
         r = resolve("clip01.mp4", "V-Crane", aliases={"vcrane": "Velvet Crane"})
         self.assertEqual(r.name, "Velvet Crane")
 
+    def test_an_alias_key_written_un_normalised_still_matches(self):
+        # the operator wrote "V-Crane" in the map and the folder on disk is
+        # "vcrane"; normalisation is applied to both sides, not just the folder
+        r = resolve("clip01.mp4", "vcrane", aliases={"V-Crane": "Velvet Crane"})
+        self.assertEqual(r.name, "Velvet Crane")
+
     def test_an_unlisted_abbreviation_does_not_resolve_to_a_guess(self):
         # guessing what an abbreviation means is how files get attributed to
         # the wrong person; not resolving is the correct failure
         r = resolve("clip01.mp4", "vc", aliases={"vcrane": "Velvet Crane"})
         self.assertIsNone(r.name)
+
+
+class AliasWiring(unittest.TestCase):
+    """A malformed alias map is refused, not resolved by luck.
+
+    Every case here used to be silent: an ambiguous key resolved by dict
+    iteration order, an unusable value resolved to itself or to nothing. A
+    wiring mistake has to fail where it was made.
+    """
+
+    def test_two_keys_that_normalise_alike_are_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            resolve("clip01.mp4", "vcrane",
+                    aliases={"vcrane": "Velvet Crane", "v crane": "Copper Wren"})
+        message = str(caught.exception)
+        self.assertIn("vcrane", message)      # both keys named, so the
+        self.assertIn("v crane", message)     # operator knows what to delete
+
+    def test_a_collision_is_refused_whoever_is_being_resolved(self):
+        # the map is wrong regardless of this file; finding out only when the
+        # ambiguous key happens to come up is finding out far too late
+        with self.assertRaises(ValueError):
+            resolve("clip01.mp4", "Copper Wren",
+                    aliases={"vcrane": "Velvet Crane", "V-Crane": "Copper Wren"})
+
+    def test_a_key_that_normalises_to_nothing_is_refused(self):
+        # it can never match; leaving it in the map looks like coverage
+        with self.assertRaises(ValueError):
+            resolve("clip01.mp4", "vcrane", aliases={"--": "Velvet Crane"})
+
+    def test_an_empty_alias_value_is_refused(self):
+        # name='' with source='alias' is not an attribution
+        with self.assertRaises(ValueError):
+            resolve("clip01.mp4", "vcrane", aliases={"vcrane": ""})
+
+    def test_a_non_string_alias_value_is_refused(self):
+        with self.assertRaises(ValueError):
+            resolve("clip01.mp4", "vcrane", aliases={"vcrane": 42})
+
+    def test_a_null_alias_value_is_refused(self):
+        # it used to fall through, and "vcrane" was then resolved as a creator
+        # in its own right -- a half-written line quietly becoming a name
+        with self.assertRaises(ValueError):
+            resolve("clip01.mp4", "vcrane", aliases={"vcrane": None})
