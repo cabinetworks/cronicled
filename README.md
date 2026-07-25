@@ -23,6 +23,20 @@ checkout runs with nothing installed beyond a matching Python:
 python3 -m unittest discover -s tests -t . -v
 ```
 
+Development and CI drive the suite through [uv](https://docs.astral.sh/uv/)
+instead, which reads the pinned version out of `.python-version` automatically
+and supplies that exact interpreter regardless of what else is on `PATH`:
+
+```sh
+uv run python -m unittest discover -s tests -t . -v
+```
+
+uv is a development and CI convenience only — it is not a project dependency.
+`pyproject.toml` declares no runtime dependencies, and the container image
+ships without uv installed in it: the command above still works for anyone
+without uv, on any interpreter meeting the `requires-python` constraint,
+because the project must never require a tool to run its own tests.
+
 ### Container
 
 Build the image, passing the declared version explicitly (this is exactly

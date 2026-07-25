@@ -30,9 +30,16 @@ class RuntimePin(unittest.TestCase):
         self.assertRegex(body, re.compile(r"^FROM python:\$\{PYTHON_VERSION\}", re.M))
 
     def test_ci_reads_the_version_file_rather_than_repeating_it(self):
+        # The test job now hands the interpreter choice to `uv run`, which
+        # reads .python-version itself with nothing spelled out in the
+        # workflow - so the literal filename no longer has to appear there
+        # for that job to stay honest. The container job still names it
+        # explicitly (`cat .python-version`), which is the surviving proof
+        # that CI derives the version from the one declared file rather
+        # than repeating it.
         with open(".github/workflows/ci.yml") as fh:
             body = fh.read()
-        self.assertIn("python-version-file", body)
+        self.assertIn(".python-version", body)
         # Catch a hardcoded version regardless of quote style, or none at all
         # (e.g. python-version: "3.11", python-version: '3.11', python-version: 3.11).
         self.assertNotRegex(body, r'python-version:\s*[\'"]?\d')
@@ -43,3 +50,33 @@ class RuntimePin(unittest.TestCase):
         with open("README.md") as fh:
             body = fh.read()
         self.assertNotRegex(body, r"\bPython\s+3\.\d+\b")
+
+
+class ProjectMetadata(unittest.TestCase):
+    """pyproject.toml necessarily restates the Python version, so it joins the set
+    of copies that must be kept honest by a test rather than by memory."""
+
+    def _pyproject(self):
+        with open("pyproject.toml") as fh:
+            return fh.read()
+
+    def test_requires_python_agrees_with_the_version_file(self):
+        m = re.search(r'requires-python\s*=\s*"[>=~^]*([\d.]+)"', self._pyproject())
+        self.assertIsNotNone(m, "pyproject.toml must declare requires-python")
+        self.assertEqual(m.group(1), _declared())
+
+    def test_declares_no_runtime_dependencies(self):
+        # the whole point of the project: it runs with an interpreter and nothing
+        # else. A runtime dependency here would be a real architectural change.
+        m = re.search(r"^dependencies\s*=\s*\[(.*?)\]", self._pyproject(),
+                      re.S | re.M)
+        self.assertIsNotNone(m, "pyproject.toml must declare dependencies")
+        self.assertEqual(m.group(1).strip(), "",
+                         "runtime dependencies are not permitted")
+
+    def test_the_image_does_not_install_uv(self):
+        # uv is a development tool; putting it in the runtime image would add a
+        # dependency to a deliberately dependency-free container
+        with open("Dockerfile") as fh:
+            body = fh.read()
+        self.assertNotIn("uv", body.lower())

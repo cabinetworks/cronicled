@@ -641,7 +641,7 @@ media_exts=("${loaded_exts[@]}")
 enumerate_tracked
 while IFS= read -r -d '' f; do
 	case "$f" in
-	*.example.json | .github/workflows/*.yml | .github/workflows/*.yaml) continue ;;
+	*.example.json | .github/workflows/*.yml | .github/workflows/*.yaml | pyproject.toml | uv.lock) continue ;;
 	esac
 	is_data=0
 	# data_exts is guaranteed non-empty here (load_ext_list aborts otherwise),

@@ -64,6 +64,11 @@
 # *.example.json; anything else must justify itself by being force-added, which
 # the leak guard then catches.
 !**/*.example.json
+# Project metadata and its lock file are configuration, not data. The negation is
+# by exact filename: *.toml stays blocked, because a .toml is a perfectly good
+# place for library data to hide.
+!pyproject.toml
+!uv.lock
 
 # --- Local user config (brand data, endpoints, secrets) -----------------------
 # Exclude the directory's CONTENTS, not the directory itself: a negated
