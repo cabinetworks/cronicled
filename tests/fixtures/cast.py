@@ -13,11 +13,11 @@ PERFORMERS = {
 }
 
 TITLES = {
-    # Fully contained in `containing`: exercises the containment auto-pick (#17).
+    # Fully contained in `containing`: exercises the containment auto-pick.
     "contained": "Copper Kettle",
     "containing": "Velvet Crane - Copper Kettle (Extended Cut)",
-    # A single generic token shared with many titles: must NOT auto-apply on its
-    # own (#16). 'session' is deliberately as generic as the real case was.
+    # A single generic token shared with many titles: must NOT auto-apply on
+    # its own. 'session' is deliberately as generic as the real case was.
     "generic_token": "My Session",
     # No token overlap with any of the above: the true-negative case.
     "unrelated": "Harbour Lights",
