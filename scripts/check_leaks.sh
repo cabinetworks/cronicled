@@ -144,112 +144,33 @@ enumerate_untracked() {
 
 if [ "$mode" = full ]; then
 
-patterns=""
-patterns_source=none
-if [ -n "${LEAK_PATTERNS:-}" ]; then
-	patterns=$LEAK_PATTERNS
-	patterns_source=env
-elif [ -f .leak-patterns ]; then
-	patterns=$(cat .leak-patterns)
-	patterns_source=file
-fi
-raw_patterns=$patterns
-
-# A byte-order mark can precede the first pattern (some editors, and the
-# Windows clipboard, prepend one to UTF-8 text). It is not whitespace, so it
-# would otherwise survive the trim below and corrupt the first pattern by
-# gluing three invisible bytes to its front - silently weakening that one
-# pattern to something that can never match, without changing the line
-# count either sed preprocessing check below would notice. Stripped once,
-# up front, before either check sees the content.
-bom=$'\xef\xbb\xbf'
-raw_patterns="${raw_patterns#"$bom"}"
-
-# --- Pattern preprocessing, and proof that it did not lose anything ----------
+# --- Pattern loading, preprocessing, and cross-checking ----------------------
+# Delegated to scripts/lib/patterns.sh, shared with scripts/hooks/commit-msg.
+# This logic (BOM stripping, sed preprocessing, and the count cross-check
+# that proves preprocessing did not silently drop a line - see that file's
+# own header for the full rationale) used to be duplicated in both places
+# and drifted twice as a result. There is now exactly one copy.
 #
-# The pattern list is cleaned with sed: comments stripped, leading/trailing
-# whitespace trimmed, blank lines dropped. Leading whitespace must be
-# stripped too: an indented pattern (e.g. pasted into the LEAK_PATTERNS
-# secret with a leading space) would otherwise never match anything and the
-# guard would silently stop checking for it.
-#
-# sed's exit status used to be discarded entirely. On BSD sed (macOS, and
-# therefore any contributor's laptop) a single byte sed's locale cannot
-# parse — a stray Latin-1 accented character or smart quote pasted into the
-# CI secret is enough — aborts sed partway through. sed exits non-zero, but
-# critically it has already written its partial output (every line before
-# the bad byte) to stdout, so a naive `patterns=$(... | sed ...)` silently
-# keeps only a truncated list, and the rest of this script would then run
-# "clean" against fewer patterns than were configured, with no hint that
-# anything was dropped.
-#
-# Two independent checks guard against that now, and either one failing
-# aborts the whole run rather than continuing with a possibly-truncated
-# list:
-#
-#   1. sed's own exit status, captured immediately.
-#   2. A line-count cross-check: the number of non-empty, non-comment lines
-#      going in must equal the number of patterns coming out. This catches
-#      truncation even in a case where sed's exit status alone were not
-#      trustworthy.
-#
-# A missing trailing newline on the pattern source does NOT need a separate
-# fix here the way it did for the extension lists below: `raw_patterns` is
-# read via `$(cat ...)` (or the LEAK_PATTERNS variable directly), and command
-# substitution captures a file's last line whether or not it ends in a
-# newline - unlike a `while read` loop reading a file directly, which drops
-# an unterminated final line silently. `printf '%s\n' "$raw_patterns"` below
-# then re-adds exactly one trailing newline before anything counts lines, so
-# the count is well-defined either way. (Verified directly: a 3-line pattern
-# source with no trailing newline on the last line still counts as 3.)
-#
-# Counting uses `grep -a` (never plain grep) on both sides: -a forces grep to
-# treat its input as text no matter whether it looks like valid UTF-8.
-# Without it, grep can itself refuse to report lines around the same invalid
-# byte, which would silently defeat the very cross-check meant to catch
-# this.
-#
-# Both counts' own exit status is checked immediately: these two `grep -c`
-# calls are themselves a read of external state, and this whole mechanism
-# exists to catch corruption - it must not be the one check exempt from
-# its own rule. A failed count would otherwise yield an empty string, the
-# numeric comparison below would throw a non-fatal bash error to stderr,
-# and the mismatch-abort would be silently skipped - execution continuing
-# past the very check this cross-check exists to enforce. Exit 1 ("no
-# lines matched") is a legitimate zero count, not a failure - verified
-# directly; only >1 is an actual grep error.
-input_count=$(printf '%s\n' "$raw_patterns" | grep -a -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' | grep -a -c '^')
-input_count_rc=$?
-if [ "$input_count_rc" -gt 1 ]; then
-	echo "check_leaks: FAILED - counting candidate pattern lines failed (exit $input_count_rc)." >&2
-	echo "  Refusing to run without a trustworthy count to cross-check preprocessing against." >&2
+# Fail closed if the library itself cannot be found or sourced: a missing or
+# broken shared dependency must break the build, not silently skip the
+# checks that depend on it.
+lib="$script_dir/lib/patterns.sh"
+if [ ! -f "$lib" ] || [ ! -r "$lib" ]; then
+	echo "check_leaks: FAILED - shared pattern-loading library is missing or unreadable: $lib" >&2
+	echo "  Refusing to run with no trusted pattern-loading logic available." >&2
 	exit 2
 fi
-
-patterns=$(printf '%s\n' "$raw_patterns" | sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d')
-sed_status=$?
-
-if [ "$sed_status" -ne 0 ]; then
-	echo "check_leaks: FAILED - pattern preprocessing exited $sed_status." >&2
-	echo "  A byte in the pattern source could not be parsed by this platform's sed," >&2
-	echo "  which aborts mid-stream and silently truncates the pattern list." >&2
-	echo "  Refusing to run with a possibly-truncated pattern list." >&2
+# shellcheck source=lib/patterns.sh
+. "$lib" || {
+	echo "check_leaks: FAILED - could not source $lib" >&2
 	exit 2
-fi
+}
 
-survived_count=$(printf '%s\n' "$patterns" | grep -a -c '^.')
-survived_count_rc=$?
-if [ "$survived_count_rc" -gt 1 ]; then
-	echo "check_leaks: FAILED - counting surviving patterns failed (exit $survived_count_rc)." >&2
-	echo "  Refusing to run without a trustworthy count to cross-check preprocessing against." >&2
-	exit 2
-fi
-if [ "$survived_count" -ne "$input_count" ]; then
-	echo "check_leaks: FAILED - pattern preprocessing dropped lines silently." >&2
-	echo "  $survived_count pattern(s) survived out of $input_count supplied." >&2
-	echo "  Refusing to run with a possibly-truncated pattern list." >&2
-	exit 2
-fi
+# load_leak_patterns populates `patterns` and `patterns_source`, or returns
+# non-zero having already printed why to stderr. Any non-zero return here is
+# fail-closed, whatever specifically went wrong inside it.
+PATTERNS_LIB_PREFIX="check_leaks: FAILED -"
+load_leak_patterns || exit 2
 
 if [ -z "$patterns" ]; then
 	echo "check_leaks: FAILED - no patterns configured." >&2
@@ -347,7 +268,16 @@ while IFS= read -r pat; do
 	#    pattern here - this script must not become the thing it guards
 	#    against.) Every tracked file was already confirmed readable above,
 	#    so `git grep`'s rc=1 here means only "no match", never "skipped".
-	hits=$(git grep -I -i -F -l -e "$pat" -- . 2>&1)
+	#    -a, NOT -I: `git grep -I` silently excludes anything git treats as
+	#    binary - including a plain-ASCII file marked `-diff` or `binary` in
+	#    .gitattributes, and any file with a single NUL byte anywhere in it.
+	#    That is a real, reachable way for a forbidden string to sit in
+	#    tracked content and never be scanned. -a forces git grep to treat
+	#    every tracked file as text regardless of that heuristic, matching
+	#    what the untracked-content leg below already does with plain
+	#    `grep -a` - the same content, scanned the same way, regardless of
+	#    which leg a file happens to fall into.
+	hits=$(git grep -a -i -F -l -e "$pat" -- . 2>&1)
 	rc=$?
 	if [ "$rc" -eq 0 ]; then
 		if [ "$redact" -eq 1 ]; then
@@ -435,8 +365,11 @@ while IFS= read -r pat; do
 	#    database, not the working tree, so the readability preflight above
 	#    does not apply here - a filesystem permission bit on a checked-out
 	#    file cannot make an already-committed blob unreadable to git.
+	#    -a, NOT -I - see the identical note on leg 1 above: a blob that was
+	#    binary-flagged (by .gitattributes at that point in history, or by
+	#    containing a NUL byte) is not exempt from history scanning either.
 	if [ -n "$all_revs" ]; then
-		hist_hits=$(git grep -I -i -F -l -e "$pat" $all_revs -- . 2>&1)
+		hist_hits=$(git grep -a -i -F -l -e "$pat" $all_revs -- . 2>&1)
 		rc=$?
 		if [ "$rc" -eq 0 ]; then
 			if [ "$redact" -eq 1 ]; then

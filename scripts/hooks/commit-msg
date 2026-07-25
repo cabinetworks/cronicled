@@ -24,6 +24,17 @@
 # the commit) after a read that failed. This file was not audited when that
 # rule was first written down for scripts/check_leaks.sh; it needed the same
 # fix - see the readability check below.
+#
+# Pattern loading, preprocessing, and cross-checking is NOT reimplemented
+# here. It used to be: this hook carried its own ~60-line copy of the same
+# logic as scripts/check_leaks.sh, and that copy drifted twice - it never
+# received the BOM strip (a BOM-prefixed first pattern was silently
+# unmatchable here while the guard caught it correctly), and it never
+# received the count cross-check's own exit-status check (a failing `grep`
+# produced a bash "integer expression expected" error and execution carried
+# on rather than aborting). Two copies of security-critical logic was the
+# actual defect, not those two symptoms - so there is now exactly one copy,
+# in scripts/lib/patterns.sh, and both this hook and the guard source it.
 set -u
 
 msg_file="${1:-}"
@@ -39,31 +50,41 @@ if [ ! -r "$msg_file" ]; then
 	exit 1
 fi
 
-patterns=""
-if [ -n "${LEAK_PATTERNS:-}" ]; then
-	patterns=$LEAK_PATTERNS
-elif [ -f .leak-patterns ]; then
-	patterns=$(cat .leak-patterns)
-fi
-raw_patterns=$patterns
-
-input_count=$(printf '%s\n' "$raw_patterns" | grep -a -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' | grep -a -c '^')
-
-patterns=$(printf '%s\n' "$raw_patterns" | sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d')
-sed_status=$?
-if [ "$sed_status" -ne 0 ]; then
-	echo "commit-msg: BLOCKED - pattern preprocessing exited $sed_status." >&2
-	echo "  Refusing to check this message against a possibly-truncated pattern list." >&2
+# Locate the shared library relative to THIS SCRIPT's own file, not the
+# current directory: this hook is meant to run installed as
+# .git/hooks/commit-msg (a copy or a symlink - see the top of this file),
+# where cwd during a real commit is the top of the working tree, but a
+# relative `scripts/lib/patterns.sh` lookup from cwd would break the moment
+# anyone runs it any other way (this file's own test suite included). `$0`'s
+# directory, two levels up, is the repository root either way: installed at
+# .git/hooks/commit-msg, dirname is .git/hooks, and two levels up is the
+# repo root; run directly from scripts/hooks/commit-msg, dirname is
+# scripts/hooks, and two levels up is the same repo root. Resolved with `cd
+# && pwd` (not string surgery), and checked: if the hook's own file has been
+# moved somewhere this no longer holds, or a permission error blocks the
+# lookup, this must fail closed rather than silently miss the library.
+hook_dir=$(cd "$(dirname "$0")" && pwd) || {
+	echo "commit-msg: BLOCKED - could not resolve this hook's own directory from '$0'." >&2
+	exit 1
+}
+repo_root=$(cd "$hook_dir/../.." && pwd) || {
+	echo "commit-msg: BLOCKED - could not resolve the repository root from $hook_dir." >&2
+	exit 1
+}
+lib="$repo_root/scripts/lib/patterns.sh"
+if [ ! -f "$lib" ] || [ ! -r "$lib" ]; then
+	echo "commit-msg: BLOCKED - shared pattern-loading library is missing or unreadable: $lib" >&2
+	echo "  Refusing to check this message with no trusted pattern-loading logic available." >&2
 	exit 1
 fi
-
-survived_count=$(printf '%s\n' "$patterns" | grep -a -c '^.')
-if [ "$survived_count" -ne "$input_count" ]; then
-	echo "commit-msg: BLOCKED - pattern preprocessing dropped lines silently." >&2
-	echo "  $survived_count pattern(s) survived out of $input_count supplied." >&2
-	echo "  Refusing to check this message against a possibly-truncated pattern list." >&2
+# shellcheck source=../lib/patterns.sh
+. "$lib" || {
+	echo "commit-msg: BLOCKED - could not source $lib" >&2
 	exit 1
-fi
+}
+
+PATTERNS_LIB_PREFIX="commit-msg: BLOCKED -"
+load_leak_patterns || exit 1
 
 if [ -z "$patterns" ]; then
 	echo "commit-msg: BLOCKED - no patterns configured." >&2

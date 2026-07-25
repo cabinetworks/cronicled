@@ -121,23 +121,33 @@ def _fake_git_dir_with_commit_side_effect(repo_dir, trigger_args, new_filename, 
     return d
 
 
-def _guard_with_ext_lists(missing=(), empty=(), whitespace_only=(), raw_content=None):
+def _guard_with_ext_lists(missing=(), empty=(), whitespace_only=(), raw_content=None,
+                           include_lib=True):
     """Copy the real guard script and its two extension lists into a fresh
     directory, then delete, empty, or overwrite specific list(s) with exact
     content, and return the path to the copy. The guard resolves
-    scripts/*-extensions.txt relative to its OWN location (not the repo it
-    is scanning), so a test that wants to exercise a missing, empty, or
-    corrupted list must not touch the real checkout - it must run a copy of
-    the script from a directory it controls instead.
+    scripts/*-extensions.txt (and scripts/lib/patterns.sh) relative to its
+    OWN location (not the repo it is scanning), so a test that wants to
+    exercise a missing, empty, or corrupted list must not touch the real
+    checkout - it must run a copy of the script from a directory it
+    controls instead.
 
     `raw_content`, if given, maps a list filename to exact text to write
     verbatim (UTF-8 encoded) - used for byte-level corruption cases (a
     missing trailing newline, a leading byte-order mark) that `empty` and
-    `whitespace_only` cannot express."""
+    `whitespace_only` cannot express.
+
+    `include_lib=False` omits scripts/lib/patterns.sh from the copy, for
+    exercising the guard's own fail-closed behaviour when its shared
+    pattern-loading dependency is missing (see PatternsLibFailClosed)."""
     d = tempfile.mkdtemp()
     shutil.copy(GUARD, os.path.join(d, "check_leaks.sh"))
     src_dir = os.path.dirname(GUARD)
     raw_content = raw_content or {}
+    if include_lib:
+        os.makedirs(os.path.join(d, "lib"), exist_ok=True)
+        shutil.copy(os.path.join(src_dir, "lib", "patterns.sh"),
+                    os.path.join(d, "lib", "patterns.sh"))
     for name in EXT_LIST_NAMES:
         if name in missing:
             continue  # do not copy: simulates a deleted/renamed list
@@ -648,3 +658,83 @@ class ExtensionListsAgree(unittest.TestCase):
         missing = sorted(self._ignored() - self._guarded() - self.ALLOWLIST_IGNORED_ONLY)
         self.assertEqual(missing, [],
                          "git-ignored but not guarded: %s" % missing)
+
+
+class BinaryDetectedContentIsScanned(unittest.TestCase):
+    """`git grep -I` (the flag both content legs used) silently excludes
+    anything git treats as binary: a plain-ASCII file `.gitattributes`
+    marks `-diff` or `binary`, and any file containing a NUL byte anywhere
+    in it (git's own heuristic for "is this binary"). Reproduced directly:
+    committing a `.gitattributes`-marked file containing a forbidden string
+    reported "check_leaks: clean", exit 0 - in the working tree AND forever
+    in history, since the history leg used the same flag. The untracked
+    leg already used `grep -a` (plain grep, not `git grep`), so it was never
+    affected - proof this was drift, not a considered decision. Fixed by
+    using `git grep -a` on both content legs, matching the untracked leg."""
+
+    def test_a_tracked_file_marked_diff_is_still_scanned_in_the_working_tree(self):
+        d = _repo(["zzsecretzz"], {
+            ".gitattributes": "doc.txt -diff\n",
+            "doc.txt": "harmless intro\ncontains zzsecretzz here\n",
+        })
+        code, out = _run(d)
+        self.assertEqual(code, 1, out)
+        self.assertIn("doc.txt", out)
+
+    def test_a_tracked_file_marked_diff_is_still_scanned_in_history(self):
+        d = _repo(["zzsecretzz"], {
+            ".gitattributes": "doc.txt -diff\n",
+            "doc.txt": "harmless intro\n",
+        })
+        with open(os.path.join(d, "doc.txt"), "w") as fh:
+            fh.write("temporarily contains zzsecretzz\n")
+        subprocess.check_call(["git", "add", "-A"], cwd=d)
+        subprocess.check_call(["git", "commit", "-q", "-m", "temp leak"], cwd=d)
+        with open(os.path.join(d, "doc.txt"), "w") as fh:
+            fh.write("clean again\n")
+        subprocess.check_call(["git", "add", "-A"], cwd=d)
+        subprocess.check_call(["git", "commit", "-q", "-m", "remove leak"], cwd=d)
+        code, out = _run(d)
+        self.assertEqual(code, 1, out)
+        self.assertIn("doc.txt", out)
+
+    def test_a_tracked_file_with_a_nul_byte_is_still_scanned_in_the_working_tree(self):
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n"})
+        path = os.path.join(d, "binlike.txt")
+        with open(path, "wb") as fh:
+            fh.write(b"otherwise ascii \x00 contains zzsecretzz too\n")
+        subprocess.check_call(["git", "add", "-A"], cwd=d)
+        subprocess.check_call(["git", "commit", "-q", "-m", "add nul-containing file"], cwd=d)
+        code, out = _run(d)
+        self.assertEqual(code, 1, out)
+        self.assertIn("binlike.txt", out)
+
+    def test_a_tracked_file_with_a_nul_byte_is_still_scanned_in_history(self):
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n"})
+        path = os.path.join(d, "binlike.txt")
+        with open(path, "wb") as fh:
+            fh.write(b"otherwise ascii \x00 contains zzsecretzz too\n")
+        subprocess.check_call(["git", "add", "-A"], cwd=d)
+        subprocess.check_call(["git", "commit", "-q", "-m", "temp leak with nul byte"], cwd=d)
+        with open(path, "wb") as fh:
+            fh.write(b"clean now, still has a \x00 byte\n")
+        subprocess.check_call(["git", "add", "-A"], cwd=d)
+        subprocess.check_call(["git", "commit", "-q", "-m", "remove leak"], cwd=d)
+        code, out = _run(d)
+        self.assertEqual(code, 1, out)
+        self.assertIn("binlike.txt", out)
+
+
+class PatternsLibFailClosed(unittest.TestCase):
+    """scripts/check_leaks.sh now sources scripts/lib/patterns.sh (shared
+    with scripts/hooks/commit-msg) rather than carrying its own copy of
+    pattern-loading logic. A missing or unreadable shared library must
+    break the build, the same as a missing pattern list or a missing
+    extension list - not be silently skipped."""
+
+    def test_a_missing_shared_library_is_a_failure(self):
+        guard = _guard_with_ext_lists(include_lib=False)
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n"})
+        code, out = _run(d, env={"LEAK_PATTERNS": "zzsecretzz"}, guard=guard)
+        self.assertNotEqual(code, 0, out)
+        self.assertNotIn("check_leaks: clean", out)
