@@ -43,7 +43,7 @@ import posixpath
 import re
 from dataclasses import dataclass
 
-from cronicled.dates import looks_like_date
+from cronicled.dates import MONTH_PATTERN, looks_like_date
 from cronicled.text import clean_folder, normalize, spaceless, strip_ext
 
 CONTAINER_NAMES = frozenset({
@@ -129,6 +129,21 @@ ARTICLE_LEADS = frozenset({"a", "an", "the", "my", "your", "no",
 MIN_NAME_CHARS = 3
 MAX_NAME_WORDS = 4
 
+# A month with a year and no day -- "Sep 2023", "2023 September". A filing
+# style, not a person.
+#
+# This and the all-digits check in `_is_name` cover two date shapes
+# `dates.looks_like_date` deliberately does not, and they are kept here rather
+# than widened into it. `looks_like_date` also drives date *extraction*:
+# `dates.unparsed_date_prefix` reports any prefix that looks like a date but
+# yields none, so teaching detection a shape extraction cannot read would turn
+# every such filename into a spurious report. This guard only ever says "not a
+# name", which is safe to widen. The month spellings come from `dates` so the
+# two cannot drift apart.
+_MONTH_YEAR_RE = re.compile(
+    r"^(?:(?:%(month)s)\.?\s+(?:19|20)\d{2}"
+    r"|(?:19|20)\d{2}\s+(?:%(month)s)\.?)$" % {"month": MONTH_PATTERN}, re.I)
+
 # "Creator - Title". Only a dash with whitespace on both sides splits, so a
 # hyphenated name ("Anne-Marie Smith.mp4") is left whole. En and em dashes
 # count: libraries use all three interchangeably.
@@ -184,7 +199,12 @@ def _is_name(text):
 
     * too short -- under MIN_NAME_CHARS, an initialism or noise;
     * too long -- over MAX_NAME_WORDS, a sentence or a title;
-    * date-shaped -- "2023 September 11" is a date convention, not a person;
+    * date-shaped -- "2023 September 11" is a date convention, not a person.
+      Three forms: what `dates.looks_like_date` recognises, an all-digit
+      candidate ("20230911", "2023"), and a month with a year but no day
+      ("Sep 2023"). A month word *alone* is not rejected: "March Hollis" and
+      "May Winters" are people, and declining them would be its own wrong
+      answer;
     * article-led -- see ARTICLE_LEADS;
     * a container word -- "Downloads" is a directory, not a creator.
 
@@ -202,6 +222,10 @@ def _is_name(text):
         return False                                    # guard: too long
     if looks_like_date(text):
         return False                                    # guard: a date
+    if spaceless(text).isdigit():
+        return False                                    # guard: a date, compact
+    if _MONTH_YEAR_RE.match(" ".join(text.split())):
+        return False                                    # guard: a date, no day
     if words[0] in ARTICLE_LEADS:
         return False                                    # guard: article-led
     if _container_name(text) in CONTAINER_NAMES:

@@ -230,6 +230,47 @@ class Guards(unittest.TestCase):
         self.assertEqual(r.name, "Velvet Crane")
 
 
+class DateShapes(unittest.TestCase):
+    """The date guard has to cover the filing styles people actually use.
+
+    A date read as a person is the worst kind of wrong answer here: it is a
+    creator who does not exist, so every file filed that way gets its own
+    fictional catalogue. The counterweight is that a month word is also an
+    ordinary given name, and rejecting those would decline real people --
+    so the tests below run in both directions.
+    """
+
+    def test_a_compact_iso_date_is_not_a_creator(self):
+        r = resolve("20230911 - Morning Ritual.mp4", "")
+        self.assertIsNone(r.name)
+
+    def test_a_bare_year_folder_is_not_a_creator(self):
+        r = resolve("clip01.mp4", "2023")
+        self.assertIsNone(r.name)
+
+    def test_an_abbreviated_month_with_a_year_is_not_a_creator(self):
+        r = resolve("Sep 2023 - Morning Ritual.mp4", "")
+        self.assertIsNone(r.name)
+
+    def test_a_spelled_month_with_a_year_is_not_a_creator(self):
+        r = resolve("September 2023 - Morning Ritual.mp4", "")
+        self.assertIsNone(r.name)
+
+    def test_a_year_before_the_month_is_not_a_creator_either(self):
+        r = resolve("2023 September - Morning Ritual.mp4", "")
+        self.assertIsNone(r.name)
+
+    def test_a_month_word_used_as_a_given_name_still_resolves(self):
+        # "March Hollis" is a person; the guard must not reach a month word
+        # that is doing duty as a first name
+        r = resolve("March Hollis - Morning Ritual.mp4", "")
+        self.assertEqual(r.name, "March Hollis")
+
+    def test_a_month_word_used_as_a_folder_name_still_resolves(self):
+        r = resolve("clip01.mp4", "May Winters")
+        self.assertEqual(r.name, "May Winters")
+
+
 class GuardIsolation(unittest.TestCase):
     """The word-count guard needs a case only it rejects.
 
