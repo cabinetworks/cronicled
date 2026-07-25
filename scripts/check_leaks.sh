@@ -208,7 +208,23 @@ raw_patterns="${raw_patterns#"$bom"}"
 # Without it, grep can itself refuse to report lines around the same invalid
 # byte, which would silently defeat the very cross-check meant to catch
 # this.
+#
+# Both counts' own exit status is checked immediately: these two `grep -c`
+# calls are themselves a read of external state, and this whole mechanism
+# exists to catch corruption - it must not be the one check exempt from
+# its own rule. A failed count would otherwise yield an empty string, the
+# numeric comparison below would throw a non-fatal bash error to stderr,
+# and the mismatch-abort would be silently skipped - execution continuing
+# past the very check this cross-check exists to enforce. Exit 1 ("no
+# lines matched") is a legitimate zero count, not a failure - verified
+# directly; only >1 is an actual grep error.
 input_count=$(printf '%s\n' "$raw_patterns" | grep -a -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' | grep -a -c '^')
+input_count_rc=$?
+if [ "$input_count_rc" -gt 1 ]; then
+	echo "check_leaks: FAILED - counting candidate pattern lines failed (exit $input_count_rc)." >&2
+	echo "  Refusing to run without a trustworthy count to cross-check preprocessing against." >&2
+	exit 2
+fi
 
 patterns=$(printf '%s\n' "$raw_patterns" | sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d')
 sed_status=$?
@@ -222,6 +238,12 @@ if [ "$sed_status" -ne 0 ]; then
 fi
 
 survived_count=$(printf '%s\n' "$patterns" | grep -a -c '^.')
+survived_count_rc=$?
+if [ "$survived_count_rc" -gt 1 ]; then
+	echo "check_leaks: FAILED - counting surviving patterns failed (exit $survived_count_rc)." >&2
+	echo "  Refusing to run without a trustworthy count to cross-check preprocessing against." >&2
+	exit 2
+fi
 if [ "$survived_count" -ne "$input_count" ]; then
 	echo "check_leaks: FAILED - pattern preprocessing dropped lines silently." >&2
 	echo "  $survived_count pattern(s) survived out of $input_count supplied." >&2
@@ -538,18 +560,45 @@ load_ext_list() {
 	# straight from the content - not derived from whatever the loop below
 	# happens to build. A mismatch between this and the entries actually
 	# loaded means a line vanished (or multiplied) somewhere in the parse,
-	# whether or not this is a vector anyone has thought of yet.
+	# whether or not this is a vector anyone has thought of yet. Checked for
+	# its own failure immediately: this grep is itself a read of external
+	# state, and this whole mechanism exists to catch a corrupted count -
+	# it must not be the one place that rule is not applied to. Exit 1
+	# ("no lines matched") is a legitimate zero, not a failure - grep uses
+	# it for a genuinely empty count as well as a real non-match, verified
+	# directly; only >1 is an actual grep error.
 	candidate_count=$(printf '%s\n' "$raw" | grep -a -c -v -e '^[[:space:]]*#' -e '^[[:space:]]*$')
+	candidate_count_rc=$?
+	if [ "$candidate_count_rc" -gt 1 ]; then
+		echo "check_leaks: FAILED - counting candidate lines in $2 extension list failed (exit $candidate_count_rc)." >&2
+		echo "  ($1)" >&2
+		echo "  Refusing to run without a trustworthy count to cross-check the parse against." >&2
+		exit 2
+	fi
 
 	while IFS= read -r ext; do
-		# Trim whitespace BEFORE testing blankness/comments: a whitespace-
-		# only line is not "" by string comparison and does not start with
-		# "#", so untrimmed it would dodge both checks and enter the array
-		# as a literal glob that can never match a real filename.
+		# Strip an inline comment before testing shape, the same way the
+		# pattern list does with `sed -e 's/#.*//'` above - THEN trim.
+		# Without this, a line like "*.env # note" passes the glob-shape
+		# check below (it starts with * and contains a .) while being
+		# stored as the literal, never-matching string "*.env # note": the
+		# independent count and the loaded-entry count then agree with
+		# each other while both being wrong, since this one line still
+		# becomes exactly one "entry" either way - exactly the failure the
+		# count cross-check exists to make impossible. Reproduced directly:
+		# a tracked secrets.env went uncaught with this line present.
+		ext="${ext%%#*}"
 		ext="${ext#"${ext%%[![:space:]]*}"}"
 		ext="${ext%"${ext##*[![:space:]]}"}"
 		[ -n "$ext" ] || continue
-		case "$ext" in \#*) continue ;; esac
+		case "$ext" in
+		*[[:space:]]*)
+			echo "check_leaks: FAILED - $2 extension list has an entry containing embedded whitespace: $ext" >&2
+			echo "  ($1)" >&2
+			echo "  Refusing to run with a glob that can never match a real filename." >&2
+			exit 2
+			;;
+		esac
 		case "$ext" in
 		\**.*) ;; # looks like *.something
 		*)

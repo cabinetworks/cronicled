@@ -69,6 +69,28 @@ def _fake_git_dir(fail_match):
     return d
 
 
+def _fake_grep_dir(fail_exact_args):
+    """A directory containing a `grep` shim, meant to be put first on PATH.
+    grep is used pervasively throughout the guard (pattern matching,
+    filename matching, every count in this file), so this matches an EXACT
+    argument string, not a substring, to fail only one specific invocation;
+    everything else passes straight through to the real grep. Resolved via
+    shutil.which rather than a bare "grep" exec, so this cannot recurse into
+    itself even if something in the environment shadows the name."""
+    real_grep = shutil.which("grep")
+    d = tempfile.mkdtemp()
+    script = os.path.join(d, "grep")
+    with open(script, "w") as fh:
+        fh.write("#!/usr/bin/env bash\n")
+        fh.write('if [ "$*" = "%s" ]; then\n' % fail_exact_args)
+        fh.write('  echo "fake-grep: simulated failure for: $*" >&2\n')
+        fh.write("  exit 2\n")
+        fh.write("fi\n")
+        fh.write('exec "%s" "$@"\n' % real_grep)
+    os.chmod(script, 0o755)
+    return d
+
+
 def _fake_git_dir_with_commit_side_effect(repo_dir, trigger_args, new_filename, new_file_content):
     """A `git` shim that, the FIRST time it is invoked with exactly
     `trigger_args`, commits a new tracked file into `repo_dir` (using the
@@ -375,6 +397,40 @@ class PatternListCorruptionVectors(unittest.TestCase):
         self.assertEqual(code, 1, out)
 
 
+class CountCrossCheckFailsClosed(unittest.TestCase):
+    """The `grep -c` calls that produce the independent candidate count (in
+    load_ext_list) and the input/survived counts (in pattern-list
+    preprocessing) were not exit-status-checked. If one failed, it yielded
+    an empty string, the numeric `[ -ne ]` comparison threw a non-fatal
+    bash "integer expression expected" error to stderr, and the
+    mismatch-abort branch was silently skipped - execution continuing past
+    the very check meant to catch corruption. Reproduced directly with a
+    stub `grep` that fails one exact invocation and passes everything else
+    through untouched (grep is used pervasively elsewhere in the guard, so
+    an exact-argument match is required, not a substring one)."""
+
+    def test_a_failing_grep_during_the_extension_list_candidate_count_aborts(self):
+        fake_grep_dir = _fake_grep_dir(
+            "-a -c -v -e ^[[:space:]]*# -e ^[[:space:]]*$")
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n"})
+        code, out = _run(d, env={
+            "LEAK_PATTERNS": "zzsecretzz",
+            "PATH": fake_grep_dir + os.pathsep + os.environ["PATH"],
+        })
+        self.assertNotEqual(code, 0, out)
+        self.assertNotIn("check_leaks: clean", out)
+
+    def test_a_failing_grep_during_the_pattern_list_input_count_aborts(self):
+        fake_grep_dir = _fake_grep_dir("-a -c ^")
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n"})
+        code, out = _run(d, env={
+            "LEAK_PATTERNS": "zzsecretzz",
+            "PATH": fake_grep_dir + os.pathsep + os.environ["PATH"],
+        })
+        self.assertNotEqual(code, 0, out)
+        self.assertNotIn("check_leaks: clean", out)
+
+
 class Section5SeesFreshState(unittest.TestCase):
     """Section 5 (the data/media extension check) runs last, after every
     pattern-based leg. An earlier version of this script took one
@@ -486,6 +542,42 @@ class ExtensionListFailClosed(unittest.TestCase):
         code, out = _run(d, env={"LEAK_PATTERNS": "zzsecretzz"}, guard=guard)
         self.assertNotEqual(code, 0, out)
         self.assertIn("not a glob", out)
+
+    def test_an_inline_comment_loads_correctly_rather_than_corrupting_the_entry(self):
+        # A line like "*.env # note" passed the glob-shape check as-is (it
+        # starts with * and contains a .) while being stored as the
+        # literal, never-matching string "*.env # note" - the independent
+        # count and the loaded-entry count then agreed with each other
+        # while both were wrong, since this one line still became exactly
+        # one "entry" either way. Reproduced directly: a tracked
+        # secrets.env went uncaught with this line present, "check_leaks:
+        # clean", exit 0. Chosen fix: strip the inline comment (the same
+        # way the pattern list already does) and load the entry correctly,
+        # rather than merely detecting the corruption and aborting -
+        # comments are a legitimate, documented feature of these files.
+        guard = _guard_with_ext_lists(raw_content={
+            "data-extensions.txt": "*.env # note\n*.json\n",
+        })
+        d = _repo(["zzpatternmatchesnothingzz"], {"a.md": "harmless\n"})
+        with open(os.path.join(d, "secrets.env"), "w") as fh:
+            fh.write("X=1\n")
+        subprocess.check_call(["git", "add", "-f", "secrets.env"], cwd=d)
+        subprocess.check_call(["git", "commit", "-q", "-m", "add data file"], cwd=d)
+        code, out = _run(d, env={"LEAK_PATTERNS": "zzpatternmatchesnothingzz"}, guard=guard)
+        self.assertEqual(code, 1, out)
+        self.assertIn("tracked data file: secrets.env", out)
+
+    def test_an_entry_with_embedded_whitespace_is_a_failure(self):
+        # No comment marker this time, so nothing strips the extra text -
+        # a glob with a space in it can never match a real filename, and
+        # this must fail loudly rather than silently store it.
+        guard = _guard_with_ext_lists(raw_content={
+            "data-extensions.txt": "*.env extra\n*.json\n",
+        })
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n"})
+        code, out = _run(d, env={"LEAK_PATTERNS": "zzsecretzz"}, guard=guard)
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("embedded whitespace", out)
 
     def test_file_types_only_mode_fails_closed_on_a_missing_list_too(self):
         # This mode exists because patterns are legitimately absent on a
