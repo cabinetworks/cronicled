@@ -19,12 +19,23 @@
 # Uses the same pattern source and the same fail-closed rules as
 # scripts/check_leaks.sh: no patterns configured is a REJECTION, not a
 # silent pass, and a pattern list sed cannot fully parse is refused rather
-# than used partially.
+# than used partially. Same governing rule too: every read of external state
+# must either succeed or abort - no path through this hook may exit 0 (allow
+# the commit) after a read that failed. This file was not audited when that
+# rule was first written down for scripts/check_leaks.sh; it needed the same
+# fix - see the readability check below.
 set -u
 
 msg_file="${1:-}"
 if [ -z "$msg_file" ] || [ ! -f "$msg_file" ]; then
 	echo "commit-msg: BLOCKED - no commit message file given." >&2
+	exit 1
+fi
+
+if [ ! -r "$msg_file" ]; then
+	echo "commit-msg: BLOCKED - commit message file is not readable: $msg_file" >&2
+	echo "  grep reports \"no match\" both for a clean message and for one it" >&2
+	echo "  cannot open, so an unreadable message file must not be treated as clean." >&2
 	exit 1
 fi
 
@@ -63,8 +74,15 @@ fi
 blocked=0
 while IFS= read -r pat; do
 	[ -n "$pat" ] || continue
-	if grep -q -a -i -F -e "$pat" -- "$msg_file" 2>/dev/null; then
+	grep -q -a -i -F -e "$pat" -- "$msg_file" 2>/dev/null
+	rc=$?
+	if [ "$rc" -eq 0 ]; then
 		echo "commit-msg: BLOCKED - message matches a forbidden pattern." >&2
+		blocked=1
+	elif [ "$rc" -gt 1 ]; then
+		# >1 is a grep ERROR (e.g. the file became unreadable mid-scan), not
+		# "no match" - never let that read as clean and allow the commit.
+		echo "commit-msg: BLOCKED - grep failed (exit $rc); a pattern was not evaluated." >&2
 		blocked=1
 	fi
 done <<EOF

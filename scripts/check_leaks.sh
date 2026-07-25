@@ -18,6 +18,21 @@
 # No patterns configured is a FAILURE, not a pass: a missing or renamed secret
 # must break the build rather than silently disable the guard.
 #
+# --- The governing rule for every read below --------------------------------
+# Every read of external state - a file, an environment variable, a command
+# substitution, a pipeline - must either succeed or abort. No code path may
+# exit 0 after a read that failed. "Could not determine" is not "clean".
+# This file has needed that rule spelled out explicitly because it has been
+# violated three different ways by three different fixes: pattern
+# preprocessing silently truncated by a byte BSD sed's locale rejected; an
+# extracted extension list that was simply absent; and, most subtly, `grep`
+# and `git grep` themselves reporting "no match" (their normal exit code for
+# a clean result) for a file they could not even open - which reads
+# identically to a clean result unless the underlying read is checked
+# directly rather than inferred from grep's exit code alone. Every git/grep
+# invocation below either distinguishes "ran successfully and found nothing"
+# from "could not run", or is preceded by an explicit check that lets it.
+#
 # Output discipline: paths and matched names are shown or redacted depending
 # on where the patterns came from, never on which leg matched.
 #
@@ -79,6 +94,29 @@ done
 
 status=0
 fail() { echo "LEAK: $1" >&2; status=1; }
+
+# --- Enumerate tracked files once, for every mode ---------------------------
+# Section 5 (the data/media extension check) needs this list regardless of
+# mode, and full mode's content and filename legs need it too. `git
+# ls-files` is run alone here, never piped directly into something else, so
+# its own exit status is captured directly rather than being hidden behind
+# a later pipeline stage's. NUL-delimited, to a scratch file rather than a
+# shell variable (which cannot hold embedded NULs) or a process substitution
+# (whose own exit status bash cannot easily surface) - filenames containing
+# spaces or brackets are the normal convention for scraped media.
+tmp_tracked=$(mktemp) || {
+	echo "check_leaks: FAILED - could not create a scratch file for tracked-file enumeration" >&2
+	exit 2
+}
+trap 'rm -f "$tmp_tracked" "${tmp_untracked:-}"' EXIT
+
+git ls-files -z > "$tmp_tracked"
+rc=$?
+if [ "$rc" -ne 0 ]; then
+	echo "check_leaks: FAILED - git ls-files failed (exit $rc)" >&2
+	echo "  Refusing to report clean without having enumerated tracked files." >&2
+	exit 2
+fi
 
 if [ "$mode" = full ]; then
 
@@ -196,6 +234,53 @@ if [ "$log_rc" -ne 0 ]; then
 	exit 2
 fi
 
+# --- Untracked-file enumeration, and readability preflight for both lists ----
+# `git ls-files --others` is captured the same way as the tracked list above:
+# alone, to a scratch file, with its own exit status checked directly.
+#
+# Then, before any pattern is tested against any file: every tracked and
+# untracked file must be readable, checked once, up front. `git grep`
+# reports rc=1 ("no match") both when nothing matches and when it silently
+# skips a file it cannot open - its warning goes to a stream this script
+# does not treat as a result either way - and a plain per-file `grep`
+# behaves the same way. Without this preflight, a single `chmod 000` on a
+# tracked file holding an uncommitted leak, or on an untracked file holding
+# one outright, would report clean.
+tmp_untracked=$(mktemp) || {
+	echo "check_leaks: FAILED - could not create a scratch file for untracked-file enumeration" >&2
+	exit 2
+}
+
+git ls-files --others --exclude-standard -z > "$tmp_untracked"
+rc=$?
+if [ "$rc" -ne 0 ]; then
+	echo "check_leaks: FAILED - git ls-files --others failed (exit $rc)" >&2
+	echo "  Refusing to run without having enumerated untracked files." >&2
+	exit 2
+fi
+
+while IFS= read -r -d '' f; do
+	if [ ! -r "$f" ]; then
+		echo "check_leaks: FAILED - tracked file is not readable: $f" >&2
+		echo "  Refusing to report clean without having been able to scan its contents." >&2
+		exit 2
+	fi
+done < "$tmp_tracked"
+
+while IFS= read -r -d '' f; do
+	if [ ! -r "$f" ]; then
+		echo "check_leaks: FAILED - untracked file is not readable: $f" >&2
+		echo "  Refusing to report clean without having been able to scan its contents." >&2
+		exit 2
+	fi
+done < "$tmp_untracked"
+
+# Newline-separated views of the same two lists, for the filename-matching
+# legs below (which substring-match a name; they never open the file, so
+# they do not need the NUL-delimited form).
+tracked_files=$(tr '\0' '\n' < "$tmp_tracked")
+untracked_files=$(tr '\0' '\n' < "$tmp_untracked")
+
 while IFS= read -r pat; do
 	[ -n "$pat" ] || continue
 
@@ -208,7 +293,8 @@ while IFS= read -r pat; do
 	#    pattern containing a regex metacharacter would need escaping it
 	#    doesn't otherwise need. (Deliberately not spelling out a real
 	#    pattern here - this script must not become the thing it guards
-	#    against.)
+	#    against.) Every tracked file was already confirmed readable above,
+	#    so `git grep`'s rc=1 here means only "no match", never "skipped".
 	hits=$(git grep -I -i -F -l -e "$pat" -- . 2>&1)
 	rc=$?
 	if [ "$rc" -eq 0 ]; then
@@ -223,8 +309,11 @@ while IFS= read -r pat; do
 		fail "git grep failed (exit $rc); a pattern was not evaluated (working tree)"
 	fi
 
-	names=$(git ls-files | grep -i -F -e "$pat" || true)
-	if [ -n "$names" ]; then
+	names=$(printf '%s\n' "$tracked_files" | grep -i -F -e "$pat")
+	grep_rc=$?
+	if [ "$grep_rc" -gt 1 ]; then
+		fail "grep failed while matching tracked filenames against a pattern (exit $grep_rc); a pattern was not evaluated"
+	elif [ -n "$names" ]; then
 		if [ "$redact" -eq 1 ]; then
 			fail "$(printf '%s\n' "$names" | grep -a -c '^') tracked filename(s) match a configured pattern - run the guard locally to see which"
 		else
@@ -239,8 +328,11 @@ while IFS= read -r pat; do
 	#    would otherwise pass clean while still resting on disk in a clone of
 	#    this working copy. --exclude-standard keeps .gitignore'd files out
 	#    of scope, matching what would actually ship if committed as-is.
-	untracked_names=$(git ls-files --others --exclude-standard | grep -i -F -e "$pat" || true)
-	if [ -n "$untracked_names" ]; then
+	untracked_names=$(printf '%s\n' "$untracked_files" | grep -i -F -e "$pat")
+	grep_rc=$?
+	if [ "$grep_rc" -gt 1 ]; then
+		fail "grep failed while matching untracked filenames against a pattern (exit $grep_rc); a pattern was not evaluated"
+	elif [ -n "$untracked_names" ]; then
 		if [ "$redact" -eq 1 ]; then
 			fail "$(printf '%s\n' "$untracked_names" | grep -a -c '^') untracked filename(s) match a configured pattern - run the guard locally to see which"
 		else
@@ -254,7 +346,7 @@ while IFS= read -r pat; do
 	# filenames containing spaces or brackets (the normal convention for
 	# scraped media) must be handled literally. Matches are buffered rather
 	# than reported inline so a redacted run can report a count instead of
-	# a path.
+	# a path. Every untracked file was already confirmed readable above.
 	untracked_content_hits=""
 	untracked_content_count=0
 	while IFS= read -r -d '' f; do
@@ -263,7 +355,7 @@ while IFS= read -r pat; do
 			untracked_content_hits="$untracked_content_hits$f
 "
 		fi
-	done < <(git ls-files --others --exclude-standard -z)
+	done < "$tmp_untracked"
 	if [ "$untracked_content_count" -gt 0 ]; then
 		if [ "$redact" -eq 1 ]; then
 			fail "$untracked_content_count untracked file(s) contain a configured pattern - run the guard locally to see which"
@@ -278,7 +370,10 @@ while IFS= read -r pat; do
 	#    committed and then deleted is still permanently public the moment
 	#    it is pushed; scanning only the working tree (as before) reports
 	#    that case as clean, which is exactly how the leak that prompted
-	#    this fix survived undetected.
+	#    this fix survived undetected. Historical blobs live in the object
+	#    database, not the working tree, so the readability preflight above
+	#    does not apply here - a filesystem permission bit on a checked-out
+	#    file cannot make an already-committed blob unreadable to git.
 	if [ -n "$all_revs" ]; then
 		hist_hits=$(git grep -I -i -F -l -e "$pat" $all_revs -- . 2>&1)
 		rc=$?
@@ -310,6 +405,12 @@ if [ -n "$commit_shas" ]; then
 	while IFS= read -r sha; do
 		[ -n "$sha" ] || continue
 		msg=$(git log -1 --format=%B "$sha" 2>&1)
+		msg_rc=$?
+		if [ "$msg_rc" -ne 0 ]; then
+			echo "check_leaks: FAILED - git log failed for commit $sha (exit $msg_rc): $msg" >&2
+			echo "  Refusing to report clean without having read that commit's message." >&2
+			exit 2
+		fi
 		while IFS= read -r pat; do
 			[ -n "$pat" ] || continue
 			if printf '%s\n' "$msg" | grep -q -a -i -F -e "$pat"; then
@@ -368,6 +469,17 @@ load_ext_list() {
 		exit 2
 	fi
 	while IFS= read -r ext; do
+		# Trim whitespace BEFORE testing blankness/comments: a whitespace-
+		# only line is not "" by string comparison and does not start with
+		# "#", so untrimmed it would dodge both checks and enter the array
+		# as a literal glob that can never match a real filename - making
+		# the array non-empty without adding anything that actually guards
+		# anything, and silently defeating the "zero usable entries" check
+		# just below. The pattern list learned this exact lesson via sed
+		# (see the preprocessing block above); this list did not repeat it
+		# until now.
+		ext="${ext#"${ext%%[![:space:]]*}"}"
+		ext="${ext%"${ext##*[![:space:]]}"}"
 		[ -n "$ext" ] || continue
 		case "$ext" in \#*) continue ;; esac
 		loaded_exts+=("$ext")
@@ -411,7 +523,7 @@ while IFS= read -r -d '' f; do
 	if [ "$is_media" -eq 1 ]; then
 		fail "tracked media file: $f"
 	fi
-done < <(git ls-files -z)
+done < "$tmp_tracked"
 
 [ "$status" -eq 0 ] && echo "check_leaks: clean"
 exit "$status"

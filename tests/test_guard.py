@@ -47,7 +47,29 @@ def _run(cwd, env=None, args=None, guard=GUARD):
     return p.returncode, p.stdout.decode("utf-8", "replace")
 
 
-def _guard_with_ext_lists(missing=(), empty=()):
+def _fake_git_dir(fail_match):
+    """A directory containing a `git` shim, meant to be put first on PATH.
+    It fails (non-zero exit, a message on stderr) only invocations whose
+    full argument string contains `fail_match`; every other invocation is
+    passed straight through to the real git. This proves a *specific* git
+    call's failure is handled correctly without needing to actually corrupt
+    a repository to make that call fail for real."""
+    real_git = shutil.which("git")
+    d = tempfile.mkdtemp()
+    script = os.path.join(d, "git")
+    with open(script, "w") as fh:
+        fh.write("#!/usr/bin/env bash\n")
+        fh.write('case "$*" in\n')
+        fh.write('*"%s"*)\n' % fail_match)
+        fh.write('  echo "fake-git: simulated failure for: $*" >&2\n')
+        fh.write("  exit 128 ;;\n")
+        fh.write("esac\n")
+        fh.write('exec "%s" "$@"\n' % real_git)
+    os.chmod(script, 0o755)
+    return d
+
+
+def _guard_with_ext_lists(missing=(), empty=(), whitespace_only=()):
     """Copy the real guard script and its two extension lists into a fresh
     directory, then delete or empty specific list(s), and return the path to
     the copy. The guard resolves scripts/*-extensions.txt relative to its
@@ -64,6 +86,12 @@ def _guard_with_ext_lists(missing=(), empty=()):
         if name in empty:
             with open(dst, "w") as fh:
                 fh.write("# only a comment\n\n")
+            continue
+        if name in whitespace_only:
+            # Not blank by string comparison, not a comment either - the
+            # exact case that dodged the un-trimmed blank/comment test.
+            with open(dst, "w") as fh:
+                fh.write("# only a comment\n   \n")
             continue
         shutil.copy(os.path.join(src_dir, name), dst)
     return os.path.join(d, "check_leaks.sh")
@@ -188,6 +216,90 @@ class RedactionBySource(unittest.TestCase):
         self.assertNotIn("zzsecretzz", out)
 
 
+class UnreadableFileFailsClosed(unittest.TestCase):
+    """`git grep` and plain `grep` both report "no match" (their normal exit
+    code for a genuinely clean result) for a file they cannot open at all -
+    the same shape of bug as the extension list, one layer down: a read
+    that failed must abort, not read as clean. `chmod 000` reproduces this
+    directly, no simulation needed."""
+
+    def setUp(self):
+        if os.geteuid() == 0:
+            self.skipTest("permission bits do not apply to root")
+
+    def test_an_unreadable_tracked_file_with_an_uncommitted_leak_aborts(self):
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n"})
+        path = os.path.join(d, "a.md")
+        with open(path, "w") as fh:
+            fh.write("contains zzsecretzz now\n")
+        os.chmod(path, 0o000)
+        try:
+            code, out = _run(d, env={"LEAK_PATTERNS": "zzsecretzz"})
+        finally:
+            os.chmod(path, 0o644)
+        self.assertNotEqual(code, 0, out)
+        self.assertNotIn("check_leaks: clean", out)
+
+    def test_an_unreadable_untracked_file_containing_the_pattern_aborts(self):
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n"})
+        path = os.path.join(d, "scratch.md")
+        with open(path, "w") as fh:
+            fh.write("contains zzsecretzz\n")
+        os.chmod(path, 0o000)
+        try:
+            code, out = _run(d, env={"LEAK_PATTERNS": "zzsecretzz"})
+        finally:
+            os.chmod(path, 0o644)
+        self.assertNotEqual(code, 0, out)
+        self.assertNotIn("check_leaks: clean", out)
+
+
+class GitFailureFailsClosed(unittest.TestCase):
+    """Re-review confirmed clean-exit-on-failure for `git ls-files` (tracked
+    and untracked filename legs, and the file-type section) and for
+    `git log -1 --format=%B` (the commit-message leg), and rejected the
+    reasoning that these need actual repository corruption to matter. A
+    fake `git` on PATH forces one specific invocation to fail without
+    needing real corruption."""
+
+    def test_tracked_ls_files_failure_aborts(self):
+        d = _repo(["zzsecretzz"], {"zzsecretzz-notes.md": "clean body\n"})
+        fake_dir = _fake_git_dir("ls-files -z")
+        code, out = _run(d, env={
+            "LEAK_PATTERNS": "zzsecretzz",
+            "PATH": fake_dir + os.pathsep + os.environ["PATH"],
+        })
+        self.assertNotEqual(code, 0, out)
+        self.assertNotIn("check_leaks: clean", out)
+
+    def test_untracked_ls_files_failure_aborts(self):
+        d = _repo(["zzsecretzz"], {"a.md": "clean\n"})
+        with open(os.path.join(d, "zzsecretzz-scratch.md"), "w") as fh:
+            fh.write("contains zzsecretzz\n")
+        fake_dir = _fake_git_dir("--others --exclude-standard -z")
+        code, out = _run(d, env={
+            "LEAK_PATTERNS": "zzsecretzz",
+            "PATH": fake_dir + os.pathsep + os.environ["PATH"],
+        })
+        self.assertNotEqual(code, 0, out)
+        self.assertNotIn("check_leaks: clean", out)
+
+    def test_git_log_failure_during_commit_message_scan_aborts(self):
+        # No other leg matches here: only the commit message does, so if the
+        # failed `git log` call were silently read as "message not found",
+        # this scenario alone must not exit 0.
+        d = _repo(["zzsecretzz"], {"a.md": "clean\n"})
+        subprocess.check_call(["git", "commit", "--allow-empty", "-q",
+                                "-m", "mentions zzsecretzz in the message"], cwd=d)
+        fake_dir = _fake_git_dir("log -1 --format=%B")
+        code, out = _run(d, env={
+            "LEAK_PATTERNS": "zzsecretzz",
+            "PATH": fake_dir + os.pathsep + os.environ["PATH"],
+        })
+        self.assertNotEqual(code, 0, out)
+        self.assertNotIn("check_leaks: clean", out)
+
+
 class ExtensionListFailClosed(unittest.TestCase):
     """Extracting the extension lists to scripts/*.txt (round 2) introduced a
     new instance of this file's recurring defect class: a failure to load
@@ -217,6 +329,21 @@ class ExtensionListFailClosed(unittest.TestCase):
         code, out = _run(d, env={"LEAK_PATTERNS": "zzsecretzz"}, guard=guard)
         self.assertNotEqual(code, 0, out)
 
+    def test_a_whitespace_only_line_does_not_count_as_a_usable_entry(self):
+        # The exact miss from the re-review: a line of only spaces is not
+        # "" by string comparison and is not a comment, so untrimmed it
+        # entered the array as a literal glob that can never match a real
+        # filename - making the array non-empty and defeating this abort.
+        guard = _guard_with_ext_lists(whitespace_only=("data-extensions.txt",))
+        d = _repo(["zzpatternmatchesnothingzz"], {"a.md": "harmless\n"})
+        with open(os.path.join(d, "secrets.env"), "w") as fh:
+            fh.write("X=1\n")
+        subprocess.check_call(["git", "add", "-f", "secrets.env"], cwd=d)
+        subprocess.check_call(["git", "commit", "-q", "-m", "add data file"], cwd=d)
+        code, out = _run(d, env={"LEAK_PATTERNS": "zzpatternmatchesnothingzz"}, guard=guard)
+        self.assertNotEqual(code, 0, out)
+        self.assertNotIn("check_leaks: clean", out)
+
     def test_file_types_only_mode_fails_closed_on_a_missing_list_too(self):
         # This mode exists because patterns are legitimately absent on a
         # fork PR; the extension lists are never legitimately absent, and
@@ -238,7 +365,7 @@ class ExtensionListFailClosed(unittest.TestCase):
         subprocess.check_call(["git", "commit", "-q", "-m", "add data file"], cwd=d)
         code, out = _run(d, env={"LEAK_PATTERNS": "zzpatternmatchesnothingzz"}, guard=guard)
         self.assertNotEqual(code, 0, out)
-        self.assertNotIn("clean", out)
+        self.assertNotIn("check_leaks: clean", out)
 
     def test_both_lists_present_and_a_clean_repo_still_exits_zero(self):
         # Regression guard on the copy-and-mutate machinery itself: nothing
