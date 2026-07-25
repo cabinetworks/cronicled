@@ -11,8 +11,11 @@ _BACKSLASH_ESCAPE_RE = re.compile(r"\\(['\"/\\])")
 
 # A handful of ordinary European letters have no canonical decomposition into
 # base letter + combining mark, so NFKD leaves them untouched (verified via
-# unicodedata.decomposition()). Folded explicitly, before the NFKD pass, so
-# `normalize` still treats them like their accented cousins that do decompose.
+# unicodedata.decomposition()). Folded explicitly, AFTER the combining-mark
+# strip (see `normalize`): an accented compound of one of these letters (e.g.
+# o-with-stroke-and-acute) DOES decompose under NFKD, into the bare letter
+# plus a combining mark, so the table has to see the bare letter left behind
+# once that mark is gone, not the original compound.
 _LETTER_FOLD = str.maketrans({
     "ł": "l", "Ł": "L",
     "ø": "o", "Ø": "O",
@@ -53,20 +56,31 @@ def normalize(s):
     them. This only catches letters whose accent is a separate combining mark
     under NFKD decomposition (e.g. e-acute -> e + combining acute) - ordinary
     letters like l-with-stroke, o-with-stroke, the ae ligature, d-with-stroke,
-    and the German sharp s do NOT decompose that way and would otherwise pass
-    through unfolded, so `_LETTER_FOLD` handles that short, explicit list
-    first. Non-Latin letters are preserved rather than deleted: dropping them
+    and the German sharp s do NOT decompose that way, so `_LETTER_FOLD` folds
+    that short, explicit list separately, AFTER the combining-mark strip
+    below: an accented compound of one of them (e.g. o-with-stroke-and-acute)
+    decomposes under NFKD into the bare letter plus a combining mark, and only
+    once that mark is stripped does the bare letter match the table.
+
+    One deliberate non-fold: Turkish dotless i (u+0131) has no decomposition
+    and is not in the table, so it passes through unfolded. Folding it to
+    ASCII "i" would be a guess - dotted and dotless i are distinct letters in
+    Turkish, and this function does not collapse distinctions it can't be
+    sure are safe to collapse.
+
+    Non-Latin letters are preserved rather than deleted: dropping them
     would give a non-Latin name an empty slug, which matches nothing.
     """
     if not s:
         return ""
-    decomposed = unicodedata.normalize("NFKD", s.translate(_LETTER_FOLD))
+    decomposed = unicodedata.normalize("NFKD", s)
     kept = []
     for ch in decomposed:
         if unicodedata.combining(ch):
             continue          # a stripped accent
-        kept.append(ch if ch.isalnum() else " ")
-    return " ".join("".join(kept).lower().split())
+        kept.append(ch)
+    folded = "".join(kept).translate(_LETTER_FOLD)
+    return " ".join("".join(c if c.isalnum() else " " for c in folded).lower().split())
 
 
 def tokens(s, drop_junk=True, drop_stop=True):

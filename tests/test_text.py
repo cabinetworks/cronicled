@@ -126,6 +126,23 @@ class NormalizeNonDecomposableLetters(unittest.TestCase):
     def test_non_latin_script_still_preserved_not_transliterated(self):
         self.assertEqual(normalize("Мир"), "мир")
 
+    def test_folds_an_accented_compound_of_a_mapped_letter(self):
+        # o-with-stroke-and-acute: NFKD decomposes this into o-with-stroke
+        # plus a combining acute *before* the table ever sees a bare letter,
+        # so the fold has to happen after the combining-mark strip, not before
+        self.assertEqual(normalize("ǿ"), "o")
+
+    def test_folds_a_second_accented_compound_of_a_mapped_letter(self):
+        # ae-with-acute: same mechanism, a different mapped letter (ae)
+        self.assertEqual(normalize("ǽ"), "ae")
+
+
+class NormalizeDeliberateNonFold(unittest.TestCase):
+    def test_turkish_dotless_i_is_preserved_not_folded_to_ascii_i(self):
+        # dotted and dotless i are distinct letters in Turkish; folding one to
+        # the other would be a guess, not a normalization, so it is left alone
+        self.assertEqual(normalize("ı"), "ı")
+
 
 class Tokens(unittest.TestCase):
     def test_drops_stopwords_by_default(self):
