@@ -108,12 +108,35 @@ class Store:
         This is the property the whole design rests on: a nightly producer
         that finds the same thing again must UPDATE a row, not create a
         second one, or the inbox turns into noise on its second night.
+
+        Before inserting, this checks whether a reviewer has already said
+        "no" to it — either this exact proposal (`dismissal`, by
+        fingerprint) or anything about this subject (`mute`, by
+        subject_type/subject_id). If either matches, `record` returns the
+        fingerprint without storing anything: a reviewer's decision outranks
+        a producer's repetition, and a dismissed or muted proposal must not
+        resurrect itself just because the producer offered it again.
+
+        On an existing fingerprint, the conflict clause updates
+        `last_seen_at` and nothing else — not state, not summary, not
+        confidence. Freshening those columns would let a producer's rerun
+        quietly overwrite a reviewer's decision (`seen`, `dismissed`,
+        `muted`) or their context; resist that urge here.
         """
         fp = fingerprint(folder, subject_type, subject_id, payload)
         when = now if now is not None else _utcnow()
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"),
                              ensure_ascii=False)
         with self._lock:
+            dismissed = self._conn.execute(
+                "SELECT 1 FROM dismissal WHERE fingerprint = ?", (fp,)
+            ).fetchone()
+            muted = self._conn.execute(
+                "SELECT 1 FROM mute WHERE subject_type = ? AND subject_id = ?",
+                (subject_type, str(subject_id)),
+            ).fetchone()
+            if dismissed or muted:
+                return fp
             self._conn.execute(
                 """
                 INSERT INTO item (fingerprint, folder, subject_type,
@@ -138,21 +161,132 @@ class Store:
             self._conn.commit()
         return fp
 
-    def items(self):
-        """Every proposal currently in the store, as dicts with `payload`
-        decoded back into the Python object that was originally recorded."""
+    def _set_state(self, fp, fields):
+        """Update `item` columns for a known fingerprint, or raise `KeyError`.
+
+        Shared by the three `mark_*` transitions: silently doing nothing on
+        an unknown fingerprint would hide a real bug in the caller, so this
+        checks the row exists before (and inside the same lock as) writing.
+        """
+        assignments = ", ".join(f"{name} = :{name}" for name in fields)
+        params = dict(fields)
+        params["fp"] = fp
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT fingerprint, folder, subject_type, subject_id, "
-                "summary, confidence, payload, producer, state, "
-                "prior_state, error, created_at, last_seen_at, resolved_at "
-                "FROM item"
+                f"UPDATE item SET {assignments} WHERE fingerprint = :fp",
+                params,
             )
+            if cursor.rowcount == 0:
+                raise KeyError(fp)
+            self._conn.commit()
+
+    def mark_seen(self, fp, now=None):
+        """Record that a human has looked at this proposal."""
+        self._set_state(fp, {"state": "seen"})
+
+    def mark_applied(self, fp, prior_state=None, now=None):
+        """Record that a proposal was applied, with an undo snapshot and a
+        resolution time."""
+        when = now if now is not None else _utcnow()
+        encoded = (json.dumps(prior_state, sort_keys=True,
+                              separators=(",", ":"), ensure_ascii=False)
+                   if prior_state is not None else None)
+        self._set_state(fp, {
+            "state": "applied",
+            "prior_state": encoded,
+            "resolved_at": when,
+        })
+
+    def mark_failed(self, fp, error, now=None):
+        """Record that applying a proposal failed, and why."""
+        when = now if now is not None else _utcnow()
+        self._set_state(fp, {
+            "state": "failed",
+            "error": error,
+            "resolved_at": when,
+        })
+
+    def dismiss(self, fp, reason=None, now=None):
+        """Reject THIS proposal by fingerprint. A better proposal for the
+        same subject may still arrive tomorrow and is not affected."""
+        when = now if now is not None else _utcnow()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO dismissal (fingerprint, reason, at) "
+                "VALUES (?, ?, ?)",
+                (fp, reason, when),
+            )
+            self._conn.execute(
+                "DELETE FROM item WHERE fingerprint = ?", (fp,)
+            )
+            self._conn.commit()
+
+    def mute(self, subject_type, subject_id, reason=None, now=None):
+        """Reject ANYTHING about a subject — for a subject that will never
+        be identifiable. Outlives any single proposal."""
+        when = now if now is not None else _utcnow()
+        subject_id = str(subject_id)
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO mute "
+                "(subject_type, subject_id, reason, at) VALUES (?, ?, ?, ?)",
+                (subject_type, subject_id, reason, when),
+            )
+            self._conn.execute(
+                "DELETE FROM item WHERE subject_type = ? AND subject_id = ?",
+                (subject_type, subject_id),
+            )
+            self._conn.commit()
+
+    def items(self, folder=None, state=None, limit=None, offset=0):
+        """Proposals currently in the store, as dicts with `payload` (and
+        `prior_state`, when present) decoded back into the Python object
+        that was originally recorded.
+
+        Optionally filtered by `folder` and/or `state`, and paginated with
+        `limit`/`offset`.
+        """
+        query = (
+            "SELECT fingerprint, folder, subject_type, subject_id, "
+            "summary, confidence, payload, producer, state, "
+            "prior_state, error, created_at, last_seen_at, resolved_at "
+            "FROM item"
+        )
+        clauses = []
+        params = []
+        if folder is not None:
+            clauses.append("folder = ?")
+            params.append(folder)
+        if state is not None:
+            clauses.append("state = ?")
+            params.append(state)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at, fingerprint"
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+        with self._lock:
+            cursor = self._conn.execute(query, params)
             columns = [d[0] for d in cursor.description]
             rows = cursor.fetchall()
         result = []
         for row in rows:
             item = dict(zip(columns, row))
             item["payload"] = json.loads(item["payload"])
+            if item["prior_state"] is not None:
+                item["prior_state"] = json.loads(item["prior_state"])
             result.append(item)
         return result
+
+    def counts(self, folder=None):
+        """Number of proposals in each state, optionally scoped to a folder."""
+        query = "SELECT state, COUNT(*) FROM item"
+        params = []
+        if folder is not None:
+            query += " WHERE folder = ?"
+            params.append(folder)
+        query += " GROUP BY state"
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return {state: n for state, n in rows}
