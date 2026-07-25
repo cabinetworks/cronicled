@@ -71,16 +71,16 @@ class UnreadableMessageFailsClosed(unittest.TestCase):
 
 
 class BomFailClosed(unittest.TestCase):
-    """This hook used to carry its own ~60-line copy of check_leaks.sh's
+    """This hook used to carry its own ~60-line copy of the guard's
     pattern loading, and that copy never received the BOM strip: a
     byte-order mark glued to the front of the first pattern (some editors,
     and the Windows clipboard, prepend one to UTF-8 text) survived the
     hook's whitespace trim and corrupted the pattern into something that
     could never match. Reproduced directly: a commit message containing
     the (BOM-corrupted) first pattern was ALLOWED here, rc=0, while
-    scripts/check_leaks.sh caught the identical content correctly (see
-    tests/test_guard.py's PatternListCorruptionVectors). Fixed by sourcing
-    the same scripts/lib/patterns.sh both scripts now share, rather than
+    the guard caught the identical content correctly (see
+    tests/test_guard.py's PatternListCorruptionVectors). Fixed by importing
+    the same scripts/lib/leakpatterns.py both scripts now share, rather than
     porting the missing strip across a third time."""
 
     def test_a_leading_bom_on_the_pattern_source_does_not_corrupt_the_first_pattern(self):
@@ -100,8 +100,8 @@ def _run_guard(cwd, env=None):
 
 
 class HookAndGuardAgree(unittest.TestCase):
-    """The hook and the guard now source the exact same
-    scripts/lib/patterns.sh, rather than two independently-maintained
+    """The hook and the guard now import the exact same
+    scripts/lib/leakpatterns.py, rather than two independently-maintained
     copies of the same ~60 lines. Across any shape the pattern list can
     arrive corrupted in - each of these four has been a real vector at
     some point - they must reach the same verdict on the same content:

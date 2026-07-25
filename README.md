@@ -121,11 +121,11 @@ exactly one:
 
 ## Leak guard
 
-`scripts/check_leaks.sh` fails the build if a forbidden string (configured out
+`scripts/check_leaks` fails the build if a forbidden string (configured out
 of band — see the script header — never committed to this repo) shows up in
 tracked file contents or filenames, in untracked-but-not-ignored files, in
 tracked file contents anywhere in history, or in a commit message anywhere in
-history. CI runs it on every push and pull request.
+history. CI runs it (`./scripts/check_leaks`) on every push and pull request.
 
 To also block a bad commit message locally, *before* it is ever written,
 enable the accompanying `commit-msg` hook. This repo's `core.hooksPath` is

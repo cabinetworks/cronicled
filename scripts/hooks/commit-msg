@@ -1,113 +1,133 @@
-#!/usr/bin/env bash
-# Reject a commit message that contains a configured leak pattern, before it
-# is ever written to history. Commit messages are permanent and public the
-# moment a commit is pushed, so catching a bad one here — before the commit
-# object exists — is strictly better than catching it later in scripts/check_leaks.sh,
-# which can only report that history already contains it.
-#
-# NOT installed automatically. This repo's core.hooksPath is owned by a
-# different, unrelated mechanism, so this hook does not touch it. To enable
-# this hook locally, copy or symlink it into .git/hooks/commit-msg:
-#
-#   cp scripts/hooks/commit-msg .git/hooks/commit-msg
-#   chmod +x .git/hooks/commit-msg
-#
-# or, to track upstream changes to this file automatically:
-#
-#   ln -sf ../../scripts/hooks/commit-msg .git/hooks/commit-msg
-#
-# Uses the same pattern source and the same fail-closed rules as
-# scripts/check_leaks.sh: no patterns configured is a REJECTION, not a
-# silent pass, and a pattern list sed cannot fully parse is refused rather
-# than used partially. Same governing rule too: every read of external state
-# must either succeed or abort - no path through this hook may exit 0 (allow
-# the commit) after a read that failed. This file was not audited when that
-# rule was first written down for scripts/check_leaks.sh; it needed the same
-# fix - see the readability check below.
-#
-# Pattern loading, preprocessing, and cross-checking is NOT reimplemented
-# here. It used to be: this hook carried its own ~60-line copy of the same
-# logic as scripts/check_leaks.sh, and that copy drifted twice - it never
-# received the BOM strip (a BOM-prefixed first pattern was silently
-# unmatchable here while the guard caught it correctly), and it never
-# received the count cross-check's own exit-status check (a failing `grep`
-# produced a bash "integer expression expected" error and execution carried
-# on rather than aborting). Two copies of security-critical logic was the
-# actual defect, not those two symptoms - so there is now exactly one copy,
-# in scripts/lib/patterns.sh, and both this hook and the guard source it.
-set -u
+#!/usr/bin/env python3
+"""Reject a commit message that contains a configured leak pattern, before it
+is ever written to history. Commit messages are permanent and public the
+moment a commit is pushed, so catching a bad one here - before the commit
+object exists - is strictly better than catching it later in
+scripts/check_leaks, which can only report that history already contains it.
 
-msg_file="${1:-}"
-if [ -z "$msg_file" ] || [ ! -f "$msg_file" ]; then
-	echo "commit-msg: BLOCKED - no commit message file given." >&2
-	exit 1
-fi
+NOT installed automatically. This repo's core.hooksPath is owned by a
+different, unrelated mechanism, so this hook does not touch it. To enable
+this hook locally, copy or symlink it into .git/hooks/commit-msg:
 
-if [ ! -r "$msg_file" ]; then
-	echo "commit-msg: BLOCKED - commit message file is not readable: $msg_file" >&2
-	echo "  grep reports \"no match\" both for a clean message and for one it" >&2
-	echo "  cannot open, so an unreadable message file must not be treated as clean." >&2
-	exit 1
-fi
+    cp scripts/hooks/commit-msg .git/hooks/commit-msg
+    chmod +x .git/hooks/commit-msg
 
-# Locate the shared library relative to THIS SCRIPT's own file, not the
-# current directory: this hook is meant to run installed as
-# .git/hooks/commit-msg (a copy or a symlink - see the top of this file),
-# where cwd during a real commit is the top of the working tree, but a
-# relative `scripts/lib/patterns.sh` lookup from cwd would break the moment
-# anyone runs it any other way (this file's own test suite included). `$0`'s
-# directory, two levels up, is the repository root either way: installed at
-# .git/hooks/commit-msg, dirname is .git/hooks, and two levels up is the
-# repo root; run directly from scripts/hooks/commit-msg, dirname is
-# scripts/hooks, and two levels up is the same repo root. Resolved with `cd
-# && pwd` (not string surgery), and checked: if the hook's own file has been
-# moved somewhere this no longer holds, or a permission error blocks the
-# lookup, this must fail closed rather than silently miss the library.
-hook_dir=$(cd "$(dirname "$0")" && pwd) || {
-	echo "commit-msg: BLOCKED - could not resolve this hook's own directory from '$0'." >&2
-	exit 1
-}
-repo_root=$(cd "$hook_dir/../.." && pwd) || {
-	echo "commit-msg: BLOCKED - could not resolve the repository root from $hook_dir." >&2
-	exit 1
-}
-lib="$repo_root/scripts/lib/patterns.sh"
-if [ ! -f "$lib" ] || [ ! -r "$lib" ]; then
-	echo "commit-msg: BLOCKED - shared pattern-loading library is missing or unreadable: $lib" >&2
-	echo "  Refusing to check this message with no trusted pattern-loading logic available." >&2
-	exit 1
-fi
-# shellcheck source=../lib/patterns.sh
-. "$lib" || {
-	echo "commit-msg: BLOCKED - could not source $lib" >&2
-	exit 1
-}
+or, to track upstream changes to this file automatically:
 
-PATTERNS_LIB_PREFIX="commit-msg: BLOCKED -"
-load_leak_patterns || exit 1
+    ln -sf ../../scripts/hooks/commit-msg .git/hooks/commit-msg
 
-if [ -z "$patterns" ]; then
-	echo "commit-msg: BLOCKED - no patterns configured." >&2
-	echo "  Create .leak-patterns (git-ignored, one pattern per line) or set LEAK_PATTERNS." >&2
-	exit 1
-fi
+Same governing rule as scripts/check_leaks: every read of external state -
+the commit message file, the shared pattern-loading module, an environment
+variable - must either succeed or abort. No path through this hook may exit
+0 (allow the commit) after a read that failed.
 
-blocked=0
-while IFS= read -r pat; do
-	[ -n "$pat" ] || continue
-	grep -q -a -i -F -e "$pat" -- "$msg_file" 2>/dev/null
-	rc=$?
-	if [ "$rc" -eq 0 ]; then
-		echo "commit-msg: BLOCKED - message matches a forbidden pattern." >&2
-		blocked=1
-	elif [ "$rc" -gt 1 ]; then
-		# >1 is a grep ERROR (e.g. the file became unreadable mid-scan), not
-		# "no match" - never let that read as clean and allow the commit.
-		echo "commit-msg: BLOCKED - grep failed (exit $rc); a pattern was not evaluated." >&2
-		blocked=1
-	fi
-done <<EOF
-$patterns
-EOF
+Pattern loading, preprocessing, and cross-checking is NOT reimplemented
+here. This hook used to carry its own ~60-line copy of the same logic as
+the guard, and that copy drifted twice - it never received a BOM strip (a
+BOM-prefixed first pattern was silently unmatchable here while the guard
+caught it correctly), and it never received the count cross-check's own
+exit-status check. Two copies of security-critical logic was the actual
+defect, not those two symptoms - so there is now exactly one copy, in
+scripts/lib/leakpatterns.py, and both this hook and the guard import it.
+"""
+import importlib.util
+import os
+import sys
+from pathlib import Path
 
-exit "$blocked"
+PREFIX = "commit-msg: BLOCKED -"
+
+
+def _blocked(message: str) -> None:
+    print(f"{PREFIX} {message}", file=sys.stderr)
+
+
+def _load_leakpatterns(lib_path: Path):
+    """Import scripts/lib/leakpatterns.py from its own file path, resolved
+    relative to THIS SCRIPT's own location (see main() for why), not the
+    normal import path. Fails closed - prints and returns None - if the
+    module is missing, unreadable, or raises anything while loading, since a
+    missing or broken shared dependency must block the commit, not silently
+    skip the checks that depend on it."""
+    if not lib_path.is_file() or not os.access(lib_path, os.R_OK):
+        _blocked(f"shared pattern-loading library is missing or unreadable: {lib_path}")
+        _blocked("  Refusing to check this message with no trusted pattern-loading logic available.")
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("leakpatterns", lib_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as exc:  # noqa: BLE001 - any load failure must fail closed
+        _blocked(f"could not load {lib_path}: {exc}")
+        return None
+    return module
+
+
+def main() -> int:
+    if len(sys.argv) < 2 or not sys.argv[1]:
+        _blocked("no commit message file given.")
+        return 1
+    msg_file = sys.argv[1]
+
+    if not os.path.isfile(msg_file) or not os.access(msg_file, os.R_OK):
+        _blocked(f"commit message file is not readable: {msg_file}")
+        _blocked(
+            "  grep reports \"no match\" both for a clean message and for one it "
+            "cannot open, so an unreadable message file must not be treated as clean."
+        )
+        return 1
+
+    # Locate the shared library relative to THIS SCRIPT's own file, not the
+    # current directory: this hook is meant to run installed as
+    # .git/hooks/commit-msg (a copy or a symlink - see the module docstring),
+    # where cwd during a real commit is the top of the working tree, but a
+    # relative "scripts/lib/leakpatterns.py" lookup from cwd would break the
+    # moment anyone runs it any other way (this file's own test suite
+    # included). Two levels above this file's own directory is the
+    # repository root either way: installed at .git/hooks/commit-msg,
+    # dirname is .git/hooks, and two levels up is the repo root; run
+    # directly from scripts/hooks/commit-msg, dirname is scripts/hooks, and
+    # two levels up is the same repo root.
+    hook_path = Path(os.path.realpath(sys.argv[0]))
+    hook_dir = hook_path.parent
+    repo_root = hook_dir.parent.parent
+    if not repo_root.is_dir():
+        _blocked(f"could not resolve the repository root from {hook_dir}.")
+        return 1
+
+    lib_path = repo_root / "scripts" / "lib" / "leakpatterns.py"
+    leakpatterns = _load_leakpatterns(lib_path)
+    if leakpatterns is None:
+        return 1
+    GuardError = leakpatterns.GuardError
+
+    # The pattern source (LEAK_PATTERNS env, else a local .leak-patterns
+    # file) is resolved against the process's OWN current directory, not
+    # against repo_root above - deliberately two different roots, matching
+    # the shell library this replaces: a real git hook always runs with cwd
+    # at the top of the working tree, so this is the repository root in
+    # practice, but nothing here assumes that by cd-ing there itself.
+    try:
+        patterns, _source = leakpatterns.load_patterns(os.environ, os.getcwd())
+    except GuardError as exc:
+        _blocked(str(exc))
+        return 1
+
+    try:
+        message = Path(msg_file).read_bytes()
+    except OSError as exc:
+        _blocked(f"could not read commit message file: {msg_file} ({exc})")
+        return 1
+    message_lower = message.decode("utf-8", "replace").lower()
+
+    blocked = False
+    for pattern in patterns:
+        if pattern.lower() in message_lower:
+            _blocked("message matches a forbidden pattern.")
+            blocked = True
+
+    return 1 if blocked else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

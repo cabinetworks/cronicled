@@ -126,8 +126,8 @@ def _guard_with_ext_lists(missing=(), empty=(), whitespace_only=(), raw_content=
     """Copy the real guard script and its two extension lists into a fresh
     directory, then delete, empty, or overwrite specific list(s) with exact
     content, and return the path to the copy. The guard resolves
-    scripts/*-extensions.txt (and scripts/lib/patterns.sh) relative to its
-    OWN location (not the repo it is scanning), so a test that wants to
+    scripts/*-extensions.txt (and scripts/lib/leakpatterns.py) relative to
+    its OWN location (not the repo it is scanning), so a test that wants to
     exercise a missing, empty, or corrupted list must not touch the real
     checkout - it must run a copy of the script from a directory it
     controls instead.
@@ -137,7 +137,7 @@ def _guard_with_ext_lists(missing=(), empty=(), whitespace_only=(), raw_content=
     missing trailing newline, a leading byte-order mark) that `empty` and
     `whitespace_only` cannot express.
 
-    `include_lib=False` omits scripts/lib/patterns.sh from the copy, for
+    `include_lib=False` omits scripts/lib/leakpatterns.py from the copy, for
     exercising the guard's own fail-closed behaviour when its shared
     pattern-loading dependency is missing (see PatternsLibFailClosed)."""
     d = tempfile.mkdtemp()
@@ -726,8 +726,8 @@ class BinaryDetectedContentIsScanned(unittest.TestCase):
 
 
 class PatternsLibFailClosed(unittest.TestCase):
-    """scripts/check_leaks.sh now sources scripts/lib/patterns.sh (shared
-    with scripts/hooks/commit-msg) rather than carrying its own copy of
+    """scripts/check_leaks imports scripts/lib/leakpatterns.py (shared with
+    scripts/hooks/commit-msg) rather than carrying its own copy of
     pattern-loading logic. A missing or unreadable shared library must
     break the build, the same as a missing pattern list or a missing
     extension list - not be silently skipped."""

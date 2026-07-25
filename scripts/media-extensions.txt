@@ -1,5 +1,5 @@
-# Extensions the leak guard treats as media files (scripts/check_leaks.sh,
-# section 5). Every glob here must also appear in .gitignore's deny-by-default
+# Extensions the leak guard treats as media files (scripts/check_leaks,
+# check_file_types). Every glob here must also appear in .gitignore's deny-by-default
 # block, and vice versa; tests/test_guard.py asserts the two agree in both
 # directions. One glob per line, each shaped like *.ext - the guard aborts on
 # a line that survives comment/blank stripping but does not look like a glob.

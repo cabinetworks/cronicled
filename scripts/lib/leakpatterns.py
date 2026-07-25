@@ -1,5 +1,5 @@
-"""Shared pattern-list and glob-list loading for the leak guard (and, in a
-later change, the commit-msg hook).
+"""Shared pattern-list and glob-list loading for the leak guard and the
+commit-msg hook.
 
 This is a straight port of scripts/lib/patterns.sh plus the load_ext_list
 helper that used to live inside scripts/check_leaks.sh. Both existed because
