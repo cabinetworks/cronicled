@@ -44,7 +44,7 @@ import re
 from dataclasses import dataclass
 
 from cronicled.dates import looks_like_date
-from cronicled.text import clean_folder, normalize, slug_match, spaceless, strip_ext
+from cronicled.text import clean_folder, normalize, spaceless, strip_ext
 
 CONTAINER_NAMES = frozenset({
     "video", "videos",
@@ -136,16 +136,32 @@ class Resolution:
     when the folder and the filename each yield a plausible but different
     person, the folder wins and the filename's answer is recorded here.
 
-    That disagreement is the most useful signal available, so it is reported
-    rather than dropped. A library where it shows up often is one whose
-    filing convention is not what the operator assumed -- files sitting in
-    the wrong creator's folder, or a naming convention that puts the guest
+    `rejected_folder` carries a folder whose text a guard threw out -- it was
+    not a name at all, so it never competed. Set whenever a non-empty folder
+    name neither won nor matched an alias, whatever `name` ended up being.
+
+    The two are kept apart on purpose. `competing` is a *name*: something a
+    consumer may legitimately search a catalogue for, or offer as the other
+    reading. `rejected_folder` is raw folder text that failed the guards --
+    "Downloads", "AB", "2023 September 11" -- and treating it as a name is
+    the mistake this module exists to prevent. Folding it into `competing`
+    would make that field mean two incompatible things and force every
+    consumer to re-run the guards to tell which it had.
+
+    Both disagreements are the most useful signal available, so both are
+    reported rather than dropped. A library where they show up often is one
+    whose filing convention is not what the operator assumed -- files sitting
+    in the wrong creator's folder, or a naming convention that puts the guest
     first. The legacy resolver silently took the first candidate that
-    qualified, which threw that away and left the mis-filing invisible.
+    qualified, which threw that away and left the mis-filing invisible. A
+    rejected folder is the sharper of the two: with it empty, a filename-
+    sourced attribution reads as "the folder had nothing to say", when in
+    fact the folder named someone else and was overruled.
     """
     name: str | None = None
     source: str | None = None
     competing: str | None = None
+    rejected_folder: str | None = None
 
 
 def _is_name(text):
@@ -179,6 +195,25 @@ def _is_name(text):
     if _container_name(text) in CONTAINER_NAMES:
         return False                                    # guard: a container
     return True
+
+
+def _same_name(a, b):
+    """True when `a` and `b` are the same name once spacing, case, punctuation
+    and accent composition are taken out -- "Velvet Crane", "velvetcrane" and
+    an NFD-spelled folder against its NFC filename all agree.
+
+    Equality, deliberately, not `text.slug_match`'s containment. Containment
+    is safe where both sides are already specific full names; here one side is
+    a folder that cleared only a 3-character, 4-word gate, so it is routinely
+    the *less* specific of the two. Under containment, a folder "Ivy" beside a
+    filename "Ivy Kingsley Waters" counts as the same person: the shorter name
+    wins and no disagreement is reported. That is the failure this module is
+    built to avoid -- a whole catalogue searched under a fragment, with
+    nothing in the resolution saying so. Two names that differ by more than
+    spelling are two names, and the caller gets told.
+    """
+    a, b = spaceless(a), spaceless(b)
+    return bool(a) and a == b
 
 
 def _featured_name(text):
@@ -274,12 +309,16 @@ def resolve(name, folder, aliases=None):
     `_featured_name`) or it is not a name at all.
 
     When the folder and the filename both name someone, and they are not the
-    same person by `text.slug_match` (so "Velvet Crane" and "velvetcrane"
-    agree), the folder wins and the filename's name is returned in
-    `competing`. It is never silently dropped -- see `Resolution`.
+    same person by `_same_name` (so "Velvet Crane" and "velvetcrane" agree,
+    while "Ivy" and "Ivy Kingsley Waters" do not), the folder wins and the
+    filename's name is returned in `competing`. When the folder yields text
+    that no guard will accept as a
+    name, it is returned in `rejected_folder`. Neither is ever silently
+    dropped -- see `Resolution`.
 
-    Returns a `Resolution`; all three of its fields are None when nothing
-    resolved, which is a real answer and not an error.
+    Returns a `Resolution`; all of its fields are None when nothing resolved
+    and there was no folder to reject, which is a real answer and not an
+    error.
     """
     folder_text = clean_folder(folder or "")
     from_filename = _filename_candidate(name)
@@ -292,10 +331,16 @@ def resolve(name, folder, aliases=None):
     elif from_filename is not None:
         resolved, source = from_filename, "filename"
     else:
-        return Resolution()
+        resolved, source = None, None
+
+    # The folder had something to say and it was not used: say so, or the
+    # filename's answer looks unopposed when it is not.
+    rejected_folder = folder_text or None
+    if source in ("folder", "alias"):
+        rejected_folder = None
 
     competing = None
     if (source != "filename" and from_filename is not None
-            and not slug_match(resolved, from_filename)):
+            and not _same_name(resolved, from_filename)):
         competing = from_filename
-    return Resolution(resolved, source, competing)
+    return Resolution(resolved, source, competing, rejected_folder)

@@ -87,6 +87,88 @@ class Resolving(unittest.TestCase):
         self.assertIsNone(r.source)
 
 
+class RejectedFolder(unittest.TestCase):
+    """A folder a guard threw out is still evidence, and is reported.
+
+    Without this the module *substitutes*: the filename's answer is returned
+    and the folder that disagreed is recorded nowhere, so a reviewer reading
+    the resolution cannot tell a file with no folder evidence from one whose
+    folder said someone else.
+    """
+
+    def test_a_guard_rejected_folder_is_recorded_not_dropped(self):
+        # /lib/The Velvet Crane/Copper Wren - Guest Spot.mp4 -- a collaboration
+        # filed under the owner and named after the guest. The article guard
+        # throws the folder out and the guest wins; saying so is the whole
+        # point, because every later step scores against Copper Wren's
+        # catalogue and nothing downstream can know the folder objected.
+        r = resolve("Copper Wren - Guest Spot.mp4", "The Velvet Crane")
+        self.assertEqual(r.name, "Copper Wren")
+        self.assertEqual(r.source, "filename")
+        self.assertEqual(r.rejected_folder, "The Velvet Crane")
+
+    def test_a_rejected_folder_is_recorded_when_nothing_resolves_either(self):
+        r = resolve("clip01.mp4", "Downloads")
+        self.assertIsNone(r.name)
+        self.assertEqual(r.rejected_folder, "Downloads")
+
+    def test_a_too_short_folder_is_recorded(self):
+        r = resolve("clip01.mp4", "AB")
+        self.assertEqual(r.rejected_folder, "AB")
+
+    def test_a_folder_that_won_is_not_also_reported_as_rejected(self):
+        r = resolve("clip01.mp4", "Velvet Crane")
+        self.assertIsNone(r.rejected_folder)
+
+    def test_a_folder_an_alias_matched_is_not_a_rejection(self):
+        # the alias consumed the folder; nothing was thrown out
+        r = resolve("clip01.mp4", "vc", aliases={"vc": "Velvet Crane"})
+        self.assertEqual(r.source, "alias")
+        self.assertIsNone(r.rejected_folder)
+
+    def test_no_folder_at_all_is_not_a_rejection(self):
+        r = resolve("Velvet Crane - Morning Ritual.mp4", "")
+        self.assertIsNone(r.rejected_folder)
+
+
+class Disagreement(unittest.TestCase):
+    """`competing` is suppressed by identity, not by containment.
+
+    A folder only has to clear a 3-character / 4-word gate, so it is often the
+    *less* specific of the two candidates. Containment ("Ivy" is inside "Ivy
+    Kingsley Waters") would call those the same person, pick the shorter, and
+    report no disagreement -- scoping every later search to the wrong name and
+    saying nothing about it.
+    """
+
+    def test_a_folder_that_is_a_fragment_of_the_filename_still_disagrees(self):
+        r = resolve("Ivy Kingsley Waters - Morning Ritual.mp4", "Ivy")
+        self.assertEqual(r.name, "Ivy")
+        self.assertEqual(r.source, "folder")
+        self.assertEqual(r.competing, "Ivy Kingsley Waters")
+
+    def test_a_filename_that_extends_the_folder_still_disagrees(self):
+        r = resolve("Velvet Crane Studios - Morning Ritual.mp4", "Velvet Crane")
+        self.assertEqual(r.name, "Velvet Crane")
+        self.assertEqual(r.competing, "Velvet Crane Studios")
+
+    def test_spacing_and_punctuation_do_not_count_as_disagreement(self):
+        # the worked example: "Velvet Crane" and "velvetcrane" are one person
+        r = resolve("velvetcrane - Morning Ritual.mp4", "Velvet Crane")
+        self.assertEqual(r.name, "Velvet Crane")
+        self.assertIsNone(r.competing)
+
+    def test_a_composed_and_a_decomposed_accent_are_one_person(self):
+        # same name, folder written NFD and filename NFC -- a routine
+        # difference between what a filesystem stores and what a scraper emits
+        folder = "Zo\u0065\u0308 Marchcroft"                    # NFD
+        filename = "Zo\u00eb Marchcroft - Morning Ritual.mp4"    # NFC
+        self.assertNotEqual(folder, "Zo\u00eb Marchcroft")       # really differ
+        r = resolve(filename, folder)
+        self.assertEqual(r.source, "folder")
+        self.assertIsNone(r.competing)
+
+
 class Guards(unittest.TestCase):
     def test_a_date_left_of_the_dash_is_not_a_creator(self):
         # "2023 September 11 - Foot cam" is a date convention, not a person
