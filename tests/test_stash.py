@@ -366,23 +366,76 @@ class PriorStateSnapshot(unittest.TestCase):
         json.loads(json.dumps(prior))
 
 
+# Every key apply_scene's `prior` snapshot can hold (see apply_scene's prior=
+# dict in cronicled/stash.py).
+FULL_PRIOR_KEYS = {"title", "details", "date", "urls", "organized", "rating100",
+                   "code", "director", "stash_ids", "studio_id", "performer_ids",
+                   "tag_ids"}
+
+# apply_scene has no write path for these three: its `inp` (the sceneUpdate
+# input it builds) never sets rating100, code or director — confirmed by
+# reading apply_scene end to end, and matching Task 1's own
+# test_snapshot_covers_every_field_the_apply_can_write, whose "writable" set
+# excludes exactly these three. An apply-driven round trip can therefore never
+# make them differ, so dropping one from a snapshot has nothing to visibly
+# fail to restore here. They stay in the snapshot (apply_scene's existing
+# contract, unchanged by this ticket) but are excluded from the per-field
+# proof below because that proof requires the field to actually move.
+_NOT_WRITABLE_BY_APPLY_SCENE = {"rating100", "code", "director"}
+
+# A starting scene with a distinctive, non-empty value in every field the
+# snapshot captures, and a match that changes every one of them apply_scene
+# can actually write (studio needs overwrite_studio=True below, since the
+# scene already has one and apply only claims an unset slot otherwise).
+RICH_STATE = dict(
+    title="Old Title", details="Old details", date="2019-01-01",
+    urls=["http://old.example/1"], organized=False, rating100=50,
+    code="OLD-CODE", director="Old Director",
+    stash_ids=[{"endpoint": "http://old.example", "stash_id": "old-stash-id"}],
+    studio={"id": "st1"}, performers=[{"id": "p1"}], tags=[{"id": "t1"}])
+
+RICH_MATCH = dict(
+    title="New Title", details="New details", date="2024-05-05",
+    urls=["http://new.example/1"],
+    stash_ids=[{"endpoint": "http://new.example", "stash_id": "new-stash-id"}],
+    studio={"name": "New Studio"},
+    performers=[{"name": "Velvet Crane"}], tags=[{"name": "JOI"}])
+
+
 class RevertRoundTrip(unittest.TestCase):
     def test_apply_then_revert_restores_the_original_state(self):
         # the round trip is the proof the snapshot is complete: if a field is
-        # missing from it, the scene does not come back the same
-        server = _mutable_scene(title="Old Title", date="2019-01-01",
-                                performers=[{"id": "p1"}], tags=[{"id": "t1"}],
-                                studio={"id": "st1"}, organized=False)
+        # missing from it, the scene does not come back the same. The match
+        # here changes every field apply_scene can write (title, details,
+        # date, urls, stash_ids, studio, performers, tags — organized always
+        # flips too) so a regression in any one field's restore path would be
+        # visible, not hidden behind an untouched field passing through
+        # unchanged on both sides of the round trip.
+        server = _mutable_scene(**RICH_STATE)
         stash = Stash("http://example.test", "k", transport=server.transport)
         before = server.snapshot()
 
-        info = stash.apply_scene("s1", {"title": "New Title", "date": "2024-05-05",
-                                        "performers": [{"name": "Velvet Crane"}],
-                                        "tags": [{"name": "JOI"}]})
+        info = stash.apply_scene("s1", RICH_MATCH, overwrite_studio=True)
         self.assertNotEqual(server.snapshot(), before)   # the apply really changed it
 
         stash.revert_scene("s1", info["prior"])
         self.assertEqual(server.snapshot(), before)
+
+    def test_every_captured_field_is_needed_to_restore(self):
+        # the snapshot's completeness is the claim this whole change rests on;
+        # assert it per-field rather than trusting one spot check. rating100/
+        # code/director are excluded — see _NOT_WRITABLE_BY_APPLY_SCENE above.
+        for field in sorted(FULL_PRIOR_KEYS - _NOT_WRITABLE_BY_APPLY_SCENE):
+            with self.subTest(field=field):
+                server = _mutable_scene(**RICH_STATE)
+                stash = Stash("http://example.test", "k", transport=server.transport)
+                before = server.snapshot()
+                info = stash.apply_scene("s1", RICH_MATCH, overwrite_studio=True)
+                partial = {k: v for k, v in info["prior"].items() if k != field}
+                stash.revert_scene("s1", partial)
+                self.assertNotEqual(server.snapshot(), before,
+                                    "dropping %r still restored cleanly — the "
+                                    "round trip does not actually cover it" % field)
 
     def test_revert_writes_once(self):
         # a partial revert is worse than none: resolve first, then one write
