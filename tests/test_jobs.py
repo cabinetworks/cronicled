@@ -33,6 +33,36 @@ class _Producer:
             raise self._raises("producer failed after yielding")
 
 
+class _StartedInterrupted:
+    """Stands in for a `Thread`'s private `_started` event so a test can hold
+    open the window `Thread.start()` spends waiting on it.
+
+    CPython's `Thread.start()` spawns the child and then blocks in
+    `self._started.wait()`; the child sets `_started` from inside
+    `_bootstrap_inner`, just before calling `run()`. This replacement raises
+    out of that `wait()` (standing in for an interrupt arriving there) and
+    parks the child at its `set()` until the test lets it go — so `_started`
+    is genuinely unset, and `is_alive()` therefore genuinely False, for as
+    long as the assertions need, with a real worker really spawned behind
+    it."""
+
+    def __init__(self):
+        self._release = threading.Event()
+
+    def is_set(self):
+        return False
+
+    def set(self):
+        # the child, in _bootstrap_inner, immediately before run()
+        self._release.wait(5)
+
+    def wait(self, timeout=None):
+        raise KeyboardInterrupt("interrupt delivered inside Thread.start()")
+
+    def let_the_worker_run(self):
+        self._release.set()
+
+
 class _RunnerCase(unittest.TestCase):
     def setUp(self):
         self._dir = tempfile.mkdtemp()
@@ -126,6 +156,78 @@ class BaseExceptions(_RunnerCase):
         self.assertEqual(len(self.store.items()), 1)
 
 
+class _BareFailure:
+    """A producer whose failure carries no message at all: `str(exc)` is `''`,
+    so a job recording only that has no record of the failure whatsoever."""
+
+    name, cost = "bare", "local"
+
+    def produce(self, ctx):
+        raise RuntimeError()
+        yield {}  # never reached; makes produce a generator function
+
+
+class _ReturnsAList:
+    """A producer that collects its proposals and returns them, losing the
+    incremental recording the runner is built around."""
+
+    name, cost = "listy", "local"
+
+    def produce(self, ctx):
+        return [{"folder": "f", "subject_type": "scene", "subject_id": "0",
+                 "summary": "proposal", "payload": {}}]
+
+
+class Diagnostics(_RunnerCase):
+    def test_a_failure_with_no_message_still_names_its_type(self):
+        # the worker swallows the exception and nothing logs it, so an error
+        # of "" would leave a failed job that looks like nothing happened
+        self.runner.register(_BareFailure())
+        job = self.runner.start("bare")
+        self.assertTrue(self.runner.wait(job.id, timeout=5))
+        failed = self.runner.job(job.id)
+        self.assertEqual(failed.state, "failed")
+        self.assertIn("RuntimeError", failed.error)
+
+    def test_a_failure_keeps_the_frames_that_say_where_it_happened(self):
+        self.runner.register(_BareFailure())
+        job = self.runner.start("bare")
+        self.assertTrue(self.runner.wait(job.id, timeout=5))
+        detail = self.runner.job(job.id).traceback
+        self.assertIn("RuntimeError", detail)
+        self.assertIn("produce", detail)
+
+    def test_a_job_that_succeeds_carries_no_error_or_traceback(self):
+        self.runner.register(_Producer(count=1))
+        job = self.runner.start("test-producer")
+        self.assertTrue(self.runner.wait(job.id, timeout=5))
+        done = self.runner.job(job.id)
+        self.assertIsNone(done.error)
+        self.assertIsNone(done.traceback)
+
+
+class ProducerContract(_RunnerCase):
+    def test_registering_a_name_twice_is_refused(self):
+        # silently replacing would swap what the name runs, and its cost
+        # class with it -- a wiring mistake, so it fails at wiring time
+        self.runner.register(_Producer(name="scan", cost="scraping"))
+        with self.assertRaises(ValueError):
+            self.runner.register(_Producer(name="scan", cost="local"))
+        job = self.runner.start("scan")
+        self.assertEqual(job.cost, "scraping")
+        self.assertTrue(self.runner.wait(job.id, timeout=5))
+
+    def test_a_produce_that_returns_a_list_is_refused(self):
+        # a list means the whole scan runs before anything is recorded, so a
+        # scrape that dies partway through keeps nothing -- exactly what the
+        # runner's yield-by-yield recording exists to prevent
+        self.runner.register(_ReturnsAList())
+        with self.assertRaises(TypeError):
+            self.runner.start("listy")
+        self.assertEqual(self.runner.jobs(), [])
+        self.assertEqual(len(self.store.items()), 0)
+
+
 class CostClasses(_RunnerCase):
     def test_a_second_scraping_job_is_refused_while_one_runs(self):
         # two scrapes at once thrash the media server's headless browser and get
@@ -203,6 +305,54 @@ class CostClasses(_RunnerCase):
         second = self.runner.start("scan")
         self.assertTrue(self.runner.wait(second.id, timeout=5))
         self.assertEqual(self.runner.job(second.id).state, "done")
+
+    def test_an_interrupt_inside_thread_start_leaves_the_slot_to_the_worker(self):
+        # The window this covers is the one Thread.start() spends in
+        # `self._started.wait()`: the child has been spawned, but it is the
+        # child that sets `_started`, so until it does, `is_alive()` is
+        # False for a worker that is already on its way. An interrupt
+        # landing there escapes start() with a live worker behind it, and
+        # rolling the reservation back would free the cost class for that
+        # live worker -- letting a second job of the class run alongside
+        # it, the exact concurrency COST_CLASS_LIMITS exists to prevent.
+        #
+        # Patching Thread.start to call the real start and *then* raise
+        # cannot reach this: by then `_started` is set and the window is
+        # over. So the test stands in for the thread's private `_started`
+        # event instead, which puts it inside the real thing -- the real
+        # start() really does spawn the child and really does raise out of
+        # `_started.wait()`, with `_started` genuinely unset, which is what
+        # makes `is_alive()` say False. The stand-in also parks the child
+        # just before run(), so the window stays open for the assertions
+        # rather than closing on a race.
+        self.runner.register(_Producer(name="scan", cost="scraping", count=1))
+        self.runner.register(_Producer(name="scan-2", cost="scraping", count=1))
+
+        real_start = threading.Thread.start
+        started = _StartedInterrupted()
+
+        def interrupted_start(thread):
+            thread._started = started
+            real_start(thread)
+
+        with mock.patch("threading.Thread.start", interrupted_start):
+            with self.assertRaises(KeyboardInterrupt):
+                self.runner.start("scan")
+
+        try:
+            # the worker exists, so the slot is its own `finally`'s to
+            # release: the class must still be held, and the job must still
+            # be visible rather than erased while its thread runs on.
+            with self.assertRaises(JobRejected):
+                self.runner.start("scan-2")
+            first = [j for j in self.runner.jobs() if j.producer == "scan"][0]
+            self.assertEqual(self.runner.job(first.id).state, "running")
+        finally:
+            started.let_the_worker_run()
+
+        self.assertTrue(self.runner.wait(first.id, timeout=5))
+        self.assertEqual(self.runner.job(first.id).state, "done")
+        self.assertEqual(len(self.store.items()), 1)
 
     def test_a_race_of_starts_never_lets_two_scraping_jobs_through(self):
         # a check-then-start that is not atomic would pass the single-
