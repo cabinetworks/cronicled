@@ -95,6 +95,26 @@ class Scoring(unittest.TestCase):
         self.assertTrue(m.contained)
         self.assertGreaterEqual(m.value, 0.9)
 
+    def test_an_extension_shaped_tail_cannot_manufacture_containment(self):
+        # dropping a trailing extension-shaped suffix shrinks the evidence
+        # set, and a smaller set is MORE likely to be a subset of a title --
+        # which is the path that bypasses the threshold entirely. So the
+        # strip that stops a rename posing as evidence must never be able to
+        # hand a wrong title containment instead. "Dawn" is exactly what
+        # separates this file from "Dusk", and it is the token being dropped.
+        for name in ("Morning Ritual.Dawn", "Morning.Ritual.Dawn"):
+            m = score(name, "", "Morning Ritual Dusk")
+            self.assertFalse(m.contained, name)
+            self.assertLess(m.value, 0.9, name)
+            self.assertIsNone(decide([m], threshold=0.95).match, name)
+
+    def test_a_known_container_is_gone_before_containment_is_judged(self):
+        # the counterpart: a container we recognise is confidently not
+        # content, so stripping it must still leave containment intact
+        m = score("Morning Ritual.mp4", "", "Morning Ritual At Dawn")
+        self.assertTrue(m.contained)
+        self.assertEqual(m.meaningful_count, 2)
+
     def test_renaming_the_container_cannot_defeat_the_generic_word_rule(self):
         # "Addict" alone is one generic word wherever it appears; the rule
         # that refuses it must not switch off because the file was renamed

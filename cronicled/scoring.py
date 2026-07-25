@@ -78,14 +78,24 @@ def _strip_unknown_ext(name):
     return match.group("stem")
 
 
+def _evidence(name, folder, artist=None):
+    """Both readings of the evidence: `kept` holds a trailing extension-shaped
+    suffix, `stripped` drops it. Callers pick per use -- see `score`."""
+    from_folder = set(tokens(clean_folder(folder)))
+    base = strip_ext(name)
+    kept = set(tokens(base)) | from_folder
+    stripped = set(tokens(_strip_unknown_ext(base))) | from_folder
+    if artist:
+        from_artist = set(tokens(artist))
+        kept -= from_artist
+        stripped -= from_artist
+    return kept, stripped
+
+
 def meaningful_tokens(name, folder, artist=None):
     """Tokens left after dropping stopwords, junk, and the artist's own name --
     the evidence that can actually distinguish one title from another."""
-    result = (set(tokens(_strip_unknown_ext(strip_ext(name))))
-              | set(tokens(clean_folder(folder))))
-    if artist:
-        result -= set(tokens(artist))
-    return result
+    return _evidence(name, folder, artist=artist)[1]
 
 
 def _recall(view_tokens, title_tokens):
@@ -128,8 +138,26 @@ def score(name, folder, title, artist=None):
               for view in views if title_norm and normalize(view)]
     best = max(scored, default=0.0)
 
-    meaningful = meaningful_tokens(name, folder, artist=artist)
-    contained = len(meaningful) >= 2 and meaningful.issubset(set(title_tokens))
+    # A container listed in VIDEO_EXTS is confidently not content, so
+    # `strip_ext` removes it outright and neither set below ever sees it. An
+    # extension-SHAPED suffix we do not recognise might be a real word, so the
+    # two sets disagree about it and each is asked only what it can safely
+    # answer: uncertainty may withhold evidence, never supply it.
+    #
+    # `meaningful_count` reads the stripped set, so a renamed container cannot
+    # inflate the count past the single-generic-word rule.
+    #
+    # `contained` reads the UN-stripped set, because containment is a subset
+    # test and dropping a token can only make a set more of a subset. Judged on
+    # the stripped set, discarding the one token that distinguishes the file
+    # from a wrong title turns the remainder into a subset of that title --
+    # floored to 0.9 and eligible without ever meeting the threshold.
+    # "Morning Ritual.Dawn" against "Morning Ritual Dusk" is that shape, and
+    # dot-separated naming makes it common. The count gate stays on the
+    # stripped set, the strictly smaller of the two, so the strip can only ever
+    # cost containment, never grant it.
+    kept, meaningful = _evidence(name, folder, artist=artist)
+    contained = len(meaningful) >= 2 and kept.issubset(set(title_tokens))
     if contained:
         best = max(best, 0.9)
 
