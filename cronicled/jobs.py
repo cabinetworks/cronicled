@@ -171,20 +171,17 @@ class JobRunner:
         `store.record()` returns a fingerprint whether it stored the
         proposal or declined it — a dismissed or muted subject returns the
         same fingerprint a freshly-stored one would. Telling the two apart
-        needs an actual check: `store.items()`, with no explicit `state`,
-        already excludes `dismissed` and `muted` rows (that is its
-        documented default). So after recording, this looks the fingerprint
-        up in that same default view, scoped to the proposal's folder — if
-        it is there, the store kept it (inserted or touched); if not, the
+        needs an actual check: `store.has()` answers exactly this, with a
+        single primary-key lookup rather than a scan of the whole folder —
+        if it is there, the store kept it (inserted or touched); if not, the
         store declined it, whether the row exists in a hidden state or
         never existed at all (a pre-emptive mute/dismissal blocks the insert
-        entirely). Presence in the default view is exactly the "did a
-        reviewer's own decision suppress this" signal a user needs to tell a
-        quiet producer from a broken one.
+        entirely). That presence is exactly the "did a reviewer's own
+        decision suppress this" signal a user needs to tell a quiet
+        producer from a broken one.
         """
-        folder = proposal["folder"]
         fp = self._store.record(
-            folder=folder,
+            folder=proposal["folder"],
             subject_type=proposal["subject_type"],
             subject_id=proposal["subject_id"],
             summary=proposal["summary"],
@@ -192,9 +189,7 @@ class JobRunner:
             producer=producer_name,
             confidence=proposal.get("confidence"),
         )
-        kept = any(
-            item["fingerprint"] == fp for item in self._store.items(folder=folder)
-        )
+        kept = self._store.has(fp)
         with self._lock:
             if kept:
                 state.recorded += 1
