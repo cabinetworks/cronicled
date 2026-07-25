@@ -26,9 +26,22 @@ from typing import Optional
 
 class JobRejected(Exception):
     """Raised by `start()` when the producer's cost class already has a job
-    running against it. Cost classes and their limits are wired up in a
-    later task; this exception exists now because producers and callers are
-    written against it from the start."""
+    running against it. Names the job that is already running, so a caller
+    told no can go find out what is holding the slot rather than just being
+    left to guess."""
+
+
+# Per-cost-class concurrency limits. `scraping` and `box` both drive a
+# headless browser inside the media server: a second one running at the
+# same time thrashes it and makes both slower, not faster, so each allows
+# exactly one job at a time. `local` analysis has no such external
+# bottleneck and must not queue behind a twenty-minute scrape, so it is
+# unlimited (`None`).
+COST_CLASS_LIMITS = {
+    "scraping": 1,
+    "box": 1,
+    "local": None,
+}
 
 
 def _now():
@@ -118,8 +131,26 @@ class JobRunner:
         self._lock = threading.Lock()
         self._jobs = {}
         self._done = {}
+        # cost class -> {job_id: producer_name} for every job of that class
+        # currently running. Guarded by `_lock`, same as everything else:
+        # the saturation check in `start()` and the reservation of a slot
+        # must happen atomically, or two callers racing `start()` at once
+        # could both see room and both proceed.
+        self._running_by_cost = {cost: {} for cost in COST_CLASS_LIMITS}
 
     def register(self, producer):
+        """Wire up a producer under its own name.
+
+        Rejects an unknown cost class here, at registration, rather than
+        later at `start()` — a typo in a cost class is a wiring mistake that
+        should fail when the producer is set up, not hours later when a
+        schedule tries to run it.
+        """
+        if producer.cost not in COST_CLASS_LIMITS:
+            raise ValueError(
+                f"unknown cost class {producer.cost!r} for producer "
+                f"{producer.name!r} (known: {sorted(COST_CLASS_LIMITS)})"
+            )
         self._producers[producer.name] = producer
 
     def start(self, name):
@@ -127,7 +158,21 @@ class JobRunner:
         job_id = str(uuid.uuid4())
         state = _JobState(job_id, producer.name, producer.cost)
         done = threading.Event()
+        limit = COST_CLASS_LIMITS[producer.cost]
         with self._lock:
+            running = self._running_by_cost[producer.cost]
+            if limit is not None and len(running) >= limit:
+                # Refuse explicitly rather than queue: a caller who believes
+                # a job started and is wrong is worse off than one told no.
+                # This check and the reservation just below happen inside
+                # the same lock acquisition, so two threads racing `start()`
+                # can never both see room and both proceed.
+                blockers = ", ".join(sorted(running.values()))
+                raise JobRejected(
+                    f"cost class {producer.cost!r} is already running "
+                    f"{blockers}"
+                )
+            running[job_id] = producer.name
             self._jobs[job_id] = state
             self._done[job_id] = done
             snapshot = state.snapshot()
@@ -158,6 +203,12 @@ class JobRunner:
                 state.state = "done"
                 state.finished_at = _now()
         finally:
+            # Release the cost-class slot no matter how the job ended. A
+            # crashed scrape that never frees its slot would permanently
+            # block every future scrape — a deadlock in slow motion, with
+            # nothing in the logs to say why the tool stopped working.
+            with self._lock:
+                self._running_by_cost[state.cost].pop(state.id, None)
             done.set()
 
     def _log(self, state, message):
