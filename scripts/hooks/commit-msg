@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Reject a commit message that contains a configured leak pattern, before it
+# is ever written to history. Commit messages are permanent and public the
+# moment a commit is pushed, so catching a bad one here — before the commit
+# object exists — is strictly better than catching it later in scripts/check_leaks.sh,
+# which can only report that history already contains it.
+#
+# NOT installed automatically. This repo's core.hooksPath is owned by a
+# different, unrelated mechanism, so this hook does not touch it. To enable
+# this hook locally, copy or symlink it into .git/hooks/commit-msg:
+#
+#   cp scripts/hooks/commit-msg .git/hooks/commit-msg
+#   chmod +x .git/hooks/commit-msg
+#
+# or, to track upstream changes to this file automatically:
+#
+#   ln -sf ../../scripts/hooks/commit-msg .git/hooks/commit-msg
+#
+# Uses the same pattern source and the same fail-closed rules as
+# scripts/check_leaks.sh: no patterns configured is a REJECTION, not a
+# silent pass, and a pattern list sed cannot fully parse is refused rather
+# than used partially.
+set -u
+
+msg_file="${1:-}"
+if [ -z "$msg_file" ] || [ ! -f "$msg_file" ]; then
+	echo "commit-msg: BLOCKED - no commit message file given." >&2
+	exit 1
+fi
+
+patterns=""
+if [ -n "${LEAK_PATTERNS:-}" ]; then
+	patterns=$LEAK_PATTERNS
+elif [ -f .leak-patterns ]; then
+	patterns=$(cat .leak-patterns)
+fi
+raw_patterns=$patterns
+
+input_count=$(printf '%s\n' "$raw_patterns" | grep -a -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' | grep -a -c '^')
+
+patterns=$(printf '%s\n' "$raw_patterns" | sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d')
+sed_status=$?
+if [ "$sed_status" -ne 0 ]; then
+	echo "commit-msg: BLOCKED - pattern preprocessing exited $sed_status." >&2
+	echo "  Refusing to check this message against a possibly-truncated pattern list." >&2
+	exit 1
+fi
+
+survived_count=$(printf '%s\n' "$patterns" | grep -a -c '^.')
+if [ "$survived_count" -ne "$input_count" ]; then
+	echo "commit-msg: BLOCKED - pattern preprocessing dropped lines silently." >&2
+	echo "  $survived_count pattern(s) survived out of $input_count supplied." >&2
+	echo "  Refusing to check this message against a possibly-truncated pattern list." >&2
+	exit 1
+fi
+
+if [ -z "$patterns" ]; then
+	echo "commit-msg: BLOCKED - no patterns configured." >&2
+	echo "  Create .leak-patterns (git-ignored, one pattern per line) or set LEAK_PATTERNS." >&2
+	exit 1
+fi
+
+blocked=0
+while IFS= read -r pat; do
+	[ -n "$pat" ] || continue
+	if grep -q -a -i -F -e "$pat" -- "$msg_file" 2>/dev/null; then
+		echo "commit-msg: BLOCKED - message matches a forbidden pattern." >&2
+		blocked=1
+	fi
+done <<EOF
+$patterns
+EOF
+
+exit "$blocked"

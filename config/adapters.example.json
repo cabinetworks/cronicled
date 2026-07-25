@@ -1,0 +1,15 @@
+{
+  "default": "examplestore",
+  "adapters": [
+    {
+      "name": "examplestore",
+      "display": "Example Store",
+      "scraper_id": "ExampleStore",
+      "owner_source": "url_segment",
+      "owner_segment": 2,
+      "catalog_resolvable": true,
+      "censorship": {},
+      "aliases": {}
+    }
+  ]
+}

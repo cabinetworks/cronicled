@@ -1,0 +1,13 @@
+# One pattern per line, matched case-insensitively against tracked file
+# contents and tracked filenames. '#' starts a comment.
+#
+# Put here anything that must never become public: a predecessor project name,
+# your real name, an email domain, hostnames, home-directory paths, and any
+# third-party brand you do not want as this project's public interface.
+#
+# In CI this list comes from the LEAK_PATTERNS repository secret instead, so
+# the list itself never enters the repository.
+
+example-old-project-name
+example-hostname
+/home/example

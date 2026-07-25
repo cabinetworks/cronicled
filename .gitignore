@@ -1,0 +1,80 @@
+# --- Deny by default: data never enters this repo -----------------------------
+# Anything that could carry library contents, credentials or local state is
+# ignored wholesale; specific config files are allowed back in below.
+*.json
+*.jsonl
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.tsv
+*.csv
+*.log
+*.err
+*.pid
+*.key
+*.pem
+*.env
+*.yaml
+*.yml
+*.ini
+*.cfg
+*.toml
+*.zip
+*.tar
+*.gz
+*.rar
+*.parquet
+
+# --- Media: never, under any circumstances ------------------------------------
+*.mp4
+*.m4v
+*.mkv
+*.avi
+*.wmv
+*.mov
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+*.webm
+*.srt
+*.vtt
+*.ass
+*.m3u
+*.mp3
+*.wav
+*.flac
+*.bmp
+*.tiff
+*.heic
+
+# --- Allowed back in ----------------------------------------------------------
+# Deliberately narrow. A JSON that genuinely belongs in the repo can be named
+# *.example.json; anything else must justify itself by being force-added, which
+# the leak guard then catches.
+!**/*.example.json
+
+# --- Local user config (brand data, endpoints, secrets) -----------------------
+# Exclude the directory's CONTENTS, not the directory itself: a negated
+# pattern cannot rescue a file inside an excluded directory, because git never
+# descends into it to check. Excluding "/config/*" still lets git look inside
+# to find the one file the negation lets back through.
+/config/*
+!/config/*.example.json
+/var/
+
+# --- The leak guard's pattern list: never committed (see Task 2) --------------
+# It has no extension, so the rules above do not cover it.
+.leak-patterns
+
+# --- Python -------------------------------------------------------------------
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+
+# --- OS -----------------------------------------------------------------------
+.DS_Store
