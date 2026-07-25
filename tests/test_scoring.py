@@ -53,6 +53,31 @@ class Scoring(unittest.TestCase):
         m = score("Addict.mp4", "", "Addict To The Sound")
         self.assertFalse(m.contained)
 
+    def test_partial_token_overlap_is_not_containment(self):
+        # containment means the filename's evidence is a SUBSET of the title,
+        # not that the two merely overlap. Relaxed to "any token in common",
+        # a wrong title floors to 0.9 and bypasses the threshold entirely.
+        m = score("Morning Ritual.mp4", "", "Morning Coffee")
+        self.assertEqual(m.meaningful_count, 2)
+        self.assertFalse(m.contained)
+        self.assertLess(m.value, 0.9)
+
+    def test_most_but_not_all_tokens_shared_is_not_containment(self):
+        # two of three tokens shared is still the wrong clip
+        m = score("Morning Ritual Dawn.mp4", "", "Morning Ritual Dusk")
+        self.assertEqual(m.meaningful_count, 3)
+        self.assertFalse(m.contained)
+        self.assertLess(m.value, 0.9)
+
+    def test_a_contained_match_is_floored_at_nine_tenths(self):
+        # containment is evidence in its own right, independent of what the
+        # arithmetic produced -- and the floor is what manufactures the ties
+        # the ambiguity rule then refuses
+        m = score("Morning Ritual.mp4", "",
+                  "Morning Ritual In Winter Light Extended")
+        self.assertTrue(m.contained)
+        self.assertGreaterEqual(m.value, 0.9)
+
     def test_meaningful_count_is_reported(self):
         m = score("Morning Ritual 1080p.mp4", "", "anything")
         self.assertEqual(m.meaningful_count, 2)
@@ -97,6 +122,19 @@ class Deciding(unittest.TestCase):
     def test_two_contained_candidates_are_ambiguous(self):
         # both floor at 0.9, so this tie is a normal outcome, not a rarity
         d = decide([self._m(0.9, contained=True), self._m(0.9, contained=True)])
+        self.assertIsNone(d.match)
+        self.assertIn("ambiguous", d.reason)
+
+    def test_the_containment_floor_is_what_makes_two_titles_ambiguous(self):
+        # raw, these two score 0.933 and 0.858 -- far enough apart that the
+        # wrong one would be applied. The floor lifts both to at least 0.9,
+        # which is what lets the ambiguity rule see the dilemma.
+        a = score("Morning Ritual.mp4", "", "Morning Ritual At Dawn")
+        b = score("Morning Ritual.mp4", "",
+                  "Morning Ritual In Winter Light Extended")
+        self.assertTrue(a.contained)
+        self.assertTrue(b.contained)
+        d = decide([a, b])
         self.assertIsNone(d.match)
         self.assertIn("ambiguous", d.reason)
 
