@@ -36,7 +36,7 @@ jobs:
           if [ "${IS_FORK_PR}" = "true" ]; then
             echo "Fork pull request: LEAK_PATTERNS is not available to fork PRs by GitHub's own design."
             echo "Running file-type checks only; the full scan still runs on push to main."
-            ./scripts/check_leaks.sh --file-types-only
+            ./scripts/check_leaks --file-types-only
           elif [ -z "${LEAK_PATTERNS}" ]; then
             echo "::error::LEAK_PATTERNS is empty on a non-fork run (push, or a same-repo PR)." >&2
             echo "::error::That cannot legitimately happen here - only a fork PR is exempt from" >&2
@@ -45,7 +45,7 @@ jobs:
             echo "::error::downgrading to file-type-only checks." >&2
             exit 1
           else
-            ./scripts/check_leaks.sh
+            ./scripts/check_leaks
           fi
 
   test:

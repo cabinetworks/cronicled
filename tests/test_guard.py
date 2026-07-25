@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import unittest
 
-GUARD = os.path.abspath("scripts/check_leaks.sh")
+GUARD = os.path.abspath("scripts/check_leaks")
 EXT_LIST_NAMES = ("data-extensions.txt", "media-extensions.txt")
 
 
@@ -141,13 +141,13 @@ def _guard_with_ext_lists(missing=(), empty=(), whitespace_only=(), raw_content=
     exercising the guard's own fail-closed behaviour when its shared
     pattern-loading dependency is missing (see PatternsLibFailClosed)."""
     d = tempfile.mkdtemp()
-    shutil.copy(GUARD, os.path.join(d, "check_leaks.sh"))
+    shutil.copy(GUARD, os.path.join(d, "check_leaks"))
     src_dir = os.path.dirname(GUARD)
     raw_content = raw_content or {}
     if include_lib:
         os.makedirs(os.path.join(d, "lib"), exist_ok=True)
-        shutil.copy(os.path.join(src_dir, "lib", "patterns.sh"),
-                    os.path.join(d, "lib", "patterns.sh"))
+        shutil.copy(os.path.join(src_dir, "lib", "leakpatterns.py"),
+                    os.path.join(d, "lib", "leakpatterns.py"))
     for name in EXT_LIST_NAMES:
         if name in missing:
             continue  # do not copy: simulates a deleted/renamed list
@@ -167,7 +167,7 @@ def _guard_with_ext_lists(missing=(), empty=(), whitespace_only=(), raw_content=
                 fh.write("# only a comment\n   \n")
             continue
         shutil.copy(os.path.join(src_dir, name), dst)
-    return os.path.join(d, "check_leaks.sh")
+    return os.path.join(d, "check_leaks")
 
 
 class OutputDiscipline(unittest.TestCase):

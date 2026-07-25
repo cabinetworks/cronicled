@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""Fail the build if anything that must never be public has entered the repo.
+
+Scans, for every configured pattern:
+  (a) the working tree: tracked file CONTENTS and tracked FILENAMES
+  (b) every commit reachable in history: tracked file CONTENTS as they
+      existed at that commit, even if later removed
+  (c) untracked-but-not-ignored files: FILENAMES and CONTENTS
+  (d) every commit message in history
+
+The pattern list is deliberately NOT stored here. A committed list would
+enumerate exactly what must stay private - a worse disclosure than any
+single string it guards against. Supply it out of band:
+
+  LEAK_PATTERNS    newline-separated, from a CI secret
+  .leak-patterns   one per line, git-ignored, for local runs
+
+No patterns configured is a FAILURE, not a pass: a missing or renamed
+secret must break the build rather than silently disable the guard.
+
+--- The governing rule for every read below --------------------------------
+Every read of external state - a file, an environment variable, a
+subprocess - must either succeed or abort. No code path may exit 0 after a
+read that failed. "Could not determine" is not "clean". Every subprocess
+call in this file goes through run_git() (or scripts/lib/leakpatterns.py's
+own grep helper), which checks the exit status and raises GuardError on
+anything unexpected - with the one nuance both the shell version and this
+port learned the hard way: `git grep` exits 1 for "no match" and >1 for an
+error; `grep -c` exits 1 on a legitimate zero count. Those two exit-1 cases
+are data, not failure; everything else non-zero aborts the run via
+GuardError, which always means exit 2.
+
+Output discipline: paths and matched names are shown or redacted depending
+on where the patterns came from, never on which leg matched.
+
+  LEAK_PATTERNS (CI secret) -> redact by default: every leg reports a
+  count, plus commit SHAs where relevant (a SHA is not sensitive), and
+  NEVER a path or a matched name. CI logs are public, and a path can
+  coincidentally contain the pattern even when a *content* leg is what
+  matched it - so every leg redacts, not just the filename legs.
+
+  .leak-patterns (local file) -> show paths and names by default: a
+  developer's own terminal is not a public log.
+
+  --redact forces the CI behaviour even when reading the local file.
+
+--file-types-only skips every pattern-based leg and does not fail when no
+patterns are configured, because none are expected in that mode. It exists
+for fork pull requests, which cannot read the LEAK_PATTERNS secret. Every
+other invocation keeps failing closed.
+"""
+import fnmatch
+import importlib.util
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+# Set once main() has loaded scripts/lib/leakpatterns.py from this script's
+# own directory (see _bootstrap_leakpatterns). Every function below raises
+# this class - resolved at call time, from the module global - rather than
+# defining a second, competing exception type here: there must be exactly
+# one GuardError, the one leakpatterns.py's own loaders already raise.
+GuardError = None
+
+
+def _bootstrap_leakpatterns(script_dir: Path):
+    """Load scripts/lib/leakpatterns.py from THIS SCRIPT's own directory,
+    not via the normal import path: this script may be invoked (and is, by
+    tests/test_guard.py) as a standalone copy in a directory that controls
+    exactly what sits next to it. Fail closed if the shared library is
+    missing or unreadable, the same standard as a missing pattern file or a
+    missing extension list: a missing or broken shared dependency must break
+    the build, not silently skip the checks that depend on it. This runs
+    before GuardError exists, so it prints and exits directly rather than
+    raising."""
+    lib_path = script_dir / "lib" / "leakpatterns.py"
+    if not lib_path.is_file() or not os.access(lib_path, os.R_OK):
+        print(
+            "check_leaks: FAILED - shared pattern-loading library is missing "
+            f"or unreadable: {lib_path}\n"
+            "  Refusing to run with no trusted pattern-loading logic available.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    try:
+        spec = importlib.util.spec_from_file_location("leakpatterns", lib_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as exc:  # noqa: BLE001 - any load failure must fail closed
+        print(f"check_leaks: FAILED - could not load {lib_path}: {exc}", file=sys.stderr)
+        sys.exit(2)
+    return module
+
+
+def run_git(args, allow_returncodes=(0,)):
+    """Run `git <args>` and check its exit status immediately. Every git
+    invocation in this file goes through here (never through a bare
+    subprocess.run elsewhere) so that check is never accidentally skipped."""
+    try:
+        proc = subprocess.run(
+            ["git", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+    except OSError as exc:
+        raise GuardError(f"could not execute git {' '.join(args)}: {exc}") from exc
+    if proc.returncode not in allow_returncodes:
+        raise GuardError(
+            f"git {' '.join(args)} failed (exit {proc.returncode}): "
+            f"{proc.stderr.decode('utf-8', 'replace').strip()}"
+        )
+    return proc
+
+
+def resolve_repo_root() -> str:
+    proc = run_git(["rev-parse", "--show-toplevel"])
+    root = proc.stdout.decode("utf-8", "replace").strip()
+    if not root:
+        raise GuardError("git rev-parse --show-toplevel returned an empty path")
+    return root
+
+
+def _split_nul_list(data: bytes) -> list[str]:
+    return [p.decode("utf-8", "surrogateescape") for p in data.split(b"\0") if p]
+
+
+def enumerate_tracked() -> list[str]:
+    """Fresh at every call - never cached and reused. An earlier version of
+    the shell guard took one tracked-file snapshot near the top and reused
+    it everywhere, including in the file-type check at the very end of the
+    run: a file added to the index partway through a run was invisible to
+    that check even though it was genuinely tracked by the time the check
+    actually ran. Every caller below re-enumerates at its own point of use."""
+    proc = run_git(["ls-files", "-z"])
+    return _split_nul_list(proc.stdout)
+
+
+def enumerate_untracked() -> list[str]:
+    proc = run_git(["ls-files", "--others", "--exclude-standard", "-z"])
+    return _split_nul_list(proc.stdout)
+
+
+def readability_preflight(paths: list[str]) -> None:
+    """Every currently tracked and untracked file must be readable before
+    any pattern is tested. `git grep` and plain `grep` both report "no
+    match" - their normal exit code for a genuinely clean result - for a
+    file they cannot open at all. Without this, an unreadable file holding
+    an uncommitted leak would report clean."""
+    for path in paths:
+        if not os.access(path, os.R_OK):
+            raise GuardError(
+                f"file is not readable: {path}\n"
+                "  Refusing to report clean without having been able to scan it."
+            )
+
+
+def scan_tracked_content(pattern: str) -> list[str]:
+    """Forbidden string in tracked file CONTENTS, working tree. -a, NOT -I:
+    `git grep -I` silently excludes anything git treats as binary -
+    including a plain-ASCII file marked `-diff`/`binary` in .gitattributes,
+    and any file with a NUL byte anywhere in it. -a forces git to treat
+    every tracked file as text regardless of that heuristic."""
+    proc = run_git(["grep", "-a", "-i", "-F", "-l", "-e", pattern, "--", "."], allow_returncodes=(0, 1))
+    if proc.returncode == 1:
+        return []
+    return [line for line in proc.stdout.decode("utf-8", "replace").split("\n") if line]
+
+
+def scan_history_content(pattern: str, revs: list[str]) -> list[str]:
+    """Same content leg as scan_tracked_content, but across every commit
+    reachable in history: a leak that was committed and then deleted is
+    still permanently public the moment it is pushed. -a here too - a blob
+    that was binary-flagged at that point in history is not exempt either."""
+    proc = run_git(
+        ["grep", "-a", "-i", "-F", "-l", "-e", pattern, *revs, "--", "."],
+        allow_returncodes=(0, 1),
+    )
+    if proc.returncode == 1:
+        return []
+    return [line for line in proc.stdout.decode("utf-8", "replace").split("\n") if line]
+
+
+def scan_filenames(names: list[str], pattern: str) -> list[str]:
+    """Case-insensitive literal substring match, used for both the tracked
+    and the untracked filename legs. A file *named* for a private term
+    leaks exactly as surely as one containing it in its body."""
+    needle = pattern.lower()
+    return [name for name in names if needle in name.lower()]
+
+
+def scan_untracked_content(names: list[str], pattern: str) -> list[str]:
+    """Untracked files are invisible to `git grep` (it only ever sees
+    tracked content), so they are read and matched directly. Every one of
+    these was already confirmed readable in the preflight above."""
+    needle = pattern.lower().encode("utf-8", "surrogateescape")
+    hits = []
+    for name in names:
+        try:
+            data = Path(name).read_bytes()
+        except OSError as exc:
+            raise GuardError(
+                f"could not read untracked file {name}: {exc}\n"
+                "  Refusing to report clean without having been able to scan it."
+            ) from exc
+        if needle in data.lower():
+            hits.append(name)
+    return hits
+
+
+ALLOWED_TRACKED_PATTERNS = (
+    "*.example.json",
+    ".github/workflows/*.yml",
+    ".github/workflows/*.yaml",
+    "pyproject.toml",
+    "uv.lock",
+)
+
+
+def check_file_types(script_dir: Path, leakpatterns, fail) -> None:
+    """Data and media files. The ignore rules should prevent these; this
+    catches a `git add -f`. The extension lists live in
+    scripts/data-extensions.txt and scripts/media-extensions.txt, loaded to
+    the same fail-closed standard as the pattern list (see
+    leakpatterns.load_globs). This runs unconditionally, even in
+    --file-types-only mode where it is the ONLY check that runs, and it
+    re-enumerates tracked files fresh (see enumerate_tracked's docstring):
+    this section runs last, after every pattern-based leg, so reusing an
+    earlier snapshot here specifically is what let a file added partway
+    through a run go unseen."""
+    data_exts = leakpatterns.load_globs(script_dir / "data-extensions.txt")
+    media_exts = leakpatterns.load_globs(script_dir / "media-extensions.txt")
+
+    for name in enumerate_tracked():
+        if any(fnmatch.fnmatchcase(name, allowed) for allowed in ALLOWED_TRACKED_PATTERNS):
+            continue
+        if any(fnmatch.fnmatchcase(name, ext) for ext in data_exts):
+            fail(f"tracked data file: {name}")
+            continue
+        if any(fnmatch.fnmatchcase(name, ext) for ext in media_exts):
+            fail(f"tracked media file: {name}")
+
+
+def main() -> int:
+    global GuardError
+    script_dir = Path(os.path.realpath(sys.argv[0])).parent
+    leakpatterns = _bootstrap_leakpatterns(script_dir)
+    GuardError = leakpatterns.GuardError
+
+    findings = 0
+
+    def fail(msg: str) -> None:
+        nonlocal findings
+        print(f"LEAK: {msg}", file=sys.stderr)
+        findings += 1
+
+    try:
+        root = resolve_repo_root()
+        os.chdir(root)
+
+        mode = "full"
+        force_redact = False
+        for arg in sys.argv[1:]:
+            if arg == "--file-types-only":
+                mode = "file-types-only"
+            elif arg == "--redact":
+                force_redact = True
+            else:
+                raise GuardError(f"unknown argument: {arg}")
+
+        if mode == "full":
+            patterns, source = leakpatterns.load_patterns(os.environ, root)
+            redact = force_redact or source == "env"
+
+            all_revs_proc = run_git(["rev-list", "--all"])
+            all_revs = [r for r in all_revs_proc.stdout.decode("utf-8", "replace").split("\n") if r]
+            if all_revs:
+                print(
+                    f"check_leaks: scanning full history ({len(all_revs)} commit(s)) "
+                    "- this can be slow on a large repo.",
+                    file=sys.stderr,
+                )
+
+            commit_shas_proc = run_git(["log", "--all", "--format=%H"])
+            commit_shas = [
+                s for s in commit_shas_proc.stdout.decode("utf-8", "replace").split("\n") if s
+            ]
+
+            readability_preflight(enumerate_tracked())
+            readability_preflight(enumerate_untracked())
+
+            for pattern in patterns:
+                hits = scan_tracked_content(pattern)
+                if hits:
+                    if redact:
+                        fail(
+                            f"{len(hits)} tracked file(s) contain a configured pattern "
+                            "(working tree) - run the guard locally to see which"
+                        )
+                    else:
+                        print("\n".join(hits), file=sys.stderr)
+                        fail("forbidden string in the contents of the file(s) above (working tree)")
+
+                names = scan_filenames(enumerate_tracked(), pattern)
+                if names:
+                    if redact:
+                        fail(
+                            f"{len(names)} tracked filename(s) match a configured pattern "
+                            "- run the guard locally to see which"
+                        )
+                    else:
+                        print("\n".join(names), file=sys.stderr)
+                        fail("forbidden string in the tracked filename(s) above")
+
+                untracked_names = scan_filenames(enumerate_untracked(), pattern)
+                if untracked_names:
+                    if redact:
+                        fail(
+                            f"{len(untracked_names)} untracked filename(s) match a configured "
+                            "pattern - run the guard locally to see which"
+                        )
+                    else:
+                        print("\n".join(untracked_names), file=sys.stderr)
+                        fail("forbidden string in the untracked filename(s) above")
+
+                untracked_hits = scan_untracked_content(enumerate_untracked(), pattern)
+                if untracked_hits:
+                    if redact:
+                        fail(
+                            f"{len(untracked_hits)} untracked file(s) contain a configured "
+                            "pattern - run the guard locally to see which"
+                        )
+                    else:
+                        print("\n".join(untracked_hits), file=sys.stderr)
+                        fail("forbidden string in the contents of the untracked file(s) above")
+
+                if all_revs:
+                    hist_hits = scan_history_content(pattern, all_revs)
+                    if hist_hits:
+                        if redact:
+                            shas = sorted({line.split(":", 1)[0] for line in hist_hits})
+                            fail(
+                                f"{len(hist_hits)} occurrence(s) of a configured pattern in "
+                                f"tracked history, commit(s): {' '.join(shas)} - run the guard "
+                                "locally to see which path(s)"
+                            )
+                        else:
+                            print("\n".join(hist_hits), file=sys.stderr)
+                            fail("forbidden string in tracked history above (commit:path)")
+
+            for sha in commit_shas:
+                msg_proc = run_git(["log", "-1", "--format=%B", sha])
+                msg = msg_proc.stdout.decode("utf-8", "replace")
+                for pattern in patterns:
+                    if pattern.lower() in msg.lower():
+                        fail(f"forbidden string in the commit message of {sha}")
+
+        check_file_types(script_dir, leakpatterns, fail)
+
+    except GuardError as exc:
+        print(f"check_leaks: FAILED - {exc}", file=sys.stderr)
+        return 2
+
+    if findings == 0:
+        print("check_leaks: clean")
+        return 0
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

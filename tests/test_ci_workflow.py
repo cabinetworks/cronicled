@@ -111,11 +111,11 @@ class CiWorkflowForkGating(unittest.TestCase):
             "a non-fork run with an empty secret must fail the job")
 
     def test_full_scan_runs_when_neither_branch_applies(self):
-        self.assertIn("./scripts/check_leaks.sh\n", self.run_script)
+        self.assertIn("./scripts/check_leaks\n", self.run_script)
         # The unqualified invocation (full mode) must appear in the final
         # `else` branch, i.e. after the fork check and the empty-secret
         # check have both been ruled out.
-        idx = self.run_script.rfind("./scripts/check_leaks.sh")
+        idx = self.run_script.rfind("./scripts/check_leaks")
         preceding = self.run_script[:idx]
         self.assertNotIn("--file-types-only", self.run_script[idx:])
         self.assertIn("else", preceding[preceding.rfind("elif"):])
