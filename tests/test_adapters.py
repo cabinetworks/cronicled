@@ -50,6 +50,14 @@ class OwnerFromUrlSegment(unittest.TestCase):
              "title": "Copper Kettle"}
         self.assertTrue(self.a.clip_features_artist(r, "velvetcrane"))
 
+    def test_owner_leg_is_a_prefix_match_not_equality(self):
+        # a store's own account handle is often the performer slug plus a
+        # house suffix ("velvetcraneofficial"); title/url-slug carry no
+        # mention of the artist, so this can only pass via the owner leg
+        r = {"url": "https://example.test/store/velvetcraneofficial/some-clip",
+             "title": "Some Clip"}
+        self.assertTrue(self.a.clip_features_artist(r, "velvetcrane"))
+
     def test_another_store_clip_naming_the_artist_also_counts(self):
         r = {"url": "https://example.test/store/marbleaux/velvet-crane-guest",
              "title": "Velvet Crane guests"}
@@ -140,6 +148,21 @@ class Defaults(unittest.TestCase):
         spec = dict(NONE_SPEC, censorship={"kestrel": ["k3strel"]})
         self.assertEqual(DeclarativeAdapter(spec).censorship,
                          {"kestrel": ["k3strel"]})
+
+
+class ExampleConfig(unittest.TestCase):
+    """The shipped example config must itself pass the spec validation added
+    alongside it - rejecting the project's own example would be worse than
+    not validating at all."""
+
+    def test_example_config_loads_a_working_adapter(self):
+        loaded = load_adapters(os.path.join("config", "adapters.example.json"))
+        self.assertEqual(sorted(loaded), ["examplestore"])
+        adapter = get_adapter(None, loaded)
+        self.assertEqual(adapter.name, "examplestore")
+        r = {"url": "https://example.test/store/velvetcrane/copper-kettle",
+             "title": "Copper Kettle"}
+        self.assertEqual(adapter.owner_of(r), "velvetcrane")
 
 
 class Registry(unittest.TestCase):

@@ -84,17 +84,47 @@ class SlugMatchPolicy(unittest.TestCase):
 class NormalizeUnicode(unittest.TestCase):
     def test_folds_accents_to_their_base_letter(self):
         # filenames routinely drop accents that store titles keep
-        self.assertEqual(normalize("café naïve"), "cafe rocio")
+        self.assertEqual(normalize("café naïve"), "cafe naive")
 
     def test_preserves_non_latin_letters(self):
-        self.assertEqual(normalize("Мария"), "мария")
+        # deleting them would give a non-Latin name an empty slug, which
+        # matches nothing at all
+        self.assertEqual(normalize("Мир"), "мир")
 
     def test_still_collapses_punctuation(self):
         self.assertEqual(normalize("Velvet.Crane - Copper_Kettle"),
                          "velvet crane copper kettle")
 
     def test_accented_and_unaccented_forms_match(self):
-        self.assertTrue(slug_match("café", "cafe"))
+        # the accent sits mid-word, so plain deletion (the old behaviour)
+        # breaks the substring containment slug_match relies on; this only
+        # passes once accents fold to their base letter first
+        self.assertTrue(slug_match("naïve", "naive"))
+
+
+class NormalizeNonDecomposableLetters(unittest.TestCase):
+    """NFKD does not decompose these into a base letter plus a combining
+    mark, so `normalize` folds them through an explicit translation table
+    instead. Verified counterexamples: Polish l-with-stroke, Scandinavian
+    o-with-stroke, the ae/German sharp-s ligatures, and d-with-stroke."""
+
+    def test_folds_l_with_stroke(self):
+        self.assertEqual(normalize("łŁ"), "ll")
+
+    def test_folds_o_with_stroke(self):
+        self.assertEqual(normalize("øØ"), "oo")
+
+    def test_folds_ae_ligature(self):
+        self.assertEqual(normalize("æÆ"), "aeae")
+
+    def test_folds_german_sharp_s(self):
+        self.assertEqual(normalize("ß"), "ss")
+
+    def test_folds_d_with_stroke(self):
+        self.assertEqual(normalize("đĐ"), "dd")
+
+    def test_non_latin_script_still_preserved_not_transliterated(self):
+        self.assertEqual(normalize("Мир"), "мир")
 
 
 class Tokens(unittest.TestCase):

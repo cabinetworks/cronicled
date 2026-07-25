@@ -9,6 +9,18 @@ from cronicled.vocab import JUNK_TOKENS, STOPWORDS, VIDEO_EXTS
 
 _BACKSLASH_ESCAPE_RE = re.compile(r"\\(['\"/\\])")
 
+# A handful of ordinary European letters have no canonical decomposition into
+# base letter + combining mark, so NFKD leaves them untouched (verified via
+# unicodedata.decomposition()). Folded explicitly, before the NFKD pass, so
+# `normalize` still treats them like their accented cousins that do decompose.
+_LETTER_FOLD = str.maketrans({
+    "ł": "l", "Ł": "L",
+    "ø": "o", "Ø": "O",
+    "æ": "ae", "Æ": "AE",
+    "đ": "d", "Đ": "D",
+    "ß": "ss", "\u1e9e": "SS",  # ẞ, the rarely-used capital sharp s
+})
+
 
 def strip_html(text):
     """Clean scraped free-text: strip HTML tags, unescape HTML entities and stray
@@ -34,16 +46,21 @@ def strip_ext(name):
 
 
 def normalize(s):
-    """Lowercase, fold accents to their base letter, reduce every other
-    non-alphanumeric character to a single space.
+    """Lowercase, fold combining-mark accents to their base letter, reduce
+    every other non-alphanumeric character to a single space.
 
     Accents fold because filenames routinely drop them while store titles keep
-    them. Non-Latin letters are preserved rather than deleted: dropping them
+    them. This only catches letters whose accent is a separate combining mark
+    under NFKD decomposition (e.g. e-acute -> e + combining acute) - ordinary
+    letters like l-with-stroke, o-with-stroke, the ae ligature, d-with-stroke,
+    and the German sharp s do NOT decompose that way and would otherwise pass
+    through unfolded, so `_LETTER_FOLD` handles that short, explicit list
+    first. Non-Latin letters are preserved rather than deleted: dropping them
     would give a non-Latin name an empty slug, which matches nothing.
     """
     if not s:
         return ""
-    decomposed = unicodedata.normalize("NFKD", s)
+    decomposed = unicodedata.normalize("NFKD", s.translate(_LETTER_FOLD))
     kept = []
     for ch in decomposed:
         if unicodedata.combining(ch):
