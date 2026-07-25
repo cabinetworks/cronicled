@@ -23,15 +23,18 @@
 # substitution, a pipeline - must either succeed or abort. No code path may
 # exit 0 after a read that failed. "Could not determine" is not "clean".
 # This file has needed that rule spelled out explicitly because it has been
-# violated three different ways by three different fixes: pattern
-# preprocessing silently truncated by a byte BSD sed's locale rejected; an
-# extracted extension list that was simply absent; and, most subtly, `grep`
-# and `git grep` themselves reporting "no match" (their normal exit code for
-# a clean result) for a file they could not even open - which reads
-# identically to a clean result unless the underlying read is checked
-# directly rather than inferred from grep's exit code alone. Every git/grep
-# invocation below either distinguishes "ran successfully and found nothing"
-# from "could not run", or is preceded by an explicit check that lets it.
+# violated by several different fixes: pattern preprocessing silently
+# truncated by a byte BSD sed's locale rejected; an extracted extension list
+# that was simply absent, or present but corrupted in ways that dodged its
+# own blank/comment test; `grep` and `git grep` themselves reporting "no
+# match" (their normal exit code for a clean result) for a file they could
+# not even open; `git ls-files` or `git log` themselves failing outright; and
+# a single tracked-file enumeration taken once and reused later in the run,
+# which can go stale relative to a check that runs after it. Every read
+# below either distinguishes "ran successfully and found nothing" from
+# "could not run" or was corrupted, or is preceded by an explicit check that
+# lets it, and every enumeration is taken fresh at its own point of use
+# rather than cached and reused across the length of a scan.
 #
 # Output discipline: paths and matched names are shown or redacted depending
 # on where the patterns came from, never on which leg matched.
@@ -95,28 +98,49 @@ done
 status=0
 fail() { echo "LEAK: $1" >&2; status=1; }
 
-# --- Enumerate tracked files once, for every mode ---------------------------
-# Section 5 (the data/media extension check) needs this list regardless of
-# mode, and full mode's content and filename legs need it too. `git
-# ls-files` is run alone here, never piped directly into something else, so
-# its own exit status is captured directly rather than being hidden behind
-# a later pipeline stage's. NUL-delimited, to a scratch file rather than a
-# shell variable (which cannot hold embedded NULs) or a process substitution
-# (whose own exit status bash cannot easily surface) - filenames containing
-# spaces or brackets are the normal convention for scraped media.
+# --- Tracked/untracked file enumeration, always fresh at point of use -------
+# `git ls-files` is written to a scratch file rather than into a shell
+# variable (which cannot hold embedded NULs) or a process substitution
+# (whose own exit status bash cannot easily surface), NUL-delimited since
+# filenames containing spaces or brackets are the normal convention for
+# scraped media. Every call is made directly (never through $(...) or a
+# pipe) so its own exit status is checked immediately, never hidden behind
+# a later pipeline stage's.
+#
+# These two functions are called AGAIN at every point that needs the list,
+# rather than once up front and reused: an earlier version of this script
+# took one tracked-file snapshot near the top and reused it everywhere,
+# including in section 5 below (which runs last, after every pattern has
+# been scanned against every leg). A file added to the index partway through
+# a run was then invisible to section 5's extension check even though it
+# was genuinely tracked by the time section 5 ran - confirmed by reproducing
+# it. Calling `git ls-files` again costs a little; trusting a stale
+# enumeration costs a missed leak.
 tmp_tracked=$(mktemp) || {
 	echo "check_leaks: FAILED - could not create a scratch file for tracked-file enumeration" >&2
 	exit 2
 }
 trap 'rm -f "$tmp_tracked" "${tmp_untracked:-}"' EXIT
 
-git ls-files -z > "$tmp_tracked"
-rc=$?
-if [ "$rc" -ne 0 ]; then
-	echo "check_leaks: FAILED - git ls-files failed (exit $rc)" >&2
-	echo "  Refusing to report clean without having enumerated tracked files." >&2
-	exit 2
-fi
+enumerate_tracked() {
+	git ls-files -z > "$tmp_tracked"
+	rc=$?
+	if [ "$rc" -ne 0 ]; then
+		echo "check_leaks: FAILED - git ls-files failed (exit $rc)" >&2
+		echo "  Refusing to report clean without having enumerated tracked files." >&2
+		exit 2
+	fi
+}
+
+enumerate_untracked() {
+	git ls-files --others --exclude-standard -z > "$tmp_untracked"
+	rc=$?
+	if [ "$rc" -ne 0 ]; then
+		echo "check_leaks: FAILED - git ls-files --others failed (exit $rc)" >&2
+		echo "  Refusing to run without having enumerated untracked files." >&2
+		exit 2
+	fi
+}
 
 if [ "$mode" = full ]; then
 
@@ -130,6 +154,16 @@ elif [ -f .leak-patterns ]; then
 	patterns_source=file
 fi
 raw_patterns=$patterns
+
+# A byte-order mark can precede the first pattern (some editors, and the
+# Windows clipboard, prepend one to UTF-8 text). It is not whitespace, so it
+# would otherwise survive the trim below and corrupt the first pattern by
+# gluing three invisible bytes to its front - silently weakening that one
+# pattern to something that can never match, without changing the line
+# count either sed preprocessing check below would notice. Stripped once,
+# up front, before either check sees the content.
+bom=$'\xef\xbb\xbf'
+raw_patterns="${raw_patterns#"$bom"}"
 
 # --- Pattern preprocessing, and proof that it did not lose anything ----------
 #
@@ -158,6 +192,16 @@ raw_patterns=$patterns
 #      going in must equal the number of patterns coming out. This catches
 #      truncation even in a case where sed's exit status alone were not
 #      trustworthy.
+#
+# A missing trailing newline on the pattern source does NOT need a separate
+# fix here the way it did for the extension lists below: `raw_patterns` is
+# read via `$(cat ...)` (or the LEAK_PATTERNS variable directly), and command
+# substitution captures a file's last line whether or not it ends in a
+# newline - unlike a `while read` loop reading a file directly, which drops
+# an unterminated final line silently. `printf '%s\n' "$raw_patterns"` below
+# then re-adds exactly one trailing newline before anything counts lines, so
+# the count is well-defined either way. (Verified directly: a 3-line pattern
+# source with no trailing newline on the last line still counts as 3.)
 #
 # Counting uses `grep -a` (never plain grep) on both sides: -a forces grep to
 # treat its input as text no matter whether it looks like valid UTF-8.
@@ -234,31 +278,22 @@ if [ "$log_rc" -ne 0 ]; then
 	exit 2
 fi
 
-# --- Untracked-file enumeration, and readability preflight for both lists ----
-# `git ls-files --others` is captured the same way as the tracked list above:
-# alone, to a scratch file, with its own exit status checked directly.
-#
-# Then, before any pattern is tested against any file: every tracked and
-# untracked file must be readable, checked once, up front. `git grep`
-# reports rc=1 ("no match") both when nothing matches and when it silently
-# skips a file it cannot open - its warning goes to a stream this script
-# does not treat as a result either way - and a plain per-file `grep`
-# behaves the same way. Without this preflight, a single `chmod 000` on a
-# tracked file holding an uncommitted leak, or on an untracked file holding
-# one outright, would report clean.
+# --- Readability preflight, once, before any pattern is tested --------------
+# `git grep` reports rc=1 ("no match") both when nothing matches and when it
+# silently skips a file it cannot open - its warning goes to a stream this
+# script does not treat as a result either way - and a plain per-file `grep`
+# behaves the same way. This is checked once, up front (not re-checked per
+# pattern below, since readability does not depend on which pattern is being
+# tested): every currently tracked and untracked file must be readable
+# before the per-pattern loop starts. Without this, a single `chmod 000` on
+# a tracked file holding an uncommitted leak, or on an untracked file
+# holding one outright, would report clean.
 tmp_untracked=$(mktemp) || {
 	echo "check_leaks: FAILED - could not create a scratch file for untracked-file enumeration" >&2
 	exit 2
 }
 
-git ls-files --others --exclude-standard -z > "$tmp_untracked"
-rc=$?
-if [ "$rc" -ne 0 ]; then
-	echo "check_leaks: FAILED - git ls-files --others failed (exit $rc)" >&2
-	echo "  Refusing to run without having enumerated untracked files." >&2
-	exit 2
-fi
-
+enumerate_tracked
 while IFS= read -r -d '' f; do
 	if [ ! -r "$f" ]; then
 		echo "check_leaks: FAILED - tracked file is not readable: $f" >&2
@@ -267,6 +302,7 @@ while IFS= read -r -d '' f; do
 	fi
 done < "$tmp_tracked"
 
+enumerate_untracked
 while IFS= read -r -d '' f; do
 	if [ ! -r "$f" ]; then
 		echo "check_leaks: FAILED - untracked file is not readable: $f" >&2
@@ -274,12 +310,6 @@ while IFS= read -r -d '' f; do
 		exit 2
 	fi
 done < "$tmp_untracked"
-
-# Newline-separated views of the same two lists, for the filename-matching
-# legs below (which substring-match a name; they never open the file, so
-# they do not need the NUL-delimited form).
-tracked_files=$(tr '\0' '\n' < "$tmp_tracked")
-untracked_files=$(tr '\0' '\n' < "$tmp_untracked")
 
 while IFS= read -r pat; do
 	[ -n "$pat" ] || continue
@@ -309,6 +339,10 @@ while IFS= read -r pat; do
 		fail "git grep failed (exit $rc); a pattern was not evaluated (working tree)"
 	fi
 
+	# Fresh enumeration at this leg's own point of use - see the note above
+	# `enumerate_tracked`'s definition.
+	enumerate_tracked
+	tracked_files=$(tr '\0' '\n' < "$tmp_tracked")
 	names=$(printf '%s\n' "$tracked_files" | grep -i -F -e "$pat")
 	grep_rc=$?
 	if [ "$grep_rc" -gt 1 ]; then
@@ -328,6 +362,8 @@ while IFS= read -r pat; do
 	#    would otherwise pass clean while still resting on disk in a clone of
 	#    this working copy. --exclude-standard keeps .gitignore'd files out
 	#    of scope, matching what would actually ship if committed as-is.
+	enumerate_untracked
+	untracked_files=$(tr '\0' '\n' < "$tmp_untracked")
 	untracked_names=$(printf '%s\n' "$untracked_files" | grep -i -F -e "$pat")
 	grep_rc=$?
 	if [ "$grep_rc" -gt 1 ]; then
@@ -346,7 +382,10 @@ while IFS= read -r pat; do
 	# filenames containing spaces or brackets (the normal convention for
 	# scraped media) must be handled literally. Matches are buffered rather
 	# than reported inline so a redacted run can report a count instead of
-	# a path. Every untracked file was already confirmed readable above.
+	# a path. Every untracked file was already confirmed readable in the
+	# preflight above. Enumerated fresh again here, at this leg's own point
+	# of use, rather than reusing the untracked-filename leg's list above.
+	enumerate_untracked
 	untracked_content_hits=""
 	untracked_content_count=0
 	while IFS= read -r -d '' f; do
@@ -446,12 +485,24 @@ fi # mode = full
 #    extension would slip past entirely.
 #
 #    Loading either list is held to the same standard as loading the pattern
-#    list: a missing file, an unreadable one, or one that yields zero usable
-#    entries after comment/blank stripping must abort the run rather than
-#    silently checking nothing. This was previously unchecked - a deleted or
-#    typo'd path here printed a "No such file or directory" error but let the
-#    script continue past it and report clean, exactly the failure-to-load
-#    silently disables a check defect this file has now had three times.
+#    list, and then some: this has already needed fixing twice, for two
+#    different silent vectors (a missing/unreadable/comment-only file; then
+#    a whitespace-only line that dodged the blank/comment test and made a
+#    non-empty-but-wrong array look loaded). Rather than keep chasing the
+#    next vector one at a time, load_ext_list asserts the actual invariant
+#    that matters: every non-comment, non-blank line becomes exactly one
+#    usable entry, counted independently of the parse and cross-checked,
+#    the same way pattern preprocessing already cross-checks itself above.
+#    That invariant, on its own, catches both a missing trailing newline
+#    (which a plain `while read` loop reading a file directly would
+#    otherwise silently drop the last line of) and a leading byte-order
+#    mark (which is not whitespace and would otherwise survive the trim and
+#    either count as a spurious extra "entry" on its own, or corrupt the
+#    first real line if glued to it). Each loaded entry is also validated
+#    to look like a glob (*.something); anything else is a sign of
+#    corruption, not a legitimate entry, since a non-glob string can never
+#    match a real filename via the `case` matching in the loop below.
+#
 #    This also runs unconditionally (not only in `mode = full`): on a fork
 #    PR, --file-types-only's extension check is the *only* thing that runs,
 #    so if it cannot load, the run must not exit 0 either.
@@ -468,22 +519,58 @@ load_ext_list() {
 		echo "  Refusing to run with an unknown set of guarded extensions." >&2
 		exit 2
 	fi
+
+	# Slurped into a variable once (like the pattern list above), rather
+	# than read line-by-line straight from the file: this is what lets a
+	# missing trailing newline and a leading BOM both be dealt with in one
+	# place, consistently, before EITHER the independent line count or the
+	# entry-building loop below sees the content. `$(cat ...)` captures a
+	# file's last line whether or not it ends in a newline (unlike `while
+	# read ... done < file`, which silently drops an unterminated final
+	# line); `printf '%s\n' "$raw"` below then re-adds exactly one trailing
+	# newline before anything counts or iterates lines, so both operations
+	# agree regardless of the source file's own line ending.
+	raw=$(cat -- "$1")
+	bom=$'\xef\xbb\xbf'
+	raw="${raw#"$bom"}"
+
+	# Independent count of candidate lines (non-blank, non-comment), taken
+	# straight from the content - not derived from whatever the loop below
+	# happens to build. A mismatch between this and the entries actually
+	# loaded means a line vanished (or multiplied) somewhere in the parse,
+	# whether or not this is a vector anyone has thought of yet.
+	candidate_count=$(printf '%s\n' "$raw" | grep -a -c -v -e '^[[:space:]]*#' -e '^[[:space:]]*$')
+
 	while IFS= read -r ext; do
 		# Trim whitespace BEFORE testing blankness/comments: a whitespace-
 		# only line is not "" by string comparison and does not start with
 		# "#", so untrimmed it would dodge both checks and enter the array
-		# as a literal glob that can never match a real filename - making
-		# the array non-empty without adding anything that actually guards
-		# anything, and silently defeating the "zero usable entries" check
-		# just below. The pattern list learned this exact lesson via sed
-		# (see the preprocessing block above); this list did not repeat it
-		# until now.
+		# as a literal glob that can never match a real filename.
 		ext="${ext#"${ext%%[![:space:]]*}"}"
 		ext="${ext%"${ext##*[![:space:]]}"}"
 		[ -n "$ext" ] || continue
 		case "$ext" in \#*) continue ;; esac
+		case "$ext" in
+		\**.*) ;; # looks like *.something
+		*)
+			echo "check_leaks: FAILED - $2 extension list has an entry that is not a glob: $ext" >&2
+			echo "  ($1)" >&2
+			echo "  Refusing to run with an entry that can never match a real filename." >&2
+			exit 2
+			;;
+		esac
 		loaded_exts+=("$ext")
-	done < "$1"
+	done <<EOF
+$raw
+EOF
+
+	if [ "${#loaded_exts[@]}" -ne "$candidate_count" ]; then
+		echo "check_leaks: FAILED - $2 extension list: $candidate_count candidate line(s) but ${#loaded_exts[@]} usable entry(ies) were loaded." >&2
+		echo "  ($1)" >&2
+		echo "  Refusing to run with a possibly-corrupted extension list." >&2
+		exit 2
+	fi
+
 	if [ "${#loaded_exts[@]}" -eq 0 ]; then
 		echo "check_leaks: FAILED - $2 extension list has no usable entries: $1" >&2
 		echo "  Refusing to run with an unknown set of guarded extensions." >&2
@@ -497,6 +584,12 @@ data_exts=("${loaded_exts[@]}")
 load_ext_list "$script_dir/media-extensions.txt" "media"
 media_exts=("${loaded_exts[@]}")
 
+# Fresh enumeration at this section's own point of use - see the note above
+# `enumerate_tracked`'s definition. Section 5 runs last, after every pattern
+# has been scanned against every leg above (when mode = full), so reusing an
+# earlier snapshot here specifically is what let a file added partway
+# through a run go unseen.
+enumerate_tracked
 while IFS= read -r -d '' f; do
 	case "$f" in
 	*.example.json | .github/workflows/*.yml | .github/workflows/*.yaml) continue ;;

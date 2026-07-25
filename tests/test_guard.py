@@ -69,20 +69,61 @@ def _fake_git_dir(fail_match):
     return d
 
 
-def _guard_with_ext_lists(missing=(), empty=(), whitespace_only=()):
+def _fake_git_dir_with_commit_side_effect(repo_dir, trigger_args, new_filename, new_file_content):
+    """A `git` shim that, the FIRST time it is invoked with exactly
+    `trigger_args`, commits a new tracked file into `repo_dir` (using the
+    real git directly, to avoid recursing into this shim) as a side effect,
+    before passing that same invocation through to the real git normally.
+    Every other invocation, and every later one matching `trigger_args`
+    again, passes straight through with no side effect (guarded by a marker
+    file so it fires exactly once).
+
+    This proves whether a consumer *later* in the script's execution sees a
+    file added *during* the run: no timing or threading needed; the side
+    effect is synchronous, fired by whichever git call the test picks as the
+    "during the scan" moment."""
+    real_git = shutil.which("git")
+    d = tempfile.mkdtemp()
+    script = os.path.join(d, "git")
+    marker = os.path.join(d, ".fired")
+    with open(script, "w") as fh:
+        fh.write("#!/usr/bin/env bash\n")
+        fh.write('if [ "$*" = "%s" ] && [ ! -f "%s" ]; then\n' % (trigger_args, marker))
+        fh.write('  touch "%s"\n' % marker)
+        fh.write('  printf %%s "%s" > "%s"\n' % (new_file_content, os.path.join(repo_dir, new_filename)))
+        fh.write('  "%s" -C "%s" add -f "%s" >&2\n' % (real_git, repo_dir, new_filename))
+        fh.write('  "%s" -C "%s" commit -q -m "added mid-scan" >&2\n' % (real_git, repo_dir))
+        fh.write("fi\n")
+        fh.write('exec "%s" "$@"\n' % real_git)
+    os.chmod(script, 0o755)
+    return d
+
+
+def _guard_with_ext_lists(missing=(), empty=(), whitespace_only=(), raw_content=None):
     """Copy the real guard script and its two extension lists into a fresh
-    directory, then delete or empty specific list(s), and return the path to
-    the copy. The guard resolves scripts/*-extensions.txt relative to its
-    OWN location (not the repo it is scanning), so a test that wants to
-    exercise a missing or empty list must not touch the real checkout - it
-    must run a copy of the script from a directory it controls instead."""
+    directory, then delete, empty, or overwrite specific list(s) with exact
+    content, and return the path to the copy. The guard resolves
+    scripts/*-extensions.txt relative to its OWN location (not the repo it
+    is scanning), so a test that wants to exercise a missing, empty, or
+    corrupted list must not touch the real checkout - it must run a copy of
+    the script from a directory it controls instead.
+
+    `raw_content`, if given, maps a list filename to exact text to write
+    verbatim (UTF-8 encoded) - used for byte-level corruption cases (a
+    missing trailing newline, a leading byte-order mark) that `empty` and
+    `whitespace_only` cannot express."""
     d = tempfile.mkdtemp()
     shutil.copy(GUARD, os.path.join(d, "check_leaks.sh"))
     src_dir = os.path.dirname(GUARD)
+    raw_content = raw_content or {}
     for name in EXT_LIST_NAMES:
         if name in missing:
             continue  # do not copy: simulates a deleted/renamed list
         dst = os.path.join(d, name)
+        if name in raw_content:
+            with open(dst, "wb") as fh:
+                fh.write(raw_content[name].encode("utf-8"))
+            continue
         if name in empty:
             with open(dst, "w") as fh:
                 fh.write("# only a comment\n\n")
@@ -300,6 +341,62 @@ class GitFailureFailsClosed(unittest.TestCase):
         self.assertNotIn("check_leaks: clean", out)
 
 
+class PatternListCorruptionVectors(unittest.TestCase):
+    """The re-review that fixed load_ext_list's whitespace-only-line vector
+    asked whether the pattern list has equivalent coverage for the SAME two
+    vectors that then hit load_ext_list a second time (a missing trailing
+    newline, a leading BOM), since the sed cross-check might not catch a
+    missing trailing newline. It already handled one and needed a fix for
+    the other:
+
+    - Missing trailing newline: NOT a bug. `raw_patterns` is read via
+      `$(cat ...)` (or the LEAK_PATTERNS variable directly), and command
+      substitution captures a file's last line whether or not it ends in a
+      newline - unlike a `while read` loop reading a file directly, which
+      is what actually dropped the last line in load_ext_list. The first
+      test below is a regression proof of this, not a fix.
+    - Leading BOM: a real, unfixed vector until this round - a BOM is not
+      whitespace, so it survived the sed trim and glued itself to the front
+      of the first pattern, silently corrupting it into something that
+      could never match. Now stripped the same way as the extension lists."""
+
+    def test_a_missing_trailing_newline_on_the_pattern_file_does_not_drop_the_last_pattern(self):
+        d = _repo(["zzfirstpattern"], {"b.md": "contains zzsecretzz\n"})
+        with open(os.path.join(d, ".leak-patterns"), "wb") as fh:
+            fh.write(b"zzfirstpattern\nzzsecretzz")  # no trailing newline
+        code, out = _run(d)
+        self.assertEqual(code, 1, out)
+
+    def test_a_leading_bom_on_the_pattern_file_does_not_corrupt_the_first_pattern(self):
+        d = _repo(["placeholder"], {"b.md": "contains zzsecretzz\n"})
+        with open(os.path.join(d, ".leak-patterns"), "wb") as fh:
+            fh.write("﻿zzsecretzz\n".encode("utf-8"))
+        code, out = _run(d)
+        self.assertEqual(code, 1, out)
+
+
+class Section5SeesFreshState(unittest.TestCase):
+    """Section 5 (the data/media extension check) runs last, after every
+    pattern-based leg. An earlier version of this script took one
+    tracked-file snapshot near the top and reused it everywhere, including
+    in section 5 - so a file added to the index partway through a run was
+    invisible to section 5's check even though it was genuinely tracked by
+    the time section 5 actually ran. `_fake_git_dir_with_commit_side_effect`
+    forces that addition to happen synchronously, during an early git call,
+    so this is deterministic and needs no timing or threading."""
+
+    def test_a_data_file_added_during_the_scan_is_still_caught_by_section_5(self):
+        d = _repo(["zznomatchzz"], {"a.md": "harmless\n"})
+        fake_dir = _fake_git_dir_with_commit_side_effect(
+            d, "rev-list --all", "secrets.env", "X=1\n")
+        code, out = _run(d, env={
+            "LEAK_PATTERNS": "zznomatchzz",
+            "PATH": fake_dir + os.pathsep + os.environ["PATH"],
+        })
+        self.assertEqual(code, 1, out)
+        self.assertIn("tracked data file: secrets.env", out)
+
+
 class ExtensionListFailClosed(unittest.TestCase):
     """Extracting the extension lists to scripts/*.txt (round 2) introduced a
     new instance of this file's recurring defect class: a failure to load
@@ -343,6 +440,52 @@ class ExtensionListFailClosed(unittest.TestCase):
         code, out = _run(d, env={"LEAK_PATTERNS": "zzpatternmatchesnothingzz"}, guard=guard)
         self.assertNotEqual(code, 0, out)
         self.assertNotIn("check_leaks: clean", out)
+
+    def test_a_missing_trailing_newline_does_not_drop_the_last_entry(self):
+        # `while read` silently skips a final line with no trailing
+        # newline. This is the invariant check working, not a guess about
+        # this one vector: the independent candidate-line count catches
+        # ANY line that fails to become a usable entry, not just this one.
+        guard = _guard_with_ext_lists(raw_content={"data-extensions.txt": "*.json\n*.env"})
+        d = _repo(["zzpatternmatchesnothingzz"], {"a.md": "harmless\n"})
+        with open(os.path.join(d, "secrets.env"), "w") as fh:
+            fh.write("X=1\n")
+        subprocess.check_call(["git", "add", "-f", "secrets.env"], cwd=d)
+        subprocess.check_call(["git", "commit", "-q", "-m", "add data file"], cwd=d)
+        code, out = _run(d, env={"LEAK_PATTERNS": "zzpatternmatchesnothingzz"}, guard=guard)
+        # The fix repairs this vector entirely (the entry loads correctly),
+        # rather than merely detecting corruption and aborting.
+        self.assertEqual(code, 1, out)
+        self.assertIn("tracked data file: secrets.env", out)
+
+    def test_a_leading_bom_does_not_corrupt_the_first_entry(self):
+        # A byte-order mark is not whitespace, so it survives trimming and
+        # would otherwise glue itself to the front of the first real glob,
+        # silently corrupting it into something that can never match.
+        guard = _guard_with_ext_lists(raw_content={
+            "data-extensions.txt": "﻿*.env\n*.json\n",
+        })
+        d = _repo(["zzpatternmatchesnothingzz"], {"a.md": "harmless\n"})
+        with open(os.path.join(d, "secrets.env"), "w") as fh:
+            fh.write("X=1\n")
+        subprocess.check_call(["git", "add", "-f", "secrets.env"], cwd=d)
+        subprocess.check_call(["git", "commit", "-q", "-m", "add data file"], cwd=d)
+        code, out = _run(d, env={"LEAK_PATTERNS": "zzpatternmatchesnothingzz"}, guard=guard)
+        self.assertEqual(code, 1, out)
+        self.assertIn("tracked data file: secrets.env", out)
+
+    def test_an_entry_that_is_not_a_glob_is_a_failure(self):
+        # A corrupted entry that survives comment/blank stripping but does
+        # not look like *.something can never match a real filename via the
+        # case-statement matching in section 5 - silent, not loud, unless
+        # this is checked explicitly.
+        guard = _guard_with_ext_lists(raw_content={
+            "data-extensions.txt": "*.json\nnotaglob\n*.env\n",
+        })
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n"})
+        code, out = _run(d, env={"LEAK_PATTERNS": "zzsecretzz"}, guard=guard)
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("not a glob", out)
 
     def test_file_types_only_mode_fails_closed_on_a_missing_list_too(self):
         # This mode exists because patterns are legitimately absent on a
