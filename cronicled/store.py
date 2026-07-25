@@ -417,6 +417,24 @@ class Store:
 
     _HIDDEN_STATES = ("dismissed", "muted")
 
+    def has(self, fp):
+        """Whether `fp` names a row currently in a visible state — i.e. one
+        `items()`'s default view would return: not `dismissed`, not `muted`.
+
+        A single primary-key lookup, unlike scanning `items()` for the same
+        fingerprint: the caller (the job runner, telling `recorded` from
+        `skipped`) only ever needs a yes/no answer for one fingerprint, not
+        every row in a folder.
+        """
+        placeholders = ", ".join("?" for _ in self._HIDDEN_STATES)
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT 1 FROM item WHERE fingerprint = ? "
+                f"AND state NOT IN ({placeholders})",
+                (fp, *self._HIDDEN_STATES),
+            ).fetchone()
+        return row is not None
+
     def items(self, folder=None, state=None, limit=None, offset=0):
         """Proposals in the store, as dicts with `payload` (and
         `prior_state`, when present) decoded back into the Python object

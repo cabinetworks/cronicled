@@ -390,3 +390,22 @@ class Reads(_StoreCase):
         self._record(subject_id="2")
         self.store.mark_seen(a)
         self.assertEqual(self.store.counts(), {"new": 1, "seen": 1})
+
+
+class Has(_StoreCase):
+    def test_true_for_a_recorded_proposal(self):
+        fp = self._record()
+        self.assertTrue(self.store.has(fp))
+
+    def test_false_for_one_never_recorded(self):
+        self.assertFalse(self.store.has("nosuchfingerprint"))
+
+    def test_false_for_a_dismissed_proposal(self):
+        fp = self._record()
+        self.store.dismiss(fp, reason="wrong match")
+        self.assertFalse(self.store.has(fp))
+
+    def test_false_for_a_muted_subjects_proposal(self):
+        fp = self._record(subject_id="1")
+        self.store.mute("scene", "1", reason="never identifiable")
+        self.assertFalse(self.store.has(fp))
