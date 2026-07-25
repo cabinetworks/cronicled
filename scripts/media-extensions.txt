@@ -1,0 +1,26 @@
+# Extensions the leak guard treats as media files (scripts/check_leaks.sh,
+# section 5). Every glob here must also appear in .gitignore's deny-by-default
+# block, and vice versa; tests/test_guard.py asserts the two agree in both
+# directions. One glob per line.
+*.mp4
+*.m4v
+*.mkv
+*.avi
+*.wmv
+*.mov
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+*.webm
+*.srt
+*.vtt
+*.ass
+*.m3u
+*.mp3
+*.wav
+*.flac
+*.bmp
+*.tiff
+*.heic

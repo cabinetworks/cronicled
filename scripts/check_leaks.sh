@@ -18,12 +18,23 @@
 # No patterns configured is a FAILURE, not a pass: a missing or renamed secret
 # must break the build rather than silently disable the guard.
 #
-# Output discipline: CI logs are public. For CONTENT matches this reports the
-# file path or commit SHA where the pattern was found - never the matched
-# line or the pattern itself. For FILENAME matches, even the path cannot be
-# shown: a filename that matches a pattern CONTAINS that pattern, so those
-# legs report a count only. Run it locally, where .leak-patterns exists, to
-# see which file.
+# Output discipline: paths and matched names are shown or redacted depending
+# on where the patterns came from, never on which leg matched.
+#
+#   LEAK_PATTERNS (CI secret) -> redact by default: every leg reports a
+#   count, plus commit SHAs where relevant (a SHA is not sensitive), and
+#   NEVER a path or a matched name. CI logs are public, and a path can
+#   coincidentally contain the pattern even when a *content* leg is what
+#   matched it (e.g. a file whose name and body both mention it) - so every
+#   leg redacts, not just the filename legs.
+#
+#   .leak-patterns (local file) -> show paths and names by default: a
+#   developer's own terminal is not a public log, and a guard that will not
+#   say what it found is not usable.
+#
+#   --redact forces the CI behaviour even when reading the local file, so
+#   this can be exercised directly rather than only implied by which source
+#   happened to supply the patterns.
 #
 # --file-types-only skips every pattern-based leg (checks 1-4 below) and
 # does not fail when no patterns are configured, because none are expected in
@@ -45,9 +56,17 @@ root=$(git rev-parse --show-toplevel 2>/dev/null) || {
 cd "$root" || exit 2
 
 mode=full
-if [ "${1:-}" = "--file-types-only" ]; then
-	mode=file-types-only
-fi
+force_redact=0
+for arg in "$@"; do
+	case "$arg" in
+	--file-types-only) mode=file-types-only ;;
+	--redact) force_redact=1 ;;
+	*)
+		echo "check_leaks: unknown argument: $arg" >&2
+		exit 2
+		;;
+	esac
+done
 
 status=0
 fail() { echo "LEAK: $1" >&2; status=1; }
@@ -55,10 +74,13 @@ fail() { echo "LEAK: $1" >&2; status=1; }
 if [ "$mode" = full ]; then
 
 patterns=""
+patterns_source=none
 if [ -n "${LEAK_PATTERNS:-}" ]; then
 	patterns=$LEAK_PATTERNS
+	patterns_source=env
 elif [ -f .leak-patterns ]; then
 	patterns=$(cat .leak-patterns)
+	patterns_source=file
 fi
 raw_patterns=$patterns
 
@@ -123,6 +145,17 @@ if [ -z "$patterns" ]; then
 	exit 2
 fi
 
+# See the header for the full rationale: env-sourced patterns imply CI (public
+# logs, redact), file-sourced patterns imply a local terminal (show detail),
+# and --redact overrides either way.
+redact=1
+if [ "$patterns_source" = file ]; then
+	redact=0
+fi
+if [ "$force_redact" -eq 1 ]; then
+	redact=1
+fi
+
 # --- History setup -----------------------------------------------------------
 # Every commit reachable from any ref, not just the current branch. A repo
 # with no commits yet has an empty list here; history scanning is then
@@ -152,8 +185,12 @@ while IFS= read -r pat; do
 	hits=$(git grep -I -i -F -l -e "$pat" -- . 2>&1)
 	rc=$?
 	if [ "$rc" -eq 0 ]; then
-		echo "$hits" >&2
-		fail "forbidden string in the contents of the file(s) above (working tree)"
+		if [ "$redact" -eq 1 ]; then
+			fail "$(printf '%s\n' "$hits" | grep -a -c '^') tracked file(s) contain a configured pattern (working tree) - run the guard locally to see which"
+		else
+			echo "$hits" >&2
+			fail "forbidden string in the contents of the file(s) above (working tree)"
+		fi
 	elif [ "$rc" -gt 1 ]; then
 		# >1 is a grep ERROR, not "no match" - never read that as clean
 		fail "git grep failed (exit $rc); a pattern was not evaluated (working tree)"
@@ -161,9 +198,12 @@ while IFS= read -r pat; do
 
 	names=$(git ls-files | grep -i -F -e "$pat" || true)
 	if [ -n "$names" ]; then
-		# never echo the names: a filename that matches a pattern CONTAINS the
-		# pattern, and CI logs are public. Run locally for detail.
-		fail "$(printf '%s\n' "$names" | wc -l | tr -d ' ') tracked filename(s) match a configured pattern - run the guard locally to see which"
+		if [ "$redact" -eq 1 ]; then
+			fail "$(printf '%s\n' "$names" | grep -a -c '^') tracked filename(s) match a configured pattern - run the guard locally to see which"
+		else
+			echo "$names" >&2
+			fail "forbidden string in the tracked filename(s) above"
+		fi
 	fi
 
 	# 2. Untracked-but-not-ignored files. These are invisible to `git grep`
@@ -174,21 +214,37 @@ while IFS= read -r pat; do
 	#    of scope, matching what would actually ship if committed as-is.
 	untracked_names=$(git ls-files --others --exclude-standard | grep -i -F -e "$pat" || true)
 	if [ -n "$untracked_names" ]; then
-		# never echo the names: a filename that matches a pattern CONTAINS the
-		# pattern, and CI logs are public. Run locally for detail.
-		fail "$(printf '%s\n' "$untracked_names" | wc -l | tr -d ' ') untracked filename(s) match a configured pattern - run the guard locally to see which"
+		if [ "$redact" -eq 1 ]; then
+			fail "$(printf '%s\n' "$untracked_names" | grep -a -c '^') untracked filename(s) match a configured pattern - run the guard locally to see which"
+		else
+			echo "$untracked_names" >&2
+			fail "forbidden string in the untracked filename(s) above"
+		fi
 	fi
 
 	# git grep cannot see untracked content at all, so untracked files are
 	# checked with plain grep instead, one file at a time. NUL-delimited:
 	# filenames containing spaces or brackets (the normal convention for
-	# scraped media) must be handled literally.
+	# scraped media) must be handled literally. Matches are buffered rather
+	# than reported inline so a redacted run can report a count instead of
+	# a path.
+	untracked_content_hits=""
+	untracked_content_count=0
 	while IFS= read -r -d '' f; do
 		if grep -I -i -q -a -F -e "$pat" -- "$f" 2>/dev/null; then
-			echo "$f" >&2
-			fail "forbidden string in the contents of the untracked file above"
+			untracked_content_count=$((untracked_content_count + 1))
+			untracked_content_hits="$untracked_content_hits$f
+"
 		fi
 	done < <(git ls-files --others --exclude-standard -z)
+	if [ "$untracked_content_count" -gt 0 ]; then
+		if [ "$redact" -eq 1 ]; then
+			fail "$untracked_content_count untracked file(s) contain a configured pattern - run the guard locally to see which"
+		else
+			printf '%s' "$untracked_content_hits" >&2
+			fail "forbidden string in the contents of the untracked file(s) above"
+		fi
+	fi
 
 	# 3. Tracked file CONTENTS at every commit in history, even if the
 	#    offending line was removed by a later commit. A leak that was
@@ -200,8 +256,16 @@ while IFS= read -r pat; do
 		hist_hits=$(git grep -I -i -F -l -e "$pat" $all_revs -- . 2>&1)
 		rc=$?
 		if [ "$rc" -eq 0 ]; then
-			echo "$hist_hits" >&2
-			fail "forbidden string in tracked history above (commit:path)"
+			if [ "$redact" -eq 1 ]; then
+				# hist_hits lines are "sha:path" - the SHA (up to the first
+				# colon) is not sensitive and safe to show; the path is not.
+				hist_shas=$(printf '%s\n' "$hist_hits" | cut -d: -f1 | sort -u | tr '\n' ' ')
+				hist_count=$(printf '%s\n' "$hist_hits" | grep -a -c '^')
+				fail "$hist_count occurrence(s) of a configured pattern in tracked history, commit(s): ${hist_shas}- run the guard locally to see which path(s)"
+			else
+				echo "$hist_hits" >&2
+				fail "forbidden string in tracked history above (commit:path)"
+			fi
 		elif [ "$rc" -gt 1 ]; then
 			fail "git grep over history failed (exit $rc); a pattern was not evaluated"
 		fi
@@ -243,17 +307,28 @@ fi # mode = full
 #    stay trackable; a config/archive/data file with the same extension
 #    anywhere else is still caught.
 #
-#    The data extensions live in scripts/data-extensions.txt, not here: this
-#    list and .gitignore's deny-by-default block are two copies of the same
-#    rule that have already drifted once (a re-initialised repo silently
-#    shipped with no CI at all), so the extensions themselves now have exactly
-#    one source of truth. A test asserts the two stay in agreement.
+#    The data and media extensions live in scripts/data-extensions.txt and
+#    scripts/media-extensions.txt, not here: those lists and .gitignore's
+#    deny-by-default block are two copies of the same rule that have already
+#    drifted once (a re-initialised repo silently shipped with no CI at
+#    all), so the extensions themselves now have exactly one source of
+#    truth each. A test asserts the two stay in agreement in both
+#    directions - an extension .gitignore excludes but this list does not
+#    know about would be invisible to this check, so a `git add -f` of that
+#    extension would slip past entirely.
 data_exts=()
 while IFS= read -r ext; do
 	[ -n "$ext" ] || continue
 	case "$ext" in \#*) continue ;; esac
 	data_exts+=("$ext")
 done < "$script_dir/data-extensions.txt"
+
+media_exts=()
+while IFS= read -r ext; do
+	[ -n "$ext" ] || continue
+	case "$ext" in \#*) continue ;; esac
+	media_exts+=("$ext")
+done < "$script_dir/media-extensions.txt"
 
 while IFS= read -r -d '' f; do
 	case "$f" in
@@ -274,12 +349,17 @@ while IFS= read -r -d '' f; do
 		fail "tracked data file: $f"
 		continue
 	fi
-	case "$f" in
-	*.mp4 | *.m4v | *.mkv | *.avi | *.wmv | *.mov | *.jpg | *.jpeg | *.png \
-	  | *.gif | *.webp | *.webm | *.srt | *.vtt | *.ass | *.m3u | *.mp3 \
-	  | *.wav | *.flac | *.bmp | *.tiff | *.heic)
-		fail "tracked media file: $f" ;;
-	esac
+	is_media=0
+	if [ "${#media_exts[@]}" -gt 0 ]; then
+		for ext in "${media_exts[@]}"; do
+			case "$f" in
+			$ext) is_media=1; break ;;
+			esac
+		done
+	fi
+	if [ "$is_media" -eq 1 ]; then
+		fail "tracked media file: $f"
+	fi
 done < <(git ls-files -z)
 
 [ "$status" -eq 0 ] && echo "check_leaks: clean"
