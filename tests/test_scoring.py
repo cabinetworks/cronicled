@@ -104,6 +104,19 @@ class Scoring(unittest.TestCase):
             self.assertEqual(m.meaningful_count, 1, name)
             self.assertIsNone(decide([m]).match, name)
 
+    def test_a_file_named_only_after_the_artist_is_never_applied(self):
+        # the score is computed over the raw name, which still carries the
+        # artist's name, while meaningful_tokens correctly subtracts it -- so
+        # the artist's name inflates the score while contributing no evidence.
+        # A bare dump named after the artist would otherwise take on the
+        # metadata of whichever of that artist's titles happened to be offered.
+        for name, title in (("Velvet Crane 1080p.mp4", "Velvet Crane"),
+                            ("Velvet Crane.mp4", "Velvet Crane Session Two")):
+            m = score(name, "", title, artist="Velvet Crane")
+            self.assertEqual(m.meaningful_count, 0, name)
+            self.assertGreater(m.value, 0.85, name)   # high enough to apply
+            self.assertIsNone(decide([m]).match, name)
+
     def test_meaningful_count_is_reported(self):
         m = score("Morning Ritual 1080p.mp4", "", "anything")
         self.assertEqual(m.meaningful_count, 2)
@@ -134,6 +147,23 @@ class Deciding(unittest.TestCase):
         self.assertIsNone(d.match)
         d = decide([self._m(0.95, meaningful_count=1)])
         self.assertIsNotNone(d.match)
+
+    def test_no_meaningful_tokens_is_never_eligible(self):
+        # zero evidence is not weak evidence -- no score and no containment
+        # claim can make it applicable
+        for m in (self._m(0.99, meaningful_count=0),
+                  self._m(1.0, meaningful_count=0),
+                  self._m(1.0, contained=True, meaningful_count=0)):
+            self.assertIsNone(decide([m], threshold=0.1).match, m)
+
+    def test_zero_evidence_is_a_distinct_refusal_from_a_generic_word(self):
+        # "a single generic word" is false when there is no word at all, and
+        # it points the user at a file rename that cannot help
+        zero = decide([self._m(0.99, meaningful_count=0)]).reason
+        generic = decide([self._m(0.7, meaningful_count=1)]).reason
+        self.assertNotEqual(zero, generic)
+        self.assertNotIn("generic word", zero)
+        self.assertIn("meaningful_count=0", zero)
 
     def test_containment_wins_regardless_of_the_threshold(self):
         d = decide([self._m(0.55, contained=True)], threshold=0.9)

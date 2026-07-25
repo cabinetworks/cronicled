@@ -130,9 +130,19 @@ def score(name, folder, title, artist=None):
 
 
 def _is_eligible(match, threshold):
-    """A match is trustworthy enough to compete for the win. Containment
-    bypasses the threshold entirely (the scorer already vetted it); a single
-    generic word needs near-certainty; everything else needs the threshold."""
+    """A match is trustworthy enough to compete for the win. No meaningful
+    token at all is barred outright, at any score; containment bypasses the
+    threshold entirely (the scorer already vetted it); a single generic word
+    needs near-certainty; everything else needs the threshold.
+
+    The zero case is barred because the score and the evidence count are
+    computed over different views of the name: the score sees the raw string,
+    which still carries the artist's name, while `meaningful_tokens` subtracts
+    it. So a file named after nobody but the artist scores 0.9+ on the
+    artist's name alone and would take on the metadata of whichever of that
+    artist's titles was offered. Zero evidence is not weak evidence."""
+    if match.meaningful_count == 0:
+        return False
     if match.contained:
         return True
     if match.meaningful_count < 2:
@@ -152,7 +162,12 @@ def decide(matches, threshold=0.5):
 
     if not eligible:
         best = max(matches, key=lambda m: m.value)
-        if best.meaningful_count < 2 and best.value < _GENERIC_WORD_THRESHOLD:
+        if best.meaningful_count == 0:
+            reason = (
+                "nothing to match on (meaningful_count=0): the name carries no "
+                "word that is not the artist's or generic"
+            )
+        elif best.meaningful_count < 2 and best.value < _GENERIC_WORD_THRESHOLD:
             reason = (
                 "best score %.3f rests on a single generic word "
                 "(meaningful_count=%d); needs %.2f or above"
