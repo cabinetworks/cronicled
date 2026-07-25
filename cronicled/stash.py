@@ -381,6 +381,36 @@ class Stash:
                 "performers": len(merged_pids), "tags": len(merged_tids),
                 "skipped": skipped, "prior": prior}
 
+    def revert_scene(self, scene_id, prior):
+        """Undo one apply_scene by restoring the scene to exactly the state
+        `prior` (as returned in apply_scene's result) describes.
+
+        This RESTORES; it does not merge. That is the opposite of
+        apply_scene's union semantics (existing ids + newly-resolved ids) —
+        every field prior holds is written back verbatim, replacing whatever
+        is there now, including wiping out performers/tags/etc. added since
+        the snapshot was taken. `prior` is assumed already-resolved (ids, not
+        names), so there is nothing here to find-or-create.
+
+        Everything is assembled into one update input before anything is
+        sent, and it goes out as a single sceneUpdate, mirroring apply_scene's
+        write-once discipline: a failure leaves no partially-reverted scene.
+
+        Raises ValueError on a missing or empty snapshot rather than quietly
+        doing nothing — a revert that no-ops is indistinguishable from one
+        that worked, which is exactly the ambiguity undo cannot afford.
+        """
+        if not prior:
+            raise ValueError(
+                "cannot revert scene %s: snapshot is missing or empty" % scene_id)
+        inp = {"id": scene_id}
+        inp.update(prior)
+        self.gql("mutation($in: SceneUpdateInput!){ sceneUpdate(input:$in){ id } }",
+                 {"in": inp})
+        return {"studio_id": prior.get("studio_id"),
+                "performers": len(prior.get("performer_ids") or []),
+                "tags": len(prior.get("tag_ids") or [])}
+
     # -- tags (consolidation) --------------------------------------------- #
 
     def all_tags(self):
