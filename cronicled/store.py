@@ -22,6 +22,7 @@ import os
 import sqlite3
 import threading
 import unicodedata
+import weakref
 from datetime import datetime, timezone
 
 SCHEMA = """
@@ -114,6 +115,15 @@ _open_paths = set()
 _open_paths_lock = threading.Lock()
 
 
+def _release_path(path):
+    """Remove `path` from the open-path registry. Idempotent by nature
+    (`set.discard` is a no-op if the path isn't there), which is what lets
+    `close()` and a `weakref.finalize` callback share this without either
+    caring whether the other already ran."""
+    with _open_paths_lock:
+        _open_paths.discard(path)
+
+
 class Store:
     """SQLite-backed store of proposals, safe to share across threads.
 
@@ -134,10 +144,23 @@ class Store:
     registry of open paths and raises `RuntimeError` if the path is already
     open; `close()` (and the context manager) releases it so the same path
     can be reopened afterwards.
+
+    The registry keys on `os.path.realpath`, not just `os.path.abspath`: a
+    symlink pointing at an already-open database file is still the same
+    file, and the guard exists precisely to stop two handles on one file,
+    not two spellings of a path that happen to differ.
+
+    A `Store` that is dropped without `close()` (an exception on some path
+    that skips a `with` block, say) still must not lock its path forever —
+    there would be no route back short of restarting the process. A
+    `weakref.finalize` registered in `__init__` releases the path when the
+    instance is garbage collected, sharing the same idempotent release
+    function `close()` uses, so whichever of the two runs first "wins" and
+    the other is a no-op rather than a double-release or an error.
     """
 
     def __init__(self, path):
-        canonical_path = os.path.abspath(path)
+        canonical_path = os.path.realpath(path)
         with _open_paths_lock:
             if canonical_path in _open_paths:
                 raise RuntimeError(
@@ -154,9 +177,9 @@ class Store:
                 self._conn.execute("PRAGMA journal_mode=WAL")
                 self._conn.executescript(SCHEMA)
                 self._conn.commit()
+            self._finalizer = weakref.finalize(self, _release_path, canonical_path)
         except Exception:
-            with _open_paths_lock:
-                _open_paths.discard(canonical_path)
+            _release_path(canonical_path)
             raise
 
     def __enter__(self):
@@ -168,8 +191,10 @@ class Store:
     def close(self):
         with self._lock:
             self._conn.close()
-        with _open_paths_lock:
-            _open_paths.discard(self._path)
+        # Calling the finalizer explicitly runs its callback now (releasing
+        # the path) and marks it "dead", so if this instance is later
+        # garbage collected the same callback does NOT fire again.
+        self._finalizer()
 
     def record(self, folder, subject_type, subject_id, summary, payload,
                producer, confidence=None, now=None):
@@ -308,6 +333,13 @@ class Store:
         modified. The dismissal is still recorded in the `dismissal` table
         (so it still blocks a future re-record of the same fingerprint) —
         only the row's own `state`/`resolved_at` are left alone.
+
+        This protection is deliberately narrow: only `applied` and `failed`
+        are terminal *resolutions* of "was the change actually made". A
+        `muted` row has no such fact to protect — nothing happened to the
+        file — so `dismiss` is free to move a `muted` row to `dismissed`
+        (and, symmetrically, `mute` is free to move a `dismissed` row to
+        `muted`). That is intended, not an oversight.
 
         Unlike `mark_seen`/`mark_applied`/`mark_failed`, calling this on a
         fingerprint with no matching `item` row is not an error: dismissal

@@ -1,5 +1,6 @@
 """The store keeps proposed changes between runs. Its fingerprint is what stops a
 nightly producer from turning the inbox into noise on its second night."""
+import gc
 import json
 import os
 import shutil
@@ -299,6 +300,35 @@ class SingleInstancePerFile(unittest.TestCase):
         first = Store(path)
         first.close()
         second = Store(path)          # must not raise
+        second.close()
+
+    def test_a_symlink_to_an_open_database_also_raises(self):
+        # os.path.abspath alone normalises "." and ".." but not symlinks;
+        # a symlink to an already-open file is still the same file, and the
+        # guard exists to stop two handles on one file, not two spellings
+        real_path = os.path.join(self._dir, "real.db")
+        link_path = os.path.join(self._dir, "link.db")
+        first = Store(real_path)
+        self.addCleanup(first.close)
+        try:
+            os.symlink(real_path, link_path)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available on this platform")
+        with self.assertRaises(RuntimeError):
+            Store(link_path)
+
+    def test_a_collected_store_releases_its_path(self):
+        # dropping the last reference without calling close() (an exception
+        # on some path that skips a `with` block, say) must not lock the
+        # path forever - there would be no route back short of restarting
+        path = os.path.join(self._dir, "s.db")
+
+        def make_and_drop():
+            Store(path)              # never closed; reference dies on return
+
+        make_and_drop()
+        gc.collect()
+        second = Store(path)         # must not raise: collection released it
         second.close()
 
 
