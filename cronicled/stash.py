@@ -164,10 +164,14 @@ class Stash:
     def scene_existing(self, scene_id):
         """The scene's CURRENT metadata, read fresh right before an apply so
         the write can merge rather than overwrite. Reading at write time (not
-        scan time) also catches metadata a human set between scan and apply."""
+        scan time) also catches metadata a human set between scan and apply.
+
+        Selects every field the apply path can write, so this same read also
+        supplies apply_scene's undo snapshot (see `apply_scene`'s docstring)."""
         q = """
         query($id: ID!){
-          findScene(id:$id){ id title date
+          findScene(id:$id){ id title details date urls organized rating100
+            code director stash_ids
             studio{ id name } performers{ id name } tags{ id name } }
         }"""
         return self.gql(q, {"id": scene_id}).get("findScene") or {}
@@ -272,11 +276,38 @@ class Stash:
         and every other performer/tag. A transient failure still raises — the
         row fails and a retry can re-run it. Everything is resolved before the
         single sceneUpdate below, so a raise still leaves no partial state on
-        the server."""
+        the server.
+
+        The returned `prior` is a JSON-serialisable snapshot of the scene as
+        it stood immediately before this write — every field this method can
+        write, shaped as the restore input the server would accept to put it
+        back (`studio_id`/`performer_ids`/`tag_ids` flattened from the read,
+        the rest passed through as-is). It exists so a later undo has
+        something to replay. The one field this apply writes that the
+        snapshot CANNOT cover is the cover image: a scene's current cover is
+        only exposed as a URL, not as the base64 payload `cover_image`
+        accepts, so there is no representation to snapshot it with — an
+        applied cover cannot be undone. If the method raises before the
+        single sceneUpdate call, nothing was replaced, so there is nothing to
+        return at all (the exception propagates and no `prior` is produced)."""
         existing = self.scene_existing(scene_id)
         existing_pids = [p["id"] for p in (existing.get("performers") or [])]
         existing_tids = [t["id"] for t in (existing.get("tags") or [])]
         existing_studio_id = (existing.get("studio") or {}).get("id")
+        prior = {
+            "title": existing.get("title"),
+            "details": existing.get("details"),
+            "date": existing.get("date"),
+            "urls": existing.get("urls") or [],
+            "organized": existing.get("organized"),
+            "rating100": existing.get("rating100"),
+            "code": existing.get("code"),
+            "director": existing.get("director"),
+            "stash_ids": existing.get("stash_ids") or [],
+            "studio_id": existing_studio_id,
+            "performer_ids": existing_pids,
+            "tag_ids": existing_tids,
+        }
 
         skipped = []
 
@@ -348,7 +379,7 @@ class Stash:
         self.gql("mutation($in: SceneUpdateInput!){ sceneUpdate(input:$in){ id } }", {"in": inp})
         return {"studio_id": write_studio or existing_studio_id,
                 "performers": len(merged_pids), "tags": len(merged_tids),
-                "skipped": skipped}
+                "skipped": skipped, "prior": prior}
 
     # -- tags (consolidation) --------------------------------------------- #
 

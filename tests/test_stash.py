@@ -112,6 +112,43 @@ class _SceneTransport:
         return {"data": {mut: {"id": outcome}}}
 
 
+def _scene_transport(**scene_fields):
+    """Fake transport for the snapshot tests: answers the scene read with
+    `scene_fields` (defaulted the same way _SceneTransport's `existing` shape
+    is elsewhere in this file) and accepts whatever sceneUpdate is sent,
+    recording it. Every performer/tag/studio find-or-create query returns
+    "not found" so apply_scene falls through to a create, which this fake
+    always grants — the snapshot tests care about what was read and
+    returned, not about entity resolution."""
+    existing = {"id": "s1", "title": None, "details": None, "date": None,
+                "urls": [], "organized": False, "rating100": None, "code": None,
+                "director": None, "stash_ids": [], "studio": None,
+                "performers": [], "tags": []}
+    existing.update(scene_fields)
+
+    def send(body, timeout):
+        q = body["query"]
+        if "findScene(" in q:
+            return {"data": {"findScene": existing}}
+        if "findStudios(" in q:
+            return {"data": {"findStudios": {"count": 0, "studios": []}}}
+        if "findPerformers(" in q:
+            return {"data": {"findPerformers": {"count": 0, "performers": []}}}
+        if "findTags(" in q:
+            return {"data": {"findTags": {"count": 0, "tags": []}}}
+        if "studioCreate" in q:
+            return {"data": {"studioCreate": {"id": "new-studio"}}}
+        if "performerCreate" in q:
+            return {"data": {"performerCreate": {"id": "new-performer"}}}
+        if "tagCreate" in q:
+            return {"data": {"tagCreate": {"id": "new-tag"}}}
+        if "sceneUpdate" in q:
+            return {"data": {"sceneUpdate": {"id": body["variables"]["in"]["id"]}}}
+        raise AssertionError("test transport does not recognize query: %s" % q)
+
+    return send
+
+
 class ApplyScene(unittest.TestCase):
     def test_performers_and_tags_are_unioned_not_replaced(self):
         existing = {"id": "1", "studio": None,
@@ -190,3 +227,39 @@ class ApplyScene(unittest.TestCase):
             Stash("http://example.test", "k", transport=t).apply_scene("1", match)
         self.assertTrue(ctx.exception.transient)
         self.assertIsNone(t.scene_update_input)  # no partial write
+
+
+class PriorStateSnapshot(unittest.TestCase):
+    def test_apply_returns_the_state_it_replaced(self):
+        # the snapshot is what makes an apply reversible; it must describe the
+        # scene as it was BEFORE the write, not after
+        stash = Stash("http://example.test", "k", transport=_scene_transport(
+            title="Old Title", date="2019-01-01",
+            performers=[{"id": "p1"}], tags=[{"id": "t1"}],
+            studio={"id": "st1"}, organized=False))
+        info = stash.apply_scene("s1", {"title": "New Title",
+                                        "performers": [], "tags": []})
+        prior = info["prior"]
+        self.assertEqual(prior["title"], "Old Title")
+        self.assertEqual(prior["date"], "2019-01-01")
+        self.assertEqual(prior["performer_ids"], ["p1"])
+        self.assertEqual(prior["tag_ids"], ["t1"])
+        self.assertEqual(prior["studio_id"], "st1")
+        self.assertIs(prior["organized"], False)
+
+    def test_snapshot_covers_every_field_the_apply_can_write(self):
+        # a field the apply writes but the snapshot omits is a silent hole in
+        # undo, and it will not be discovered until someone needs it
+        writable = {"title", "details", "date", "urls", "stash_ids",
+                    "studio_id", "performer_ids", "tag_ids", "organized"}
+        stash = Stash("http://example.test", "k", transport=_scene_transport())
+        prior = stash.apply_scene("s1", {"performers": [], "tags": []})["prior"]
+        self.assertTrue(writable.issubset(set(prior)),
+                        "snapshot missing: %s" % sorted(writable - set(prior)))
+
+    def test_snapshot_is_json_serialisable(self):
+        # the store will persist it verbatim
+        import json
+        stash = Stash("http://example.test", "k", transport=_scene_transport())
+        prior = stash.apply_scene("s1", {"performers": [], "tags": []})["prior"]
+        json.loads(json.dumps(prior))
