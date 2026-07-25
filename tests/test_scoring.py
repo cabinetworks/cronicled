@@ -194,6 +194,22 @@ class Deciding(unittest.TestCase):
         self.assertIsNone(d.match)
         self.assertIn("ambiguous", d.reason)
 
+    def test_a_gap_of_exactly_the_margin_is_refused(self):
+        # nominally identical gaps land on opposite sides of a raw float
+        # comparison -- 0.900-0.850 is 0.050000000000000044 while
+        # 0.850-0.800 is 0.049999999999999930 -- so the same dilemma is
+        # refused or auto-written depending on where the pair happens to sit
+        for top, runner in ((0.900, 0.850), (0.850, 0.800),
+                            (0.800, 0.750), (0.700, 0.650)):
+            d = decide([self._m(top), self._m(runner)])
+            self.assertIsNone(d.match, "%.3f vs %.3f" % (top, runner))
+            self.assertIn("ambiguous", d.reason)
+
+    def test_a_gap_just_over_the_margin_is_decided(self):
+        for top, runner in ((0.900, 0.849), (0.850, 0.799), (0.700, 0.649)):
+            d = decide([self._m(top), self._m(runner)])
+            self.assertEqual(d.index, 0, "%.3f vs %.3f" % (top, runner))
+
     def test_a_clear_margin_over_the_runner_up_is_decided(self):
         d = decide([self._m(0.9), self._m(0.5)])
         self.assertEqual(d.index, 0)

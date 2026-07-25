@@ -184,7 +184,13 @@ def decide(matches, threshold=0.5):
 
     if len(eligible) > 1:
         runner_value = eligible[1][0]
-        if top_value - runner_value <= AMBIGUITY_MARGIN:
+        # Rounded to the same three places `score` rounds a value to, because
+        # a raw float subtraction decides this by representation rather than
+        # by intent: 0.900-0.850 comes out just OVER the margin and applies,
+        # 0.850-0.800 comes out just under and refuses. Both are a gap of
+        # 0.05, and the majority of the pairs `score` produces land on the
+        # unsafe side.
+        if round(top_value - runner_value, 3) <= AMBIGUITY_MARGIN:
             reason = "ambiguous: %.3f vs %.3f are too close to call" % (
                 top_value, runner_value,
             )
