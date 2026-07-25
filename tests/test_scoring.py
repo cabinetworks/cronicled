@@ -233,9 +233,25 @@ class Deciding(unittest.TestCase):
         self.assertEqual(d.index, 0)
 
     def test_only_eligible_candidates_count_towards_ambiguity(self):
-        # a near-tie below the threshold is not a dilemma, it is two rejects
-        d = decide([self._m(0.8), self._m(0.3), self._m(0.29)])
+        # a reject WITHIN the margin is still not a dilemma -- it was never a
+        # candidate for writing. The 0.78 here is refused for resting on one
+        # generic word, so the 0.80 wins outright despite the near-tie.
+        d = decide([self._m(0.80), self._m(0.78, meaningful_count=1)])
         self.assertEqual(d.index, 0)
+
+    def test_the_winner_is_not_assumed_to_be_first(self):
+        # index is the field telling the caller WHICH candidate to write; an
+        # off-by-one writes the wrong metadata silently
+        low, mid, win = self._m(0.2), self._m(0.4), self._m(0.9)
+        d = decide([low, mid, win])
+        self.assertEqual(d.index, 2)
+        self.assertIs(d.match, win)
+
+    def test_the_winner_is_not_assumed_to_be_first_among_eligible(self):
+        runner, win = self._m(0.6), self._m(0.95)
+        d = decide([runner, win])
+        self.assertEqual(d.index, 1)
+        self.assertIs(d.match, win)
 
     def test_an_empty_candidate_list_is_refused_with_a_reason(self):
         d = decide([])
