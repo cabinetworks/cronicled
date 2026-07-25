@@ -20,6 +20,19 @@ class DeclarativeAdapter(SiteAdapter):
         self._owner_segment = spec.get("owner_segment")
         self._owner_field = spec.get("owner_field") or []
 
+        valid = ("url_segment", "result_field", "none")
+        if self._owner_source not in valid:
+            raise ValueError("adapter %r: owner_source must be one of %s, got %r"
+                             % (self.name, ", ".join(valid), self._owner_source))
+        if self._owner_source == "url_segment":
+            if not isinstance(self._owner_segment, int) or self._owner_segment < 0:
+                raise ValueError("adapter %r: owner_segment must be a non-negative "
+                                 "integer when owner_source is 'url_segment'"
+                                 % self.name)
+        if self._owner_source == "result_field" and not self._owner_field:
+            raise ValueError("adapter %r: owner_field is required when "
+                             "owner_source is 'result_field'" % self.name)
+
     def _segments(self, url):
         # drop scheme, then query and fragment: a tracking parameter must not
         # become part of the title slug

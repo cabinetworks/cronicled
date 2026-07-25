@@ -2,6 +2,7 @@
 import html
 import os
 import re
+import unicodedata
 
 from cronicled.vocab import JUNK_TOKENS, STOPWORDS, VIDEO_EXTS
 
@@ -33,8 +34,22 @@ def strip_ext(name):
 
 
 def normalize(s):
-    s = re.sub(r"[^0-9a-zA-Z]+", " ", (s or "").lower())
-    return re.sub(r"\s+", " ", s).strip()
+    """Lowercase, fold accents to their base letter, reduce every other
+    non-alphanumeric character to a single space.
+
+    Accents fold because filenames routinely drop them while store titles keep
+    them. Non-Latin letters are preserved rather than deleted: dropping them
+    would give a non-Latin name an empty slug, which matches nothing.
+    """
+    if not s:
+        return ""
+    decomposed = unicodedata.normalize("NFKD", s)
+    kept = []
+    for ch in decomposed:
+        if unicodedata.combining(ch):
+            continue          # a stripped accent
+        kept.append(ch if ch.isalnum() else " ")
+    return " ".join("".join(kept).lower().split())
 
 
 def tokens(s, drop_junk=True, drop_stop=True):

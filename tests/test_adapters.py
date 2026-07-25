@@ -97,6 +97,39 @@ class NoOwnerAnywhere(unittest.TestCase):
         self.assertFalse(self.a.clip_features_artist(r, ""))
 
 
+class InvalidSpec(unittest.TestCase):
+    """A mistyped config must fail loudly: an empty owner falls through to
+    title-substring matching in clip_features_artist, so a bad owner_source or
+    owner_segment would otherwise produce plausible wrong matches instead of an
+    error."""
+
+    def test_unrecognised_owner_source_raises(self):
+        spec = dict(NONE_SPEC, name="badsource", owner_source="nonsense")
+        with self.assertRaises(ValueError) as ctx:
+            DeclarativeAdapter(spec)
+        self.assertIn("badsource", str(ctx.exception))
+
+    def test_url_segment_without_a_segment_raises(self):
+        spec = dict(URL_SPEC, name="nosegment", owner_source="url_segment")
+        del spec["owner_segment"]
+        with self.assertRaises(ValueError) as ctx:
+            DeclarativeAdapter(spec)
+        self.assertIn("nosegment", str(ctx.exception))
+
+    def test_negative_owner_segment_raises(self):
+        spec = dict(URL_SPEC, name="negsegment", owner_segment=-1)
+        with self.assertRaises(ValueError) as ctx:
+            DeclarativeAdapter(spec)
+        self.assertIn("negsegment", str(ctx.exception))
+
+    def test_result_field_without_an_owner_field_raises(self):
+        spec = dict(FIELD_SPEC, name="nofield")
+        del spec["owner_field"]
+        with self.assertRaises(ValueError) as ctx:
+            DeclarativeAdapter(spec)
+        self.assertIn("nofield", str(ctx.exception))
+
+
 class Defaults(unittest.TestCase):
     def test_censorship_and_aliases_default_to_empty(self):
         a = DeclarativeAdapter(NONE_SPEC)

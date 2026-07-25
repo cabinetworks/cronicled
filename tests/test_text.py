@@ -60,6 +60,43 @@ class StripExt(unittest.TestCase):
         self.assertEqual(strip_ext("Copper Kettle Vol.2"), "Copper Kettle Vol.2")
 
 
+class SlugMatchPolicy(unittest.TestCase):
+    """Bidirectional containment, NOT equality: a store handle is often the
+    performer name plus a suffix, or vice versa. The plan originally specified
+    equality; the shipped behaviour is containment and it is what works."""
+
+    def test_matches_when_one_contains_the_other(self):
+        self.assertTrue(slug_match("Velvet Crane", "velvet-crane-official"))
+        self.assertTrue(slug_match("velvetcraneofficial", "Velvet Crane"))
+
+    def test_matches_ignoring_case_and_separators(self):
+        self.assertTrue(slug_match("Velvet Crane", "velvet-crane"))
+
+    def test_rejects_unrelated_names(self):
+        self.assertFalse(slug_match("Velvet Crane", "Harbour Lights"))
+
+    def test_known_limitation_short_names_over_match(self):
+        # documented, not desired: a short handle is a substring of many words.
+        # The matcher engine must not rely on slug_match alone for short names.
+        self.assertTrue(slug_match("ana", "banana"))
+
+
+class NormalizeUnicode(unittest.TestCase):
+    def test_folds_accents_to_their_base_letter(self):
+        # filenames routinely drop accents that store titles keep
+        self.assertEqual(normalize("café naïve"), "cafe rocio")
+
+    def test_preserves_non_latin_letters(self):
+        self.assertEqual(normalize("Мария"), "мария")
+
+    def test_still_collapses_punctuation(self):
+        self.assertEqual(normalize("Velvet.Crane - Copper_Kettle"),
+                         "velvet crane copper kettle")
+
+    def test_accented_and_unaccented_forms_match(self):
+        self.assertTrue(slug_match("café", "cafe"))
+
+
 class Tokens(unittest.TestCase):
     def test_drops_stopwords_by_default(self):
         self.assertNotIn("the", tokens("The Copper Kettle"))
