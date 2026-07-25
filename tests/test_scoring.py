@@ -34,6 +34,20 @@ class MeaningfulTokens(unittest.TestCase):
         self.assertIn("extended",
                       meaningful_tokens("Morning Ritual.Extended", ""))
 
+    def test_the_extension_shape_is_bounded_at_both_ends(self):
+        # the suffix length bounds decide how much of a name can vanish, and
+        # both directions are load-bearing: too low and a one-letter part
+        # marker stops counting as evidence, too high and a real trailing
+        # word does. Fewer tokens is a smaller set, and a smaller set is the
+        # one that slips past the threshold as containment.
+        for name, expected in (
+            ("Winter Study.B", {"winter", "study", "b"}),          # 1 char
+            ("Winter Study.rm", {"winter", "study"}),              # 2 chars
+            ("Winter Study.mpeg2", {"winter", "study"}),           # 5 chars
+            ("Winter Study.Sequel", {"winter", "study", "sequel"}),  # 6 chars
+        ):
+            self.assertEqual(meaningful_tokens(name, ""), expected, name)
+
     def test_the_folder_contributes_tokens(self):
         got = meaningful_tokens("Part 2.mp4", "Garden Sessions")
         self.assertIn("garden", got)
@@ -160,8 +174,17 @@ class Scoring(unittest.TestCase):
         self.assertNotIn("ambiguous", decide([blank, blank], threshold=0.3).reason)
 
     def test_score_is_rounded_to_three_places(self):
-        m = score("Morning Ritual.mp4", "", "Morning Something Else")
-        self.assertEqual(m.value, round(m.value, 3))
+        # asserting only `value == round(value, 3)` is vacuous in the
+        # direction that matters -- it is equally true of a 2-place value. So
+        # pin that the score actually CARRIES a third decimal place, because
+        # `decide` compares its ambiguity gap rounded to three places on the
+        # assumption that its inputs are that precise. Coarsen `score` and
+        # that comparison quietly stops matching its inputs.
+        for name, title in (("Morning Ritual.mp4", "Morning Something Else"),
+                            ("Morning Ritual Part Two.mp4", "Morning Ritual")):
+            m = score(name, "", title)
+            self.assertEqual(m.value, round(m.value, 3), name)
+            self.assertNotEqual(m.value, round(m.value, 2), name)
 
 
 class Deciding(unittest.TestCase):
@@ -258,6 +281,18 @@ class Deciding(unittest.TestCase):
         # generic word, so the 0.80 wins outright despite the near-tie.
         d = decide([self._m(0.80), self._m(0.78, meaningful_count=1)])
         self.assertEqual(d.index, 0)
+
+    def test_the_runner_up_is_the_second_best_not_the_last(self):
+        # with three eligible candidates the near-tie is between the top two;
+        # comparing the top against the worst of the field instead sees a
+        # comfortable 0.30 gap and writes the winner despite a live dilemma
+        # 0.02 away from it
+        for matches in ([self._m(0.90), self._m(0.88), self._m(0.60)],
+                        [self._m(0.60), self._m(0.90), self._m(0.88)]):
+            d = decide(matches)
+            self.assertIsNone(d.match, matches)
+            self.assertIn("ambiguous", d.reason)
+            self.assertIn("0.880", d.reason)
 
     def test_the_winner_is_not_assumed_to_be_first(self):
         # index is the field telling the caller WHICH candidate to write; an
