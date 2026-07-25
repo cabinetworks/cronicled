@@ -193,7 +193,17 @@ class JobRunner:
             ctx = _JobContext(lambda message: self._log(state, message))
             for proposal in producer.produce(ctx):
                 self._record(state, proposal, producer.name)
-        except Exception as exc:
+        except BaseException as exc:
+            # Deliberately broader than `except Exception`: a producer is
+            # arbitrary third-party code running on a thread with no other
+            # supervisor, and `KeyboardInterrupt`/`SystemExit`/a leaked
+            # `GeneratorExit` are all `BaseException`, not `Exception`. Any
+            # of them escaping here would leave the job in `running` forever
+            # — indistinguishable from one still genuinely working — because
+            # nothing else ever marks it failed. Do not narrow this back to
+            # `Exception`; do not re-raise, either: this is a worker thread,
+            # so a re-raise only reaches the thread excepthook and prints,
+            # it does not propagate anywhere a caller could observe.
             with self._lock:
                 state.state = "failed"
                 state.error = str(exc)

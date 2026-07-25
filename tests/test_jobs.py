@@ -12,12 +12,14 @@ from cronicled.store import Store
 
 class _Producer:
     """A producer under test. `gate` lets a test hold it mid-run; `boom` makes it
-    fail after yielding some real work."""
+    fail after yielding some real work; `raises` overrides what it raises after
+    that first yield (default `RuntimeError`, an ordinary `Exception`)."""
 
     def __init__(self, name="test-producer", cost="local", count=3,
-                 gate=None, boom=False):
+                 gate=None, boom=False, raises=None):
         self.name, self.cost, self._count = name, cost, count
         self._gate, self._boom = gate, boom
+        self._raises = raises or RuntimeError
 
     def produce(self, ctx):
         for i in range(self._count):
@@ -27,7 +29,7 @@ class _Producer:
             yield {"folder": "f", "subject_type": "scene", "subject_id": str(i),
                    "summary": "proposal %d" % i, "payload": {"n": i}}
         if self._boom:
-            raise RuntimeError("producer failed after yielding")
+            raise self._raises("producer failed after yielding")
 
 
 class _RunnerCase(unittest.TestCase):
@@ -105,6 +107,22 @@ class Failure(_RunnerCase):
         good = self.runner.start("good")
         self.runner.wait(good.id, timeout=5)
         self.assertEqual(self.runner.job(good.id).state, "done")
+
+
+class BaseExceptions(_RunnerCase):
+    def test_a_keyboard_interrupt_still_fails_the_job_and_keeps_the_yield(self):
+        # KeyboardInterrupt (and SystemExit, GeneratorExit) are BaseException,
+        # not Exception: a bare `except Exception` lets one strand the job in
+        # "running" forever, indistinguishable from a job still working.
+        self.runner.register(
+            _Producer(count=1, boom=True, raises=KeyboardInterrupt)
+        )
+        job = self.runner.start("test-producer")
+        self.assertTrue(self.runner.wait(job.id, timeout=5))
+        failed = self.runner.job(job.id)
+        self.assertEqual(failed.state, "failed")
+        self.assertIn("producer failed", failed.error)
+        self.assertEqual(len(self.store.items()), 1)
 
 
 class CostClasses(_RunnerCase):
