@@ -18,8 +18,10 @@ producers that happen to build a payload's keys in a different order.
 """
 import hashlib
 import json
+import os
 import sqlite3
 import threading
+import unicodedata
 from datetime import datetime, timezone
 
 SCHEMA = """
@@ -52,6 +54,27 @@ CREATE TABLE IF NOT EXISTS mute (
 """
 
 
+def _nfc(value):
+    """Recursively normalise every string in a JSON-compatible value to NFC.
+
+    A filesystem commonly hands back a decomposed form (e.g. "e" + combining
+    acute) while a title from an API is composed (a single "é" codepoint).
+    Those are the same human-identical string, and without this they'd hash
+    to two different fingerprints — silently duplicating a proposal on the
+    exact grounds `fingerprint` exists to prevent. Dict keys are normalised
+    too, for the same reason. Non-string scalars (int, float, bool, None)
+    pass through unchanged: normalising *values* doesn't mean coercing
+    *types* — see the note on `1` vs `1.0` below.
+    """
+    if isinstance(value, str):
+        return unicodedata.normalize("NFC", value)
+    if isinstance(value, dict):
+        return {_nfc(k): _nfc(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_nfc(v) for v in value]
+    return value
+
+
 def fingerprint(folder, subject_type, subject_id, payload):
     """Stable identity for a proposal.
 
@@ -60,15 +83,35 @@ def fingerprint(folder, subject_type, subject_id, payload):
     stored fingerprint depends on this serialisation: changing it silently
     invalidates them all, and the symptom is duplicate rows after an upgrade
     rather than an error. Nothing else may serialise a payload for hashing.
+
+    Every string involved — `folder`, `subject_type`, `subject_id`, and any
+    string anywhere inside `payload` — is normalised to Unicode NFC first
+    (see `_nfc`), so a composed and a decomposed spelling of the same title
+    are one proposal, not two.
+
+    Numeric type is deliberately NOT coerced: `1` and `1.0` remain distinct
+    fingerprints. Collapsing them would mean guessing they represent the
+    same logical value, which is exactly the kind of interpretation this
+    store refuses to do with an opaque payload.
     """
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"),
-                           ensure_ascii=False)
-    joined = "\x1f".join([folder, subject_type, str(subject_id), canonical])
+    normalized_payload = _nfc(payload)
+    canonical = json.dumps(normalized_payload, sort_keys=True,
+                           separators=(",", ":"), ensure_ascii=False)
+    joined = "\x1f".join([
+        unicodedata.normalize("NFC", folder),
+        unicodedata.normalize("NFC", subject_type),
+        unicodedata.normalize("NFC", str(subject_id)),
+        canonical,
+    ])
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 
 def _utcnow():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+_open_paths = set()
+_open_paths_lock = threading.Lock()
 
 
 class Store:
@@ -80,15 +123,41 @@ class Store:
     the store owns — callers never think about concurrency themselves.
     WAL mode lets those reads and writes proceed without blocking each other
     on the filesystem any more than the lock already requires.
+
+    Exactly one `Store` may be open on a given database file at a time. The
+    lock above is per-instance, not per-file: a second `Store` opened on the
+    same path would get its own lock, so two handles could interleave — one
+    handle's `dismiss` landing between another handle's dismissal-check and
+    its `INSERT` in `record`, resurrecting a just-dismissed proposal with
+    `state='new'`. Nothing today opens a second handle, but nothing should
+    have to remember not to either, so `__init__` checks a process-wide
+    registry of open paths and raises `RuntimeError` if the path is already
+    open; `close()` (and the context manager) releases it so the same path
+    can be reopened afterwards.
     """
 
     def __init__(self, path):
-        self._lock = threading.Lock()
-        self._conn = sqlite3.connect(path, check_same_thread=False)
-        with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.executescript(SCHEMA)
-            self._conn.commit()
+        canonical_path = os.path.abspath(path)
+        with _open_paths_lock:
+            if canonical_path in _open_paths:
+                raise RuntimeError(
+                    f"Store is already open on {canonical_path!r} — only one "
+                    "Store instance may hold a given database file at a time "
+                    "(see the class docstring for why)."
+                )
+            _open_paths.add(canonical_path)
+        try:
+            self._path = canonical_path
+            self._lock = threading.Lock()
+            self._conn = sqlite3.connect(path, check_same_thread=False)
+            with self._lock:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.executescript(SCHEMA)
+                self._conn.commit()
+        except Exception:
+            with _open_paths_lock:
+                _open_paths.discard(canonical_path)
+            raise
 
     def __enter__(self):
         return self
@@ -99,6 +168,8 @@ class Store:
     def close(self):
         with self._lock:
             self._conn.close()
+        with _open_paths_lock:
+            _open_paths.discard(self._path)
 
     def record(self, folder, subject_type, subject_id, summary, payload,
                producer, confidence=None, now=None):
@@ -122,7 +193,16 @@ class Store:
         confidence. Freshening those columns would let a producer's rerun
         quietly overwrite a reviewer's decision (`seen`, `dismissed`,
         `muted`) or their context; resist that urge here.
+
+        `confidence`, unlike `payload`, is not opaque — the store has a
+        documented contract for it (0 to 1 inclusive, or `None`) and
+        enforces it here, raising `ValueError` on anything outside that
+        range rather than storing a nonsensical score.
         """
+        if confidence is not None and not (0 <= confidence <= 1):
+            raise ValueError(
+                f"confidence must be between 0 and 1 (or None), got {confidence!r}"
+            )
         fp = fingerprint(folder, subject_type, subject_id, payload)
         when = now if now is not None else _utcnow()
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"),
@@ -206,6 +286,8 @@ class Store:
             "resolved_at": when,
         })
 
+    _TERMINAL_STATES = ("applied", "failed")
+
     def dismiss(self, fp, reason=None, now=None):
         """Reject THIS proposal by fingerprint. A better proposal for the
         same subject may still arrive tomorrow and is not affected.
@@ -217,8 +299,28 @@ class Store:
         makes the rejection stick — it is never pruned, so re-recording the
         same fingerprint can never resurrect it, with or without a matching
         `item` row.
+
+        If the row is already in a terminal state (`applied` or `failed`),
+        this does NOT move it to `dismissed` — `applied`/`failed` plus their
+        `resolved_at` record that a real change already happened (or was
+        attempted) and when; overwriting that with `dismissed` would erase
+        the fact and time of that change while the file itself stays
+        modified. The dismissal is still recorded in the `dismissal` table
+        (so it still blocks a future re-record of the same fingerprint) —
+        only the row's own `state`/`resolved_at` are left alone.
+
+        Unlike `mark_seen`/`mark_applied`/`mark_failed`, calling this on a
+        fingerprint with no matching `item` row is not an error: dismissal
+        (like mute) is allowed pre-emptively, before the row exists, mirroring
+        `mute`'s ability to block a subject that has never had a proposal.
+        The three `mark_*` transitions describe something that happened to
+        an already-recorded proposal, so an unknown fingerprint there is a
+        caller bug; `dismiss`/`mute` describe a standing rejection that may
+        outlive — or precede — any particular row, so there's nothing to
+        require existing first.
         """
         when = now if now is not None else _utcnow()
+        placeholders = ", ".join("?" for _ in self._TERMINAL_STATES)
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO dismissal (fingerprint, reason, at) "
@@ -226,9 +328,15 @@ class Store:
                 (fp, reason, when),
             )
             self._conn.execute(
-                "UPDATE item SET state = 'dismissed', resolved_at = ? "
-                "WHERE fingerprint = ?",
-                (when, fp),
+                f"""
+                UPDATE item SET
+                    state = CASE WHEN state IN ({placeholders})
+                                 THEN state ELSE 'dismissed' END,
+                    resolved_at = CASE WHEN state IN ({placeholders})
+                                       THEN resolved_at ELSE ? END
+                WHERE fingerprint = ?
+                """,
+                (*self._TERMINAL_STATES, *self._TERMINAL_STATES, when, fp),
             )
             self._conn.commit()
 
@@ -242,9 +350,19 @@ class Store:
         rather than by fingerprint — so it works even for a subject with no
         `item` row yet, which is the whole point of muting ahead of a
         proposal ever arriving.
+
+        Same terminal-state protection as `dismiss`: any row already
+        `applied` or `failed` keeps its own `state` and `resolved_at` — the
+        subject-level mute still gets recorded in the `mute` table and still
+        blocks future proposals for it, it just doesn't overwrite the record
+        of a real change that already happened to this particular row.
+
+        Also like `dismiss`, calling this for a subject with no `item` row
+        at all is not an error — see `dismiss`'s docstring for why.
         """
         when = now if now is not None else _utcnow()
         subject_id = str(subject_id)
+        placeholders = ", ".join("?" for _ in self._TERMINAL_STATES)
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO mute "
@@ -252,9 +370,16 @@ class Store:
                 (subject_type, subject_id, reason, when),
             )
             self._conn.execute(
-                "UPDATE item SET state = 'muted', resolved_at = ? "
-                "WHERE subject_type = ? AND subject_id = ?",
-                (when, subject_type, subject_id),
+                f"""
+                UPDATE item SET
+                    state = CASE WHEN state IN ({placeholders})
+                                 THEN state ELSE 'muted' END,
+                    resolved_at = CASE WHEN state IN ({placeholders})
+                                       THEN resolved_at ELSE ? END
+                WHERE subject_type = ? AND subject_id = ?
+                """,
+                (*self._TERMINAL_STATES, *self._TERMINAL_STATES, when,
+                 subject_type, subject_id),
             )
             self._conn.commit()
 

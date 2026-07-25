@@ -2,7 +2,9 @@
 nightly producer from turning the inbox into noise on its second night."""
 import json
 import os
+import shutil
 import tempfile
+import unicodedata
 import unittest
 
 from cronicled.store import Store, fingerprint
@@ -36,6 +38,30 @@ class Fingerprint(unittest.TestCase):
         b = fingerprint("g", "scene", "1", {"title": "Copper Kettle"})
         self.assertNotEqual(a, b)
 
+    def test_composed_and_decomposed_unicode_hash_identically(self):
+        # a filesystem commonly hands back a decomposed form while a title
+        # from an API is composed; those are the same human-identical title
+        composed = "café"                        # "é" as one codepoint
+        decomposed = unicodedata.normalize("NFD", composed)  # "e" + combining acute
+        self.assertNotEqual(composed, decomposed)     # sanity: genuinely different strings
+        a = fingerprint("f", "scene", "1", {"title": composed})
+        b = fingerprint("f", "scene", "1", {"title": decomposed})
+        self.assertEqual(a, b)
+
+    def test_composed_and_decomposed_unicode_hash_identically_when_nested(self):
+        composed = "café"
+        decomposed = unicodedata.normalize("NFD", composed)
+        a = fingerprint("f", "scene", "1", {"x": {"title": composed}})
+        b = fingerprint("f", "scene", "1", {"x": {"title": decomposed}})
+        self.assertEqual(a, b)
+
+    def test_int_and_float_of_the_same_value_are_different_fingerprints(self):
+        # numeric type is not coerced: collapsing 1 and 1.0 would mean
+        # guessing they're the same logical value in an opaque payload
+        a = fingerprint("f", "scene", "1", {"n": 1})
+        b = fingerprint("f", "scene", "1", {"n": 1.0})
+        self.assertNotEqual(a, b)
+
 
 class _StoreCase(unittest.TestCase):
     def setUp(self):
@@ -45,7 +71,6 @@ class _StoreCase(unittest.TestCase):
 
     def _cleanup(self):
         self.store.close()
-        import shutil
         shutil.rmtree(self._dir, ignore_errors=True)
 
     def _record(self, subject_id="1", payload=None, folder="scene-matches"):
@@ -183,6 +208,98 @@ class States(_StoreCase):
         # silently doing nothing would hide a real bug in a caller
         with self.assertRaises(KeyError):
             self.store.mark_seen("nosuchfingerprint")
+
+
+class RejectionDoesNotOverwriteATerminalResolution(_StoreCase):
+    # applied/failed plus resolved_at record that a real change already
+    # happened (or was attempted) and when; a later dismiss/mute must not
+    # erase that just because a reviewer also rejects the fingerprint/subject
+    def test_dismissing_an_applied_proposal_preserves_its_state_and_timestamp(self):
+        fp = self._record()
+        self.store.mark_applied(fp, prior_state={"title": "Old Title"}, now="2020-01-01T00:00:00")
+        before = self.store.items(state="applied")[0]
+
+        self.store.dismiss(fp, reason="too late, already applied", now="2020-06-01T00:00:00")
+
+        after = self.store.items(state="applied")[0]
+        self.assertEqual(after["state"], "applied")
+        self.assertEqual(after["resolved_at"], before["resolved_at"])
+        self.assertEqual(after["prior_state"], {"title": "Old Title"})
+        # the rejection still stuck: re-recording does not create a new row
+        # or move this one back to "new"
+        self._record()
+        self.assertEqual(len(self.store.items(state="applied")), 1)
+        self.assertEqual(len(self.store.items(state="new")), 0)
+
+    def test_muting_a_failed_proposals_subject_preserves_its_state_and_timestamp(self):
+        fp = self._record(subject_id="7")
+        self.store.mark_failed(fp, error="server refused the name", now="2020-01-01T00:00:00")
+        before = self.store.items(state="failed")[0]
+
+        self.store.mute("scene", "7", reason="never identifiable", now="2020-06-01T00:00:00")
+
+        after = self.store.items(state="failed")[0]
+        self.assertEqual(after["state"], "failed")
+        self.assertEqual(after["resolved_at"], before["resolved_at"])
+        self.assertEqual(after["error"], "server refused the name")
+        # the mute still blocks a later proposal for the same subject
+        self._record(subject_id="7")
+        self.assertEqual(len(self.store.items(state="failed")), 1)
+        self.assertEqual(len(self.store.items(state="new")), 0)
+
+
+class ConfidenceValidation(_StoreCase):
+    def test_confidence_above_one_raises(self):
+        with self.assertRaises(ValueError):
+            self.store.record(folder="scene-matches", subject_type="scene",
+                              subject_id="1", summary="a proposal",
+                              payload={"title": "x"}, producer="test-producer",
+                              confidence=57.3)
+
+    def test_confidence_below_zero_raises(self):
+        with self.assertRaises(ValueError):
+            self.store.record(folder="scene-matches", subject_type="scene",
+                              subject_id="1", summary="a proposal",
+                              payload={"title": "x"}, producer="test-producer",
+                              confidence=-3)
+
+    def test_confidence_boundary_values_are_allowed(self):
+        self.store.record(folder="scene-matches", subject_type="scene",
+                          subject_id="1", summary="a proposal",
+                          payload={"title": "x"}, producer="test-producer",
+                          confidence=0)
+        self.store.record(folder="scene-matches", subject_type="scene",
+                          subject_id="2", summary="a proposal",
+                          payload={"title": "y"}, producer="test-producer",
+                          confidence=1)
+        self.assertEqual(len(self.store.items()), 2)
+
+    def test_confidence_none_is_allowed(self):
+        self.store.record(folder="scene-matches", subject_type="scene",
+                          subject_id="1", summary="a proposal",
+                          payload={"title": "x"}, producer="test-producer",
+                          confidence=None)
+        self.assertIsNone(self.store.items()[0]["confidence"])
+
+
+class SingleInstancePerFile(unittest.TestCase):
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self._dir, ignore_errors=True))
+
+    def test_opening_a_second_store_on_the_same_path_raises(self):
+        path = os.path.join(self._dir, "s.db")
+        first = Store(path)
+        self.addCleanup(first.close)
+        with self.assertRaises(RuntimeError):
+            Store(path)
+
+    def test_a_path_can_be_reopened_after_close(self):
+        path = os.path.join(self._dir, "s.db")
+        first = Store(path)
+        first.close()
+        second = Store(path)          # must not raise
+        second.close()
 
 
 class Concurrency(_StoreCase):
