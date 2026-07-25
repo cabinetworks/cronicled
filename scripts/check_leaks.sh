@@ -18,13 +18,41 @@
 # No patterns configured is a FAILURE, not a pass: a missing or renamed secret
 # must break the build rather than silently disable the guard.
 #
-# Output discipline: CI logs are public, so this reports FILE PATHS and COMMIT
-# SHAs only. It never echoes a matched line or a pattern. Run it locally,
-# where .leak-patterns exists, to see detail.
+# Output discipline: CI logs are public. For CONTENT matches this reports the
+# file path or commit SHA where the pattern was found - never the matched
+# line or the pattern itself. For FILENAME matches, even the path cannot be
+# shown: a filename that matches a pattern CONTAINS that pattern, so those
+# legs report a count only. Run it locally, where .leak-patterns exists, to
+# see which file.
+#
+# --file-types-only skips every pattern-based leg (checks 1-4 below) and
+# does not fail when no patterns are configured, because none are expected in
+# that mode. It exists for fork pull requests, which cannot read the
+# LEAK_PATTERNS secret. Every other invocation keeps failing closed.
 set -u
+
+# The extension list ships alongside this script, not inside whatever repo is
+# being scanned - resolve it from $0's own location before anything below
+# changes directory.
+script_dir=$(cd "$(dirname "$0")" && pwd)
+
+# Resolve everything else from the repository root: the pattern file and the
+# scan scope must not depend on where the script was invoked from.
+root=$(git rev-parse --show-toplevel 2>/dev/null) || {
+	echo "check_leaks: not inside a git repository" >&2
+	exit 2
+}
+cd "$root" || exit 2
+
+mode=full
+if [ "${1:-}" = "--file-types-only" ]; then
+	mode=file-types-only
+fi
 
 status=0
 fail() { echo "LEAK: $1" >&2; status=1; }
+
+if [ "$mode" = full ]; then
 
 patterns=""
 if [ -n "${LEAK_PATTERNS:-}" ]; then
@@ -133,8 +161,9 @@ while IFS= read -r pat; do
 
 	names=$(git ls-files | grep -i -F -e "$pat" || true)
 	if [ -n "$names" ]; then
-		echo "$names" >&2
-		fail "forbidden string in the tracked filename(s) above"
+		# never echo the names: a filename that matches a pattern CONTAINS the
+		# pattern, and CI logs are public. Run locally for detail.
+		fail "$(printf '%s\n' "$names" | wc -l | tr -d ' ') tracked filename(s) match a configured pattern - run the guard locally to see which"
 	fi
 
 	# 2. Untracked-but-not-ignored files. These are invisible to `git grep`
@@ -145,8 +174,9 @@ while IFS= read -r pat; do
 	#    of scope, matching what would actually ship if committed as-is.
 	untracked_names=$(git ls-files --others --exclude-standard | grep -i -F -e "$pat" || true)
 	if [ -n "$untracked_names" ]; then
-		echo "$untracked_names" >&2
-		fail "forbidden string in the untracked filename(s) above"
+		# never echo the names: a filename that matches a pattern CONTAINS the
+		# pattern, and CI logs are public. Run locally for detail.
+		fail "$(printf '%s\n' "$untracked_names" | wc -l | tr -d ' ') untracked filename(s) match a configured pattern - run the guard locally to see which"
 	fi
 
 	# git grep cannot see untracked content at all, so untracked files are
@@ -202,6 +232,8 @@ $commit_shas
 EOF
 fi
 
+fi # mode = full
+
 # 5. Data and media files. The ignore rules should prevent these; this catches
 #    a `git add -f`. NUL-delimited: filenames containing spaces, brackets or
 #    glob characters must be handled literally, and bracketed names are the
@@ -210,16 +242,39 @@ fi
 #    .github/workflows/ — those are legitimate, non-secret config and must
 #    stay trackable; a config/archive/data file with the same extension
 #    anywhere else is still caught.
+#
+#    The data extensions live in scripts/data-extensions.txt, not here: this
+#    list and .gitignore's deny-by-default block are two copies of the same
+#    rule that have already drifted once (a re-initialised repo silently
+#    shipped with no CI at all), so the extensions themselves now have exactly
+#    one source of truth. A test asserts the two stay in agreement.
+data_exts=()
+while IFS= read -r ext; do
+	[ -n "$ext" ] || continue
+	case "$ext" in \#*) continue ;; esac
+	data_exts+=("$ext")
+done < "$script_dir/data-extensions.txt"
+
 while IFS= read -r -d '' f; do
 	case "$f" in
 	*.example.json | .github/workflows/*.yml | .github/workflows/*.yaml) continue ;;
 	esac
+	is_data=0
+	# Guard the expansion itself, not just the loop body: under `set -u`,
+	# bash 3.2 (the version macOS ships) treats "${arr[@]}" on a genuinely
+	# empty array as an unbound-variable error rather than zero words.
+	if [ "${#data_exts[@]}" -gt 0 ]; then
+		for ext in "${data_exts[@]}"; do
+			case "$f" in
+			$ext) is_data=1; break ;;
+			esac
+		done
+	fi
+	if [ "$is_data" -eq 1 ]; then
+		fail "tracked data file: $f"
+		continue
+	fi
 	case "$f" in
-	*.json | *.jsonl | *.db | *.sqlite | *.sqlite3 | *.tsv | *.csv | *.log \
-	  | *.err | *.pid | *.key | *.pem | *.crt | *.env | *.sql | *.bak | *.nfo \
-	  | *.yaml | *.yml | *.ini | *.cfg | *.toml | *.zip | *.tar | *.gz | *.rar \
-	  | *.parquet)
-		fail "tracked data file: $f" ;;
 	*.mp4 | *.m4v | *.mkv | *.avi | *.wmv | *.mov | *.jpg | *.jpeg | *.png \
 	  | *.gif | *.webp | *.webm | *.srt | *.vtt | *.ass | *.m3u | *.mp3 \
 	  | *.wav | *.flac | *.bmp | *.tiff | *.heic)

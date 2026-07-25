@@ -14,7 +14,11 @@
 *.pid
 *.key
 *.pem
+*.crt
 *.env
+*.sql
+*.bak
+*.nfo
 *.yaml
 *.yml
 *.ini

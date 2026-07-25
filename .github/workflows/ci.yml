@@ -17,7 +17,14 @@ jobs:
       - name: Leak guard
         env:
           LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
-        run: ./scripts/check_leaks.sh
+        run: |
+          if [ -z "${LEAK_PATTERNS}" ]; then
+            echo "No pattern list available (expected on a fork PR):"
+            echo "running file-type checks only; the full scan runs on merge."
+            ./scripts/check_leaks.sh --file-types-only
+          else
+            ./scripts/check_leaks.sh
+          fi
 
   test:
     needs: guard

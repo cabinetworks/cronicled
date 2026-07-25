@@ -1,0 +1,30 @@
+# Extensions the leak guard treats as data files (scripts/check_leaks.sh,
+# section 5). Every glob here must also appear in .gitignore's deny-by-default
+# block; tests/test_guard.py asserts the two agree. One glob per line.
+*.json
+*.jsonl
+*.db
+*.sqlite
+*.sqlite3
+*.tsv
+*.csv
+*.log
+*.err
+*.pid
+*.key
+*.pem
+*.crt
+*.env
+*.sql
+*.bak
+*.nfo
+*.yaml
+*.yml
+*.ini
+*.cfg
+*.toml
+*.zip
+*.tar
+*.gz
+*.rar
+*.parquet
