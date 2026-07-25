@@ -51,6 +51,11 @@
 *.heic
 
 # --- Allowed back in ----------------------------------------------------------
+# CI workflow definitions are config, not data. Without this the deny-by-default
+# *.yml rule silently excludes them: the file survives only while it is already
+# tracked, so a fresh clone-and-add drops CI entirely.
+!.github/workflows/*.yml
+!.github/workflows/*.yaml
 # Deliberately narrow. A JSON that genuinely belongs in the repo can be named
 # *.example.json; anything else must justify itself by being force-added, which
 # the leak guard then catches.
