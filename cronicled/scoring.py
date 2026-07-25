@@ -27,6 +27,22 @@ class Match(NamedTuple):
     meaningful_count: int
 
 
+class Decision(NamedTuple):
+    match: Optional[Match]
+    index: Optional[int]
+    reason: str
+
+
+# A one-generic-word match (e.g. a single common word shared with some other
+# title) is not evidence of a real match on its own -- it must score very
+# high before we trust it.
+_GENERIC_WORD_THRESHOLD = 0.9
+
+# Two eligible candidates within this margin of each other are a dilemma, not
+# a decision -- refuse rather than silently pick whichever came first.
+AMBIGUITY_MARGIN = 0.05
+
+
 def _without_series_prefix(name):
     """Strip a leading 'Series - ' prefix from a stripped-extension filename,
     if present. Returns None when there's nothing to strip (no separator, the
@@ -87,3 +103,53 @@ def score(name, folder, title, artist=None):
         best = max(best, 0.9)
 
     return Match(value=round(best, 3), contained=contained, meaningful_count=len(meaningful))
+
+
+def _is_eligible(match, threshold):
+    """A match is trustworthy enough to compete for the win. Containment
+    bypasses the threshold entirely (the scorer already vetted it); a single
+    generic word needs near-certainty; everything else needs the threshold."""
+    if match.contained:
+        return True
+    if match.meaningful_count < 2:
+        return match.value >= _GENERIC_WORD_THRESHOLD
+    return match.value >= threshold
+
+
+def decide(matches, threshold=0.5):
+    """Pick the one candidate confident enough to apply automatically, or
+    refuse with a reason a person can act on. Never guesses between two
+    plausible candidates -- ambiguity is refused, not resolved by picking
+    whichever came first."""
+    if not matches:
+        return Decision(match=None, index=None, reason="no candidates offered")
+
+    eligible = [(m.value, i, m) for i, m in enumerate(matches) if _is_eligible(m, threshold)]
+
+    if not eligible:
+        best = max(matches, key=lambda m: m.value)
+        if best.meaningful_count < 2 and best.value < _GENERIC_WORD_THRESHOLD:
+            reason = (
+                "best score %.3f rests on a single generic word "
+                "(meaningful_count=%d); needs %.2f or above"
+                % (best.value, best.meaningful_count, _GENERIC_WORD_THRESHOLD)
+            )
+        else:
+            reason = "nothing above the threshold (%.2f); best score was %.3f" % (
+                threshold, best.value,
+            )
+        return Decision(match=None, index=None, reason=reason)
+
+    eligible.sort(key=lambda t: t[0], reverse=True)
+    top_value, top_index, top_match = eligible[0]
+
+    if len(eligible) > 1:
+        runner_value = eligible[1][0]
+        if top_value - runner_value <= AMBIGUITY_MARGIN:
+            reason = "ambiguous: %.3f vs %.3f are too close to call" % (
+                top_value, runner_value,
+            )
+            return Decision(match=None, index=None, reason=reason)
+
+    reason = "chosen with score %.3f" % (top_value,)
+    return Decision(match=top_match, index=top_index, reason=reason)

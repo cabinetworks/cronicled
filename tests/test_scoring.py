@@ -2,7 +2,7 @@
 the tests here state the wrong match each rule prevents."""
 import unittest
 
-from cronicled.scoring import Match, meaningful_tokens, score
+from cronicled.scoring import Match, decide, meaningful_tokens, score
 
 
 class MeaningfulTokens(unittest.TestCase):
@@ -60,3 +60,68 @@ class Scoring(unittest.TestCase):
     def test_score_is_rounded_to_three_places(self):
         m = score("Morning Ritual.mp4", "", "Morning Something Else")
         self.assertEqual(m.value, round(m.value, 3))
+
+
+class Deciding(unittest.TestCase):
+    def _m(self, value, contained=False, meaningful_count=2):
+        return Match(value=value, contained=contained,
+                     meaningful_count=meaningful_count)
+
+    def test_a_clear_winner_is_chosen(self):
+        d = decide([self._m(0.8), self._m(0.2)])
+        self.assertEqual(d.index, 0)
+
+    def test_nothing_above_the_threshold_is_refused(self):
+        d = decide([self._m(0.4), self._m(0.2)])
+        self.assertIsNone(d.match)
+        self.assertIn("threshold", d.reason)
+
+    def test_one_generic_word_needs_a_very_high_score(self):
+        # "Addict" matching some other title's "addict" is not evidence they
+        # are the same clip -- this is the rule that stops that
+        d = decide([self._m(0.7, meaningful_count=1)])
+        self.assertIsNone(d.match)
+        d = decide([self._m(0.95, meaningful_count=1)])
+        self.assertIsNotNone(d.match)
+
+    def test_containment_wins_regardless_of_the_threshold(self):
+        d = decide([self._m(0.55, contained=True)], threshold=0.9)
+        self.assertIsNotNone(d.match)
+
+    def test_two_close_candidates_are_refused_not_guessed(self):
+        # the legacy code took whichever the scraper returned first, silently
+        d = decide([self._m(0.80), self._m(0.78)])
+        self.assertIsNone(d.match)
+        self.assertIn("ambiguous", d.reason)
+
+    def test_two_contained_candidates_are_ambiguous(self):
+        # both floor at 0.9, so this tie is a normal outcome, not a rarity
+        d = decide([self._m(0.9, contained=True), self._m(0.9, contained=True)])
+        self.assertIsNone(d.match)
+        self.assertIn("ambiguous", d.reason)
+
+    def test_a_clear_margin_over_the_runner_up_is_decided(self):
+        d = decide([self._m(0.9), self._m(0.5)])
+        self.assertEqual(d.index, 0)
+
+    def test_only_eligible_candidates_count_towards_ambiguity(self):
+        # a near-tie below the threshold is not a dilemma, it is two rejects
+        d = decide([self._m(0.8), self._m(0.3), self._m(0.29)])
+        self.assertEqual(d.index, 0)
+
+    def test_an_empty_candidate_list_is_refused_with_a_reason(self):
+        d = decide([])
+        self.assertIsNone(d.match)
+        self.assertTrue(d.reason)
+
+    def test_every_outcome_carries_a_reason(self):
+        for matches in ([], [self._m(0.1)], [self._m(0.9)],
+                        [self._m(0.8), self._m(0.79)]):
+            self.assertTrue(decide(matches).reason,
+                            "no reason given for %r" % (matches,))
+
+    def test_a_missing_meaningful_count_raises(self):
+        # the legacy default was 2 -- the exact value that skips the
+        # generic-word rule, so a malformed candidate failed OPEN
+        with self.assertRaises((TypeError, ValueError)):
+            decide([Match(value=0.9, contained=False)])
