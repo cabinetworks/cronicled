@@ -185,6 +185,45 @@ class States(_StoreCase):
             self.store.mark_seen("nosuchfingerprint")
 
 
+class Concurrency(_StoreCase):
+    def test_concurrent_writers_do_not_lose_or_corrupt_rows(self):
+        # the job runner writes from a background thread while the interface reads
+        import threading
+        errors = []
+
+        def writer(start):
+            try:
+                for i in range(start, start + 25):
+                    self._record(subject_id="w%d" % i)
+            except Exception as e:      # noqa: BLE001 - the test is the assertion
+                errors.append(e)
+
+        threads = [threading.Thread(target=writer, args=(n * 25,)) for n in range(4)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(self.store.items(limit=1000)), 100)
+
+    def test_reads_during_writes_do_not_raise(self):
+        import threading
+        stop = threading.Event()
+        errors = []
+
+        def reader():
+            try:
+                while not stop.is_set():
+                    self.store.counts()
+            except Exception as e:      # noqa: BLE001
+                errors.append(e)
+
+        r = threading.Thread(target=reader); r.start()
+        for i in range(50):
+            self._record(subject_id="c%d" % i)
+        stop.set(); r.join()
+        self.assertEqual(errors, [])
+
+
 class Reads(_StoreCase):
     def test_filters_by_folder_and_state(self):
         a = self._record(subject_id="1", folder="scene-matches")
