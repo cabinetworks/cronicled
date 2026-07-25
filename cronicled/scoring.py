@@ -119,7 +119,14 @@ def score(name, folder, title, artist=None):
     if prefix_stripped is not None:
         views.append(prefix_stripped)
 
-    best = max(_view_score(view, title_norm, title_tokens) for view in views)
+    # An empty string on either side is not a resemblance to be measured:
+    # difflib rates two of them a perfect 1.0, which gave a blank candidate
+    # title 0.3 against every file in the library -- eligible under any
+    # threshold of 0.3 or below, and two blanks refused as the nonsense
+    # "ambiguous: 0.300 vs 0.300". Skip such views rather than score them.
+    scored = [_view_score(view, title_norm, title_tokens)
+              for view in views if title_norm and normalize(view)]
+    best = max(scored, default=0.0)
 
     meaningful = meaningful_tokens(name, folder, artist=artist)
     contained = len(meaningful) >= 2 and meaningful.issubset(set(title_tokens))

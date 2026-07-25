@@ -121,6 +121,24 @@ class Scoring(unittest.TestCase):
         m = score("Morning Ritual 1080p.mp4", "", "anything")
         self.assertEqual(m.meaningful_count, 2)
 
+    def test_a_candidate_with_no_title_scores_zero(self):
+        # difflib rates two empty strings a perfect match, so a blank
+        # candidate scored 0.3 against every file in the library -- eligible
+        # under any threshold of 0.3 or below
+        for title in ("", "   ", "!!!"):
+            self.assertEqual(score("Morning Ritual.mp4", "", title).value, 0.0,
+                             repr(title))
+
+    def test_a_file_with_no_name_or_folder_scores_zero(self):
+        self.assertEqual(score("", "", "Morning Ritual").value, 0.0)
+
+    def test_two_blank_candidates_are_not_a_dilemma(self):
+        # "ambiguous: 0.300 vs 0.300" told the user to choose between two
+        # candidates that say nothing
+        blank = score("Morning Ritual.mp4", "", "")
+        self.assertIsNone(decide([blank, blank], threshold=0.3).match)
+        self.assertNotIn("ambiguous", decide([blank, blank], threshold=0.3).reason)
+
     def test_score_is_rounded_to_three_places(self):
         m = score("Morning Ritual.mp4", "", "Morning Something Else")
         self.assertEqual(m.value, round(m.value, 3))
