@@ -248,6 +248,49 @@ class Deciding(unittest.TestCase):
             self.assertTrue(decide(matches).reason,
                             "no reason given for %r" % (matches,))
 
+    def test_the_threshold_reason_names_the_threshold_and_the_best_score(self):
+        # the threshold is the one lever that would have changed this outcome
+        d = decide([self._m(0.42)], threshold=0.75)
+        self.assertIn("0.75", d.reason)
+        self.assertIn("0.420", d.reason)
+
+    def test_the_generic_word_reason_names_the_count(self):
+        d = decide([self._m(0.7, meaningful_count=1)])
+        self.assertIn("generic word", d.reason)
+        self.assertIn("meaningful_count=1", d.reason)
+
+    def test_the_ambiguity_reason_names_both_scores(self):
+        d = decide([self._m(0.80), self._m(0.78)])
+        self.assertIn("0.800", d.reason)
+        self.assertIn("0.780", d.reason)
+
+    def test_the_chosen_reason_names_the_winning_score(self):
+        self.assertIn("0.900", decide([self._m(0.9)]).reason)
+
+    def test_every_outcome_gives_its_own_distinct_reason(self):
+        # "reason" is the question a user asks constantly; one catch-all
+        # string that happens to contain every word we assert on is no answer
+        reasons = [
+            decide([]).reason,
+            decide([self._m(0.9, meaningful_count=0)]).reason,
+            decide([self._m(0.7, meaningful_count=1)]).reason,
+            decide([self._m(0.4)]).reason,
+            decide([self._m(0.8), self._m(0.78)]).reason,
+            decide([self._m(0.9)]).reason,
+        ]
+        self.assertEqual(len(set(reasons)), len(reasons), reasons)
+
+    def test_the_refusal_names_the_candidate_that_came_closest(self):
+        # the second nearly qualified -- a threshold of 0.45 would have taken
+        # it. The first can never qualify at that score however the file is
+        # renamed, so naming it sends the user down a dead end.
+        d = decide([self._m(0.60, meaningful_count=1),
+                    self._m(0.49, meaningful_count=4)])
+        self.assertIsNone(d.match)
+        self.assertIn("threshold", d.reason)
+        self.assertIn("0.490", d.reason)
+        self.assertNotIn("generic word", d.reason)
+
     def test_a_missing_meaningful_count_raises(self):
         # the legacy default was 2 -- the exact value that skips the
         # generic-word rule, so a malformed candidate failed OPEN

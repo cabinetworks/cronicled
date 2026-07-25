@@ -157,6 +157,20 @@ def _is_eligible(match, threshold):
     return match.value >= threshold
 
 
+def _shortfall(match, threshold):
+    """How far a rejected candidate was from being eligible -- so a refusal
+    names the candidate that nearly qualified, not merely the highest-scoring
+    one. Naming the wrong one points the user at renaming the file, a dead end,
+    instead of at the threshold, the one lever that would have worked.
+
+    Zero evidence has no finite shortfall: no score makes it eligible."""
+    if match.meaningful_count == 0:
+        return float("inf")
+    if match.meaningful_count < 2:
+        return _GENERIC_WORD_THRESHOLD - match.value
+    return threshold - match.value
+
+
 def decide(matches, threshold=0.5):
     """Pick the one candidate confident enough to apply automatically, or
     refuse with a reason a person can act on. Never guesses between two
@@ -168,13 +182,17 @@ def decide(matches, threshold=0.5):
     eligible = [(m.value, i, m) for i, m in enumerate(matches) if _is_eligible(m, threshold)]
 
     if not eligible:
-        best = max(matches, key=lambda m: m.value)
+        # The candidate that came CLOSEST to being eligible, not the one with
+        # the highest raw value: in a mixed list those are different
+        # candidates, and only the near-miss tells the user something they can
+        # act on. Ties break towards the higher score.
+        best = min(matches, key=lambda m: (_shortfall(m, threshold), -m.value))
         if best.meaningful_count == 0:
             reason = (
                 "nothing to match on (meaningful_count=0): the name carries no "
                 "word that is not the artist's or generic"
             )
-        elif best.meaningful_count < 2 and best.value < _GENERIC_WORD_THRESHOLD:
+        elif best.meaningful_count < 2:
             reason = (
                 "best score %.3f rests on a single generic word "
                 "(meaningful_count=%d); needs %.2f or above"
