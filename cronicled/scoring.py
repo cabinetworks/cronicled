@@ -20,6 +20,20 @@ from cronicled.text import clean_folder, normalize, strip_ext, tokens
 # in the stripped view.
 _SERIES_SEP_RE = re.compile(r"\s+-{1,2}\s+")
 
+# `strip_ext` removes only the containers listed in VIDEO_EXTS -- shared
+# vocabulary that also decides which files get scanned at all, so widening it
+# would change unrelated behaviour. Any other container therefore survives into
+# the token set and counts as evidence, inflating meaningful_count past the
+# `< 2` trigger and switching the single-generic-word rule off: `Addict.mp4` is
+# refused, `Addict.mpeg` applies. So drop a trailing extension-SHAPED suffix
+# whatever the container: 2-5 alphanumerics after a dot with something in front
+# of it, containing at least one letter. The letter requirement keeps a numeric
+# part number intact ("Volume 2.10"), and the five-character ceiling keeps a
+# real word intact ("Morning Ritual.Extended"). Applied once, not repeatedly --
+# one trailing container is what a rename leaves behind, and looping would eat
+# the tail of an ordinary dot-separated filename.
+_EXT_SHAPED_RE = re.compile(r"^(?P<stem>.+)\.(?P<suffix>[A-Za-z0-9]{2,5})$")
+
 
 class Match(NamedTuple):
     value: float
@@ -55,10 +69,20 @@ def _without_series_prefix(name):
     return rest or None
 
 
+def _strip_unknown_ext(name):
+    """Drop a trailing extension-shaped suffix `strip_ext` did not recognise,
+    so a renamed container cannot pose as evidence. See `_EXT_SHAPED_RE`."""
+    match = _EXT_SHAPED_RE.match(name)
+    if not match or not any(c.isalpha() for c in match.group("suffix")):
+        return name
+    return match.group("stem")
+
+
 def meaningful_tokens(name, folder, artist=None):
     """Tokens left after dropping stopwords, junk, and the artist's own name --
     the evidence that can actually distinguish one title from another."""
-    result = set(tokens(strip_ext(name))) | set(tokens(clean_folder(folder)))
+    result = (set(tokens(_strip_unknown_ext(strip_ext(name))))
+              | set(tokens(clean_folder(folder))))
     if artist:
         result -= set(tokens(artist))
     return result

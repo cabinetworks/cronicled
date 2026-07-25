@@ -17,6 +17,23 @@ class MeaningfulTokens(unittest.TestCase):
                                 artist="Velvet Crane")
         self.assertEqual(got, {"morning", "ritual"})
 
+    def test_an_unknown_container_extension_is_not_evidence(self):
+        # only the containers we scan get stripped by name; renaming a file to
+        # any other container must not smuggle a second "meaningful" token in
+        for name in ("Addict.mpeg", "Addict.divx", "Addict.rm", "Addict.m2ts",
+                     "Addict.ogm", "Addict.MPEG", "Addict.3gp"):
+            self.assertEqual(meaningful_tokens(name, ""), {"addict"}, name)
+
+    def test_a_trailing_numeric_fragment_is_not_an_extension(self):
+        # "Volume 2.10" is a part number, not a container
+        self.assertEqual(meaningful_tokens("Volume 2.10", ""),
+                         {"volume", "2", "10"})
+
+    def test_a_trailing_word_is_not_an_extension(self):
+        # only extension-SHAPED suffixes go; a real word stays evidence
+        self.assertIn("extended",
+                      meaningful_tokens("Morning Ritual.Extended", ""))
+
     def test_the_folder_contributes_tokens(self):
         got = meaningful_tokens("Part 2.mp4", "Garden Sessions")
         self.assertIn("garden", got)
@@ -77,6 +94,15 @@ class Scoring(unittest.TestCase):
                   "Morning Ritual In Winter Light Extended")
         self.assertTrue(m.contained)
         self.assertGreaterEqual(m.value, 0.9)
+
+    def test_renaming_the_container_cannot_defeat_the_generic_word_rule(self):
+        # "Addict" alone is one generic word wherever it appears; the rule
+        # that refuses it must not switch off because the file was renamed
+        for name in ("Addict.mp4", "Addict.mpeg", "Addict.divx",
+                     "Addict.rm", "Addict.m2ts"):
+            m = score(name, "", "Addict To The Sound")
+            self.assertEqual(m.meaningful_count, 1, name)
+            self.assertIsNone(decide([m]).match, name)
 
     def test_meaningful_count_is_reported(self):
         m = score("Morning Ritual 1080p.mp4", "", "anything")
