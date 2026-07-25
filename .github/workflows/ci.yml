@@ -17,11 +17,33 @@ jobs:
       - name: Leak guard
         env:
           LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
+          # The real discriminator: whether this run IS a pull request from
+          # a fork. An empty LEAK_PATTERNS does NOT mean that - a fork PR is
+          # only one of several ways the secret ends up empty (the others
+          # being it deleted, renamed, expired, or scoped to the wrong
+          # environment), and this workflow has no way to tell those apart
+          # from the secret's value alone. Reduced (--file-types-only) mode
+          # exists solely because a fork PR cannot read repository secrets
+          # at all, by GitHub's own design - so it may be used ONLY when
+          # this is genuinely a fork PR, never merely because the variable
+          # came through empty. `github.event.pull_request` does not exist
+          # on a `push` event, so this evaluates to `false` there rather
+          # than erroring - a fork PR is impossible by construction on a
+          # push to main, and an absent secret in that case must fail the
+          # job loudly instead.
+          IS_FORK_PR: ${{ github.event.pull_request.head.repo.fork == true }}
         run: |
-          if [ -z "${LEAK_PATTERNS}" ]; then
-            echo "No pattern list available (expected on a fork PR):"
-            echo "running file-type checks only; the full scan runs on merge."
+          if [ "${IS_FORK_PR}" = "true" ]; then
+            echo "Fork pull request: LEAK_PATTERNS is not available to fork PRs by GitHub's own design."
+            echo "Running file-type checks only; the full scan still runs on push to main."
             ./scripts/check_leaks.sh --file-types-only
+          elif [ -z "${LEAK_PATTERNS}" ]; then
+            echo "::error::LEAK_PATTERNS is empty on a non-fork run (push, or a same-repo PR)." >&2
+            echo "::error::That cannot legitimately happen here - only a fork PR is exempt from" >&2
+            echo "::error::having this secret, and this is not one. The secret was deleted," >&2
+            echo "::error::renamed, expired, or mis-scoped. Failing loudly rather than silently" >&2
+            echo "::error::downgrading to file-type-only checks." >&2
+            exit 1
           else
             ./scripts/check_leaks.sh
           fi
