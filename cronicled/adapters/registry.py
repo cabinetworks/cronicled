@@ -7,8 +7,7 @@ import json
 import os
 
 from cronicled.adapters.declarative import DeclarativeAdapter
-
-DEFAULT_CONFIG_PATH = os.path.join("config", "adapters.json")
+from cronicled.config import config_dir
 
 
 class AdapterMap(dict):
@@ -18,7 +17,19 @@ class AdapterMap(dict):
     default = None
 
 
-def load_adapters(path=DEFAULT_CONFIG_PATH):
+def default_adapters_path(env=None):
+    return os.path.join(config_dir(env), "adapters.json")
+
+
+def load_adapters(path=None, env=None):
+    """The configured adapters, keyed by name. `path` defaults to
+    `adapters.json` inside `cronicled.config.config_dir()` (see
+    config/adapters.example.json for the shape); an explicit `path` is used
+    exactly as given, unaffected by `$CRONICLED_CONFIG_DIR`. `env` defaults to
+    `os.environ` but is injectable so a test can supply one without mutating
+    the real environment."""
+    if path is None:
+        path = default_adapters_path(env)
     adapters = AdapterMap()
     if not os.path.exists(path):
         return adapters

@@ -19,6 +19,9 @@ VOLUME ["/config", "/var/lib/cronicled"]
 
 ENV CRONICLED_CONFIG_DIR=/config
 
-# The service entry point arrives with the service itself; until then the image
-# is exercised by running the test suite against it.
-CMD ["python", "-c", "import cronicled; print('cronicled runtime ready')"]
+# The service entry point arrives with the service itself; until then the
+# image's default command is a self-check that imports every module in the
+# package and exercises a handful of pure functions end to end, so the pinned
+# interpreter is proven to actually run this project's code rather than just
+# having a directory copied into it (see cronicled/selfcheck.py).
+CMD ["python", "-m", "cronicled.selfcheck"]

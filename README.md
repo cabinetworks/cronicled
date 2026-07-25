@@ -1,15 +1,23 @@
 # cronicled
 
-An always-on companion for a [Stash](https://github.com/stashapp/stash) media
-library. It watches the library on a schedule and files what it finds into an
-inbox of proposed changes — metadata matches, tag merges, performer fixes — that
-you confirm or dismiss. Nothing is written to your library without your say-so.
+A foundation for an always-on companion to a
+[Stash](https://github.com/stashapp/stash) media library. What is here today:
+string and filename normalization, date extraction, a client for the media
+server's own API, a pluggable site-adapter interface for matching against a
+clip store, and a leak guard for the repo itself.
+
+**Not yet built:** there is no scheduler, no inbox of proposed changes, no
+persistence, and no entry point that runs any of this continuously. The
+pieces above are library code, called directly (including by tests); nothing
+here watches a library or writes to it on its own.
 
 Zero runtime dependencies: Python standard library only.
 
 ## Status
 
-Early. The foundation layer is in place; the service itself is being built.
+Early. The foundation layer described above is what exists; the always-on
+service built on top of it — scheduled scans, a review/confirm inbox, writes
+gated on user approval — has not been built yet.
 
 ## Running it
 
@@ -46,7 +54,11 @@ what CI does):
 docker build --build-arg PYTHON_VERSION="$(cat .python-version)" -t cronicled .
 ```
 
-Run it:
+There is no service yet for the container to run (see "Status" above), so
+its default command is a self-check: it imports every module in the package
+and exercises a handful of pure functions end to end, proving the pinned
+interpreter actually runs this project's code. Running the image today
+builds and self-checks the runtime — it is not yet a way to run the tool:
 
 ```sh
 docker run --rm \
@@ -55,10 +67,23 @@ docker run --rm \
   cronicled
 ```
 
+```
+cronicled selfcheck ready (12 modules imported)
+```
+
 The image bakes in nothing specific to any one installation; everything that
 varies between installs is mounted, not copied in:
 
-- `/config` — server and adapter configuration (see "Site adapters" below)
+- `/config` — server and adapter configuration (see "Site adapters" below).
+  The container sets `$CRONICLED_CONFIG_DIR=/config`, which both `server.json`
+  and `adapters.json` are read from by default (see `cronicled/config.py`'s
+  `config_dir`); a local checkout with no such directory set falls back to a
+  `config/` directory relative to the working directory instead.
+
+  This is deliberately a separate mechanism from `$STASH_URL`/`$STASH_API_KEY`:
+  those two name the *media server* being managed, not this project, and an
+  operator may already have them set for their own reasons — a decision, not
+  an inconsistency.
 - `/var/lib/cronicled` — the database
 
 A read-only mount for the library itself will be documented here once the
