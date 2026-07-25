@@ -2,7 +2,8 @@
 state the wrong attribution each rule prevents."""
 import unittest
 
-from cronicled.artist import CONTAINER_NAMES, creator_folder, resolve
+from cronicled.artist import (CONTAINER_NAMES, MAX_NAME_WORDS, MIN_NAME_CHARS,
+                              creator_folder, resolve)
 
 
 class CreatorFolder(unittest.TestCase):
@@ -269,6 +270,73 @@ class DateShapes(unittest.TestCase):
     def test_a_month_word_used_as_a_folder_name_still_resolves(self):
         r = resolve("clip01.mp4", "May Winters")
         self.assertEqual(r.name, "May Winters")
+
+
+class GuardBoundaries(unittest.TestCase):
+    """The permissive side of the two numeric guards.
+
+    Only the restrictive side was pinned, so a guard that drifted one step
+    tighter -- rejecting exactly three characters, or exactly four words --
+    would break no test. That failure is quieter than the loose one it
+    replaces: it hands back no name at all, so every downstream search is
+    scoped to nothing and every assertion that something is rejected still
+    passes. The fixtures are tied to the constants so they cannot drift.
+    """
+
+    def test_a_name_of_exactly_the_minimum_length_is_accepted(self):
+        self.assertEqual(len("Ivy"), MIN_NAME_CHARS)
+        r = resolve("clip01.mp4", "Ivy")
+        self.assertEqual(r.name, "Ivy")
+
+    def test_a_name_of_exactly_the_maximum_word_count_is_accepted(self):
+        folder = "Ivy Kingsley Waters Marchcroft"
+        self.assertEqual(len(folder.split()), MAX_NAME_WORDS)
+        r = resolve("clip01.mp4", folder)
+        self.assertEqual(r.name, folder)
+
+
+class FilenameConventions(unittest.TestCase):
+    """How a filename is split, in both directions."""
+
+    def test_a_hyphenated_name_is_left_whole(self):
+        # no whitespace round the hyphen, so it is part of the name and not a
+        # separator -- "Wren-Copper" is half of who this belongs to
+        r = resolve("Wren-Copper Marchcroft - Morning Ritual.mp4", "")
+        self.assertEqual(r.name, "Wren-Copper Marchcroft")
+
+    def test_a_doubled_dash_does_not_separate(self):
+        # pinned, not endorsed: the split wants exactly one dash with
+        # whitespace either side, so "A -- B" yields nothing rather than
+        # guessing at a second convention. Declining is the cheap failure.
+        r = resolve("Velvet Crane -- Morning Ritual.mp4", "")
+        self.assertIsNone(r.name)
+
+    def test_an_en_dash_separates(self):
+        r = resolve("Velvet Crane – Morning Ritual.mp4", "")
+        self.assertEqual(r.name, "Velvet Crane")
+
+    def test_an_em_dash_separates(self):
+        r = resolve("Velvet Crane — Morning Ritual.mp4", "")
+        self.assertEqual(r.name, "Velvet Crane")
+
+    def test_only_the_first_dash_splits(self):
+        # later dashes belong to the title; splitting on all of them would
+        # make the creator whatever the last segment happened to be
+        r = resolve("Velvet Crane - Morning Ritual - Part Two.mp4", "")
+        self.assertEqual(r.name, "Velvet Crane")
+
+    def test_ft_is_read_as_a_feature_marker(self):
+        r = resolve("Velvet Crane Morning Ritual Ft Velvet Crane.mp4", "")
+        self.assertEqual(r.name, "Velvet Crane")
+
+    def test_featuring_is_read_as_a_feature_marker(self):
+        r = resolve("Velvet Crane Morning Ritual Featuring Velvet Crane.mp4", "")
+        self.assertEqual(r.name, "Velvet Crane")
+
+    def test_a_guest_after_ft_is_still_not_credited(self):
+        # the marker being recognised is what makes the guest guard reachable
+        r = resolve("Copper Wren Presents A Show Ft Velvet Crane.mp4", "")
+        self.assertIsNone(r.name)
 
 
 class GuardIsolation(unittest.TestCase):

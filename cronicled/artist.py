@@ -144,9 +144,12 @@ _MONTH_YEAR_RE = re.compile(
     r"^(?:(?:%(month)s)\.?\s+(?:19|20)\d{2}"
     r"|(?:19|20)\d{2}\s+(?:%(month)s)\.?)$" % {"month": MONTH_PATTERN}, re.I)
 
-# "Creator - Title". Only a dash with whitespace on both sides splits, so a
-# hyphenated name ("Anne-Marie Smith.mp4") is left whole. En and em dashes
-# count: libraries use all three interchangeably.
+# "Creator - Title". Only a single dash with whitespace on both sides splits,
+# so a hyphenated name ("Wren-Copper Marchcroft.mp4") is left whole. En and em
+# dashes count: libraries use all three interchangeably. A doubled dash
+# ("Velvet Crane -- Morning Ritual") is deliberately not a separator -- one
+# convention, read one way; the file goes unattributed rather than the left of
+# a dash quietly meaning two different things.
 _DASH_SPLIT_RE = re.compile(r"\s+[-–—]\s+")
 
 # "... feat Velvet Crane". The marker must start a word and be followed by
