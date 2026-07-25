@@ -164,10 +164,14 @@ class Stash:
     def scene_existing(self, scene_id):
         """The scene's CURRENT metadata, read fresh right before an apply so
         the write can merge rather than overwrite. Reading at write time (not
-        scan time) also catches metadata a human set between scan and apply."""
+        scan time) also catches metadata a human set between scan and apply.
+
+        Selects every field the apply path can write, so this same read also
+        supplies apply_scene's undo snapshot (see `apply_scene`'s docstring)."""
         q = """
         query($id: ID!){
-          findScene(id:$id){ id title date
+          findScene(id:$id){ id title details date urls organized rating100
+            code director stash_ids
             studio{ id name } performers{ id name } tags{ id name } }
         }"""
         return self.gql(q, {"id": scene_id}).get("findScene") or {}
@@ -272,11 +276,38 @@ class Stash:
         and every other performer/tag. A transient failure still raises — the
         row fails and a retry can re-run it. Everything is resolved before the
         single sceneUpdate below, so a raise still leaves no partial state on
-        the server."""
+        the server.
+
+        The returned `prior` is a JSON-serialisable snapshot of the scene as
+        it stood immediately before this write — every field this method can
+        write, shaped as the restore input the server would accept to put it
+        back (`studio_id`/`performer_ids`/`tag_ids` flattened from the read,
+        the rest passed through as-is). It exists so a later undo has
+        something to replay. The one field this apply writes that the
+        snapshot CANNOT cover is the cover image: a scene's current cover is
+        only exposed as a URL, not as the base64 payload `cover_image`
+        accepts, so there is no representation to snapshot it with — an
+        applied cover cannot be undone. If the method raises before the
+        single sceneUpdate call, nothing was replaced, so there is nothing to
+        return at all (the exception propagates and no `prior` is produced)."""
         existing = self.scene_existing(scene_id)
         existing_pids = [p["id"] for p in (existing.get("performers") or [])]
         existing_tids = [t["id"] for t in (existing.get("tags") or [])]
         existing_studio_id = (existing.get("studio") or {}).get("id")
+        prior = {
+            "title": existing.get("title"),
+            "details": existing.get("details"),
+            "date": existing.get("date"),
+            "urls": existing.get("urls") or [],
+            "organized": existing.get("organized"),
+            "rating100": existing.get("rating100"),
+            "code": existing.get("code"),
+            "director": existing.get("director"),
+            "stash_ids": existing.get("stash_ids") or [],
+            "studio_id": existing_studio_id,
+            "performer_ids": existing_pids,
+            "tag_ids": existing_tids,
+        }
 
         skipped = []
 
@@ -348,7 +379,37 @@ class Stash:
         self.gql("mutation($in: SceneUpdateInput!){ sceneUpdate(input:$in){ id } }", {"in": inp})
         return {"studio_id": write_studio or existing_studio_id,
                 "performers": len(merged_pids), "tags": len(merged_tids),
-                "skipped": skipped}
+                "skipped": skipped, "prior": prior}
+
+    def revert_scene(self, scene_id, prior):
+        """Undo one apply_scene by restoring the scene to exactly the state
+        `prior` (as returned in apply_scene's result) describes.
+
+        This RESTORES; it does not merge. That is the opposite of
+        apply_scene's union semantics (existing ids + newly-resolved ids) —
+        every field prior holds is written back verbatim, replacing whatever
+        is there now, including wiping out performers/tags/etc. added since
+        the snapshot was taken. `prior` is assumed already-resolved (ids, not
+        names), so there is nothing here to find-or-create.
+
+        Everything is assembled into one update input before anything is
+        sent, and it goes out as a single sceneUpdate, mirroring apply_scene's
+        write-once discipline: a failure leaves no partially-reverted scene.
+
+        Raises ValueError on a missing or empty snapshot rather than quietly
+        doing nothing — a revert that no-ops is indistinguishable from one
+        that worked, which is exactly the ambiguity undo cannot afford.
+        """
+        if not prior:
+            raise ValueError(
+                "cannot revert scene %s: snapshot is missing or empty" % scene_id)
+        inp = {"id": scene_id}
+        inp.update(prior)
+        self.gql("mutation($in: SceneUpdateInput!){ sceneUpdate(input:$in){ id } }",
+                 {"in": inp})
+        return {"studio_id": prior.get("studio_id"),
+                "performers": len(prior.get("performer_ids") or []),
+                "tags": len(prior.get("tag_ids") or [])}
 
     # -- tags (consolidation) --------------------------------------------- #
 

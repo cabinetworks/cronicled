@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from cronicled.stash import Stash, StashError
@@ -112,6 +113,143 @@ class _SceneTransport:
         return {"data": {mut: {"id": outcome}}}
 
 
+def _scene_transport(**scene_fields):
+    """Fake transport for the snapshot tests: answers the scene read with
+    `scene_fields` (defaulted the same way _SceneTransport's `existing` shape
+    is elsewhere in this file) and accepts whatever sceneUpdate is sent,
+    recording it. Every performer/tag/studio find-or-create query returns
+    "not found" so apply_scene falls through to a create, which this fake
+    always grants — the snapshot tests care about what was read and
+    returned, not about entity resolution."""
+    existing = {"id": "s1", "title": None, "details": None, "date": None,
+                "urls": [], "organized": False, "rating100": None, "code": None,
+                "director": None, "stash_ids": [], "studio": None,
+                "performers": [], "tags": []}
+    existing.update(scene_fields)
+
+    def send(body, timeout):
+        q = body["query"]
+        if "findScene(" in q:
+            return {"data": {"findScene": existing}}
+        if "findStudios(" in q:
+            return {"data": {"findStudios": {"count": 0, "studios": []}}}
+        if "findPerformers(" in q:
+            return {"data": {"findPerformers": {"count": 0, "performers": []}}}
+        if "findTags(" in q:
+            return {"data": {"findTags": {"count": 0, "tags": []}}}
+        if "studioCreate" in q:
+            return {"data": {"studioCreate": {"id": "new-studio"}}}
+        if "performerCreate" in q:
+            return {"data": {"performerCreate": {"id": "new-performer"}}}
+        if "tagCreate" in q:
+            return {"data": {"tagCreate": {"id": "new-tag"}}}
+        if "sceneUpdate" in q:
+            return {"data": {"sceneUpdate": {"id": body["variables"]["in"]["id"]}}}
+        raise AssertionError("test transport does not recognize query: %s" % q)
+
+    return send
+
+
+class _MutableScene:
+    """A fake media server that actually holds scene state: findScene reads
+    answer from it, sceneUpdate mutations write onto it the way a real server
+    would (replacing whatever fields/arrays are sent, leaving every field the
+    mutation omits untouched), and studio/performer/tag find-or-create calls
+    resolve against a tiny name registry, creating a fresh id the first time a
+    name is seen. `writes` counts every sceneUpdate; `snapshot()` returns a
+    JSON-round-tripped (so independent, mutation-proof) copy of the current
+    state, shaped exactly like apply_scene's `prior` so the two are directly
+    comparable in a round-trip assertion. Without a server that genuinely
+    mutates like this, a revert test would only be checking the client
+    against itself."""
+
+    _FIND = {"studio": ("findStudios", "studios", "aliases"),
+             "performer": ("findPerformers", "performers", "alias_list"),
+             "tag": ("findTags", "tags", "aliases")}
+    _CREATE_MUTATION = {"studio": "studioCreate", "performer": "performerCreate",
+                        "tag": "tagCreate"}
+
+    def __init__(self, **fields):
+        state = {"title": None, "details": None, "date": None, "urls": [],
+                  "organized": False, "rating100": None, "code": None,
+                  "director": None, "stash_ids": [], "studio_id": None,
+                  "performer_ids": [], "tag_ids": []}
+        # accept the same nested shape scene_existing()'s read uses
+        # (studio{id}, performers{id}, tags{id}) so callers can build a fake
+        # scene the same way they'd read one back
+        if "studio" in fields:
+            fields["studio_id"] = (fields.pop("studio") or {}).get("id")
+        if "performers" in fields:
+            fields["performer_ids"] = [p["id"] for p in fields.pop("performers")]
+        if "tags" in fields:
+            fields["tag_ids"] = [t["id"] for t in fields.pop("tags")]
+        state.update(fields)
+        self._state = state
+        self.writes = 0
+        self._registry = {"studio": {}, "performer": {}, "tag": {}}
+        self._next_id = 1
+        self.transport = self._handle
+
+    def snapshot(self):
+        return json.loads(json.dumps(self._state))
+
+    def _handle(self, body, timeout):
+        q = body["query"]
+        if "findScene(" in q:
+            return {"data": {"findScene": self._read_scene()}}
+        for kind, (fn, field, alias_field) in self._FIND.items():
+            if fn + "(" in q:
+                return self._find(kind, fn, field, alias_field, body)
+        for kind, mut in self._CREATE_MUTATION.items():
+            if mut in q:
+                return self._create(kind, mut, body)
+        if "sceneUpdate" in q:
+            return self._apply_update(body)
+        raise AssertionError("test transport does not recognize query: %s" % q)
+
+    def _read_scene(self):
+        s = self._state
+        return {
+            "id": "s1", "title": s["title"], "details": s["details"],
+            "date": s["date"], "urls": list(s["urls"]), "organized": s["organized"],
+            "rating100": s["rating100"], "code": s["code"], "director": s["director"],
+            "stash_ids": list(s["stash_ids"]),
+            "studio": {"id": s["studio_id"]} if s["studio_id"] else None,
+            "performers": [{"id": pid} for pid in s["performer_ids"]],
+            "tags": [{"id": tid} for tid in s["tag_ids"]],
+        }
+
+    def _find(self, kind, fn, field, alias_field, body):
+        name = body["variables"]["f"]["q"]
+        entity_id = self._registry[kind].get(name.strip().lower())
+        if entity_id is None:
+            return {"data": {fn: {"count": 0, field: []}}}
+        return {"data": {fn: {"count": 1,
+                              field: [{"id": entity_id, "name": name, alias_field: []}]}}}
+
+    def _create(self, kind, mut, body):
+        name = body["variables"]["in"]["name"]
+        new_id = "%s-%d" % (kind, self._next_id)
+        self._next_id += 1
+        self._registry[kind][name.strip().lower()] = new_id
+        return {"data": {mut: {"id": new_id}}}
+
+    def _apply_update(self, body):
+        # replace exactly what's sent, leave everything else in self._state
+        # alone — this is what makes the fake a genuine (if tiny) server
+        # rather than an echo chamber
+        inp = dict(body["variables"]["in"])
+        scene_id = inp.pop("id")
+        inp.pop("cover_image", None)  # no representation held in this fake
+        self._state.update(inp)
+        self.writes += 1
+        return {"data": {"sceneUpdate": {"id": scene_id}}}
+
+
+def _mutable_scene(**fields):
+    return _MutableScene(**fields)
+
+
 class ApplyScene(unittest.TestCase):
     def test_performers_and_tags_are_unioned_not_replaced(self):
         existing = {"id": "1", "studio": None,
@@ -190,3 +328,125 @@ class ApplyScene(unittest.TestCase):
             Stash("http://example.test", "k", transport=t).apply_scene("1", match)
         self.assertTrue(ctx.exception.transient)
         self.assertIsNone(t.scene_update_input)  # no partial write
+
+
+class PriorStateSnapshot(unittest.TestCase):
+    def test_apply_returns_the_state_it_replaced(self):
+        # the snapshot is what makes an apply reversible; it must describe the
+        # scene as it was BEFORE the write, not after
+        stash = Stash("http://example.test", "k", transport=_scene_transport(
+            title="Old Title", date="2019-01-01",
+            performers=[{"id": "p1"}], tags=[{"id": "t1"}],
+            studio={"id": "st1"}, organized=False))
+        info = stash.apply_scene("s1", {"title": "New Title",
+                                        "performers": [], "tags": []})
+        prior = info["prior"]
+        self.assertEqual(prior["title"], "Old Title")
+        self.assertEqual(prior["date"], "2019-01-01")
+        self.assertEqual(prior["performer_ids"], ["p1"])
+        self.assertEqual(prior["tag_ids"], ["t1"])
+        self.assertEqual(prior["studio_id"], "st1")
+        self.assertIs(prior["organized"], False)
+
+    def test_snapshot_covers_every_field_the_apply_can_write(self):
+        # a field the apply writes but the snapshot omits is a silent hole in
+        # undo, and it will not be discovered until someone needs it
+        writable = {"title", "details", "date", "urls", "stash_ids",
+                    "studio_id", "performer_ids", "tag_ids", "organized"}
+        stash = Stash("http://example.test", "k", transport=_scene_transport())
+        prior = stash.apply_scene("s1", {"performers": [], "tags": []})["prior"]
+        self.assertTrue(writable.issubset(set(prior)),
+                        "snapshot missing: %s" % sorted(writable - set(prior)))
+
+    def test_snapshot_is_json_serialisable(self):
+        # the store will persist it verbatim
+        import json
+        stash = Stash("http://example.test", "k", transport=_scene_transport())
+        prior = stash.apply_scene("s1", {"performers": [], "tags": []})["prior"]
+        json.loads(json.dumps(prior))
+
+
+# Every key apply_scene's `prior` snapshot can hold (see apply_scene's prior=
+# dict in cronicled/stash.py).
+FULL_PRIOR_KEYS = {"title", "details", "date", "urls", "organized", "rating100",
+                   "code", "director", "stash_ids", "studio_id", "performer_ids",
+                   "tag_ids"}
+
+# apply_scene has no write path for these three: its `inp` (the sceneUpdate
+# input it builds) never sets rating100, code or director — confirmed by
+# reading apply_scene end to end, and matching Task 1's own
+# test_snapshot_covers_every_field_the_apply_can_write, whose "writable" set
+# excludes exactly these three. An apply-driven round trip can therefore never
+# make them differ, so dropping one from a snapshot has nothing to visibly
+# fail to restore here. They stay in the snapshot (apply_scene's existing
+# contract, unchanged by this ticket) but are excluded from the per-field
+# proof below because that proof requires the field to actually move.
+_NOT_WRITABLE_BY_APPLY_SCENE = {"rating100", "code", "director"}
+
+# A starting scene with a distinctive, non-empty value in every field the
+# snapshot captures, and a match that changes every one of them apply_scene
+# can actually write (studio needs overwrite_studio=True below, since the
+# scene already has one and apply only claims an unset slot otherwise).
+RICH_STATE = dict(
+    title="Old Title", details="Old details", date="2019-01-01",
+    urls=["http://old.example/1"], organized=False, rating100=50,
+    code="OLD-CODE", director="Old Director",
+    stash_ids=[{"endpoint": "http://old.example", "stash_id": "old-stash-id"}],
+    studio={"id": "st1"}, performers=[{"id": "p1"}], tags=[{"id": "t1"}])
+
+RICH_MATCH = dict(
+    title="New Title", details="New details", date="2024-05-05",
+    urls=["http://new.example/1"],
+    stash_ids=[{"endpoint": "http://new.example", "stash_id": "new-stash-id"}],
+    studio={"name": "New Studio"},
+    performers=[{"name": "Velvet Crane"}], tags=[{"name": "JOI"}])
+
+
+class RevertRoundTrip(unittest.TestCase):
+    def test_apply_then_revert_restores_the_original_state(self):
+        # the round trip is the proof the snapshot is complete: if a field is
+        # missing from it, the scene does not come back the same. The match
+        # here changes every field apply_scene can write (title, details,
+        # date, urls, stash_ids, studio, performers, tags — organized always
+        # flips too) so a regression in any one field's restore path would be
+        # visible, not hidden behind an untouched field passing through
+        # unchanged on both sides of the round trip.
+        server = _mutable_scene(**RICH_STATE)
+        stash = Stash("http://example.test", "k", transport=server.transport)
+        before = server.snapshot()
+
+        info = stash.apply_scene("s1", RICH_MATCH, overwrite_studio=True)
+        self.assertNotEqual(server.snapshot(), before)   # the apply really changed it
+
+        stash.revert_scene("s1", info["prior"])
+        self.assertEqual(server.snapshot(), before)
+
+    def test_every_captured_field_is_needed_to_restore(self):
+        # the snapshot's completeness is the claim this whole change rests on;
+        # assert it per-field rather than trusting one spot check. rating100/
+        # code/director are excluded — see _NOT_WRITABLE_BY_APPLY_SCENE above.
+        for field in sorted(FULL_PRIOR_KEYS - _NOT_WRITABLE_BY_APPLY_SCENE):
+            with self.subTest(field=field):
+                server = _mutable_scene(**RICH_STATE)
+                stash = Stash("http://example.test", "k", transport=server.transport)
+                before = server.snapshot()
+                info = stash.apply_scene("s1", RICH_MATCH, overwrite_studio=True)
+                partial = {k: v for k, v in info["prior"].items() if k != field}
+                stash.revert_scene("s1", partial)
+                self.assertNotEqual(server.snapshot(), before,
+                                    "dropping %r still restored cleanly — the "
+                                    "round trip does not actually cover it" % field)
+
+    def test_revert_writes_once(self):
+        # a partial revert is worse than none: resolve first, then one write
+        server = _mutable_scene(title="Old Title")
+        stash = Stash("http://example.test", "k", transport=server.transport)
+        info = stash.apply_scene("s1", {"title": "New", "performers": [], "tags": []})
+        server.writes = 0
+        stash.revert_scene("s1", info["prior"])
+        self.assertEqual(server.writes, 1)
+
+    def test_revert_of_an_empty_snapshot_is_refused(self):
+        stash = Stash("http://example.test", "k", transport=_scene_transport())
+        with self.assertRaises(ValueError):
+            stash.revert_scene("s1", None)
