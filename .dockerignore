@@ -1,8 +1,25 @@
+# Everything the image must not contain. The Dockerfile copies `cronicled/`
+# and nothing else, so this list is a second line of defence rather than the
+# only one -- but the image is published to a public registry now, so any
+# future COPY line that widens what goes in has to be checked against this
+# file before it ships.
 .git
 .github
 tests
 scripts
 config
 *.md
-__pycache__
 .leak-patterns
+
+# Docker matches these with Go's filepath.Match, NOT gitignore semantics: a
+# bare `__pycache__` matches only the context root, so `cronicled/__pycache__`
+# and `cronicled/adapters/__pycache__` were copied in verbatim. Anyone who had
+# run the suite locally baked their own byte code into the image; CI never saw
+# it because CI builds from a clean checkout. `**/` is what matches at any
+# depth here.
+**/__pycache__
+**/*.pyc
+
+# Not copied into the image, but a local checkout following the README has a
+# virtualenv here and it is by far the largest thing in the build context.
+.venv
