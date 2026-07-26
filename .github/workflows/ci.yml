@@ -2,6 +2,10 @@ name: ci
 on:
   push:
     branches: [main]
+    # Release tags publish a version-tagged image as well as the SHA-tagged
+    # one. The publish job checks the tag against the declared version rather
+    # than trusting the tag name.
+    tags: ["v*"]
   pull_request:
 
 jobs:
@@ -157,3 +161,84 @@ jobs:
             pages deploy site
             --project-name=cronicled
             --branch=${{ github.head_ref || github.ref_name }}
+
+  publish:
+    # `needs: guard` is the one that must never be dropped: it is what makes
+    # "published" and "scanned" the same set. `test` and `container` are here
+    # too because an image that fails them is not worth a permanent tag.
+    #
+    # Everything that ends up in the image is tracked source the guard has
+    # already scanned - the Dockerfile copies `cronicled/` and nothing else,
+    # and .dockerignore excludes the rest. That property is what makes
+    # publishing from CI safe at all, and it holds only while COPY and
+    # .dockerignore agree; a new COPY line has to be checked against
+    # .dockerignore before it ships to a public registry.
+    needs: [guard, test, container]
+    # Never from a pull request. Fork PRs cannot read repository secrets by
+    # GitHub's design (see the guard job), and a pull request able to push an
+    # image into the project's own namespace is a hole, not a feature. Pushes
+    # to other branches are excluded for the same reason.
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    permissions:
+      # No new repository secret: the built-in token is enough to write to the
+      # account's own package namespace, and there is nothing extra to rotate.
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Work out the image tags and the pinned interpreter
+        id: inputs
+        run: |
+          set -eu
+          image=ghcr.io/cabinetworks/cronicled
+
+          # There is deliberately NO `latest` tag, and this is not an
+          # oversight to be helpfully corrected. `latest` is read as "the one
+          # you want", and nobody pulls it expecting a program that imports a
+          # package, prints a line and exits - which is all this image does
+          # until there is a service to put in it. A commit SHA and a release
+          # version make no such promise, so those are the only tags pushed.
+          tags="${image}:${GITHUB_SHA}"
+
+          case "${GITHUB_REF}" in
+            refs/tags/v*)
+              declared=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' pyproject.toml | head -n 1)
+              tagged=${GITHUB_REF#refs/tags/v}
+              if [ -z "${declared}" ]; then
+                echo "::error::no version declared in pyproject.toml" >&2
+                exit 1
+              fi
+              # A tag naming one version while pyproject declares another is
+              # not a tie to break by preferring one of them: the published
+              # image would be labelled with a version it was not built from.
+              if [ "${declared}" != "${tagged}" ]; then
+                echo "::error::release tag v${tagged} does not match the declared version ${declared}" >&2
+                exit 1
+              fi
+              tags="${tags},${image}:${declared}"
+              ;;
+          esac
+
+          printf 'tags=%s\n' "${tags}" >> "${GITHUB_OUTPUT}"
+          # Passed to the build explicitly, exactly as the container job does.
+          # The Dockerfile's own ARG default is a fallback for a hand build,
+          # not a second declaration CI is allowed to lean on.
+          printf 'interpreter=%s\n' "$(cat .python-version)" >> "${GITHUB_OUTPUT}"
+      # The audience for a self-hosted media-library companion is on a NAS, a
+      # small board or an Apple Silicon machine at least as often as on x86.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            PYTHON_VERSION=${{ steps.inputs.outputs.interpreter }}
+          tags: ${{ steps.inputs.outputs.tags }}

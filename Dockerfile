@@ -4,6 +4,16 @@
 ARG PYTHON_VERSION=3.12
 FROM python:${PYTHON_VERSION}-slim
 
+# The registry listing is populated from these, not typed into a web form, so
+# it cannot drift from the image it describes. The description is the important
+# one: a published container reads as a runnable thing, and this one is not.
+# Whoever finds it on the registry has none of the README's context, so the
+# first sentence has to say what it is and the second what it does not do.
+LABEL org.opencontainers.image.title="cronicled" \
+      org.opencontainers.image.source="https://github.com/cabinetworks/cronicled" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.description="A pinned, reproducible runtime for a library that has no entry point yet. There is no service in this image: its default command imports the package, exercises a handful of pure functions, prints one line and exits. It is a way to run this project's code on the interpreter the project declares, not a way to run the tool."
+
 # No runtime dependencies by design: the standard library only. There is
 # deliberately no pip install step here.
 WORKDIR /app

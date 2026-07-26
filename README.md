@@ -109,3 +109,17 @@ below is documented in exactly one of those pages, not in both.
 ## License
 
 MIT
+
+## The published image
+
+Every push to the default branch publishes a multi-architecture image to
+`ghcr.io/cabinetworks/cronicled`, tagged with the commit SHA:
+
+```sh
+docker pull ghcr.io/cabinetworks/cronicled:<commit-sha>
+```
+
+**There is no `latest` tag, and its absence is deliberate.** The image is a
+pinned runtime for a library with no entry point yet — its default command
+prints one line and exits — and `latest` is read as "the one you want".
+[The container page](docs/container.md) has the tagging scheme and the mounts.
