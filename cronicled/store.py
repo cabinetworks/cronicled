@@ -15,6 +15,10 @@ stable identity for "this proposal", its second run duplicates its first and
 the inbox becomes noise instead of a queue. `fingerprint` is that identity;
 see its docstring for how canonical serialisation makes it stable across
 producers that happen to build a payload's keys in a different order.
+
+The store also remembers when each producer last ran, for the scheduler that
+decides what is due. Same reason as the proposals: an answer that resets on
+restart makes every producer due at once. See the block above `record_run`.
 """
 import hashlib
 import json
@@ -52,7 +56,29 @@ CREATE TABLE IF NOT EXISTS mute (
     subject_type TEXT NOT NULL, subject_id TEXT NOT NULL,
     reason TEXT, at TEXT NOT NULL,
     PRIMARY KEY (subject_type, subject_id));
+
+CREATE TABLE IF NOT EXISTS producer_run (
+    producer TEXT PRIMARY KEY,
+    at       TEXT NOT NULL);
 """
+
+# On adding to this schema, given databases already exist
+# ------------------------------------------------------
+# The whole script is re-applied on every open and every statement in it is
+# `IF NOT EXISTS`, so a database written before a table existed gains it and
+# keeps everything already in it. `producer_run` was added that way and it was
+# checked rather than assumed: a database built by the previous code, then
+# opened by this one, came back with its item, dismissal and mute rows
+# identical, its dismissals and mutes still blocking, and
+# `PRAGMA integrity_check` reporting ok. `SchemaAdditionOnAnExistingDatabase`
+# in the tests pins it.
+#
+# That covers *additive* change only. Altering or dropping something that
+# already holds data is a different problem and this offers nothing for it —
+# there is no version column here, and the first change of that kind has to
+# add one. The store's spec deferred migrations because there was no user data
+# to preserve; there is now, so the deferral survives only for as long as
+# every change stays additive.
 
 
 def _nfc(value):
@@ -531,3 +557,83 @@ class Store:
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
         return {state: n for state, n in rows}
+
+    # When each producer last ran
+    # ---------------------------
+    # A scheduler decides what is due by comparing a producer's cadence against
+    # when it last ran, so that answer has to outlive the process. Held in
+    # memory it resets on every restart, which makes every producer due at once
+    # — a nightly full-library scrape would run on every deploy, and a service
+    # restarting a few times in an afternoon would scrape continuously. That is
+    # the load the cost classes exist to prevent, arriving through a door they
+    # do not watch.
+    #
+    # It lives here rather than in a state file of its own because this is
+    # already the durable local state, already has a schema created on first
+    # open, and already survives exactly as long as the proposals do.
+    #
+    # Like everything else on this class, each of the three takes `self._lock`
+    # exactly once and calls nothing that takes it. `record()`'s note about
+    # holding the lock across its mute check applies in reverse here: the lock
+    # is a plain non-reentrant `threading.Lock`, so none of these may ever be
+    # called from inside a block that already holds it.
+
+    def record_run(self, producer, at=None):
+        """Remember that `producer` has just run, replacing any previous record.
+
+        A producer has *a* last run, not a history — the scheduler only ever
+        asks "how long ago", and a growing row-per-run would be a log this
+        store has no reason to keep. `producer` is the primary key and the
+        write is an upsert, so the table holds one row per producer however
+        many times it runs.
+
+        `at` is stored exactly as given and is not compared with what is
+        already there. Keeping whichever timestamp is larger would mean
+        interpreting it, and would quietly ignore an operator correcting a run
+        stamped by a skewed clock. Omitted, it is the current UTC time in the
+        same format as every other timestamp here.
+
+        This is recorded for a failed run as much as a successful one. Backing
+        off after a failure is a real feature and deliberately not this; a
+        producer that fell silent for a day after one transient error would be
+        a worse outcome than one that retries on its normal cadence.
+        """
+        when = at if at is not None else _utcnow()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO producer_run (producer, at) VALUES (?, ?) "
+                "ON CONFLICT(producer) DO UPDATE SET at = excluded.at",
+                (producer, when),
+            )
+            self._conn.commit()
+
+    def last_run(self, producer):
+        """When `producer` last ran, or `None` if it never has.
+
+        `None` rather than an error: a producer that has never run is the
+        ordinary state of one just added to the schedule, and the caller's
+        answer to it — run it now — is a normal decision, not a failure.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT at FROM producer_run WHERE producer = ?",
+                (producer,),
+            ).fetchone()
+        return row[0] if row is not None else None
+
+    def runs(self):
+        """Every producer's last run, as `{producer: at}`, in one query.
+
+        A tick asks about every producer it knows before deciding what to
+        start, so the read is shaped for that rather than for N calls to
+        `last_run`.
+
+        A producer that has never run is simply absent — no key, not a key
+        mapped to `None`. The caller iterating this is comparing timestamps,
+        and a `None` sitting among them would be a value every comparison has
+        to remember to exclude.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT producer, at FROM producer_run").fetchall()
+        return {producer: at for producer, at in rows}

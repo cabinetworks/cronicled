@@ -228,6 +228,27 @@ class ProducerContract(_RunnerCase):
         self.assertEqual(len(self.store.items()), 0)
 
 
+class WhatIsRegistered(_RunnerCase):
+    """A schedule reads a producer's own declared cadence off the object, so
+    it needs the objects and not just their names."""
+
+    def test_nothing_is_registered_to_begin_with(self):
+        self.assertEqual(self.runner.producers(), [])
+
+    def test_the_producers_come_back_in_the_order_they_were_registered(self):
+        first = _Producer(name="alpha")
+        second = _Producer(name="zulu")
+        self.runner.register(first)
+        self.runner.register(second)
+        self.assertEqual(self.runner.producers(), [first, second])
+
+    def test_the_answer_is_a_copy_so_a_caller_cannot_rewire_the_runner(self):
+        producer = _Producer(name="alpha")
+        self.runner.register(producer)
+        self.runner.producers().clear()
+        self.assertEqual(self.runner.producers(), [producer])
+
+
 class CostClasses(_RunnerCase):
     def test_a_second_scraping_job_is_refused_while_one_runs(self):
         # two scrapes at once thrash the media server's headless browser and get

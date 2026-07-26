@@ -1,7 +1,7 @@
 site_name: cronicled
 site_description: >-
   A foundation for an always-on companion to a self-hosted media library.
-site_url: https://cronicled.pages.dev/
+site_url: https://cabinetworks.github.io/cronicled/
 repo_url: https://github.com/cabinetworks/cronicled
 edit_uri: ""
 docs_dir: docs

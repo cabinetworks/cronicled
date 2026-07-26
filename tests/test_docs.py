@@ -10,10 +10,11 @@ edit away from drifting, and none of them fails anything when it does:
   instead of by good intentions.
 * the self-check transcript quotes a module count. It said 12 while the
   program printed 16.
-* the site's deploy step is inert until two Cloudflare secrets are added to
-  the repository. "Inert" has to mean the job still passes: a red main for a
-  secret nobody has added yet teaches everyone to ignore a red main. That
-  behaviour is tested by running the workflow's own shell, not by reading it.
+* the site publishes from the default branch and nowhere else, after the
+  leak guard has run. That used to be a gate deciding whether a Cloudflare
+  deploy could go ahead without its secrets; GitHub Pages needs no secret, so
+  what is left to protect is that a pull request cannot publish and that
+  nothing reaches the internet ahead of the guard.
 
 None of this needs a YAML parser or a Markdown parser, and deliberately so -
 the suite runs on a bare interpreter with nothing installed.
@@ -115,11 +116,77 @@ class ThePlannedServiceIsMarkedAsPlanned(unittest.TestCase):
                 "PLANNED: or BUILT:, so which is which cannot be mistaken")
 
     def test_the_diagrams_of_what_exists_claim_nothing_planned(self):
+        # A diagram is believed before a paragraph is, so a picture of the
+        # whole intended system would undo what the prose is careful about.
+        # These are the things that genuinely do not exist.
+        #
+        # "scheduler" used to be on this list and is not any more, because
+        # `cronicled/schedule.py` now exists. That move is the maintenance
+        # this test is for: a planned thing becoming built should require
+        # someone to change an assertion on purpose, rather than a diagram
+        # drifting into claiming it. Note what stayed true through that
+        # change - nothing constructs a Scheduler, so the entry point is
+        # still drawn as planned even though the scheduler beside it is not.
         built_diagrams = [f for f in _fences(INDEX) if "PLANNED" not in f]
         self.assertEqual(len(built_diagrams), 3)
         for fence in built_diagrams:
-            self.assertNotIn("scheduler", fence.lower())
             self.assertNotIn("inbox", fence.lower())
+            self.assertNotIn("approval", fence.lower())
+
+
+class NothingStartsThisProjectYet(unittest.TestCase):
+    """The README's central claim, and the one most likely to go stale next.
+
+    "The scheduler knows what is due and can run it; nothing constructs a
+    scheduler" is the sentence the whole Status section turns on, and the
+    fourth diagram draws the entry point as PLANNED on the strength of it.
+    Both go quietly wrong the day someone adds a `__main__` or a console
+    script, which is exactly the next thing anyone would build.
+
+    The honesty test above covers the inbox and the approval gate. This is
+    its counterpart for the entry point: a claim about absence, which no
+    diagram assertion can make, because there is no node to inspect.
+    """
+
+    def test_no_module_in_the_package_constructs_a_scheduler(self):
+        offenders = []
+        for root, _dirs, names in os.walk("cronicled"):
+            if "__pycache__" in root:
+                continue
+            for name in sorted(names):
+                if not name.endswith(".py"):
+                    continue
+                path = os.path.join(root, name)
+                if "Scheduler(" in _read(path):
+                    offenders.append(path)
+        self.assertEqual(
+            offenders, [],
+            "%s constructs a Scheduler. If this project now starts itself, "
+            "the README's 'nothing constructs a scheduler' and the fourth "
+            "diagram's PLANNED entry point are both wrong and need changing "
+            "with it." % ", ".join(offenders))
+
+    def test_the_package_declares_no_entry_point(self):
+        # A console script or a __main__ would make `cronicled` runnable
+        # without anything importing it, which is the other way the claim
+        # stops being true.
+        self.assertNotIn(
+            "[project.scripts]", _read("pyproject.toml"),
+            "pyproject declares a console script, so something does start "
+            "this project - the README says nothing does")
+        self.assertFalse(
+            os.path.exists(os.path.join("cronicled", "__main__.py")),
+            "cronicled/__main__.py exists, so `python -m cronicled` starts "
+            "something - the README says nothing does")
+
+    def test_the_readme_still_makes_that_claim(self):
+        # If the claim is ever removed, the two tests above become guards
+        # over a promise nobody is making. Better to fail and be deleted
+        # together than to sit passing vacuously.
+        # Collapsed, because the sentence wraps and a line break in the
+        # middle of it must not be what decides whether this passes.
+        prose = " ".join(_read(README).split())
+        self.assertIn("nothing constructs a scheduler", prose)
 
 
 class TheSelfCheckTranscriptIsCurrent(unittest.TestCase):
@@ -175,97 +242,82 @@ class TheDocsBuildRunsOnEveryCommit(unittest.TestCase):
                 "`%s` must declare needs: guard" % job)
 
 
-class TheDeployIsInertNotBroken(unittest.TestCase):
-    """Neither Cloudflare secret exists on the repository yet. Until they do,
-    the deploy must skip with a visible notice and a passing job.
+class TheDeployGoesOnlyToTheDefaultBranch(unittest.TestCase):
+    """The site publishes from `main` and from nowhere else, after the guard.
 
-    This runs the gate step's own shell rather than reading its text: the
-    thing that matters is what it decides for a given set of inputs, and a
-    condition can be reworded a dozen ways that all read fine and one of
-    which is wrong."""
+    This replaced a gate that decided whether a Cloudflare deploy could run,
+    given two repository secrets that might be absent. GitHub Pages needs no
+    secret - it authenticates with the workflow's own OIDC token - so there is
+    nothing to be absent, and the skip-with-a-notice mechanism went with it.
+    What is left to protect is narrower and more important: that nothing
+    reaches the open internet without the leak guard having run, and that a
+    pull request cannot publish.
+
+    Note what a fork pull request gets now. Previously it was skipped with an
+    explaining notice, because it could not read a secret. Now it simply does
+    not match the `if`, like any other pull request. The site is still BUILT
+    for it by the `docs` job, which is the check that catches a broken page;
+    what it does not get is a preview URL, because GitHub Pages has one site
+    per repository and no concept of one."""
 
     @classmethod
     def setUpClass(cls):
-        ci = _read(CI_YML)
-        # Deliberately not re.DOTALL across the whole pattern: `.` staying
-        # line-bound is what keeps this a linear scan instead of a
-        # backtracking one.
-        m = re.search(
-            r"^      - name: Decide whether this run can publish\n"
-            r"((?:        .*\n|\n)*)",
-            ci, re.M)
-        assert m, "no 'Decide whether this run can publish' step in %s" % CI_YML
-        body = m.group(1)
-        run = re.search(r"^        run: \|\n((?:          .*\n|\n)*)", body, re.M)
-        assert run, "that step has no `run: |` script"
-        cls.script = run.group(1)
-        cls.ci = ci
+        cls.ci = _read(CI_YML)
+        m = re.search(r"^  docs-deploy:\n((?:    .*\n|\n)*)", cls.ci, re.M)
+        assert m, "no docs-deploy job in %s" % CI_YML
+        cls.job = m.group(1)
 
-    def _decide(self, is_fork_pr, token, account_id):
-        with tempfile.TemporaryDirectory() as tmp:
-            out_path = os.path.join(tmp, "gh_output")
-            open(out_path, "w").close()
-            env = dict(os.environ)
-            env.update({
-                "GITHUB_OUTPUT": out_path,
-                "IS_FORK_PR": is_fork_pr,
-                "CLOUDFLARE_API_TOKEN": token,
-                "CLOUDFLARE_ACCOUNT_ID": account_id,
-            })
-            proc = subprocess.run(
-                ["sh", "-c", self.script], env=env,
-                capture_output=True, text=True)
-            with open(out_path) as fh:
-                written = fh.read()
-        return proc, written
+    def test_it_waits_for_the_guard(self):
+        # The whole reason this is a workflow job rather than a Pages branch
+        # setting: a build on GitHub's side would publish without the guard
+        # ever running against the commit that produced the pages.
+        self.assertRegex(self.job, r"needs:\s*\[[^]]*\bguard\b")
 
-    def test_a_missing_token_skips_the_deploy_without_failing_the_job(self):
-        proc, written = self._decide("false", "", "an-account-id")
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("publish=no", written)
-        self.assertIn("::notice::", proc.stdout)
+    def test_it_runs_only_on_a_push_to_the_default_branch(self):
+        # Both halves are load-bearing. Without the event check, a
+        # `pull_request_target` run - which carries the base repository's
+        # permissions - reports `refs/heads/main` and would let a fork's pull
+        # request publish. Without the ref check, any pushed branch would
+        # overwrite the published site.
+        m = re.search(r"^    if: (.*)$", self.job, re.M)
+        self.assertIsNotNone(m, "docs-deploy has no `if:` gate at all")
+        gate = m.group(1)
+        self.assertIn("github.event_name == 'push'", gate)
+        self.assertIn("refs/heads/main", gate)
 
-    def test_a_missing_account_id_skips_it_too(self):
-        # Deploying with one of the two present is not a partial success -
-        # wrangler would fail mid-publish instead of never starting.
-        proc, written = self._decide("false", "a-token", "")
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("publish=no", written)
+    def test_it_asks_for_no_more_permission_than_publishing_needs(self):
+        m = re.search(r"^    permissions:\n((?:      .*\n)*)", self.job, re.M)
+        self.assertIsNotNone(m, "docs-deploy declares no permissions block")
+        granted = dict(re.findall(r"^      (\S+):\s*(\S+)$", m.group(1), re.M))
+        self.assertEqual(
+            granted, {"pages": "write", "id-token": "write"},
+            "publishing to Pages needs exactly these two: `pages` to write "
+            "the site and `id-token` for the OIDC exchange. Anything else "
+            "here is scope this job does not use")
 
-    def test_a_fork_pull_request_skips_it_and_says_why(self):
-        proc, written = self._decide("true", "a-token", "an-account-id")
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("publish=no", written)
-        self.assertIn("fork", proc.stdout.lower())
-
-    def test_a_run_with_both_secrets_does_publish(self):
-        # The other half, and the one a "skip cleanly" change would quietly
-        # break: a gate that never says yes is not cautious, it is broken,
-        # and nothing else in this file would notice.
-        proc, written = self._decide("false", "a-token", "an-account-id")
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("publish=yes", written)
-        self.assertNotIn("publish=no", written)
-
-    def test_nothing_publishes_except_through_that_decision(self):
-        m = re.search(r"^  docs-deploy:\n((?:    .*\n|\n)*)", self.ci, re.M)
-        self.assertIsNotNone(m)
-        job = m.group(1)
-        # Every step that could touch Cloudflare, or fetch what would be
-        # sent there, has to be gated on the decision above. An ungated
-        # wrangler step would fail the job with a missing token - the exact
-        # outcome the gate exists to avoid.
-        steps = re.split(r"^      - ", job, flags=re.M)[1:]
-        publishing = [s for s in steps if "wrangler" in s or "download-artifact" in s]
-        self.assertGreaterEqual(
-            len(publishing), 2,
-            "expected the artifact download and the wrangler publish step")
-        for step in publishing:
-            self.assertRegex(
-                step, r"if:\s*steps\.gate\.outputs\.publish == 'yes'",
-                "this step runs regardless of whether the run can publish:\n%s"
-                % step)
-
+    def test_no_trace_of_the_previous_host_survives_anywhere(self):
+        # The switch is only finished when nothing still reaches for the old
+        # provider - not just its secrets. A leftover mention reads as
+        # configuration the repository is missing rather than one it
+        # deliberately dropped, and the worst case is a reader following stale
+        # prose into setting up the build-from-a-branch integration that very
+        # prose argues against, which is the un-guarded publish path.
+        #
+        # An earlier version of this test read only ci.yml, and only for the
+        # uppercase secret name. It passed with four live mentions of the
+        # provider in that same file and three more on a published docs page.
+        # The name promised "no leftover reference" and the assertion checked
+        # for a secret - so it is swept case-insensitively, across every
+        # document as well as the workflow.
+        stale = ("cloudflare", "wrangler", "pages.dev")
+        for path in _doc_paths() + [CI_YML]:
+            haystack = _read(path).lower()
+            for needle in stale:
+                self.assertNotIn(
+                    needle, haystack,
+                    "%s still mentions %r. The site is published by GitHub "
+                    "Pages now; a stale reference sends a reader looking for "
+                    "configuration that does not exist." % (path, needle))
 
 if __name__ == "__main__":
     unittest.main()
