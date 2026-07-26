@@ -1,4 +1,5 @@
-"""Choosing the batch a scan works on, and working one file of it.
+"""Choosing the batch a scan works on, working one file of it, and running a
+whole batch of them.
 
 `SelectTest` is about *ordering*: narrowing runs before the limit. The scarce
 resource is a network lookup per selected file, so a limit spent on a file
@@ -14,19 +15,37 @@ about the network rather than about the file. Conflating any two of them is a
 bug a user feels — either a file hidden forever because a socket blipped
 once, or a scan that re-decides the same hopeless file every night.
 
+`SingleFlightTest` and `ScanProducerTest` are about composition and about the two properties that only
+exist once several files are worked at once: identical queries collapse to one
+lookup, and a proposal is yielded the moment it is ready rather than at the end
+of the batch. Both protect the same thing — the lookups a run spends, and the
+work a run keeps when it dies partway.
+
 No test touches a real filesystem and no test opens a socket. A path is a
 string; a scene is a dict; the store is opened in memory; the search callable
-is a fake that answers from a script and records what it was asked.
+is a fake that answers from a script and records what it was asked; the media
+client is a fake that refuses every call but the one read a scan is allowed to
+make. Nothing sleeps: threads are ordered with `threading.Event`, and every
+wait carries a timeout that exists only so a broken implementation fails
+instead of hanging.
 """
+import inspect
+import threading
 import unittest
 
+from cronicled.jobs import COST_CLASS_LIMITS, JobRunner
 from cronicled.scan import (
     Counts, MAX_RUNNERS_UP, MUTE_NO_CANDIDATES, MUTE_UNRESOLVED_CREATOR,
-    Outcome, SUBJECT_TYPE, examine, select,
+    Outcome, ScanProducer, SUBJECT_TYPE, _SingleFlight, examine, select,
 )
 from cronicled.store import Store
 
 FOLDER = "library"
+
+# Every wait in this file is bounded by this. It is a deadlock guard, never a
+# synchronisation device: in a passing run every wait returns the instant the
+# other thread sets its event, and nothing here ever waits for time to pass.
+WAIT = 10
 
 
 def scene(scene_id, *paths):
@@ -764,6 +783,688 @@ class ExamineTest(unittest.TestCase):
         with self.assertRaises(KeyError):
             self.run_examine("/library/Velvet Crane/Morning Ritual.mp4",
                              results=[{"url": "https://example.invalid/x"}])
+
+
+# -- running a whole batch ------------------------------------------------- #
+
+class FakeStash:
+    """The media client, which a scan may READ and must never write to.
+
+    Every attribute other than the one read a scan is allowed to make comes
+    back as a call that records itself and then fails the test. That makes the
+    read-only property hold across every test in the file rather than in the
+    one test named for it — a write added anywhere in the scan path is caught
+    by whichever test reaches it first.
+
+    `calls` records the whole call, arguments included, so a test can assert
+    the entire conversation with the media server as one shape. A test that
+    checked only "no writes" could not notice a read that was added, and the
+    argument this scan passes is itself load-bearing: fetching with the scan's
+    `limit` would apply the limit at the SOURCE, before any narrowing.
+    """
+
+    def __init__(self, scenes):
+        self._scenes = list(scenes)
+        self.calls = []
+
+    def unorganized_scenes(self, limit):
+        self.calls.append(("unorganized_scenes", (limit,), {}))
+        scenes = self._scenes if limit is None else self._scenes[:limit]
+        return len(self._scenes), list(scenes)
+
+    def __getattr__(self, name):
+        def refuse(*args, **kwargs):
+            self.calls.append((name, args, kwargs))
+            raise AssertionError(
+                "the scan called %r on the media server; a scan reads and "
+                "looks things up, it never writes" % (name,))
+        return refuse
+
+
+class ScriptedSearch:
+    """The injected lookup: answers each query from a script, and records the
+    queries several threads asked it.
+
+    `gates` holds a query open until an event is set, which is how a test
+    orders two files without sleeping. A gate that never opens raises rather
+    than hanging, and records the timeout in `timeouts` — a test that waits on
+    an ordering must be able to tell "the fast file really did come out first"
+    from "the slow file gave up and was skipped", because those two look
+    identical in the yielded proposals.
+    """
+
+    def __init__(self, script=None, gates=None, opens=None):
+        self._script = dict(script or {})
+        self._gates = dict(gates or {})
+        self._opens = dict(opens or {})
+        self._lock = threading.Lock()
+        self.queries = []
+        self.timeouts = []
+
+    def __call__(self, query):
+        with self._lock:
+            self.queries.append(query)
+        opened = self._opens.get(query)
+        if opened is not None:
+            opened.set()
+        gate = self._gates.get(query)
+        if gate is not None and not gate.wait(WAIT):
+            with self._lock:
+                self.timeouts.append(query)
+            raise AssertionError("the gate for %r never opened" % (query,))
+        answer = self._script.get(query, [])
+        if isinstance(answer, BaseException):
+            raise answer
+        return list(answer)
+
+
+class FakeCtx:
+    """What the runner gives a producer: somewhere to log progress."""
+
+    def __init__(self):
+        self.messages = []
+        self._lock = threading.Lock()
+
+    def log(self, message):
+        with self._lock:
+            self.messages.append(message)
+
+
+class MuteSpy:
+    """A real store with its `mute` calls recorded on the way through.
+
+    Delegating rather than faking, so a test can assert both that the producer
+    called `mute` with the reason Task 2 chose AND that the real store now
+    refuses proposals for that subject. A fake store could pass the first
+    check while the mute never landed.
+    """
+
+    def __init__(self, store):
+        self._store = store
+        self.mutes = []
+
+    def mute(self, subject_type, subject_id, reason=None):
+        self.mutes.append((subject_type, subject_id, reason))
+        return self._store.mute(subject_type, subject_id, reason=reason)
+
+    def __getattr__(self, name):
+        return getattr(self._store, name)
+
+
+class SingleFlightTest(unittest.TestCase):
+    """The collapse itself, in isolation.
+
+    The batch tests below pin that N files naming one creator fire one query.
+    They cannot tell a single-flight cache from a plain memo that happens not
+    to race, because a memo only issues a duplicate while the first answer is
+    still in flight. That window is what these tests hold open on purpose.
+    """
+
+    def test_a_second_caller_arriving_mid_flight_does_not_issue_its_own(self):
+        """The first call is held open, and the second is made while it is
+        still running. A memo that only stores the answer once it arrives has
+        nothing to find at that moment and issues a second lookup — which is
+        precisely the case parallelism creates and the cache exists for.
+
+        The residual, stated rather than papered over: `calling` is set by the
+        second thread immediately BEFORE its call, not from inside the cache,
+        so nothing here proves it had entered before the release. Winning that
+        race requires the first thread to wake, return and publish in the time
+        the second takes to make one call, which is not the ordering to bet
+        on, but it is not a proof either.
+        """
+        entered = threading.Event()
+        release = threading.Event()
+        calling = threading.Event()
+        queries = []
+
+        def search(query):
+            queries.append(query)
+            entered.set()
+            self.assertTrue(release.wait(WAIT))
+            return [{"title": query}]
+
+        flight = _SingleFlight(search)
+        answers = {}
+
+        def first():
+            answers["first"] = flight("Velvet Crane")
+
+        def second():
+            calling.set()
+            answers["second"] = flight("Velvet Crane")
+
+        one = threading.Thread(target=first)
+        one.start()
+        self.assertTrue(entered.wait(WAIT))
+        two = threading.Thread(target=second)
+        two.start()
+        self.assertTrue(calling.wait(WAIT))
+        release.set()
+        one.join(WAIT)
+        two.join(WAIT)
+
+        self.assertEqual(queries, ["Velvet Crane"])
+        self.assertEqual(answers["first"], [{"title": "Velvet Crane"}])
+        self.assertEqual(answers["second"], [{"title": "Velvet Crane"}])
+
+    def test_a_query_that_failed_is_not_retried_within_the_run(self):
+        """A dead query is dead for every file that would phrase it. Retrying
+        it once per file spends the whole budget discovering the same outage."""
+        queries = []
+
+        def search(query):
+            queries.append(query)
+            raise RuntimeError("connection reset")
+
+        flight = _SingleFlight(search)
+        for _ in range(3):
+            with self.assertRaises(RuntimeError):
+                flight("Velvet Crane")
+
+        self.assertEqual(queries, ["Velvet Crane"])
+
+    def test_queries_differing_only_in_case_or_spacing_are_one_query(self):
+        queries = []
+
+        def search(query):
+            queries.append(query)
+            return []
+
+        flight = _SingleFlight(search)
+        flight("Velvet Crane")
+        flight("velvet crane")
+        flight("Velvet  Crane")
+
+        self.assertEqual(queries, ["Velvet Crane"])
+
+    def test_different_queries_are_not_collapsed(self):
+        """The other half of the boundary: a cache that answered everything
+        from one entry would satisfy every test above and attribute every file
+        in the library to one creator."""
+        queries = []
+
+        def search(query):
+            queries.append(query)
+            return [{"title": query}]
+
+        flight = _SingleFlight(search)
+        first = flight("Velvet Crane")
+        second = flight("Ivy Kingsley")
+
+        self.assertEqual(queries, ["Velvet Crane", "Ivy Kingsley"])
+        self.assertEqual(first, [{"title": "Velvet Crane"}])
+        self.assertEqual(second, [{"title": "Ivy Kingsley"}])
+
+
+class ScanProducerTest(unittest.TestCase):
+
+    MORNING = candidate("Morning Ritual", "morning-ritual")
+    EVENING = candidate("Evening Errand", "evening-errand")
+    LEDGER = candidate("Winter Ledger", "winter-ledger")
+
+    # One creator with a catalogue, one with a single title. Both invented.
+    SCRIPT = {"Velvet Crane": [MORNING, EVENING],
+              "Ivy Kingsley": [LEDGER]}
+
+    MORNING_PATH = "/library/Velvet Crane/Morning Ritual.mp4"
+    EVENING_PATH = "/library/Velvet Crane/Evening Errand.mp4"
+    LEDGER_PATH = "/library/Ivy Kingsley/Winter Ledger.mp4"
+    UNNAMED_PATH = "/lib/2020-05-04/clip one.mp4"
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+        self.ctx = FakeCtx()
+        self.stash = None
+
+    def build(self, scenes, search, store=None, **kwargs):
+        self.stash = FakeStash(scenes)
+        kwargs.setdefault("folder", FOLDER)
+        return ScanProducer(self.stash, search,
+                            store=self.store if store is None else store,
+                            **kwargs)
+
+    def scan(self, scenes, search, **kwargs):
+        """Run a whole batch and return the proposals it yielded."""
+        return list(self.build(scenes, search, **kwargs).produce(self.ctx))
+
+    def ids(self, proposals):
+        return sorted(p["subject_id"] for p in proposals)
+
+    # -- the producer protocol -------------------------------------------- #
+
+    def test_it_satisfies_the_producer_protocol(self):
+        """`name`, a known cost class, and a `produce` that is a generator.
+        The runner refuses a `produce` that returns a list, because such a
+        producer computes everything before the runner sees a single proposal
+        — losing exactly the partial progress this design exists to keep."""
+        producer = self.build([scene(1, self.MORNING_PATH)],
+                              ScriptedSearch(self.SCRIPT))
+
+        self.assertEqual(producer.name, "library-scan")
+        self.assertEqual(producer.cost, "scraping")
+        self.assertIn(producer.cost, COST_CLASS_LIMITS)
+
+        stream = producer.produce(self.ctx)
+        self.assertTrue(inspect.isgenerator(stream))
+        # Making a generator is not running one: nothing has been read from
+        # the media server yet, so `start()` can do this on the caller's
+        # thread and still leave all of the work on the worker's.
+        self.assertEqual(self.stash.calls, [])
+        stream.close()
+
+    def test_the_runner_accepts_it(self):
+        """Registration is where a cost class typo is caught, so a producer
+        that cannot be registered is not a producer."""
+        JobRunner(self.store).register(
+            self.build([], ScriptedSearch(self.SCRIPT)))
+
+    # -- what a proposal carries ------------------------------------------- #
+
+    def test_a_decided_file_is_yielded_as_a_complete_proposal(self):
+        """Asserted as one whole shape: the runner passes these fields
+        straight to `record()`, which hashes the payload, so a field added
+        here changes every fingerprint and a field missing here is a
+        `KeyError` on a background thread."""
+        proposals = self.scan([scene(7, self.LEDGER_PATH)],
+                              ScriptedSearch(self.SCRIPT))
+
+        self.assertEqual(proposals, [{
+            "folder": FOLDER,
+            "subject_type": SUBJECT_TYPE,
+            "subject_id": "7",
+            "summary": 'Winter Ledger.mp4 -> "Winter Ledger" by Ivy Kingsley '
+                       '(score 1.000)',
+            "confidence": 1.0,
+            "payload": {
+                "path": self.LEDGER_PATH,
+                "creator": {"name": "Ivy Kingsley", "source": "folder",
+                            "competing": None, "rejected_folder": None},
+                "candidate": self.LEDGER,
+                "score": 1.0,
+                "runners_up": [],
+            },
+        }])
+
+    def test_the_default_folder_reaches_the_proposal(self):
+        producer = ScanProducer(FakeStash([scene(1, self.LEDGER_PATH)]),
+                                ScriptedSearch(self.SCRIPT), store=self.store)
+        proposals = list(producer.produce(self.ctx))
+
+        self.assertEqual([p["folder"] for p in proposals], ["library"])
+
+    def test_the_folder_reaches_both_the_proposal_and_the_store(self):
+        """`folder` is the store's proposal namespace. A scan told to work one
+        namespace must propose into it AND ask its "already proposed?"
+        question about it — a hard-coded folder would file the work in one
+        place while suppressing it from another."""
+        for subject_id, folder in (("1", "review"), ("2", "inbox")):
+            self.store.record(folder=folder, subject_type=SUBJECT_TYPE,
+                              subject_id=subject_id, summary="a proposal",
+                              payload={"title": "something"},
+                              producer="earlier")
+        search = ScriptedSearch(self.SCRIPT)
+        proposals = self.scan(
+            [scene(1, self.MORNING_PATH), scene(2, self.LEDGER_PATH),
+             scene(3, self.EVENING_PATH)],
+            search, folder="review")
+
+        # 1 is already proposed in the folder being scanned and is dropped;
+        # 2's proposal lives in another folder and does not suppress it here.
+        self.assertEqual(self.ids(proposals), ["2", "3"])
+        self.assertEqual([p["folder"] for p in proposals], ["review", "review"])
+
+    # -- the two properties that only exist in a batch --------------------- #
+
+    def test_proposals_are_yielded_as_they_complete_not_in_input_order(self):
+        """A slow first file must not hold back a fast second one. Yielding
+        early is what makes progress survive an interruption, so an
+        implementation that gathers the batch and yields at the end loses the
+        whole point of the generator protocol.
+
+        `timeouts` is asserted because without it this test passes for the
+        wrong reason: an in-order implementation waits on the gated file,
+        which gives up, errors, and yields nothing — leaving the fast file's
+        proposal first anyway.
+        """
+        release = threading.Event()
+        search = ScriptedSearch(self.SCRIPT,
+                                gates={"Velvet Crane": release})
+        producer = self.build(
+            [scene(1, self.MORNING_PATH), scene(2, self.LEDGER_PATH)], search)
+        stream = producer.produce(self.ctx)
+
+        first = next(stream)
+        self.assertEqual(first["subject_id"], "2")
+        release.set()
+        rest = list(stream)
+
+        self.assertEqual([p["subject_id"] for p in rest], ["1"])
+        self.assertEqual(search.timeouts, [])
+
+    def test_identical_queries_collapse_to_one_lookup(self):
+        """Three files by one creator fire one search, not three. Without
+        this, parallelism multiplies consumption of exactly the resource the
+        whole selection step exists to conserve."""
+        search = ScriptedSearch(
+            {"Velvet Crane": [self.MORNING, self.EVENING, self.LEDGER]})
+        proposals = self.scan(
+            [scene(1, self.MORNING_PATH), scene(2, self.EVENING_PATH),
+             scene(3, "/library/Velvet Crane/Winter Ledger.mp4")],
+            search, workers=3)
+
+        self.assertEqual(search.queries, ["Velvet Crane"])
+        self.assertEqual(self.ids(proposals), ["1", "2", "3"])
+
+    def test_a_failing_query_is_not_retried_by_every_file(self):
+        """The catalogue being down is one fact, not one fact per file. Every
+        file still gets its own error, and none of them is muted."""
+        search = ScriptedSearch({"Velvet Crane": RuntimeError("connection reset")})
+        proposals = self.scan(
+            [scene(1, self.MORNING_PATH), scene(2, self.EVENING_PATH),
+             scene(3, "/library/Velvet Crane/Winter Ledger.mp4")],
+            search, workers=3)
+
+        self.assertEqual(search.queries, ["Velvet Crane"])
+        self.assertEqual(proposals, [])
+        self.assertEqual(self.store.muted_subjects(), set())
+        self.assertEqual(
+            len([m for m in self.ctx.messages
+                 if "RuntimeError: connection reset" in m]), 3)
+
+    def test_work_already_yielded_survives_a_later_failure(self):
+        """Driven partway, then made to fail: the proposal already handed over
+        is intact and complete. The legacy tool computed everything and wrote
+        at the end, so a crash on file 49 of 50 discarded the 48 already
+        done."""
+        release = threading.Event()
+        search = ScriptedSearch(
+            {"Velvet Crane": KeyboardInterrupt("interrupted"),
+             "Ivy Kingsley": [self.LEDGER]},
+            gates={"Velvet Crane": release})
+        producer = self.build(
+            [scene(1, self.MORNING_PATH), scene(2, self.LEDGER_PATH)], search)
+        stream = producer.produce(self.ctx)
+
+        yielded = next(stream)
+        release.set()
+        with self.assertRaises(KeyboardInterrupt):
+            next(stream)
+
+        self.assertEqual(yielded["subject_id"], "2")
+        self.assertEqual(yielded["payload"]["candidate"], self.LEDGER)
+        self.assertEqual(search.timeouts, [])
+        # A run that died did not finish. The closing line is the only record
+        # anyone reads afterwards, and it must not claim a clean end.
+        self.assertEqual([m for m in self.ctx.messages
+                          if m.startswith("finished:")], [])
+
+    def test_the_runner_keeps_what_a_failed_scan_had_already_found(self):
+        """The same property through the real runner, which is what actually
+        persists a yield. The failure is held back until the first proposal
+        has been recorded, so a store that only wrote at the end would have
+        nothing here."""
+        release = threading.Event()
+        search = ScriptedSearch(
+            {"Velvet Crane": KeyboardInterrupt("interrupted"),
+             "Ivy Kingsley": [self.LEDGER]},
+            gates={"Velvet Crane": release})
+        producer = self.build(
+            [scene(1, self.MORNING_PATH), scene(2, self.LEDGER_PATH)], search)
+
+        recorded = self.store.record
+
+        def record(**kwargs):
+            fp = recorded(**kwargs)
+            release.set()
+            return fp
+
+        self.store.record = record
+        runner = JobRunner(self.store)
+        runner.register(producer)
+        job = runner.start(producer.name)
+        self.assertTrue(runner.wait(job.id, WAIT))
+
+        finished = runner.job(job.id)
+        self.assertEqual(finished.state, "failed")
+        self.assertEqual(finished.recorded, 1)
+        self.assertIn("KeyboardInterrupt", finished.error)
+        self.assertEqual([row["subject_id"]
+                          for row in self.store.items(folder=FOLDER)], ["2"])
+        self.assertEqual(search.timeouts, [])
+
+    # -- the scan is read-only against the media server -------------------- #
+
+    def test_the_scan_never_writes_to_the_media_server(self):
+        """A scan reads and it looks things up. It never sets `organized`,
+        never touches tags or performers, and that is what makes it safe to
+        run repeatedly — a property easy to lose by accident later, so the
+        whole conversation with the client is asserted rather than trusted."""
+        proposals = self.scan(
+            [scene(1, self.MORNING_PATH), scene(2, self.LEDGER_PATH)],
+            ScriptedSearch(self.SCRIPT))
+
+        # The conversation first, so that when this test fails it is this
+        # assertion that speaks: a stray write shows up here by name, while a
+        # missing proposal only says something went wrong somewhere.
+        self.assertEqual(self.stash.calls,
+                         [("unorganized_scenes", (None,), {})])
+        self.assertEqual(self.ids(proposals), ["1", "2"])
+
+    def test_the_limit_is_not_spent_at_the_source(self):
+        """Fetching with the scan's own limit would limit BEFORE narrowing:
+        the batch would be the first `limit` files overall, and the muted and
+        already-proposed ones among them would eat the budget."""
+        self.store.mute(SUBJECT_TYPE, "1")
+        proposals = self.scan(
+            [scene(1, self.MORNING_PATH), scene(2, self.LEDGER_PATH)],
+            ScriptedSearch(self.SCRIPT), limit=1)
+
+        self.assertEqual(self.stash.calls,
+                         [("unorganized_scenes", (None,), {})])
+        self.assertEqual(self.ids(proposals), ["2"])
+
+    # -- narrowing before limiting, through the producer ------------------- #
+
+    def test_a_filter_plus_a_limit_spends_the_limit_on_matching_files(self):
+        """The rule the module exists for, seen from the outside: the limit
+        slices the FILTERED set. The unmatched file must not buy a lookup."""
+        search = ScriptedSearch(self.SCRIPT)
+        proposals = self.scan(
+            [scene(1, self.LEDGER_PATH), scene(2, self.MORNING_PATH),
+             scene(3, self.EVENING_PATH)],
+            search, name_filter="velvet", limit=1)
+
+        self.assertEqual(self.ids(proposals), ["2"])
+        self.assertEqual(search.queries, ["Velvet Crane"])
+
+    def test_a_muted_file_buys_no_lookup(self):
+        """The budget is lookups, and a subject the store would refuse a
+        proposal for must not spend one."""
+        self.store.mute(SUBJECT_TYPE, "1", reason="not this one")
+        search = ScriptedSearch(self.SCRIPT)
+        proposals = self.scan([scene(1, self.MORNING_PATH)], search)
+
+        self.assertEqual(proposals, [])
+        self.assertEqual(search.queries, [])
+
+    def test_an_already_proposed_file_buys_no_lookup(self):
+        self.store.record(folder=FOLDER, subject_type=SUBJECT_TYPE,
+                          subject_id="1", summary="a proposal",
+                          payload={"title": "something"}, producer="earlier")
+        search = ScriptedSearch(self.SCRIPT)
+        proposals = self.scan([scene(1, self.MORNING_PATH)], search)
+
+        self.assertEqual(proposals, [])
+        self.assertEqual(search.queries, [])
+
+    # -- what happens to the files that do not become proposals ------------ #
+
+    def test_an_unidentifiable_file_is_muted_through_the_store_with_a_reason(self):
+        """The skiplist is a mute. The two reasons stay distinct, because one
+        says the catalogue had nothing for a creator we did identify and the
+        other says the library's own layout named nobody — and only the second
+        is fixed by an alias."""
+        spy = MuteSpy(self.store)
+        proposals = self.scan(
+            [scene(1, "/library/Velvet Crane/Harbour Lights.mp4"),
+             scene(2, self.UNNAMED_PATH)],
+            ScriptedSearch({"Velvet Crane": []}), store=spy)
+
+        self.assertEqual(proposals, [])
+        self.assertEqual(sorted(spy.mutes), sorted([
+            (SUBJECT_TYPE, "1", MUTE_NO_CANDIDATES),
+            (SUBJECT_TYPE, "2", MUTE_UNRESOLVED_CREATOR),
+        ]))
+        self.assertEqual(self.store.muted_subjects(),
+                         {(SUBJECT_TYPE, "1"), (SUBJECT_TYPE, "2")})
+
+    def test_an_error_never_mutes_and_does_not_end_the_scan(self):
+        """A lookup that raised is evidence about the network, not about the
+        file. Muting on it would hide a file permanently because a socket
+        blipped once, and no later run would ever revisit it."""
+        search = ScriptedSearch({"Velvet Crane": TimeoutError("timed out"),
+                                 "Ivy Kingsley": [self.LEDGER]})
+        proposals = self.scan(
+            [scene(1, self.MORNING_PATH), scene(2, self.LEDGER_PATH)], search)
+
+        self.assertEqual(self.ids(proposals), ["2"])
+        self.assertEqual(self.store.muted_subjects(), set())
+        self.assertTrue(any("TimeoutError: timed out" in m
+                            for m in self.ctx.messages), self.ctx.messages)
+
+    def test_an_ambiguous_file_is_neither_proposed_nor_muted(self):
+        """A tie means a human should look. Muting it would silently hide a
+        file that is one glance from being resolved."""
+        dawn = candidate("Morning Ritual Dawn", "morning-ritual-dawn")
+        dusk = candidate("Morning Ritual Dusk", "morning-ritual-dusk")
+        proposals = self.scan([scene(1, self.MORNING_PATH)],
+                              ScriptedSearch({"Velvet Crane": [dawn, dusk]}))
+
+        self.assertEqual(proposals, [])
+        self.assertEqual(self.store.muted_subjects(), set())
+        self.assertTrue(any("ambiguous" in m for m in self.ctx.messages),
+                        self.ctx.messages)
+
+    def test_a_malformed_scene_costs_that_file_and_no_more(self):
+        """`examine` raises on a scene with no file rather than muting it. The
+        producer turns that into one file's error: the batch continues, and
+        the malformed record is not quietly marked never-show-me-again."""
+        search = ScriptedSearch(self.SCRIPT)
+        proposals = self.scan([scene(1), scene(2, self.LEDGER_PATH)], search)
+
+        self.assertEqual(self.ids(proposals), ["2"])
+        self.assertEqual(self.store.muted_subjects(), set())
+        self.assertTrue(any("ValueError" in m for m in self.ctx.messages),
+                        self.ctx.messages)
+
+    def test_a_malformed_alias_map_ends_the_run_before_anything_is_read(self):
+        """A duplicated alias line is a wiring mistake, wrong for every file.
+        Reported once per file it looks like N transient failures; raised once
+        it names the mistake where it was made — and costs no lookups."""
+        search = ScriptedSearch(self.SCRIPT)
+        producer = self.build([scene(1, "/library/VC/Morning Ritual.mp4")],
+                              search,
+                              aliases={"VC": "Velvet Crane",
+                                       "v c": "Ivy Kingsley"})
+
+        with self.assertRaises(ValueError):
+            next(producer.produce(self.ctx))
+
+        self.assertEqual(search.queries, [])
+        self.assertEqual(self.stash.calls, [])
+
+    # -- what the caller's knobs reach ------------------------------------- #
+
+    def test_the_threshold_reaches_the_decision(self):
+        """The same file, refused at one threshold and proposed at another, so
+        a hard-coded threshold cannot pass both halves."""
+        path = "/library/Velvet Crane/Harbour Lights.mp4"
+
+        refused = self.scan([scene(1, path)], ScriptedSearch(self.SCRIPT))
+        proposed = self.scan([scene(1, path)], ScriptedSearch(self.SCRIPT),
+                             threshold=0.1)
+
+        self.assertEqual(refused, [])
+        self.assertEqual([p["payload"]["candidate"] for p in proposed],
+                         [self.EVENING])
+
+    def test_the_aliases_reach_the_resolver(self):
+        search = ScriptedSearch(self.SCRIPT)
+        proposals = self.scan([scene(1, "/library/VC/Morning Ritual.mp4")],
+                              search, aliases={"VC": "Velvet Crane"})
+
+        self.assertEqual(search.queries, ["Velvet Crane"])
+        self.assertEqual([p["payload"]["creator"]["source"] for p in proposals],
+                         ["alias"])
+
+    def test_one_worker_is_accepted(self):
+        """The permissive side of the guard, pinned: a scan narrowed to a
+        single worker is a legitimate instruction (a fragile catalogue, a
+        rate limit), not a wiring mistake."""
+        proposals = self.scan(
+            [scene(1, self.MORNING_PATH), scene(2, self.LEDGER_PATH)],
+            ScriptedSearch(self.SCRIPT), workers=1)
+
+        self.assertEqual(self.ids(proposals), ["1", "2"])
+
+    def test_a_pool_of_no_workers_is_refused(self):
+        """It would do nothing at all, forever. Refused where the mistake was
+        made rather than on a background thread hours later."""
+        with self.assertRaises(ValueError):
+            ScanProducer(FakeStash([]), ScriptedSearch(), store=self.store,
+                         workers=0)
+
+    # -- what the log says -------------------------------------------------- #
+
+    def test_the_log_reports_the_batch_and_then_each_file_as_it_completes(self):
+        """`skipped` on the job says "your earlier decision suppressed this";
+        the scan's own log is what says how the batch was chosen, and it has
+        to be honest that muted files were dropped rather than absent."""
+        self.store.mute(SUBJECT_TYPE, "4")
+        search = ScriptedSearch(self.SCRIPT)
+        self.scan([scene(1, self.MORNING_PATH), scene(2, self.LEDGER_PATH),
+                   scene(3, self.EVENING_PATH), scene(4, self.MORNING_PATH),
+                   scene(5, self.UNNAMED_PATH)],
+                  search, name_filter="library", limit=2)
+
+        self.assertEqual(
+            self.ctx.messages[0],
+            "selected 2 of 5 files (0 already proposed, 1 muted, "
+            "1 outside the filter, 1 deferred)")
+        self.assertEqual([m.split(" ", 1)[0] for m in self.ctx.messages[1:3]],
+                         ["1/2", "2/2"])
+        self.assertEqual(self.ctx.messages[-1],
+                         "finished: 2 proposed, 0 muted, 0 refused, 0 errors")
+
+    def test_each_completed_file_is_logged_with_what_it_concluded(self):
+        self.scan([scene(9, self.LEDGER_PATH)], ScriptedSearch(self.SCRIPT))
+
+        self.assertEqual(self.ctx.messages, [
+            "selected 1 of 1 files (0 already proposed, 0 muted, "
+            "0 outside the filter, 0 deferred)",
+            "1/1 scene 9: chosen with score 1.000",
+            "finished: 1 proposed, 0 muted, 0 refused, 0 errors",
+        ])
+
+    def test_the_closing_line_counts_every_kind_of_outcome(self):
+        """Four outcomes, four counts. A summary that reported only proposals
+        cannot tell a scan that found nothing from one whose catalogue was
+        down."""
+        search = ScriptedSearch({"Velvet Crane": TimeoutError("timed out"),
+                                 "Ivy Kingsley": [],
+                                 "Ada Whitlock": [self.MORNING, self.EVENING]})
+        self.scan([scene(1, self.MORNING_PATH), scene(2, self.LEDGER_PATH),
+                   scene(3, "/library/Ada Whitlock/Harbour Lights.mp4"),
+                   scene(4, "/library/Ada Whitlock/Morning Ritual.mp4"),
+                   scene(5, "/library/Ada Whitlock/Southern Crossing.mp4")],
+                  search)
+
+        # Four different counts, on purpose: with any two of them equal, two
+        # counters swapped by an edit would report the same line.
+        self.assertEqual(self.ctx.messages[-1],
+                         "finished: 1 proposed, 1 muted, 2 refused, 1 errors")
 
 
 if __name__ == "__main__":

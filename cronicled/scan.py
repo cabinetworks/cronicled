@@ -1,10 +1,12 @@
-"""Choosing which files a library scan works on, and working one of them.
+"""Choosing which files a library scan works on, working one of them, and
+running a whole batch.
 
-Two halves, deliberately separate. `select` picks the batch: no scoring, no
+Three parts, deliberately separate. `select` picks the batch: no scoring, no
 lookups, no threading happens there. `examine` works one file: one lookup,
-one decision, and no threading either. Threading composes them and lives
-elsewhere, because a function that both decides and schedules is untestable
-in either respect.
+one decision, and no threading either. `ScanProducer` is the only part that
+schedules anything — it composes the other two across a bounded pool and
+yields proposals as they complete — so a function that decides is never also
+a function that schedules, and each is testable in its own terms.
 
 Selection is deliberately separate from the work: no scoring, no lookups, no
 threading happens here. What survives selection is a plain list of scenes and
@@ -25,6 +27,8 @@ spent on files that were never going to be proposed is a scan that appears to
 run and achieves nothing.
 """
 import posixpath
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from cronicled.artist import creator_folder, resolve
@@ -381,3 +385,245 @@ def _runners_up(candidates, matches, winning_index):
     losers.sort(key=lambda row: (-row[0], row[1]))
     return [{"candidate": c, "score": value}
             for value, _, c in losers[:MAX_RUNNERS_UP]]
+
+
+# --- Running a batch -------------------------------------------------------
+
+
+def _query_key(query):
+    """The form in which two queries are the SAME query.
+
+    Case and internal spacing only. Nothing cleverer: a key that stripped
+    punctuation or dropped words would collapse two creators who are not the
+    same person into one lookup, and the caller would never see it — every
+    file of the second creator would be attributed from the first one's
+    catalogue. Folding case and runs of whitespace is spelling; anything
+    beyond that is a guess about identity, and this cache is not the place to
+    make one.
+    """
+    return " ".join(query.split()).casefold()
+
+
+class _Flight:
+    """One query's slot in the cache: the answer, or the failure, plus the
+    event every later caller waits on until one of the two exists."""
+
+    __slots__ = ("done", "result", "error")
+
+    def __init__(self):
+        self.done = threading.Event()
+        self.result = None
+        self.error = None
+
+
+class _SingleFlight:
+    """Wraps a search so identical queries issue ONE lookup per run.
+
+    Single-flight, not a memo: a caller arriving while an identical query is
+    still in flight waits on that flight rather than starting its own. The
+    distinction is the whole point under a pool — a memo that only publishes
+    an answer once it has arrived is empty for exactly as long as the lookup
+    takes, which is precisely the window N workers resolving one creator
+    arrive in. Without this, parallelism multiplies consumption of the
+    network lookups the selection step exists to conserve.
+
+    Failures are cached too, and re-raised to every later caller. A catalogue
+    that is down is one fact about the run, not one fact per file, and
+    retrying it once per file spends the whole budget rediscovering the same
+    outage. The cost, stated: a failure that would have cleared mid-run is
+    not retried until the next run. The reverse — a dead query retried by
+    every worker — is the failure this exists to stop, and a run is the
+    natural boundary because the cache does not outlive one.
+
+    The cached exception object is re-raised as-is, so several threads may
+    hold the same instance and its traceback accumulates frames. That is
+    cosmetic; `examine` reads only the type and the message from it.
+
+    One entry per distinct creator for the life of a run. That is bounded by
+    the batch, not by the library, and each entry holds a catalogue the
+    caller was going to hold anyway.
+    """
+
+    def __init__(self, search):
+        self._search = search
+        self._lock = threading.Lock()
+        self._flights = {}
+
+    def __call__(self, query):
+        key = _query_key(query)
+        with self._lock:
+            flight = self._flights.get(key)
+            mine = flight is None
+            if mine:
+                flight = self._flights[key] = _Flight()
+        if mine:
+            try:
+                flight.result = list(self._search(query))
+            except BaseException as exc:
+                # Deliberately broader than `Exception`: whatever ends this
+                # call has to be published, or every waiter on this flight
+                # blocks on an event nothing will ever set.
+                flight.error = exc
+            finally:
+                flight.done.set()
+        else:
+            flight.done.wait()
+        if flight.error is not None:
+            raise flight.error
+        # A fresh list per caller: one file's candidates list must not be the
+        # object another file is iterating.
+        return list(flight.result)
+
+
+class ScanProducer:
+    """Reads a batch of the library, works out what each file is, and yields
+    a proposal for every file it could decide.
+
+    `produce` is a GENERATOR, and that is the design rather than a detail:
+    the runner records each proposal as it is yielded, so a scan that dies on
+    file 49 of 50 keeps the 48 it already found. The legacy tool computed
+    everything and wrote at the end, and lost all of it on the same failure.
+
+    `search` is injected. Nothing in this package executes a query — the
+    adapter layer phrases one and reads the results — so the expensive,
+    networked half is the caller's, and no test here opens a socket.
+
+    `store` is injected for two reasons and no others: `select` asks it which
+    subjects are muted or already proposed, and an unidentifiable file is
+    muted through it. It is deliberately NOT how proposals are persisted —
+    those are yielded, and the runner records them, so the dismissal and mute
+    rules that make a reviewer's past decisions stick stay in one place.
+    Hand this the same `Store` the runner holds; `Store` is
+    single-instance-per-file and will refuse a second handle on the same
+    path.
+
+    A scan NEVER writes to the media server. It reads the batch and it looks
+    things up; it does not set `organized`, does not touch tags or
+    performers, and does not write anything back. That is what makes it safe
+    to run repeatedly.
+    """
+
+    name = "library-scan"
+    # Every selected file drives a lookup against a scraper, which is the
+    # resource `COST_CLASS_LIMITS` rations to one job at a time.
+    cost = "scraping"
+
+    def __init__(self, stash, search, *, store, folder="library", limit=None,
+                 name_filter=None, threshold=0.5, aliases=None, workers=4):
+        if workers < 1:
+            # A pool of nothing would do nothing at all, forever. Refuse it
+            # where the mistake was made rather than on a background thread
+            # hours later. `select` owns the matching rule for `limit`.
+            raise ValueError(f"workers must be at least 1, got {workers!r}")
+        self._stash = stash
+        self._search = search
+        self._store = store
+        self._folder = folder
+        self._limit = limit
+        self._name_filter = name_filter
+        self._threshold = threshold
+        self._aliases = aliases
+        self._workers = workers
+
+    def produce(self, ctx):
+        """Yield one proposal per file the scan could decide.
+
+        Yielded in COMPLETION order, not input order: order carries no
+        meaning downstream (the store is keyed by fingerprint), and a slow
+        file must not hold back the proposals behind it, because a proposal
+        still queued when the run dies is a proposal lost.
+
+        Each file that is not proposed is accounted for in one of three
+        ways, and the difference between them is the reason `examine`
+        exists as its own step:
+
+        * unidentifiable — no candidates, or no creator resolved — is MUTED,
+          so it stops consuming a lookup on every future run;
+        * a refusal (a tie, or nothing over the threshold) is logged and
+          nothing else: a human should look, and muting would hide a file
+          that is one glance from being resolved;
+        * an error is logged and nothing else: that is evidence about the
+          network, not about the file.
+        """
+        # The alias map is validated once, before anything is read or looked
+        # up. A duplicated or empty alias line is a wiring mistake that is
+        # wrong for EVERY file: caught per file it would be reported N times
+        # as N files' bad luck, and the run would go on spending lookups
+        # against a map nobody can trust.
+        resolve("", "", self._aliases)
+
+        # Fetched WHOLE, deliberately: `limit` belongs to `select`, which
+        # applies it after the narrowings. Passing it here would limit at the
+        # source, so a batch of 50 would be the first 50 files overall and
+        # the muted and already-proposed ones among them would eat the
+        # budget. The accepted cost is one query for the unorganized set
+        # rather than a page of it.
+        _, scenes = self._stash.unorganized_scenes(None)
+        selected, counts = select(
+            scenes, store=self._store, folder=self._folder,
+            name_filter=self._name_filter, limit=self._limit)
+        ctx.log(
+            "selected %d of %d files (%d already proposed, %d muted, "
+            "%d outside the filter, %d deferred)" % (
+                counts.selected, counts.total, counts.already_proposed,
+                counts.muted, counts.filtered_out, counts.deferred))
+
+        search = _SingleFlight(self._search)
+        proposed = muted = refused = errors = 0
+        pool = ThreadPoolExecutor(max_workers=self._workers,
+                                  thread_name_prefix=self.name)
+        try:
+            futures = {pool.submit(self._examine, scene, search): scene
+                       for scene in selected}
+            for done, future in enumerate(as_completed(futures), start=1):
+                subject_id = str(futures[future]["id"])
+                outcome = future.result()
+                if outcome.mute_reason is not None:
+                    # Through the store, with the reason, so a later reader
+                    # learns whether the catalogue had nothing for a creator
+                    # we did identify or the layout named nobody at all —
+                    # only the second is fixed by an alias.
+                    self._store.mute(SUBJECT_TYPE, subject_id,
+                                     reason=outcome.mute_reason)
+                    muted += 1
+                elif outcome.error is not None:
+                    errors += 1
+                elif outcome.proposal is None:
+                    refused += 1
+                else:
+                    proposed += 1
+                ctx.log("%d/%d scene %s: %s" % (
+                    done, len(selected), subject_id, outcome.reason))
+                if outcome.proposal is not None:
+                    yield outcome.proposal
+        finally:
+            # `cancel_futures` matters when the consumer walks away — a
+            # closed generator, or a runner shutting down mid-batch. The
+            # default `shutdown(wait=True)` would hold the closer until
+            # every queued file had been looked up, which for a large batch
+            # means a "stop" that takes as long as finishing. Files already
+            # in flight cannot be cancelled and are left to finish; nothing
+            # reads their results.
+            pool.shutdown(wait=False, cancel_futures=True)
+        # Outside the `finally` on purpose: a run that was abandoned did not
+        # finish, and a log line claiming it did would be the only record.
+        ctx.log("finished: %d proposed, %d muted, %d refused, %d errors"
+                % (proposed, muted, refused, errors))
+
+    def _examine(self, scene, search):
+        """One file's turn, with its exceptions kept to itself.
+
+        The isolation is around `examine` as a whole, not only around the
+        lookup: a malformed scene raises there too, and one bad record must
+        not end a batch whose other files are fine. It is reported as an
+        error rather than a mute, because a mute is a verdict that the file
+        is unidentifiable and a malformed record is not evidence of that.
+        """
+        try:
+            return examine(scene, search=search, folder=self._folder,
+                           threshold=self._threshold, aliases=self._aliases)
+        except Exception as exc:
+            # Name the type as well as the message, for the same reason
+            # `examine` does: `str(exc)` alone is '' for a bare raise.
+            error = "%s: %s" % (type(exc).__name__, exc)
+            return Outcome(error=error, reason=error)
