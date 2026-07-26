@@ -69,6 +69,19 @@
 # place for library data to hide.
 !pyproject.toml
 !uv.lock
+# The documentation site's configuration, by exact filename for the same reason:
+# *.yml stays blocked. Without this the deny-by-default rule drops the site's
+# only config file, and the docs build fails on a fresh clone with nothing to
+# say why.
+!mkdocs.yml
+
+# --- The built documentation site ---------------------------------------------
+# Generated output (mkdocs writes it to site/, see mkdocs.yml's site_dir). CI
+# builds it fresh on every run and publishes from there; a committed copy would
+# be stale the moment a page changed. Ignoring it also keeps it out of the leak
+# guard's untracked-file scan, which would otherwise walk a few hundred
+# generated HTML files on every local run.
+/site/
 
 # --- Local user config (brand data, endpoints, secrets) -----------------------
 # Exclude the directory's CONTENTS, not the directory itself: a negated

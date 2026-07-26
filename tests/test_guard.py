@@ -236,6 +236,53 @@ class FileTypesOnly(unittest.TestCase):
         self.assertEqual(code, 0, out)
 
 
+class AllowedTrackedFiles(unittest.TestCase):
+    """`*.yml` is a data file type, deny-by-default, because a .yml is a
+    perfectly good place for library data to hide. A handful of specific
+    configuration files the project cannot work without are named back in
+    (ALLOWED_TRACKED_PATTERNS). Both halves are pinned here: an allow-list
+    that stops allowing wedges the build, and one that quietly widens to
+    every .yml is the guard failing open."""
+
+    def test_the_named_config_files_are_allowed(self):
+        d = _repo(None, {
+            "mkdocs.yml": "site_name: x\n",
+            "pyproject.toml": "[project]\nname = 'x'\n",
+            "uv.lock": "version = 1\n",
+            ".github/workflows/ci.yml": "name: ci\n",
+            "config/adapters.example.json": "{}\n",
+        })
+        code, out = _run(d, args=["--file-types-only"])
+        self.assertEqual(code, 0, out)
+
+    def test_any_other_yml_is_still_a_tracked_data_file(self):
+        # The widening is one filename, not the extension. A .yml that is not
+        # on the list must still fail, or the entry above has quietly turned
+        # off the rule for every YAML file in the repo.
+        d = _repo(None, {"a.md": "harmless\n"})
+        with open(os.path.join(d, "library.yml"), "w") as fh:
+            fh.write("scenes:\n  - one\n")
+        subprocess.check_call(["git", "add", "-f", "library.yml"], cwd=d)
+        subprocess.check_call(["git", "commit", "-q", "-m", "add data file"], cwd=d)
+        code, out = _run(d, args=["--file-types-only"])
+        self.assertEqual(code, 1, out)
+        self.assertIn("tracked data file: library.yml", out)
+
+    def test_the_allowance_is_anchored_to_the_repository_root(self):
+        # fnmatchcase on the full path, not on the basename: a data file
+        # parked in a subdirectory must not inherit the root allowance by
+        # borrowing its name.
+        d = _repo(None, {"a.md": "harmless\n"})
+        os.makedirs(os.path.join(d, "elsewhere"), exist_ok=True)
+        with open(os.path.join(d, "elsewhere", "mkdocs.yml"), "w") as fh:
+            fh.write("scenes:\n  - one\n")
+        subprocess.check_call(["git", "add", "-f", "elsewhere/mkdocs.yml"], cwd=d)
+        subprocess.check_call(["git", "commit", "-q", "-m", "add data file"], cwd=d)
+        code, out = _run(d, args=["--file-types-only"])
+        self.assertEqual(code, 1, out)
+        self.assertIn("tracked data file: elsewhere/mkdocs.yml", out)
+
+
 class RedactionBySource(unittest.TestCase):
     """Round 1 redacted the filename legs but left the content legs printing
     paths verbatim - and a path can coincidentally contain the pattern even
