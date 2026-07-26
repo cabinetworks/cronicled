@@ -5,9 +5,14 @@ together. It is deliberately explicit about a distinction the diagrams below
 would otherwise blur: **everything in the first three diagrams exists in the
 repository today; everything in the fourth does not.**
 
-There is no scheduler, no inbox of proposed changes, and no entry point that
-runs any of this continuously. What exists is library code, called directly —
-including by the tests, which are currently its only caller.
+There is no inbox of proposed changes, nothing that applies one, and no entry
+point that runs any of this continuously. What exists is library code, called
+directly — including by the tests, which are currently its only caller.
+
+A scheduler is part of that library code: it resolves each producer's cadence,
+decides what is due, runs it and records the run. What does not exist is a
+process that constructs one. A scheduler nobody starts is a component, not a
+service, and the fourth diagram is drawn around that distinction.
 
 ## The module map
 
@@ -43,6 +48,7 @@ flowchart TD
     subgraph recording["Recording what was found"]
         store["store<br/>proposals, dismissals, mutes"]
         jobs["jobs<br/>JobRunner, cost classes"]
+        schedule["schedule<br/>cadence, due-ness, the tick"]
     end
 
     selfcheck["selfcheck<br/>imports every module in the package;<br/>the container's default command"]
@@ -57,6 +63,8 @@ flowchart TD
     declarative --> text
     registry --> declarative
     registry --> config
+    schedule --> jobs
+    schedule --> store
     stash --> text
     jobs -. "holds a Store it is given" .-> store
 ```
@@ -201,15 +209,15 @@ is built.
 
 ```mermaid
 flowchart TD
-    entry["PLANNED: a long-running entry point<br/>nothing starts this project today"]
-    sched["PLANNED: a scheduler deciding when each producer runs"]
+    entry["PLANNED: a long-running entry point<br/>nothing constructs a scheduler today"]
+    sched["BUILT: Scheduler decides what is due,<br/>runs it, and records the run"]
     built["BUILT: JobRunner drives the producer,<br/>Store records each proposal as it is yielded"]
     inbox["PLANNED: an inbox — somewhere a person sees what was proposed"]
     gate{"PLANNED: approval<br/>no write happens without one"}
     apply["PLANNED: the caller that applies an approved proposal<br/>Stash.apply_scene and revert_scene themselves are built"]
 
     entry --> sched
-    sched -- "PLANNED: starts a job on a schedule" --> built
+    sched -- "starts a job when a producer is due" --> built
     built -- "PLANNED: something reads the store back" --> inbox
     inbox --> gate
     gate -- "approved" --> apply
@@ -217,15 +225,20 @@ flowchart TD
 
     classDef planned stroke-dasharray:6 4
     classDef built stroke-width:3px
-    class entry,sched,inbox,gate,apply planned
-    class built built
+    class entry,inbox,gate,apply planned
+    class sched,built built
 ```
 
-One node in that diagram is solid, and it is the only one that exists: the
-runner and the store. Everything reaching it, and everything leading away from
-it, is a label starting with `PLANNED:` and has no code behind it. The single
-built node is there to show where the planned parts would attach, not to
-suggest the surrounding machinery is half-finished.
+Two nodes in that diagram are solid, and they are the only ones that exist: the
+scheduler, and the runner with the store behind it. Everything reaching the
+scheduler, and everything leading away from the runner, is a label starting with
+`PLANNED:` and has no code behind it.
+
+The scheduler being solid is worth reading carefully. It decides what is due and
+starts it, and it is tested doing so — but the arrow *into* it is planned, which
+is the whole point: nothing constructs a scheduler, so nothing ever calls the
+code that would run producers unattended. The built nodes show where the planned
+parts would attach, not that the surrounding machinery is half-finished.
 
 The store already keeps the *record* an inbox would read — proposals, their
 states, dismissals and mutes — and the media-server client already knows how to

@@ -115,11 +115,22 @@ class ThePlannedServiceIsMarkedAsPlanned(unittest.TestCase):
                 "PLANNED: or BUILT:, so which is which cannot be mistaken")
 
     def test_the_diagrams_of_what_exists_claim_nothing_planned(self):
+        # A diagram is believed before a paragraph is, so a picture of the
+        # whole intended system would undo what the prose is careful about.
+        # These are the things that genuinely do not exist.
+        #
+        # "scheduler" used to be on this list and is not any more, because
+        # `cronicled/schedule.py` now exists. That move is the maintenance
+        # this test is for: a planned thing becoming built should require
+        # someone to change an assertion on purpose, rather than a diagram
+        # drifting into claiming it. Note what stayed true through that
+        # change - nothing constructs a Scheduler, so the entry point is
+        # still drawn as planned even though the scheduler beside it is not.
         built_diagrams = [f for f in _fences(INDEX) if "PLANNED" not in f]
         self.assertEqual(len(built_diagrams), 3)
         for fence in built_diagrams:
-            self.assertNotIn("scheduler", fence.lower())
             self.assertNotIn("inbox", fence.lower())
+            self.assertNotIn("approval", fence.lower())
 
 
 class TheSelfCheckTranscriptIsCurrent(unittest.TestCase):
