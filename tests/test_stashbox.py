@@ -1,3 +1,4 @@
+import re
 import unittest
 
 from cronicled.scoring import Decision, Match, decide
@@ -428,6 +429,24 @@ class RequestShape(unittest.TestCase):
 
         box.performer_catalogue("p1", per_page=2, timeout=7)
 
+        # The query constant is asserted against itself in the bodies below,
+        # so mutating it moves both sides and nothing notices. A fake
+        # transport cannot check it against a real schema either, so the
+        # properties the read depends on are pinned as properties.
+        #
+        # `title` is the one that matters, and the only one here whose loss is
+        # SILENT. Dropped, a real server returns every scene titleless, every
+        # candidate scores near zero, `contenders` is 0 and the read is
+        # complete -- absent=True for every file in the library, over a
+        # catalogue that genuinely was read in full. The others fail loudly:
+        # no `count` is a KeyError on the first page, and a wrong endpoint
+        # name is a GraphQL error.
+        self.assertIn("queryScenes(input: $input)", PERFORMER_SCENES)
+        self.assertIn("SceneQueryInput!", PERFORMER_SCENES)
+        requested = set(re.findall(r"[A-Za-z_]+", PERFORMER_SCENES))
+        for field in ("count", "id", "title"):
+            self.assertIn(field, requested,
+                          "the read depends on %s" % (field,))
         self.assertEqual([body for body, _ in t.calls], [
             {"query": PERFORMER_SCENES, "variables": {"input": {
                 "performers": {"value": ["p1"], "modifier": "INCLUDES"},
