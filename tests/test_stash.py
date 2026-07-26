@@ -1,5 +1,10 @@
+import io
 import json
+import socket
+import threading
 import unittest
+import urllib.error
+from unittest import mock
 
 from cronicled.stash import Stash, StashError
 
@@ -53,6 +58,187 @@ class Transience(unittest.TestCase):
 
     def test_a_permanent_error_is_not(self):
         self.assertFalse(StashError("bad name").transient)
+
+
+# -- error classification ------------------------------------------------- #
+#
+# `transient` is the single flag that decides whether a failed call is worth
+# retrying or whether the name it was carrying is given up on for good, so
+# every test below starts from the CONDITION (an HTTP status, a socket
+# failure, an `errors` array, the hard deadline) and asserts what the client
+# concludes from it. Constructing a StashError and reading back the flag the
+# constructor was handed pins the dataclass, not the decision — the whole
+# table could be inverted underneath such a test without a single failure.
+#
+# Both directions of a wrong call are expensive, which is why they are pinned
+# separately rather than as one "errors are classified" test:
+#
+#   permanent when it should be transient — apply_scene drops that performer
+#   or studio from the write, records it in `skipped`, marks the scene
+#   ORGANIZED and moves on. The scene now looks done, so no later pass
+#   revisits it: the metadata is silently and permanently incomplete.
+#
+#   transient when it should be permanent — a name the server will never
+#   accept is retried forever and the batch never terminates.
+
+
+def _client():
+    """A client with NO injected transport, so the call goes through the real
+    `_perform`. The classification under test lives there; an injected
+    transport would bypass the exact `except` chain these tests exist to pin."""
+    return Stash("http://example.test", "k")
+
+
+def _raising_urlopen(exc):
+    """Stand in for urllib.request.urlopen and fail the way `exc` says."""
+
+    def fake_urlopen(req, timeout=None):
+        raise exc
+
+    return fake_urlopen
+
+
+def _answering_urlopen(payload):
+    """Stand in for urlopen with a real HTTP 200 whose body is `payload`."""
+    body = json.dumps(payload).encode()
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return body
+
+    def fake_urlopen(req, timeout=None):
+        return _Resp()
+
+    return fake_urlopen
+
+
+def _http_error(code):
+    """The HTTPError urlopen raises for `code`, with a readable body (the
+    client reads the response detail into the message)."""
+    return urllib.error.HTTPError("http://example.test/graphql", code,
+                                  "reason", None, io.BytesIO(b"server said so"))
+
+
+class ErrorClassification(unittest.TestCase):
+    """One condition per test; each asserts what the client CONCLUDES."""
+
+    def _failure_from(self, urlopen):
+        """Drive a real gql() call whose urlopen behaves as given, and return
+        the StashError it produced."""
+        with mock.patch("urllib.request.urlopen", urlopen):
+            with self.assertRaises(StashError) as ctx:
+                _client().gql("query{x}")
+        return ctx.exception
+
+    def test_a_5xx_from_the_server_is_retryable(self):
+        # HARM: condemning a 5xx drops the performer/studio from the apply and
+        # marks the scene organized, so a server that was merely having a bad
+        # minute costs that scene its metadata permanently — nothing revisits
+        # a scene that already looks done.
+        for code in (500, 502, 503):
+            with self.subTest(code=code):
+                err = self._failure_from(_raising_urlopen(_http_error(code)))
+                self.assertTrue(err.transient,
+                                "HTTP %s is the server having a bad time and "
+                                "must be retryable" % code)
+
+    def test_a_4xx_from_the_server_is_permanent(self):
+        # HARM: retrying a refusal the server will repeat verbatim means the
+        # batch never terminates — the same rejected name is sent forever.
+        for code in (400, 401, 404, 422):
+            with self.subTest(code=code):
+                err = self._failure_from(_raising_urlopen(_http_error(code)))
+                self.assertFalse(err.transient,
+                                 "HTTP %s is the server refusing this request "
+                                 "and will refuse it again" % code)
+
+    def test_the_boundary_between_the_two_families_is_499_500(self):
+        # HARM: an off-by-one here silently reclassifies a whole family in one
+        # direction or the other — every 5xx condemned, or every 4xx retried
+        # forever — and nothing else in the suite would notice.
+        permanent = self._failure_from(_raising_urlopen(_http_error(499)))
+        retryable = self._failure_from(_raising_urlopen(_http_error(500)))
+        self.assertFalse(permanent.transient, "499 is still a client-side refusal")
+        self.assertTrue(retryable.transient, "500 is the first server-side fault")
+
+    def test_an_unreachable_host_is_retryable(self):
+        # HARM: a host that is down or a name that will not resolve says
+        # nothing whatsoever about the performer's name — condemning it loses
+        # metadata for a reason that has already fixed itself by next run.
+        err = self._failure_from(_raising_urlopen(
+            urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))))
+        self.assertTrue(err.transient, "an unreachable host is worth retrying")
+
+    def test_a_timed_out_socket_is_retryable(self):
+        # HARM: a timeout is the definition of "unknown outcome" — the server
+        # may not even have seen the request. Treating it as a refusal
+        # condemns a name nobody ever rejected.
+        # socket.timeout is an alias of the builtin TimeoutError on every
+        # Python this project runs on; both spellings are driven anyway so the
+        # day that stops being true the test still covers what it claims to.
+        for label, exc in (("socket.timeout", socket.timeout("timed out")),
+                           ("TimeoutError", TimeoutError("timed out"))):
+            with self.subTest(raised=label):
+                err = self._failure_from(_raising_urlopen(exc))
+                self.assertTrue(err.transient, "a timeout is worth retrying")
+
+    def test_a_dropped_connection_is_retryable(self):
+        # HARM: a reset connection is transport trouble, not a verdict on the
+        # request. It is also not a URLError, so it reaches the client as a
+        # bare OSError — one that must still arrive as a retryable StashError
+        # rather than escaping the StashError contract entirely.
+        err = self._failure_from(_raising_urlopen(
+            ConnectionResetError(104, "Connection reset by peer")))
+        self.assertTrue(err.transient, "a dropped connection is worth retrying")
+
+    def test_a_200_carrying_a_graphql_errors_array_is_permanent(self):
+        # HARM: the server answered, understood, and said no — this is the
+        # rejection that must NOT be retried ("name 'X' is used as alias
+        # for..."), or the batch spins on it forever.
+        err = self._failure_from(_answering_urlopen(
+            {"errors": [{"message": "name 'Strapon' is used as alias for 'Strap-on'"}]}))
+        self.assertFalse(err.transient,
+                         "a GraphQL errors array is the server rejecting this "
+                         "input, not a blip")
+        self.assertIn("Strapon", str(err))  # the server's own reason survives
+
+    def test_an_unrecognised_failure_is_assumed_retryable(self):
+        # HARM: a failure the client has no rule for is exactly the case where
+        # it does not know the name was refused. Assuming permanent there
+        # discards metadata on the strength of a guess; assuming retryable
+        # costs at worst a repeat.
+        err = self._failure_from(_raising_urlopen(ValueError("something new")))
+        self.assertTrue(err.transient,
+                        "an unknown failure must not condemn the input")
+
+    def test_the_hard_deadline_is_retryable(self):
+        # HARM: the deadline fires on a wedged host, which is the most
+        # transient condition there is. Condemning on it would mean a single
+        # wedged moment silently strips names off every scene in the batch.
+        release = threading.Event()
+
+        def wedged_transport(body, timeout):
+            release.wait(30)  # never released before the deadline is asserted
+            return {"data": {}}
+
+        stash = Stash("http://example.test", "k", transport=wedged_transport)
+        try:
+            # slack of 0 with timeout 0 makes the deadline fire immediately —
+            # the condition is the deadline expiring, not how long it took
+            with mock.patch("cronicled.stash.HARD_DEADLINE_SLACK", 0):
+                with self.assertRaises(StashError) as ctx:
+                    stash.gql("query{x}", timeout=0)
+            self.assertIn("deadline", str(ctx.exception))  # the right raise fired
+            self.assertTrue(ctx.exception.transient,
+                            "an abandoned request is worth retrying")
+        finally:
+            release.set()
 
 
 class _SceneTransport:
