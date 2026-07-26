@@ -134,6 +134,61 @@ class ThePlannedServiceIsMarkedAsPlanned(unittest.TestCase):
             self.assertNotIn("approval", fence.lower())
 
 
+class NothingStartsThisProjectYet(unittest.TestCase):
+    """The README's central claim, and the one most likely to go stale next.
+
+    "The scheduler knows what is due and can run it; nothing constructs a
+    scheduler" is the sentence the whole Status section turns on, and the
+    fourth diagram draws the entry point as PLANNED on the strength of it.
+    Both go quietly wrong the day someone adds a `__main__` or a console
+    script, which is exactly the next thing anyone would build.
+
+    The honesty test above covers the inbox and the approval gate. This is
+    its counterpart for the entry point: a claim about absence, which no
+    diagram assertion can make, because there is no node to inspect.
+    """
+
+    def test_no_module_in_the_package_constructs_a_scheduler(self):
+        offenders = []
+        for root, _dirs, names in os.walk("cronicled"):
+            if "__pycache__" in root:
+                continue
+            for name in sorted(names):
+                if not name.endswith(".py"):
+                    continue
+                path = os.path.join(root, name)
+                if "Scheduler(" in _read(path):
+                    offenders.append(path)
+        self.assertEqual(
+            offenders, [],
+            "%s constructs a Scheduler. If this project now starts itself, "
+            "the README's 'nothing constructs a scheduler' and the fourth "
+            "diagram's PLANNED entry point are both wrong and need changing "
+            "with it." % ", ".join(offenders))
+
+    def test_the_package_declares_no_entry_point(self):
+        # A console script or a __main__ would make `cronicled` runnable
+        # without anything importing it, which is the other way the claim
+        # stops being true.
+        self.assertNotIn(
+            "[project.scripts]", _read("pyproject.toml"),
+            "pyproject declares a console script, so something does start "
+            "this project - the README says nothing does")
+        self.assertFalse(
+            os.path.exists(os.path.join("cronicled", "__main__.py")),
+            "cronicled/__main__.py exists, so `python -m cronicled` starts "
+            "something - the README says nothing does")
+
+    def test_the_readme_still_makes_that_claim(self):
+        # If the claim is ever removed, the two tests above become guards
+        # over a promise nobody is making. Better to fail and be deleted
+        # together than to sit passing vacuously.
+        # Collapsed, because the sentence wraps and a line break in the
+        # middle of it must not be what decides whether this passes.
+        prose = " ".join(_read(README).split())
+        self.assertIn("nothing constructs a scheduler", prose)
+
+
 class TheSelfCheckTranscriptIsCurrent(unittest.TestCase):
     """The README quoted `12 modules imported` while the program printed 16.
 
@@ -240,12 +295,29 @@ class TheDeployGoesOnlyToTheDefaultBranch(unittest.TestCase):
             "the site and `id-token` for the OIDC exchange. Anything else "
             "here is scope this job does not use")
 
-    def test_no_cloudflare_credential_survives_anywhere(self):
+    def test_no_trace_of_the_previous_host_survives_anywhere(self):
         # The switch is only finished when nothing still reaches for the old
-        # secrets. A leftover reference reads as configuration the repository
-        # is missing, rather than one it deliberately dropped.
-        self.assertNotIn("CLOUDFLARE", self.ci)
-        self.assertNotIn("wrangler", self.ci.lower())
+        # provider - not just its secrets. A leftover mention reads as
+        # configuration the repository is missing rather than one it
+        # deliberately dropped, and the worst case is a reader following stale
+        # prose into setting up the build-from-a-branch integration that very
+        # prose argues against, which is the un-guarded publish path.
+        #
+        # An earlier version of this test read only ci.yml, and only for the
+        # uppercase secret name. It passed with four live mentions of the
+        # provider in that same file and three more on a published docs page.
+        # The name promised "no leftover reference" and the assertion checked
+        # for a secret - so it is swept case-insensitively, across every
+        # document as well as the workflow.
+        stale = ("cloudflare", "wrangler", "pages.dev")
+        for path in _doc_paths() + [CI_YML]:
+            haystack = _read(path).lower()
+            for needle in stale:
+                self.assertNotIn(
+                    needle, haystack,
+                    "%s still mentions %r. The site is published by GitHub "
+                    "Pages now; a stale reference sends a reader looking for "
+                    "configuration that does not exist." % (path, needle))
 
 if __name__ == "__main__":
     unittest.main()

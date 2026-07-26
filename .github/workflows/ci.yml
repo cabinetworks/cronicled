@@ -101,25 +101,20 @@ jobs:
           path: site/
           retention-days: 1
 
-  # Publish what the `docs` job built. Deliberately NOT a Cloudflare Pages Git
-  # integration: that would build on Cloudflare's side, outside this workflow,
-  # and publish without ./scripts/check_leaks ever running against the commit
-  # that produced the pages. Everything that reaches the open internet goes
-  # through the guard first, which is why this job needs it explicitly as well
-  # as through `docs`.
   # Publish what the `docs` job built, to GitHub Pages.
   #
   # Deliberately NOT a Pages "build from a branch" setting: that would run
-  # Jekyll on Cloudflare's or GitHub's side, outside this workflow, and
+  # Jekyll on GitHub's side, outside this workflow, and
   # publish without ./scripts/check_leaks ever running against the commit
   # that produced the pages. Everything that reaches the open internet goes
   # through the guard first, which is why this needs it explicitly as well as
   # through `docs`.
   #
   # No secret is involved. Pages authenticates with the workflow's own OIDC
-  # token, which is why this cannot be skipped for want of configuration the
-  # way the previous Cloudflare deploy could - and why a fork PR is handled by
-  # not running the job at all rather than by explaining an absent secret.
+  # token, so there is nothing here that can be absent: a deploy needing a
+  # repository secret has to decide what to do when it is missing, and this
+  # one has no such state. That is also why a fork pull request is handled by
+  # not matching the gate at all, rather than by explaining an absent secret.
   #
   # There are no preview deploys, because GitHub Pages has exactly one site
   # per repository and no concept of one. A pull request still BUILDS the site

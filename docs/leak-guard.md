@@ -36,13 +36,18 @@ ln -sf ../../scripts/hooks/commit-msg .git/hooks/commit-msg
 
 This site is the first thing the project pushes to the open internet, so it is
 built and deployed by the same workflow that runs the guard: both site jobs
-take `needs: guard`, and nothing reaches Cloudflare unless the guard passed
-first.
+take `needs: guard`, and nothing is published unless the guard passed first.
 
-A Cloudflare Pages Git integration would be the easier setup and is
-deliberately not used. It builds on Cloudflare's side, outside this workflow,
-and would publish pages without `scripts/check_leaks` ever running against the
-commit that produced them.
+Letting the platform build the site from a branch would be the easier setup and
+is deliberately not used. It builds outside this workflow, and would publish
+pages without `scripts/check_leaks` ever running against the commit that
+produced them.
+
+The deploy needs no credential of its own — it authenticates with the
+workflow's own token — so there is no secret to add and none to leak. It runs
+only on a push to the default branch, which is also why a pull request gets no
+preview: there is one site, and a pull request must not be able to overwrite
+it.
 
 The guard is a backstop, not a filter. It knows only the patterns it is
 configured with, so it catches a known string that slipped through — it cannot
