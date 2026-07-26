@@ -1,5 +1,6 @@
 import io
 import json
+import re
 import threading
 import unittest
 import urllib.error
@@ -86,10 +87,15 @@ class _SceneTransport:
         self.found = found or {}
         self.create = create or {}
         self.scene_update_input = None
+        # the variables of every findScene read, in order: the apply's merge
+        # and its undo snapshot both come from that read, so WHICH scene it
+        # asked about is part of what a test needs to be able to see
+        self.scene_read_variables = []
 
     def __call__(self, body, timeout):
         q = body["query"]
         if "findScene(" in q:
+            self.scene_read_variables.append(body["variables"])
             return {"data": {"findScene": self.existing}}
         for kind, (fn, field, alias_field) in self._FIND.items():
             if fn + "(" in q:
@@ -603,14 +609,27 @@ class _ReadTransport:
     filter is visible in the results, the scenes have already been written to.
 
     `tag_pages` is a list of findTags result pages, served by the requested
-    page number, so paging can be observed rather than assumed.
+    page number, so paging can be observed rather than assumed. By default the
+    reported `count` is the true total across those pages; `tag_count`
+    overrides it, which is how a fixture makes the two arms of all_tags' stop
+    condition DISAGREE (a real server's count can over-report — rows deleted
+    between pages, a count computed before a filter). While they agree, either
+    arm alone ends the read and neither is really pinned.
+
+    Past the last page it serves empty pages, and refuses after
+    `max_tag_pages` requests: a client that never stops would otherwise walk
+    empty pages forever, and a test that hangs is not a test that fails.
     """
 
-    def __init__(self, scenes=None, count=None, tag_pages=None):
+    def __init__(self, scenes=None, count=None, tag_pages=None, tag_count=None,
+                 max_tag_pages=6):
         self.calls = []  # (query, variables) for every request sent, in order
         self.scenes = [] if scenes is None else scenes
         self.count = len(self.scenes) if count is None else count
         self.tag_pages = [[]] if tag_pages is None else tag_pages
+        self.tag_count = tag_count
+        self.max_tag_pages = max_tag_pages
+        self.tag_requests = 0
 
     def __call__(self, body, timeout):
         q, variables = body["query"], body["variables"]
@@ -619,10 +638,17 @@ class _ReadTransport:
             return {"data": {"findScenes": {"count": self.count,
                                             "scenes": self.scenes}}}
         if "findTags(" in q:
+            self.tag_requests += 1
+            if self.tag_requests > self.max_tag_pages:
+                raise AssertionError(
+                    "the client is still asking for tag pages after %d requests "
+                    "— it never stopped" % self.max_tag_pages)
             page = (variables.get("f") or {}).get("page", 1)
             rows = self.tag_pages[page - 1] if page <= len(self.tag_pages) else []
             total = sum(len(p) for p in self.tag_pages)
-            return {"data": {"findTags": {"count": total, "tags": rows}}}
+            return {"data": {"findTags": {
+                "count": total if self.tag_count is None else self.tag_count,
+                "tags": rows}}}
         raise AssertionError("test transport does not recognize query: %s" % q)
 
     def only(self):
@@ -672,6 +698,16 @@ class FindScenes(unittest.TestCase):
         # HARM: per_page -1 is the server's "all of them"; any positive number
         # silently truncates the worklist, so a full-library scan quietly
         # covers only the first slice and the rest is reported as done.
+        #
+        # PINS CURRENT BEHAVIOUR, and the behaviour carries a known risk:
+        # _find_scenes does NOT page. It sends ONE request with per_page -1 and
+        # trusts the server to return everything, where all_tags() loops until
+        # a page comes back short. If a server (or a proxy in front of it) caps
+        # -1 at some maximum, this read is silently truncated and nothing in
+        # the client can tell — unlike all_tags, which would at least keep
+        # asking. A "full library" scan would then cover only the cap and
+        # report itself complete. Flagged, not fixed: changing the read is a
+        # behaviour change and this ticket only pins what is here today.
         t = _ReadTransport(scenes=SCENE_ROWS)
         _read_stash(t)._find_scenes({"organized": False}, None)
         self.assertEqual(t.find_filter(),
@@ -773,6 +809,17 @@ class TagIdByName(unittest.TestCase):
         # string where the scene filter expects an id, and the cohort read
         # comes back empty — a scan that reports "nothing to do" rather than
         # failing. Picking a later row picks a different tag.
+        #
+        # PINS CURRENT BEHAVIOUR, and the behaviour carries a known risk: the
+        # lookup asks for per_page 5 and then reads row 0 only, discarding the
+        # other four without looking at them. With an EQUALS filter a second
+        # row should not exist, so today the extra four are merely fetched and
+        # thrown away — but if the server ever returns more than one row for an
+        # exact name (case-differing duplicates, an alias hit), "first row
+        # wins" silently picks one of them by search rank and the whole cohort
+        # scan runs against whichever that was, with nothing logged. Flagged,
+        # not fixed: the fixture below deliberately supplies a second row, and
+        # the test pins that the FIRST is taken.
         t = _ReadTransport(tag_pages=[[
             {"id": COHORT_TAG_ID, "name": COHORT_TAG_NAME, "scene_count": 2},
             {"id": "tag-other", "name": "Lantern Drift II", "scene_count": 9}]])
@@ -816,9 +863,50 @@ class AllTags(unittest.TestCase):
     def test_a_short_first_page_ends_the_read(self):
         # HARM: the other half of the paging contract. Not stopping means an
         # endless walk of empty pages against a live server.
+        #
+        # NOTE: the stop condition has TWO arms (a short page, or the running
+        # total reaching the server's `count`), and this fixture makes them
+        # agree — 4 rows out of a reported 4 — so it does not distinguish
+        # them: either arm alone passes this test. The two tests below drive
+        # the arms apart so each is pinned on its own.
         t = _ReadTransport(tag_pages=[_tag_rows(4, "alpha")])
         got = _read_stash(t).all_tags()
         self.assertEqual(len(got), 4)
+        self.assertEqual(len(t.calls), 1)
+
+    def test_a_short_page_ends_the_read_even_when_the_count_over_reports(self):
+        # HARM: pins the short-page arm ALONE, by making the count arm unable
+        # to fire — the server claims far more tags than it hands back. A count
+        # can over-report on a real server (rows deleted between pages, a total
+        # computed before a filter), and then the short page is the only thing
+        # that ends the walk: without that arm the client asks for page after
+        # empty page forever, against a live server, and all_tags never
+        # returns — the consolidation run hangs rather than failing.
+        #
+        # Driven at a plainly-short page AND at the boundary one (exactly one
+        # row less than the page size), because "short" means short OF THE
+        # REQUESTED PAGE SIZE: an arm testing some other threshold would still
+        # end a 4-row read, and only the boundary case notices.
+        for short in (4, TAG_PAGE_SIZE - 1):
+            with self.subTest(rows=short):
+                t = _ReadTransport(tag_pages=[_tag_rows(short, "alpha")],
+                                   tag_count=TAG_PAGE_SIZE * 3)
+                got = _read_stash(t).all_tags()
+                self.assertEqual(len(got), short)
+                self.assertEqual(len(t.calls), 1)
+
+    def test_a_full_page_that_completes_the_count_ends_the_read(self):
+        # HARM: pins the count arm ALONE, by making the short-page arm unable
+        # to fire — exactly 500 rows, which is indistinguishable from "there
+        # is more" by length. `count` is what stops it, and without that arm
+        # every read spends an extra round trip past the end of the tag list;
+        # against a server that answers an over-run page by repeating the last
+        # one (rather than returning nothing), the walk never terminates and
+        # the returned list grows duplicates of tags the merge planner would
+        # then plan merges between.
+        t = _ReadTransport(tag_pages=[_tag_rows(TAG_PAGE_SIZE, "alpha")])
+        got = _read_stash(t).all_tags()
+        self.assertEqual(len(got), TAG_PAGE_SIZE)
         self.assertEqual(len(t.calls), 1)
 
 
@@ -1291,11 +1379,31 @@ def _resolve_stash(transport):
 
 class FindOrCreate(unittest.TestCase):
     def test_a_stored_id_is_returned_without_searching_at_all(self):
-        # HARM: the stored id came from the match itself — it is the entity the
-        # scrape actually identified. Searching anyway lets a fuzzy name match
-        # override it, attaching a different (or newly created) performer to
-        # every scene the match is applied to. Asserted as "no request was
-        # sent", because a search that happens is a search whose result can win.
+        # PINS CURRENT BEHAVIOUR — and the behaviour is a FLAGGED RISK, not a
+        # rule this test endorses. A `stored_id` is returned as-is: no
+        # existence check, no name cross-check, no fallback to a search if it
+        # is stale or was never an id on this server. Entity ids here are
+        # explicitly installation-specific (see tag_id_by_name's docstring), so
+        # the moment an adapter populates stored_id from anything remote — a
+        # StashBox id, a cached id from another install, a stale export — every
+        # scene that match touches gets a WRONG performer/studio/tag attached,
+        # silently, with no error and no search that could have caught it. The
+        # write is a union, so the wrong entity is added rather than replacing
+        # anything, and only the undo snapshot's performer_ids/tag_ids records
+        # that it happened.
+        #
+        # Nothing in this repo sets stored_id today (it appears only inside
+        # stash.py), so the hazard is latent, not live — which is why it is
+        # pinned rather than changed by this tests-only ticket. If a caller
+        # ever starts supplying it, this test is the one to revisit FIRST:
+        # verifying the id would break it, and that break is the intended
+        # signal, not a regression.
+        #
+        # What the current shortcut buys, and why it is not simply wrong: the
+        # stored id names the entity the scrape actually identified, so
+        # searching by name instead would let a fuzzy match override it.
+        # Asserted as "no request was sent", because a search that happens is a
+        # search whose result can win.
         t = _ResolveTransport("performer", results={
             "Velvet Crane": [[{"id": "performer-other", "name": "Velvet Crane"}]]})
         got = _resolve_stash(t).find_or_create("performer", "Velvet Crane",
@@ -1629,3 +1737,334 @@ class ApplyWriteShape(unittest.TestCase):
         stash = Stash("http://example.test", "k", transport=server.transport)
         stash.apply_scene("sc-9", RICH_MATCH, overwrite_studio=True)
         self.assertEqual(server.writes, 1)
+
+
+# -- the write shape, across EVERY match shape ----------------------------- #
+
+# The whole-key-set assertion above is the right assertion — it fails on an
+# added key and on a removed one alike — but it only ever evaluates two match
+# shapes: the full SHAPE_MATCH and {}. A rule about what an apply may write is
+# a rule about ALL match shapes, and a write gated on a key neither of those
+# two carries slips straight past it. This costs nothing on either shape:
+#
+#     if match.get("rating"):
+#         inp["rating100"] = match["rating"]
+#
+# ...and blanks or overwrites rating100 on every scene an adapter that does
+# carry `rating` touches — a field that is not in the undo snapshot's writable
+# set, so the damage is not even reversible. `rating`, `code`, `director` and
+# `studio_code` are all things a scraper plausibly hands back. One shape cannot
+# pin a rule about all shapes, so the sweep below drives the same assertion
+# over many, including a match carrying every plausible adapter key at once and
+# each of those keys on its own.
+#
+# Every value here is invented; none of these keys is read by apply_scene
+# today, which is exactly the property being pinned.
+ADAPTER_NOISE = {
+    "rating": 100,
+    "rating100": 100,
+    "code": "HRB-014",
+    "director": "Wren Ashby",
+    "studio_code": "HRB",
+    "organized": False,
+    "id": "sc-somewhere-else",
+    "cover_image": "data:image/jpeg;base64,aW52ZW50ZWQtd3Jvbmc=",
+    "o_counter": 3,
+    "play_count": 9,
+    "phash": "invented-phash-0000",
+    "duration": 1234,
+    "index": 2,
+    "endpoint": "http://scene-source.invalid",
+    "stash_id": "invented-scene-id",
+    "source": "invented-adapter",
+    "score": 0.97,
+    "aliases": ["Harbour Fog (2021)"],
+    "movies": [{"movie_id": "movie-1"}],
+    "groups": [{"group_id": "group-1"}],
+    "galleries": [{"id": "gallery-1"}],
+    "files": [{"basename": "harbour-fog.mp4"}],
+    "path": "/m/harbour-fog.mp4",
+    "director_url": "http://scene-source.invalid/wren-ashby",
+}
+
+# Every sceneUpdate carries these two whatever the match holds: the scene it is
+# about, and the flag that takes it out of the unorganized worklist.
+BASE_WRITE_KEYS = {"id", "organized"}
+
+# A match whose every field is present but empty. Nothing may be written from
+# one: a match that knows nothing must not erase anything.
+EMPTY_VALUED_MATCH = {"title": "", "details": None, "date": "", "urls": [],
+                      "url": "", "stash_ids": [], "image": None, "studio": {},
+                      "performers": [], "tags": []}
+
+
+def _shape_sweep():
+    """(label, match, the EXACT key set its sceneUpdate may hold).
+
+    Exact rather than "a subset of SHAPE_KEYS", so each case fails on a
+    dropped key as well as an added one — the same both-directions property
+    the single-shape assertion has, now held across the range of shapes an
+    adapter can actually produce.
+    """
+    m = SHAPE_MATCH
+    cases = [
+        ("everything", dict(m), SHAPE_KEYS),
+        ("nothing", {}, BASE_WRITE_KEYS),
+        ("every field present but empty", dict(EMPTY_VALUED_MATCH), BASE_WRITE_KEYS),
+        ("title only", {"title": m["title"]}, BASE_WRITE_KEYS | {"title"}),
+        ("details only", {"details": m["details"]}, BASE_WRITE_KEYS | {"details"}),
+        ("date only", {"date": m["date"]}, BASE_WRITE_KEYS | {"date"}),
+        ("urls only", {"urls": m["urls"]}, BASE_WRITE_KEYS | {"urls"}),
+        ("singular url only", {"url": m["urls"][0]}, BASE_WRITE_KEYS | {"urls"}),
+        ("stash_ids only", {"stash_ids": m["stash_ids"]},
+         BASE_WRITE_KEYS | {"stash_ids"}),
+        ("image only", {"image": m["image"]}, BASE_WRITE_KEYS | {"cover_image"}),
+        ("studio only", {"studio": m["studio"]}, BASE_WRITE_KEYS | {"studio_id"}),
+        ("performers only", {"performers": m["performers"]},
+         BASE_WRITE_KEYS | {"performer_ids"}),
+        ("tags only", {"tags": m["tags"]}, BASE_WRITE_KEYS | {"tag_ids"}),
+        ("every plausible adapter key and nothing else",
+         dict(ADAPTER_NOISE), BASE_WRITE_KEYS),
+        ("everything plus every plausible adapter key",
+         dict(ADAPTER_NOISE, **m), SHAPE_KEYS),
+    ]
+    # each adapter key on its own: a write gated on one key is not visible in
+    # the combined shape above if some earlier key already added its own
+    cases += [("only the adapter key %r" % k, {k: v}, BASE_WRITE_KEYS)
+              for k, v in sorted(ADAPTER_NOISE.items())]
+    return cases
+
+
+class ApplyWriteShapeOverEveryMatchShape(unittest.TestCase):
+    def test_no_match_shape_can_put_an_unlisted_key_in_the_update_input(self):
+        # HARM: verbatim the harm this module's key-set assertion was written
+        # for — a field written that nothing asked for, replacing whatever the
+        # user had on every scene a bulk run touches — reached through the one
+        # door a single-shape assertion leaves open: a match key no fixture
+        # happens to carry.
+        for label, match, expected in _shape_sweep():
+            with self.subTest(match=label):
+                t = _shape_transport()
+                _shape_stash(t).apply_scene("sc-9", match)
+                self.assertEqual(set(t.scene_update_input), expected)
+                self.assertLessEqual(set(t.scene_update_input), SHAPE_KEYS)
+
+    def test_the_sweep_reaches_every_key_this_module_is_allowed_to_write(self):
+        # HARM: the sweep is only as good as its coverage. If SHAPE_KEYS ever
+        # grows a key no shape above produces, that key is listed as allowed
+        # but never actually exercised — the sweep would keep passing while
+        # saying nothing about it. This fails when that happens.
+        seen = set()
+        for label, match, _ in _shape_sweep():
+            t = _shape_transport()
+            _shape_stash(t).apply_scene("sc-9", match)
+            seen |= set(t.scene_update_input)
+        self.assertEqual(seen, SHAPE_KEYS)
+
+
+# -- the read that makes the merge and the undo possible ------------------- #
+
+# Every scene fake above answers a findScene by keying on the string
+# "findScene(" and handing back its canned row whole, so what the query
+# actually SELECTED is invisible to them: drop `urls` from the selection set
+# and the fake still returns urls. That blind spot is one layer above the write
+# assertions — apply_scene's union and its entire `prior` snapshot are built
+# out of this read, so a field the client stops asking for reads back as
+# None/[] and the snapshot records THAT as the scene's real state. revert_scene
+# then writes the empty value back, wiping the field it existed to restore.
+# The helpers below read the selection set out of the query text so it can be
+# asserted on directly, and answer by it so the harm is reproducible.
+
+
+def _selection_block(query, field):
+    """The text between `field`'s selection braces, braces balanced."""
+    start = query.index("{", query.index(field))
+    depth = 0
+    for i in range(start, len(query)):
+        if query[i] == "{":
+            depth += 1
+        elif query[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return query[start + 1:i]
+    raise AssertionError("unbalanced selection set for %r in: %s" % (field, query))
+
+
+def _selection_of(query, field):
+    """What `field`'s selection set asks for: {name: None} for a scalar,
+    {name: [nested names]} for a block. One level of nesting is enough — that
+    is all this client's scene read uses."""
+    fields, depth, last, owner = {}, 0, None, None
+    for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*|[{}]",
+                            _selection_block(query, field)):
+        if token == "{":
+            depth += 1
+            if depth == 1:
+                owner = last
+                fields[owner] = []
+        elif token == "}":
+            depth -= 1
+            if depth == 0:
+                owner = None
+        elif depth == 0:
+            fields.setdefault(token, None)
+            last = token
+        elif depth == 1 and owner is not None:
+            fields[owner].append(token)
+    return fields
+
+
+def _project(row, selection):
+    """`row` reduced to exactly what `selection` asked for — what a real
+    GraphQL server returns, and what none of the other fakes here do."""
+    out = {}
+    for field, nested in selection.items():
+        if field not in row:
+            raise AssertionError("the scene read selected %r, which this fake "
+                                 "scene does not have" % field)
+        value = row[field]
+        if nested is None:
+            out[field] = value
+        elif isinstance(value, list):
+            out[field] = [{k: r.get(k) for k in nested} for r in value]
+        elif value is None:
+            out[field] = None
+        else:
+            out[field] = {k: value.get(k) for k in nested}
+    return out
+
+
+class _SelectiveScene(_MutableScene):
+    """_MutableScene, except its findScene answers with ONLY the fields the
+    query actually selected. That one difference is what makes the selection
+    set testable: against this server, a field the client stops asking for is
+    a field it stops getting, exactly as on a real one."""
+
+    def __init__(self, **fields):
+        _MutableScene.__init__(self, **fields)
+        self.scene_read_variables = []
+
+    def _handle(self, body, timeout):
+        if "findScene(" in body["query"]:
+            self.scene_read_variables.append(body["variables"])
+            return {"data": {"findScene": _project(
+                self._read_scene(), _selection_of(body["query"], "findScene"))}}
+        return _MutableScene._handle(self, body, timeout)
+
+
+# Exactly what scene_existing must select. `studio`/`performers`/`tags` feed
+# apply_scene's union (keep what the scene already has, add what was
+# resolved); the rest are copied into the `prior` snapshot verbatim and are
+# the whole of what an undo has to replay.
+SCENE_READ_FIELDS = {"id", "title", "details", "date", "urls", "organized",
+                     "rating100", "code", "director", "stash_ids",
+                     "studio", "performers", "tags"}
+
+
+def _read_one_scene(scene_id="sc-42"):
+    """Run scene_existing and hand back the request it sent."""
+    t = _transport([{"data": {"findScene": {"id": scene_id}}}])
+    _read_stash(t).scene_existing(scene_id)
+    body, _ = t.calls[0]
+    return body
+
+
+class SceneReadTarget(unittest.TestCase):
+    def test_the_read_asks_about_the_scene_it_was_given(self):
+        # HARM: reading a DIFFERENT scene than the one being written is
+        # invisible to every assertion about the write — the update still goes
+        # to the right scene, carrying the wrong scene's performers and tags
+        # unioned in, and a `prior` snapshot describing a scene that was never
+        # written. The undo then restores one scene's metadata onto another.
+        # Two ids, because one fixture cannot tell "sends the id it was given"
+        # apart from "always sends sc-42".
+        for scene_id in ("sc-42", "sc-7"):
+            with self.subTest(scene_id=scene_id):
+                body = _read_one_scene(scene_id)
+                self.assertEqual(body["variables"], {"id": scene_id})
+
+    def test_the_id_travels_as_a_variable_not_baked_into_the_query(self):
+        # HARM: an id interpolated into the query text instead of bound as a
+        # variable is both unescaped and unpinnable — the assertion above
+        # would pass while the server was sent something else entirely.
+        body = _read_one_scene("sc-42")
+        self.assertIn("$id", body["query"])
+        self.assertNotIn("sc-42", body["query"])
+
+    def test_the_apply_reads_the_scene_it_is_about_to_write(self):
+        # HARM: the same wrong-scene harm, reached through the caller that
+        # matters. The read and the write must name the same scene: this is
+        # the seam where the merge's "existing" ids and the undo snapshot come
+        # from, and nothing downstream can tell they came from elsewhere.
+        t = _shape_transport()
+        _shape_stash(t).apply_scene("sc-9", SHAPE_MATCH)
+        self.assertEqual(t.scene_read_variables, [{"id": "sc-9"}])
+        self.assertEqual(t.scene_update_input["id"], "sc-9")
+
+
+class SceneReadSelection(unittest.TestCase):
+    def test_the_selection_set_is_exactly_the_fields_the_snapshot_needs(self):
+        # HARM: this selection set is the sole source of both the apply's
+        # union and the undo snapshot. Dropping `urls` makes prior["urls"]
+        # always [], and revert_scene writes that back — the scene's links,
+        # gone. Dropping `stash_ids` loses the canonical external id the same
+        # way. Asserted as the whole set, so a field going missing fails here
+        # rather than several layers downstream, and every field is named once
+        # in a place that says why it is needed.
+        selection = _selection_of(_read_one_scene()["query"], "findScene")
+        self.assertEqual(set(selection), SCENE_READ_FIELDS)
+
+    def test_the_nested_selections_carry_the_ids_the_merge_needs(self):
+        # HARM: studio/performers/tags come back as objects, and it is their
+        # `id` the apply unions and the snapshot stores. A block that selects
+        # only `name` reads back ids of None, so the merge appends nothing
+        # sensible and the undo has nothing to restore.
+        selection = _selection_of(_read_one_scene()["query"], "findScene")
+        for block in ("studio", "performers", "tags"):
+            with self.subTest(block=block):
+                self.assertEqual(selection[block], ["id", "name"])
+
+    def test_the_snapshot_holds_what_the_read_selected_and_nothing_more(self):
+        # HARM: the same rule again, proved end to end instead of by reading
+        # the query — against a server that answers ONLY what was selected,
+        # every field the read stops asking for turns up in the snapshot as
+        # None or [], claiming the scene had nothing there. Compared whole:
+        # `prior` and this fake's state are deliberately the same shape.
+        server = _SelectiveScene(**RICH_STATE)
+        before = server.snapshot()
+        stash = Stash("http://example.test", "k", transport=server.transport)
+        prior = stash.apply_scene("s1", {})["prior"]
+        self.assertEqual(prior, before)
+
+    def test_the_round_trip_holds_only_while_the_read_selects_everything(self):
+        # HARM: the full chain, against a server that honours the selection
+        # set — apply, then undo, and the scene must come back exactly as it
+        # was. A field missing from the read is snapshotted as empty and
+        # WRITTEN BACK empty by the revert, which is how a dropped `urls`
+        # turns into wiped urls on every reverted scene. This also covers
+        # rating100/code/director, which the apply never writes and the other
+        # round-trip test therefore cannot see (_NOT_WRITABLE_BY_APPLY_SCENE).
+        server = _SelectiveScene(**RICH_STATE)
+        before = server.snapshot()
+        stash = Stash("http://example.test", "k", transport=server.transport)
+        info = stash.apply_scene("s1", RICH_MATCH, overwrite_studio=True)
+        self.assertNotEqual(server.snapshot(), before)  # the apply really changed it
+        stash.revert_scene("s1", info["prior"])
+        self.assertEqual(server.snapshot(), before)
+
+    def test_the_existing_cast_survives_only_because_the_read_selects_it(self):
+        # HARM: sceneUpdate REPLACES the performer and tag arrays, so the
+        # union depends entirely on the read seeing what is already there.
+        # Drop `performers` from the selection and a bulk run stops adding to
+        # the cast and starts REPLACING it — every scene it touches loses the
+        # performers a human attached, at scale, and the tag arm does the same
+        # to tags.
+        server = _SelectiveScene(performers=[{"id": "p1"}], tags=[{"id": "t1"}])
+        stash = Stash("http://example.test", "k", transport=server.transport)
+        stash.apply_scene("s1", {"performers": [{"name": "Velvet Crane"}],
+                                 "tags": [{"name": CANONICAL_TAG_NAME}]})
+        state = server.snapshot()
+        self.assertEqual(len(state["performer_ids"]), 2)
+        self.assertEqual(state["performer_ids"][0], "p1")
+        self.assertEqual(len(state["tag_ids"]), 2)
+        self.assertEqual(state["tag_ids"][0], "t1")
