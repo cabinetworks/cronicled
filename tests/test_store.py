@@ -4,9 +4,11 @@ import gc
 import json
 import os
 import shutil
+import sqlite3
 import tempfile
 import unicodedata
 import unittest
+from datetime import datetime, timezone
 
 from cronicled.store import Store, fingerprint
 
@@ -478,3 +480,224 @@ class MutedSubjects(_StoreCase):
 
     def test_nothing_muted_is_an_empty_set(self):
         self.assertEqual(self.store.muted_subjects(), set())
+
+
+class ProducerRuns(_StoreCase):
+    """When each producer last ran.
+
+    This is the whole reason the record is in the store rather than in a
+    scheduler's memory: in memory, every process restart makes every producer
+    due at once, so a nightly full-library scrape runs on every deploy.
+    """
+
+    def test_a_producer_that_has_never_run_reports_nothing(self):
+        """`None`, not an error: "never" is the ordinary state of a producer on
+        the first tick after it is added, not a caller mistake."""
+        self.assertIsNone(self.store.last_run("nightly-scrape"))
+
+    def test_a_recorded_run_reads_back_what_was_recorded(self):
+        self.store.record_run("nightly-scrape", at="2026-07-26T02:00:00+00:00")
+        self.assertEqual(self.store.last_run("nightly-scrape"),
+                         "2026-07-26T02:00:00+00:00")
+
+    def test_recording_again_replaces_rather_than_accumulates(self):
+        """A producer has *a* last run, not a history. The whole-dict assertion
+        is the one that can see accumulation — `last_run` alone would pass on a
+        table with two rows as long as the query happened to pick the right
+        one."""
+        self.store.record_run("nightly-scrape", at="2026-07-26T02:00:00+00:00")
+        self.store.record_run("nightly-scrape", at="2026-07-27T02:00:00+00:00")
+        self.assertEqual(self.store.last_run("nightly-scrape"),
+                         "2026-07-27T02:00:00+00:00")
+        self.assertEqual(self.store.runs(),
+                         {"nightly-scrape": "2026-07-27T02:00:00+00:00"})
+
+    def test_recording_an_earlier_time_replaces_too(self):
+        """The store records what it was told; it does not keep the maximum.
+        Preferring the larger value would mean interpreting the timestamp, and
+        an operator correcting a run stamped by a skewed clock would find the
+        store quietly keeping the value they are trying to replace."""
+        self.store.record_run("nightly-scrape", at="2026-07-27T02:00:00+00:00")
+        self.store.record_run("nightly-scrape", at="2026-07-26T02:00:00+00:00")
+        self.assertEqual(self.store.last_run("nightly-scrape"),
+                         "2026-07-26T02:00:00+00:00")
+
+    def test_the_time_defaults_to_now(self):
+        """Bracketed rather than compared to a fixture, because the point is
+        that an omitted `at` is a real UTC clock reading and not, say, the
+        empty string or the epoch."""
+        before = datetime.now(timezone.utc).replace(microsecond=0)
+        self.store.record_run("nightly-scrape")
+        after = datetime.now(timezone.utc)
+        recorded = datetime.fromisoformat(self.store.last_run("nightly-scrape"))
+        self.assertIsNotNone(recorded.tzinfo)
+        self.assertLessEqual(before, recorded)
+        self.assertLessEqual(recorded, after)
+
+    def test_one_producers_run_does_not_answer_for_another(self):
+        self.store.record_run("nightly-scrape", at="2026-07-26T02:00:00+00:00")
+        self.assertIsNone(self.store.last_run("hourly-tags"))
+
+    def test_nothing_has_run_is_an_empty_mapping(self):
+        self.assertEqual(self.store.runs(), {})
+
+    def test_runs_answers_for_every_producer_in_one_call(self):
+        """The scheduler asks about every producer it knows on every tick, so
+        the read is a mapping rather than N lookups. Asserted as a whole dict:
+        a read that reported a producer that had never run would make it look
+        not-due, silently skipping it."""
+        self.store.record_run("nightly-scrape", at="2026-07-26T02:00:00+00:00")
+        self.store.record_run("hourly-tags", at="2026-07-26T09:00:00+00:00")
+        self.assertEqual(self.store.runs(), {
+            "nightly-scrape": "2026-07-26T02:00:00+00:00",
+            "hourly-tags": "2026-07-26T09:00:00+00:00",
+        })
+
+    def test_a_producer_that_has_never_run_is_simply_absent(self):
+        """Absent, not an error and not a `None` entry — a caller iterating the
+        mapping is looking at producers with a run to compare against."""
+        self.store.record_run("nightly-scrape", at="2026-07-26T02:00:00+00:00")
+        runs = self.store.runs()
+        self.assertNotIn("hourly-tags", runs)
+        self.assertEqual(runs, {"nightly-scrape": "2026-07-26T02:00:00+00:00"})
+
+    def test_recording_a_run_is_not_a_proposal(self):
+        """The two tables are independent: a run must not appear in the inbox,
+        and must not disturb the counts a badge reads."""
+        self.store.record_run("nightly-scrape", at="2026-07-26T02:00:00+00:00")
+        self.assertEqual(self.store.items(), [])
+        self.assertEqual(self.store.counts(), {})
+
+
+class ProducerRunsSurviveARestart(unittest.TestCase):
+    """The property the table exists for, across a real close and reopen.
+
+    Everything in `ProducerRuns` would pass just as well against a dict held on
+    the instance; only this can tell the two apart.
+    """
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self.path = os.path.join(self._dir, "s.db")
+        self.addCleanup(shutil.rmtree, self._dir, True)
+
+    def test_a_run_recorded_before_a_restart_is_still_known_after_it(self):
+        with Store(self.path) as store:
+            store.record_run("nightly-scrape", at="2026-07-26T02:00:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.last_run("nightly-scrape"),
+                             "2026-07-26T02:00:00+00:00")
+            self.assertEqual(store.runs(),
+                             {"nightly-scrape": "2026-07-26T02:00:00+00:00"})
+
+
+class SchemaAdditionOnAnExistingDatabase(unittest.TestCase):
+    """A database written before `producer_run` existed gains it on open, and
+    keeps everything already in it.
+
+    The store's spec defers migrations on the grounds that there is no user
+    data to preserve. There now is — proposals, dismissals and mutes, on
+    anyone who has run this — so adding a table is the moment that deferral
+    has to be checked rather than quietly extended. What makes it safe is that
+    the whole schema is re-applied at every open and every statement in it is
+    `IF NOT EXISTS`, so the script is a no-op for what is already there.
+
+    The older database is emulated by dropping `producer_run` from one the
+    current code created, which leaves exactly the tables the previous code
+    created. That equivalence was checked against a database actually built by
+    the previous code: item, dismissal and mute rows came back identical and
+    `PRAGMA integrity_check` reported ok.
+
+    The claim is only about *additive* change. Nothing here says anything about
+    altering or dropping a column that already holds data; that would need a
+    version table, and this does not provide one.
+    """
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self.path = os.path.join(self._dir, "s.db")
+        self.addCleanup(shutil.rmtree, self._dir, True)
+        self.snapshot, self.dismissed_fp = self._make_database_without_the_table()
+
+    def _make_database_without_the_table(self):
+        with Store(self.path) as store:
+            seen = store.record(folder="scene-matches", subject_type="scene",
+                                subject_id="1", summary="a proposal",
+                                payload={"title": "Copper Kettle"},
+                                producer="nightly-scrape", confidence=0.9)
+            store.mark_seen(seen)
+            store.record(folder="tag-matches", subject_type="scene",
+                         subject_id="3", summary="a third proposal",
+                         payload={"tags": ["kettle"]}, producer="hourly-tags")
+            rejected = store.record(folder="scene-matches",
+                                    subject_type="scene", subject_id="2",
+                                    summary="another proposal",
+                                    payload={"title": "Harbour Lights"},
+                                    producer="nightly-scrape")
+            store.dismiss(rejected, reason="wrong match")
+            store.mute("scene", "9", reason="never identifiable")
+            snapshot = {
+                "visible": store.items(),
+                "dismissed": store.items(state="dismissed"),
+                "muted_rows": store.items(state="muted"),
+                "muted_subjects": sorted(store.muted_subjects()),
+                "counts": store.counts(),
+            }
+        connection = sqlite3.connect(self.path)
+        connection.execute("DROP TABLE producer_run")
+        connection.commit()
+        tables = {row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        connection.close()
+        # the emulation is worth nothing if the table is still there
+        self.assertNotIn("producer_run", tables)
+        return snapshot, rejected
+
+    def test_the_missing_table_is_created_on_open(self):
+        with Store(self.path) as store:
+            self.assertIsNone(store.last_run("nightly-scrape"))
+            store.record_run("nightly-scrape", at="2026-07-26T02:00:00+00:00")
+            self.assertEqual(store.runs(),
+                             {"nightly-scrape": "2026-07-26T02:00:00+00:00"})
+
+    def test_every_existing_row_survives_the_addition_unchanged(self):
+        """Whole rows, every state, not a sampled field: a column blanked or an
+        extra row invented by the reopen is exactly what this has to see."""
+        with Store(self.path) as store:
+            after = {
+                "visible": store.items(),
+                "dismissed": store.items(state="dismissed"),
+                "muted_rows": store.items(state="muted"),
+                "muted_subjects": sorted(store.muted_subjects()),
+                "counts": store.counts(),
+            }
+        self.assertEqual(after, self.snapshot)
+
+    def test_the_surviving_rows_are_not_empty(self):
+        """Guards the test above from passing by comparing nothing to nothing —
+        a reopen that lost every row would satisfy an equality of two empty
+        snapshots if the fixture had silently failed to write."""
+        self.assertEqual(len(self.snapshot["visible"]), 2)
+        self.assertEqual(len(self.snapshot["dismissed"]), 1)
+        self.assertEqual(self.snapshot["muted_subjects"], [("scene", "9")])
+        self.assertEqual(self.snapshot["counts"], {"seen": 1, "new": 1})
+
+    def test_a_dismissal_still_blocks_the_proposal_it_rejected(self):
+        """Rows surviving is not enough — a reviewer's decision has to keep
+        acting. A dismissal that stopped blocking would resurrect the rejected
+        proposal on the producer's next run."""
+        with Store(self.path) as store:
+            again = store.record(folder="scene-matches", subject_type="scene",
+                                 subject_id="2", summary="another proposal",
+                                 payload={"title": "Harbour Lights"},
+                                 producer="nightly-scrape")
+            self.assertEqual(again, self.dismissed_fp)
+            self.assertFalse(store.has(again))
+
+    def test_a_mute_still_blocks_its_subject(self):
+        with Store(self.path) as store:
+            store.record(folder="scene-matches", subject_type="scene",
+                         subject_id="9", summary="about a muted subject",
+                         payload={"title": "Anything At All"},
+                         producer="nightly-scrape")
+            self.assertEqual(store.items(), self.snapshot["visible"])
