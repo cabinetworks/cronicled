@@ -450,3 +450,135 @@ class RevertRoundTrip(unittest.TestCase):
         stash = Stash("http://example.test", "k", transport=_scene_transport())
         with self.assertRaises(ValueError):
             stash.revert_scene("s1", None)
+
+
+# -- tag writes (irreversible) -------------------------------------------- #
+
+class _TagTransport:
+    """Fake transport for the tag-write tests, in the style of
+    _SceneTransport: it recognizes the two tag mutations, records the exact
+    input each one was sent, and answers with a minimal payload shaped like
+    the real server's. Opens no socket.
+
+    The recording is the point. merge_tags and update_tag_aliases have no
+    read-back and no undo — once the mutation body leaves the client the
+    damage is done on the server — so the only thing a test can check is the
+    body itself.
+    """
+
+    def __init__(self, merged=None):
+        self.calls = []  # (query, input) for every mutation sent, in order
+        self.merged = merged or {"id": "tag-canonical", "name": "Lantern Drift",
+                                 "aliases": []}
+
+    def __call__(self, body, timeout):
+        q = body["query"]
+        inp = body["variables"]["in"]
+        self.calls.append((q, inp))
+        if "tagsMerge" in q:
+            return {"data": {"tagsMerge": self.merged}}
+        if "tagUpdate" in q:
+            return {"data": {"tagUpdate": {"id": inp["id"],
+                                           "aliases": inp.get("aliases")}}}
+        raise AssertionError("test transport does not recognize query: %s" % q)
+
+    def only(self):
+        """The single mutation input sent — fails if it was not exactly one."""
+        if len(self.calls) != 1:
+            raise AssertionError("expected exactly 1 mutation, got %d"
+                                 % len(self.calls))
+        return self.calls[0][1]
+
+
+# Invented tag vocabulary: a canonical tag, a misspelling of it that a scrape
+# created, and the alias set that should survive the merge.
+CANONICAL_TAG_ID = "tag-canonical"
+TYPO_TAG_ID = "tag-typo"
+SECOND_TYPO_TAG_ID = "tag-typo-2"
+MERGED_ALIASES = ["Lantren Drift", "lantern-drift", "Lanterndrift"]
+
+
+def _tag_stash(transport):
+    return Stash("http://example.test", "k", transport=transport)
+
+
+class MergeTags(unittest.TestCase):
+    def test_sources_go_in_source_and_the_destination_in_destination(self):
+        # HARM: swapping these deletes the canonical tag and keeps the typo,
+        # dragging every scene association onto the misspelling. tagsMerge is
+        # a permanent server-side delete — nothing in this module can undo it,
+        # and the only evidence of the mistake is which id landed in which
+        # role in this one mutation body.
+        t = _TagTransport()
+        _tag_stash(t).merge_tags(CANONICAL_TAG_ID,
+                                 [TYPO_TAG_ID, SECOND_TYPO_TAG_ID])
+        inp = t.only()
+        self.assertEqual(inp["destination"], CANONICAL_TAG_ID)
+        self.assertEqual(inp["source"], [TYPO_TAG_ID, SECOND_TYPO_TAG_ID])
+        # and, explicitly: the tag being kept is never among those being
+        # destroyed, whatever else the input holds
+        self.assertNotIn(CANONICAL_TAG_ID, inp["source"])
+
+    def test_the_alias_set_is_sent_with_the_merge(self):
+        # HARM: without it the merged-away spellings are lost with the tags
+        # that carried them, and the next scrape recreates the very duplicates
+        # this merge was run to remove.
+        t = _TagTransport()
+        _tag_stash(t).merge_tags(CANONICAL_TAG_ID, [TYPO_TAG_ID],
+                                 aliases=MERGED_ALIASES)
+        inp = t.only()
+        self.assertEqual(inp["values"],
+                         {"id": CANONICAL_TAG_ID, "aliases": MERGED_ALIASES})
+        # the alias write must target the tag that survives, not one being
+        # merged away, or it lands on a tag the same call is deleting
+        self.assertEqual(inp["values"]["id"], inp["destination"])
+
+    def test_an_empty_alias_list_is_sent_as_an_explicit_clear(self):
+        # HARM: a truthiness check (`if aliases:`) collapses [] into None, so
+        # deliberately clearing a tag's aliases becomes a silent no-op — the
+        # caller is told it worked and the stale aliases stay on the server.
+        t = _TagTransport()
+        _tag_stash(t).merge_tags(CANONICAL_TAG_ID, [TYPO_TAG_ID], aliases=[])
+        inp = t.only()
+        self.assertIn("values", inp)
+        self.assertEqual(inp["values"]["aliases"], [])
+
+    def test_aliases_none_omits_the_values_block_entirely(self):
+        # HARM: the other half of the same distinction. `values` REPLACES the
+        # destination's alias list, so sending it when the caller passed
+        # nothing would wipe the destination's existing aliases as a side
+        # effect of a merge that was never asked to touch them.
+        t = _TagTransport()
+        _tag_stash(t).merge_tags(CANONICAL_TAG_ID, [TYPO_TAG_ID])
+        self.assertNotIn("values", t.only())
+
+    def test_the_merge_actually_issues_a_mutation(self):
+        # HARM: a no-op merge leaves the duplicate tags in place while the
+        # caller records the consolidation as done, so the pair is never
+        # revisited.
+        t = _TagTransport()
+        _tag_stash(t).merge_tags(CANONICAL_TAG_ID, [TYPO_TAG_ID])
+        self.assertEqual(len(t.calls), 1)
+        self.assertIn("tagsMerge", t.calls[0][0])
+
+
+class UpdateTagAliases(unittest.TestCase):
+    def test_it_writes_the_list_it_was_given(self):
+        # HARM: writing [] (or any list other than the caller's) instead
+        # replaces the tag's aliases with nothing — one call wipes every
+        # spelling variant a user curated by hand, with no snapshot taken and
+        # no undo path in this module.
+        t = _TagTransport()
+        _tag_stash(t).update_tag_aliases(CANONICAL_TAG_ID, MERGED_ALIASES)
+        inp = t.only()
+        self.assertEqual(inp["aliases"], MERGED_ALIASES)
+        self.assertEqual(inp["id"], CANONICAL_TAG_ID)
+
+    def test_it_actually_issues_a_mutation(self):
+        # HARM: making this a no-op survives the rest of the suite, so an
+        # alias top-up would silently never persist — every later run would
+        # recompute the same "missing" aliases and believe it had written them.
+        t = _TagTransport()
+        _tag_stash(t).update_tag_aliases(CANONICAL_TAG_ID, MERGED_ALIASES)
+        self.assertEqual(len(t.calls), 1)
+        self.assertIn("tagUpdate", t.calls[0][0])
