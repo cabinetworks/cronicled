@@ -8,7 +8,30 @@ live) is a separate concern from the above, and is resolved by `config_dir`
 below, shared with `cronicled.adapters.registry`. `$STASH_URL`/`$STASH_API_KEY`
 deliberately stay their own thing rather than folding into that directory
 scheme: they name the media server being managed, not this project, and an
-operator may already have them set for a reason of their own.
+operator may already have them set for a reason of their own. Renaming either
+half to match the other would stop reading an environment that already works,
+so the split stays.
+
+THE RULE A NEW CONFIG LOADER FOLLOWS
+------------------------------------
+Configuration the thing cannot function without RAISES, naming exactly which
+values were missing and where they could have come from. Configuration whose
+absence is a legitimate state RETURNS AN EMPTY VALUE, so the app still starts
+and can tell the operator what to configure.
+
+That is why `load_server` below raises while
+`cronicled.adapters.registry.load_adapters` returns an empty mapping: nothing
+can reach the media server without a URL and a key, whereas a fresh install
+with no adapters configured is a normal state and not an error. The asymmetry
+is deliberate, not an inconsistency to tidy away — making the two agree would
+either hand a URL-less client to the network layer or stop a fresh install
+from starting. Both halves are pinned by tests in tests/test_config.py.
+
+Two shapes every loader here shares, whichever half of the rule it falls
+under: `path=None` resolved INSIDE the function (a default bound in the
+signature is fixed at import time and so cannot see `$CRONICLED_CONFIG_DIR`),
+and `env=None` defaulting to `os.environ` but injectable, so a test never has
+to mutate the real environment.
 """
 import json
 import os
