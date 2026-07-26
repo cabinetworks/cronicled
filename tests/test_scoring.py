@@ -376,11 +376,11 @@ class Deciding(unittest.TestCase):
 
     def test_a_decision_says_how_many_candidates_competed(self):
         # Refusals arrive as match=None and mean opposite things. "Nothing
-        # cleared the bar" is consistent with the file having no entry in the
-        # catalogue at all; "two cleared it and I cannot say which" is the
+        # cleared the bar" is consistent with the source listing no entry for
+        # the file at all; "two cleared it and I cannot say which" is the
         # opposite -- entries that look like this file are RIGHT THERE. A
         # consumer that treats a refusal as evidence of absence
-        # (stashbox.absence_verdict) has to tell them apart, and the only
+        # (stashbox.listing_verdict) has to tell them apart, and the only
         # thing that currently distinguishes them is the wording of `reason`.
         # scan.py already refuses to read a fact off that prose, for the
         # reason stated there: the wording is free to change and nothing would
@@ -398,15 +398,16 @@ class Deciding(unittest.TestCase):
         self.assertEqual(
             decide([self._m(0.9), self._m(0.75), self._m(0.2)]).contenders, 2)
 
-    def test_a_decision_says_whether_the_catalogue_was_interrogated(self):
+    def test_a_decision_says_whether_the_candidates_were_interrogated(self):
         # `contenders == 0` is returned for four different refusals and only
-        # one of them is evidence about the catalogue. Two of the others never
-        # weighed a single candidate title: the caller offered nothing, or the
-        # filename carried no word that is not the artist's or generic --
+        # one of them is evidence about the source's listing. Two of the
+        # others never weighed a single candidate title: the caller offered
+        # nothing, or the filename carried no word that is not the artist's
+        # or generic --
         # which `_is_eligible` bars at ANY score, so no title was ever
         # compared. A consumer reading only `contenders` cannot tell those
         # from "500 entries were checked and none is close", and would report
-        # a fabricated absence over a catalogue it never questioned.
+        # a fabricated absence over a listing it never questioned.
         self.assertFalse(decide([]).interrogated, "the caller asked nothing")
         self.assertFalse(
             decide([self._m(0.9, meaningful_count=0)]).interrogated,

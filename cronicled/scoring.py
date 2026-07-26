@@ -45,16 +45,16 @@ class Decision(NamedTuple):
     """The one candidate confident enough to apply, or a refusal.
 
     Two of these fields exist for a single consumer: a caller deciding whether
-    a refusal is evidence that a file has no entry in the catalogue at all.
+    a refusal is evidence that a source lists no entry for a file at all.
     `match=None` cannot answer that, because it covers at least four refusals
-    and only one of them is a statement about the catalogue.
+    and only one of them is a statement about the source's listing.
 
     `contenders` counts the candidates that were trustworthy enough to compete
     for the win. It separates "nothing cleared the bar" -- consistent with the
     file having no entry -- from "several did and which one is right could not
     be decided", where entries that look like this file are right there.
 
-    `interrogated` says whether the catalogue was actually questioned at all.
+    `interrogated` says whether the candidates were actually questioned at all.
     `contenders == 0` is also what comes back when the *filename* carried no
     word that is not the artist's or generic, which `_is_eligible` bars at any
     score so that not one candidate title was ever weighed, and when the
@@ -279,7 +279,7 @@ def decide(matches, threshold=DEFAULT_THRESHOLD):
                         reason="no candidates offered", contenders=0,
                         interrogated=False)
 
-    # Whether the catalogue was actually questioned with this file's evidence.
+    # Whether the candidates were actually questioned with this file's evidence.
     # A candidate with no meaningful token is barred by `_is_eligible` at any
     # score, so it is never weighed against anything -- the refusal it produces
     # is a fact about the filename, not about the titles it was handed.

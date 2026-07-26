@@ -4,8 +4,8 @@ import unittest
 from cronicled.scoring import Decision, Match, decide
 from cronicled.stash import StashError
 from cronicled.stashbox import (
-    PERFORMER_SCENES, SCENES_BY_FINGERPRINT, Catalogue, StashBox,
-    absence_verdict)
+    PERFORMER_SCENES, SCENES_BY_FINGERPRINT, SourceListing, StashBox,
+    listing_verdict)
 
 
 def _transport(responses):
@@ -35,37 +35,37 @@ def _blocks(blocks):
     return {"data": {"findScenesBySceneFingerprints": [list(b) for b in blocks]}}
 
 
-class PerformerCatalogue(unittest.TestCase):
-    def test_a_catalogue_that_fits_on_one_page_is_complete(self):
+class PerformerListing(unittest.TestCase):
+    def test_a_listing_that_fits_on_one_page_is_complete(self):
         # The ordinary case: the count matches what the first page handed
         # back, so there is nothing left to ask for.
         t = _transport([_page(2, [{"id": "s1"}, {"id": "s2"}])])
         box = StashBox("https://box.test", "k", transport=t)
 
-        catalogue = box.performer_catalogue("p1", per_page=100)
+        listing = box.performer_listing("p1", per_page=100)
 
-        self.assertEqual([s["id"] for s in catalogue.scenes], ["s1", "s2"])
-        self.assertTrue(catalogue.complete)
+        self.assertEqual([s["id"] for s in listing.scenes], ["s1", "s2"])
+        self.assertTrue(listing.complete)
         self.assertEqual(len(t.calls), 1, "did not ask for a second page")
 
     def test_a_performer_with_nothing_is_a_complete_answer(self):
         # Nothing promised and nothing served. This is the most valuable
-        # answer the module produces — an empty catalogue is the strongest
+        # answer the module produces — an empty listing is the strongest
         # evidence of absence obtainable — and complete=True is what licenses
         # a caller to act on it. Reporting it as a failed read would refuse to
         # vouch for the one case where absence is certain.
         t = _transport([_page(0, [])])
         box = StashBox("https://box.test", "k", transport=t)
 
-        catalogue = box.performer_catalogue("p1")
+        listing = box.performer_listing("p1")
 
-        self.assertEqual(catalogue.scenes, ())
-        self.assertTrue(catalogue.complete)
-        self.assertEqual(len(t.calls), 1, "did not page past an empty catalogue")
+        self.assertEqual(listing.scenes, ())
+        self.assertTrue(listing.complete)
+        self.assertEqual(len(t.calls), 1, "did not page past an empty listing")
 
     def test_an_empty_first_page_with_a_count_that_says_otherwise_is_not_complete(self):
         # The source promises scenes and serves none, from the very first
-        # page. This looks exactly like the genuinely-empty catalogue above
+        # page. This looks exactly like the genuinely-empty listing above
         # and must not be reported like one: "nothing exists" is the strongest
         # claim this module makes, and here the source itself contradicts it.
         # A count of one is the boundary — the smallest overstatement, and the
@@ -75,10 +75,10 @@ class PerformerCatalogue(unittest.TestCase):
                 t = _transport([_page(count, [])])
                 box = StashBox("https://box.test", "k", transport=t)
 
-                catalogue = box.performer_catalogue("p1", per_page=2, max_pages=10)
+                listing = box.performer_listing("p1", per_page=2, max_pages=10)
 
-                self.assertEqual(catalogue.scenes, ())
-                self.assertFalse(catalogue.complete)
+                self.assertEqual(listing.scenes, ())
+                self.assertFalse(listing.complete)
                 self.assertEqual(len(t.calls), 1, "stopped at the empty page")
 
     def test_a_count_that_drops_to_zero_mid_read_is_not_complete(self):
@@ -91,10 +91,10 @@ class PerformerCatalogue(unittest.TestCase):
         ])
         box = StashBox("https://box.test", "k", transport=t)
 
-        catalogue = box.performer_catalogue("p1", per_page=2, max_pages=10)
+        listing = box.performer_listing("p1", per_page=2, max_pages=10)
 
-        self.assertEqual(len(catalogue.scenes), 2)
-        self.assertFalse(catalogue.complete)
+        self.assertEqual(len(listing.scenes), 2)
+        self.assertFalse(listing.complete)
         self.assertEqual(len(t.calls), 2, "stopped at the empty page")
 
     def test_reads_every_page_and_reports_the_read_complete(self):
@@ -104,10 +104,10 @@ class PerformerCatalogue(unittest.TestCase):
         ])
         box = StashBox("https://box.test", "k", transport=t)
 
-        catalogue = box.performer_catalogue("p1", per_page=2)
+        listing = box.performer_listing("p1", per_page=2)
 
-        self.assertEqual([s["id"] for s in catalogue.scenes], ["s1", "s2", "s3"])
-        self.assertTrue(catalogue.complete)
+        self.assertEqual([s["id"] for s in listing.scenes], ["s1", "s2", "s3"])
+        self.assertTrue(listing.complete)
 
     def test_a_read_that_hits_the_page_cap_is_not_complete(self):
         # Six scenes, two per page, but only two pages are allowed. The four
@@ -116,10 +116,10 @@ class PerformerCatalogue(unittest.TestCase):
         t = _transport([_page(6, [{"id": "s1"}, {"id": "s2"}])])
         box = StashBox("https://box.test", "k", transport=t)
 
-        catalogue = box.performer_catalogue("p1", per_page=2, max_pages=2)
+        listing = box.performer_listing("p1", per_page=2, max_pages=2)
 
-        self.assertEqual(len(catalogue.scenes), 4)
-        self.assertFalse(catalogue.complete)
+        self.assertEqual(len(listing.scenes), 4)
+        self.assertFalse(listing.complete)
         self.assertEqual(len(t.calls), 2, "stopped asking at the cap")
 
     def test_a_page_that_returns_nothing_ends_the_read_as_incomplete(self):
@@ -133,10 +133,10 @@ class PerformerCatalogue(unittest.TestCase):
         ])
         box = StashBox("https://box.test", "k", transport=t)
 
-        catalogue = box.performer_catalogue("p1", per_page=2, max_pages=10)
+        listing = box.performer_listing("p1", per_page=2, max_pages=10)
 
-        self.assertEqual(len(catalogue.scenes), 4)
-        self.assertFalse(catalogue.complete)
+        self.assertEqual(len(listing.scenes), 4)
+        self.assertFalse(listing.complete)
         self.assertEqual(len(t.calls), 3, "stopped at the empty page")
 
     def test_a_short_page_is_not_the_end_of_the_read(self):
@@ -148,7 +148,7 @@ class PerformerCatalogue(unittest.TestCase):
         # after counting" shape this module's docstring anticipates.
         #
         # Under the page-length rule the read stops here and returns three
-        # scenes as complete=True. A truncated catalogue reported as read in
+        # scenes as complete=True. A truncated listing reported as read in
         # full is the one input that turns every downstream absence into a
         # confident lie, so both the scene count and the number of requests
         # are pinned.
@@ -159,10 +159,10 @@ class PerformerCatalogue(unittest.TestCase):
         ])
         box = StashBox("https://box.test", "k", transport=t)
 
-        catalogue = box.performer_catalogue("p1", per_page=5, max_pages=10)
+        listing = box.performer_listing("p1", per_page=5, max_pages=10)
 
-        self.assertEqual(len(catalogue.scenes), 9)
-        self.assertTrue(catalogue.complete)
+        self.assertEqual(len(listing.scenes), 9)
+        self.assertTrue(listing.complete)
         self.assertEqual(len(t.calls), 3, "kept asking past the short page")
 
     def test_a_short_page_the_source_never_makes_up_is_not_complete(self):
@@ -180,10 +180,10 @@ class PerformerCatalogue(unittest.TestCase):
         ])
         box = StashBox("https://box.test", "k", transport=t)
 
-        catalogue = box.performer_catalogue("p1", per_page=5, max_pages=10)
+        listing = box.performer_listing("p1", per_page=5, max_pages=10)
 
-        self.assertEqual(len(catalogue.scenes), 3)
-        self.assertFalse(catalogue.complete)
+        self.assertEqual(len(listing.scenes), 3)
+        self.assertFalse(listing.complete)
         self.assertEqual(len(t.calls), 2, "stopped at the empty page")
 
     def test_a_transport_failure_part_way_through_raises(self):
@@ -200,7 +200,7 @@ class PerformerCatalogue(unittest.TestCase):
         box = StashBox("https://box.test", "k", transport=t)
 
         with self.assertRaises(StashError) as caught:
-            box.performer_catalogue("p1", per_page=2, max_pages=10)
+            box.performer_listing("p1", per_page=2, max_pages=10)
 
         self.assertTrue(caught.exception.transient, "retryability survives the raise")
         self.assertEqual(len(t.calls), 3, "stopped at the failed page")
@@ -419,7 +419,7 @@ class RequestShape(unittest.TestCase):
     def test_every_request_is_asserted_whole(self):
         # Whole bodies, not sampled keys: a renamed criterion, a page that
         # stopped advancing, or a filter quietly gaining a field would each
-        # point the read somewhere other than this performer's catalogue, and
+        # point the read somewhere other than this performer's listing, and
         # a key-by-key assertion notices none of them.
         t = _transport([
             _page(3, [{"id": "s1"}, {"id": "s2"}]),
@@ -427,7 +427,7 @@ class RequestShape(unittest.TestCase):
         ])
         box = StashBox("https://box.test", "k", transport=t)
 
-        box.performer_catalogue("p1", per_page=2, timeout=7)
+        box.performer_listing("p1", per_page=2, timeout=7)
 
         # The query constant is asserted against itself in the bodies below,
         # so mutating it moves both sides and nothing notices. A fake
@@ -437,8 +437,8 @@ class RequestShape(unittest.TestCase):
         # `title` is the one that matters, and the only one here whose loss is
         # SILENT. Dropped, a real server returns every scene titleless, every
         # candidate scores near zero, `contenders` is 0 and the read is
-        # complete -- absent=True for every file in the library, over a
-        # catalogue that genuinely was read in full. The others fail loudly:
+        # complete -- unlisted=True for every file in the library, over a
+        # listing that genuinely was read in full. The others fail loudly:
         # no `count` is a KeyError on the first page, and a wrong endpoint
         # name is a GraphQL error.
         self.assertIn("queryScenes(input: $input)", PERFORMER_SCENES)
@@ -475,9 +475,9 @@ class RequestShape(unittest.TestCase):
 
         surface = sorted(name for name in dir(box)
                          if not name.startswith("_") and callable(getattr(box, name)))
-        self.assertEqual(surface, ["known_by_fingerprint", "performer_catalogue"],
+        self.assertEqual(surface, ["known_by_fingerprint", "performer_listing"],
                          "a new call on this client must be exercised here too")
-        box.performer_catalogue("p1", per_page=2)
+        box.performer_listing("p1", per_page=2)
         box.known_by_fingerprint([("PHASH", "aaaa1111")])
 
         self.assertTrue(t.calls, "the surface was actually exercised")
@@ -488,9 +488,9 @@ class RequestShape(unittest.TestCase):
 PERFORMER = "pf-8821"
 
 
-def _catalogue(scenes=2, complete=True, performer_id=PERFORMER):
-    return Catalogue(performer_id,
-                     [{"id": "s%d" % n} for n in range(scenes)], complete)
+def _listing(scenes=2, complete=True, performer_id=PERFORMER):
+    return SourceListing(performer_id,
+                         [{"id": "s%d" % n} for n in range(scenes)], complete)
 
 
 def _m(value, contained=False, meaningful_count=2):
@@ -500,7 +500,7 @@ def _m(value, contained=False, meaningful_count=2):
 
 def _refused():
     """A scoring refusal with nothing that came close: no candidate in the
-    catalogue was a plausible entry for this file."""
+    listing was a plausible entry for this file."""
     return decide([_m(0.41)])
 
 
@@ -517,82 +517,102 @@ def _nothing_to_ask_with(scenes=2):
     """A refusal of a THIRD kind, and the one that looks most like the first.
 
     The filename carried no word that is not the artist's or generic, so every
-    candidate is barred at any score and not one catalogue title was ever
+    candidate is barred at any score and not one listing title was ever
     weighed. The scores are deliberately high: nothing about the numbers
     distinguishes this from a near miss, and `contenders` is 0 for both."""
     return decide([_m(0.95, meaningful_count=0) for _ in range(scenes)])
 
 
 def _one_generic_word():
-    """A refusal that DID interrogate the catalogue, on thin evidence. The one
+    """A refusal that DID interrogate the listing, on thin evidence. The one
     meaningful token was compared against every title and fell short of a bar
     a higher score would have cleared."""
     return decide([_m(0.7, meaningful_count=1)])
 
 
-class AbsenceVerdict(unittest.TestCase):
-    """What an absence is allowed to claim.
+def _every_branch_reason():
+    """One reason from each branch of `listing_verdict`, the claiming branch
+    first. Every one of these is prose shown to a person, so the properties
+    that hold across all of them are worth asserting across all of them."""
+    return [
+        listing_verdict(_listing(), _refused()).reason,
+        listing_verdict(_listing(complete=False), _refused()).reason,
+        listing_verdict(_listing(), _decided()).reason,
+        listing_verdict(_listing(), _ambiguous()).reason,
+        listing_verdict(_listing(), _refused(),
+                        attribution_certain=False).reason,
+        listing_verdict(_listing(), _nothing_to_ask_with()).reason,
+    ]
+
+
+class ListingVerdict(unittest.TestCase):
+    """What a completed read is allowed to claim.
 
     The scorer must always pick a winner from what it is handed, and against a
     real library it applied a wrong entry 6% of the time when the right one
-    was not in the catalogue at all. A catalogue read in full lets a refusal
-    say something the scorer never can -- "this performer's catalogue was read
-    whole and this file is not in it" -- which tells a reviewer the file is
-    either filed under the wrong performer or genuinely not at the source.
+    was not in the candidate list at all. A listing read in full lets a refusal
+    say something the scorer never can -- "every entry this source lists for
+    this performer was read and this file matches none of them" -- which tells
+    a reviewer the file may be filed under the wrong performer.
 
-    That claim is made to a person, and a wrong one has no undo. So every test
-    here is about the conditions under which it may NOT be made.
+    What it does NOT say is that the scene is not this performer's. The source
+    is an index contributors fill in by hand, so it holds a subset of what a
+    performer released and a file missing from it has most likely just never
+    been submitted. Both halves are made to a person, a wrong one has no undo,
+    and the half that is easy to lose is the second. So the tests here cover
+    the conditions under which the claim may NOT be made, and the words it is
+    made in.
     """
 
     def test_a_complete_read_and_a_refusal_is_an_absence(self):
-        # The case the whole ticket exists for. The catalogue was read whole,
+        # The case the whole ticket exists for. The listing was read whole,
         # nothing in it is this file, and the reason says so in those terms --
         # naming the performer, because "not in it" is worthless to a reviewer
-        # who cannot tell whose catalogue was searched.
-        verdict = absence_verdict(_catalogue(complete=True), _refused())
+        # who cannot tell whose listing was searched.
+        verdict = listing_verdict(_listing(complete=True), _refused())
 
-        self.assertIs(verdict.absent, True)
+        self.assertIs(verdict.unlisted, True)
         self.assertIn("in full", verdict.reason)
         self.assertIn(PERFORMER, verdict.reason)
 
-    def test_an_empty_catalogue_read_in_full_is_still_an_absence(self):
+    def test_an_empty_listing_read_in_full_is_still_an_absence(self):
         # A performer the source holds nothing for, and therefore no candidate
-        # to score. This is the strongest evidence of absence obtainable and
-        # the answer most worth acting on; an implementation that needed
-        # scenes in hand before it would commit would refuse exactly here.
-        verdict = absence_verdict(_catalogue(scenes=0, complete=True), decide([]))
+        # to score. This is the strongest evidence obtainable here and the
+        # answer most worth acting on; an implementation that needed scenes in
+        # hand before it would commit would refuse exactly here.
+        verdict = listing_verdict(_listing(scenes=0, complete=True), decide([]))
 
-        self.assertIs(verdict.absent, True)
+        self.assertIs(verdict.unlisted, True)
         self.assertIn("in full", verdict.reason)
 
     def test_a_partial_read_can_never_be_an_absence(self):
-        # THE test. `absent` is three-valued on purpose: True and False are
+        # THE test. `unlisted` is three-valued on purpose: True and False are
         # claims, None is the honest answer when the evidence supports
         # neither. Collapsing None into False makes "we could not tell"
         # indistinguishable from "it is there", and the page the read never
         # reached is exactly where the file's entry would be.
         #
         # Both shapes of partial read are here. The empty one matters most: it
-        # is byte-for-byte the same view as the genuinely-empty catalogue
+        # is byte-for-byte the same view as the genuinely-empty listing
         # above apart from one flag, so anything that reads the scene list
         # instead of the flag passes the case above and gets this one
         # catastrophically wrong.
         for scenes in (0, 2):
             with self.subTest(scenes=scenes):
-                verdict = absence_verdict(
-                    _catalogue(scenes=scenes, complete=False), _refused())
+                verdict = listing_verdict(
+                    _listing(scenes=scenes, complete=False), _refused())
 
                 self.assertIsNone(
-                    verdict.absent,
+                    verdict.unlisted,
                     "a partial read reported as a definite answer")
-                self.assertIsNot(verdict.absent, False)
+                self.assertIsNot(verdict.unlisted, False)
                 self.assertIn("stopped early", verdict.reason)
                 self.assertNotIn("in full", verdict.reason)
 
     def test_a_decided_match_is_not_an_absence(self):
-        verdict = absence_verdict(_catalogue(complete=True), _decided())
+        verdict = listing_verdict(_listing(complete=True), _decided())
 
-        self.assertIs(verdict.absent, False)
+        self.assertIs(verdict.unlisted, False)
         self.assertIn("has this file", verdict.reason)
         self.assertNotIn("in full", verdict.reason)
 
@@ -602,48 +622,48 @@ class AbsenceVerdict(unittest.TestCase):
         # survives a short read -- and an implementation that checked the flag
         # before looking at the decision would downgrade this to None and
         # report a found file as unknown.
-        verdict = absence_verdict(_catalogue(complete=False), _decided())
+        verdict = listing_verdict(_listing(complete=False), _decided())
 
-        self.assertIs(verdict.absent, False)
+        self.assertIs(verdict.unlisted, False)
 
     def test_a_contested_attribution_never_claims_an_absence(self):
         # The resolver reports it when a folder names one creator and the
         # filename names another, and this is that signal's first consumer.
-        # A contested attribution means the catalogue that was enumerated may
+        # A contested attribution means the listing that was enumerated may
         # belong to someone else entirely -- so "not in it" answers a question
         # about the wrong person, confidently, which is worse than not
         # answering. The view here is COMPLETE: completeness is not the thing
-        # in doubt, whose catalogue it is is.
-        verdict = absence_verdict(_catalogue(complete=True), _refused(),
+        # in doubt, whose listing it is is.
+        verdict = listing_verdict(_listing(complete=True), _refused(),
                                   attribution_certain=False)
 
-        self.assertIsNone(verdict.absent)
-        self.assertIsNot(verdict.absent, False)
+        self.assertIsNone(verdict.unlisted)
+        self.assertIsNot(verdict.unlisted, False)
         self.assertIn("different creators", verdict.reason)
         self.assertNotIn("in full", verdict.reason)
 
     def test_a_contested_attribution_does_not_claim_a_presence_either(self):
-        # The mirror. A match found in a catalogue that may be the wrong
+        # The mirror. A match found in a listing that may be the wrong
         # person's is a wrong identification, not a confirmation -- it is the
         # very failure the resolver's disagreement is warning about. Neither
-        # direction is claimable when it is unknown whose catalogue was read.
-        verdict = absence_verdict(_catalogue(complete=True), _decided(),
+        # direction is claimable when it is unknown whose listing was read.
+        verdict = listing_verdict(_listing(complete=True), _decided(),
                                   attribution_certain=False)
 
-        self.assertIsNone(verdict.absent)
+        self.assertIsNone(verdict.unlisted)
         self.assertIn("different creators", verdict.reason)
 
     def test_a_refusal_between_two_contenders_is_not_an_absence(self):
         # A refusal is not one thing. "Nothing cleared the bar" is consistent
         # with the file having no entry here; "two cleared it and I cannot say
         # which" is the opposite claim -- entries that look like this file are
-        # right there in the catalogue. Both arrive as match=None, and
+        # right there in the listing. Both arrive as match=None, and
         # reporting the second as an absence would send a reviewer hunting a
         # mis-filing while the two candidate entries sit in the same reply.
-        verdict = absence_verdict(_catalogue(complete=True), _ambiguous())
+        verdict = listing_verdict(_listing(complete=True), _ambiguous())
 
-        self.assertIsNone(verdict.absent)
-        self.assertIsNot(verdict.absent, True)
+        self.assertIsNone(verdict.unlisted)
+        self.assertIsNot(verdict.unlisted, True)
         self.assertIn("competed", verdict.reason)
         self.assertNotIn("in full", verdict.reason)
 
@@ -664,9 +684,9 @@ class AbsenceVerdict(unittest.TestCase):
             contenders=0, interrogated=True)
 
         self.assertIsNone(
-            absence_verdict(_catalogue(), looks_like_a_near_miss).absent)
+            listing_verdict(_listing(), looks_like_a_near_miss).unlisted)
         self.assertIs(
-            absence_verdict(_catalogue(), looks_ambiguous).absent, True)
+            listing_verdict(_listing(), looks_ambiguous).unlisted, True)
 
     def test_a_file_with_nothing_to_ask_with_is_not_an_absence(self):
         # The ticket's own harm, arriving through the door built to stop it.
@@ -680,14 +700,14 @@ class AbsenceVerdict(unittest.TestCase):
         # full (500 scenes) and this file is not in it: nothing to match on"
         # -- and the first clause is the one a reviewer acts on. They get sent
         # to hunt a mis-filing the tool never looked for.
-        verdict = absence_verdict(_catalogue(scenes=500, complete=True),
+        verdict = listing_verdict(_listing(scenes=500, complete=True),
                                   _nothing_to_ask_with(500))
 
-        self.assertIsNone(verdict.absent)
-        self.assertIsNot(verdict.absent, True)
+        self.assertIsNone(verdict.unlisted)
+        self.assertIsNot(verdict.unlisted, True)
         self.assertIn("never weighed", verdict.reason)
         self.assertNotIn("in full", verdict.reason)
-        # Whose catalogue, how much of it, and which refusal -- the same three
+        # Whose listing, how much of it, and which refusal -- the same three
         # facts the absence branch carries, for the same reason: a reviewer
         # who cannot see what was skipped cannot judge whether it mattered.
         self.assertIn(PERFORMER, verdict.reason)
@@ -697,14 +717,14 @@ class AbsenceVerdict(unittest.TestCase):
     def test_a_caller_that_offered_no_candidates_is_not_an_absence(self):
         # The same defect from the other side, and it is a statement about the
         # CALLER: candidate-building that silently produced nothing looks
-        # identical to a catalogue that holds nothing close. The view here is
+        # identical to a listing that holds nothing close. The view here is
         # stocked and complete, which is exactly what makes the wrong answer
         # so confident.
-        verdict = absence_verdict(_catalogue(scenes=500, complete=True),
+        verdict = listing_verdict(_listing(scenes=500, complete=True),
                                   decide([]))
 
-        self.assertIsNone(verdict.absent)
-        self.assertIsNot(verdict.absent, True)
+        self.assertIsNone(verdict.unlisted)
+        self.assertIsNot(verdict.unlisted, True)
         self.assertIn("never weighed", verdict.reason)
         self.assertNotIn("in full", verdict.reason)
         self.assertIn("no candidates offered", verdict.reason)
@@ -721,10 +741,10 @@ class AbsenceVerdict(unittest.TestCase):
             reason="ambiguous: 0.800 vs 0.780 are too close to call",
             contenders=2, interrogated=False)
 
-        verdict = absence_verdict(_catalogue(complete=True),
+        verdict = listing_verdict(_listing(complete=True),
                                   competed_on_thin_ground)
 
-        self.assertIsNone(verdict.absent)
+        self.assertIsNone(verdict.unlisted)
         self.assertIn("competed", verdict.reason)
         self.assertNotIn("never weighed", verdict.reason)
 
@@ -739,22 +759,22 @@ class AbsenceVerdict(unittest.TestCase):
             match=_m(0.9), index=0, reason="chosen with score 0.900",
             contenders=1, interrogated=False)
 
-        verdict = absence_verdict(_catalogue(complete=True),
+        verdict = listing_verdict(_listing(complete=True),
                                   found_on_thin_ground)
 
-        self.assertIs(verdict.absent, False)
+        self.assertIs(verdict.unlisted, False)
         self.assertIn("has this file", verdict.reason)
 
     def test_thin_evidence_is_still_evidence(self):
         # The loose side of the same boundary, and the quieter failure. One
         # meaningful token IS an interrogation: it was compared against every
         # title and fell short of a bar a higher score would have cleared,
-        # which is a fact about the catalogue. A guard that swept this in with
+        # which is a fact about the listing. A guard that swept this in with
         # the two cases above would stop answering for every short filename
         # and nothing would say why.
-        verdict = absence_verdict(_catalogue(complete=True), _one_generic_word())
+        verdict = listing_verdict(_listing(complete=True), _one_generic_word())
 
-        self.assertIs(verdict.absent, True)
+        self.assertIs(verdict.unlisted, True)
         self.assertIn("in full", verdict.reason)
 
     def test_a_question_never_asked_is_reported_before_a_read_never_finished(self):
@@ -764,10 +784,10 @@ class AbsenceVerdict(unittest.TestCase):
         # reading the rest cannot change an answer that was never asked. That
         # is a retry which can never come good, and pointing at it is worse
         # than saying nothing.
-        verdict = absence_verdict(_catalogue(scenes=3, complete=False),
+        verdict = listing_verdict(_listing(scenes=3, complete=False),
                                   _nothing_to_ask_with(3))
 
-        self.assertIsNone(verdict.absent)
+        self.assertIsNone(verdict.unlisted)
         self.assertIn("never weighed", verdict.reason)
         self.assertNotIn("stopped early", verdict.reason)
 
@@ -777,36 +797,85 @@ class AbsenceVerdict(unittest.TestCase):
         # actually reads. Exactly one of the branches may say "in full", and
         # a single catch-all string that satisfied every assertion above
         # cannot also satisfy this.
-        reasons = [
-            absence_verdict(_catalogue(), _refused()).reason,
-            absence_verdict(_catalogue(complete=False), _refused()).reason,
-            absence_verdict(_catalogue(), _decided()).reason,
-            absence_verdict(_catalogue(), _ambiguous()).reason,
-            absence_verdict(_catalogue(), _refused(),
-                            attribution_certain=False).reason,
-            absence_verdict(_catalogue(), _nothing_to_ask_with()).reason,
-        ]
+        reasons = _every_branch_reason()
 
         self.assertEqual([r for r in reasons if "in full" in r],
                          [reasons[0]])
         self.assertEqual(len(set(reasons)), len(reasons), reasons)
+
+    def test_the_absence_is_worded_as_what_was_read_and_what_that_shows(self):
+        # The sentence, whole, because the sentence IS the output here and a
+        # sampled assertion is blind to what it leaves out. What it used to
+        # say was "performer pf's catalogue was read in full (500 scenes) and
+        # this file is not in it" -- an assertion about the performer's body
+        # of work, which no read of this source can support. The source is a
+        # contributor-submitted index; a scene nobody entered is missing from
+        # it exactly as a scene that does not exist is.
+        #
+        # The limit rides INSIDE the reason rather than in the docs because
+        # this string is what gets pasted into a ticket, and it is pasted
+        # without them. Read alone it must still teach a reviewer that a gap
+        # in the index is not a gap in the world -- otherwise they go hunting
+        # a mis-filing for a scene that was simply never submitted, and that
+        # search has no undo either.
+        verdict = listing_verdict(_listing(scenes=500, complete=True),
+                                  _refused())
+
+        self.assertIs(verdict.unlisted, True)
+        self.assertEqual(
+            verdict.reason,
+            "this source's listing for performer pf-8821 was read in full "
+            "(500 entries) and this file is not in it — but the listing holds "
+            "only what contributors have submitted, so a file missing from it "
+            "may simply never have been submitted: nothing above the "
+            "threshold (0.70); best score was 0.410")
+
+    def test_the_absence_carries_its_limit_however_it_is_worded(self):
+        # The companion to the assertion above, and the one that survives a
+        # rewrite of it: pinning the sentence verbatim is satisfied by pasting
+        # whatever the code now says back into the test, which is exactly what
+        # a re-introduced overclaim would do. These are the properties that
+        # make the sentence honest, asserted independently of its phrasing --
+        # it names the source's own listing as what was read, and it says in
+        # the same breath that the listing holds only what was submitted to
+        # it.
+        reason = listing_verdict(_listing(scenes=500, complete=True),
+                                 _refused()).reason
+
+        self.assertIn("this source's listing", reason)
+        self.assertIn("submitted", reason)
+        self.assertIn("only what contributors", reason)
+
+    def test_no_reason_claims_a_performer_s_catalogue_was_read(self):
+        # Across every branch, not just the claiming one: "catalogue",
+        # "career", "body of work" and "everything" all name the performer's
+        # output, and this module never reads that -- it reads one index's
+        # record of it. The word is barred rather than the phrasing pinned
+        # because the harm does not depend on which sentence carries it, and
+        # a future branch will be written by somebody who did not read this
+        # file.
+        for reason in _every_branch_reason():
+            with self.subTest(reason=reason):
+                for overclaim in ("catalogue", "body of work", "career",
+                                  "every scene", "all of this performer"):
+                    self.assertNotIn(overclaim, reason.lower(), reason)
 
     def test_the_verdict_carries_a_claim_and_a_reason_and_nothing_else(self):
         # Asserted whole rather than probed key by key: the failure worth
         # preventing is a field being ADDED -- a confidence, a score, a
         # candidate -- which would re-create the thing this layer exists to
         # replace, and a sampled assertion is blind to exactly that.
-        verdict = absence_verdict(_catalogue(), _refused())
+        verdict = listing_verdict(_listing(), _refused())
 
-        self.assertEqual(sorted(vars(verdict)), ["absent", "reason"])
+        self.assertEqual(sorted(vars(verdict)), ["reason", "unlisted"])
 
     def test_certainty_cannot_be_passed_positionally(self):
-        # The natural mis-wiring is `absence_verdict(view, decision,
+        # The natural mis-wiring is `listing_verdict(listing, decision,
         # resolution.competing)` -- and `competing` holds a NAME when the
         # attribution is contested, which is truthy, so the guard would be
         # switched off by exactly the value that should switch it on.
         with self.assertRaises(TypeError):
-            absence_verdict(_catalogue(), _refused(), False)
+            listing_verdict(_listing(), _refused(), False)
 
     def test_a_certainty_that_is_not_a_boolean_raises(self):
         # Same mis-wiring, spelled as a keyword. Silently treating a truthy
@@ -816,7 +885,7 @@ class AbsenceVerdict(unittest.TestCase):
         for bad in ("Velvet Crane", 1, 0, None, ""):
             with self.subTest(bad=bad):
                 with self.assertRaises(TypeError):
-                    absence_verdict(_catalogue(), _refused(),
+                    listing_verdict(_listing(), _refused(),
                                     attribution_certain=bad)
 
 

@@ -1,15 +1,25 @@
-"""stash-box client: enumerate what a source *has*, rather than what matches.
+"""stash-box client: enumerate what a source *lists*, rather than what matches.
 
 Every scraper action the media server offers answers "what matches this?".
-None answers "what exists?" — which is the question behind a refusal that
-means anything. stash-box's `queryScenes` takes a performer criterion and
-reports a `count` alongside the page, so a performer's whole catalogue can be
-read and *known* to have been read in full.
+None answers "what does the source list?" — which is the question behind a
+refusal that means anything. stash-box's `queryScenes` takes a performer
+criterion and reports a `count` alongside the page, so every entry a source
+lists for a performer can be read and *known* to have been read in full.
 
-Reading it in full is the entire point, and the reason `Catalogue.complete`
-exists as a separate fact from the scenes themselves: a view that stopped
-early is not evidence of absence, and must never be reported as though it
-were.
+What that establishes, and what it does not, is this module's whole care.
+stash-box is a **contributor-submitted index**: it holds what somebody took
+the trouble to enter, which for most performers is a subset — often a small
+one — of what they actually released. So a complete read establishes that
+*this source lists no entry* matching a file. It never establishes that no
+such scene exists, and a file missing from the listing has most likely just
+never been submitted. Nothing here — type name, field name, docstring or
+reason string — may read as though the performer's body of work had been
+read, because the person acting on it cannot check that from the sentence.
+
+Reading the listing in full is still the entire point, and the reason
+`SourceListing.complete` exists as a separate fact from the scenes
+themselves: a read that stopped early is not evidence of anything, and must
+never be reported as though it were.
 
 The other question worth asking a source is "do you already have this exact
 file?", which `findScenesBySceneFingerprints` answers for a whole batch of
@@ -23,15 +33,15 @@ whole surface is testable without a network.
 
 from cronicled.stash import DEFAULT_TIMEOUT, Stash, StashError
 
-# stash-box's own default is 25. A catalogue read is a whole-catalogue read,
-# so it pays for itself in round trips saved.
+# stash-box's own default is 25. A listing read is a whole-listing read, so it
+# pays for itself in round trips saved.
 PER_PAGE = 100
 
 # A bound on a read that would otherwise be unbounded. At PER_PAGE that is
-# 10,000 scenes for one performer — far past any real catalogue, which is the
-# point: it is here to stop a runaway, not to trim a large but honest read.
-# Hitting it makes the read incomplete, and an incomplete read can never be
-# reported as an absence.
+# 10,000 scenes for one performer — far past any listing a real source holds,
+# which is the point: it is here to stop a runaway, not to trim a large but
+# honest read. Hitting it makes the read incomplete, and an incomplete read
+# can never be reported as an absence.
 MAX_PAGES = 100
 
 PERFORMER_SCENES = """
@@ -116,15 +126,22 @@ class FingerprintHit:
             self.scene.get("id"), self.algorithm, self.hash)
 
 
-class Catalogue:
-    """The scenes a performer has on the source, and whether that is all of
-    them.
+class SourceListing:
+    """The entries a source lists for a performer, and whether that is all of
+    the entries it lists.
+
+    Named for the *source*, not for the performer, and that is not a
+    stylistic preference. The scenes here are what contributors submitted to
+    this one index; they are not the performer's catalogue, output or body of
+    work, and a type called after any of those invites every caller and every
+    message downstream to claim something the read cannot support. A whole
+    listing is a subset of a career, and usually a small one.
 
     `complete` is the field that carries the weight: only a `True` licenses a
-    caller to say a file is *absent* from this performer's catalogue. It is
-    kept beside the scenes rather than inferred from their length, because
-    the length of a partial read and the length of a complete one look
-    exactly alike.
+    caller to say a file is not listed here. It is kept beside the scenes
+    rather than inferred from their length, because the length of a partial
+    read and the length of a complete one look exactly alike. It means every
+    entry this source holds for the performer was read — nothing more.
     """
 
     def __init__(self, performer_id, scenes, complete):
@@ -133,52 +150,74 @@ class Catalogue:
         self.complete = complete
 
     def __repr__(self):
-        return "Catalogue(performer_id=%r, scenes=%d, complete=%r)" % (
+        return "SourceListing(performer_id=%r, scenes=%d, complete=%r)" % (
             self.performer_id, len(self.scenes), self.complete)
 
 
 class Verdict:
-    """Whether a file is absent from a catalogue, and why that is the answer.
+    """Whether this source lists a file, and why that is the answer.
 
-    `absent` is three-valued, and that is the whole point of the type. `True`
-    and `False` are claims about the source; `None` is the honest answer when
-    the evidence supports neither. Collapsing `None` into `False` would make
-    "we could not tell" indistinguishable from "it is there".
+    `unlisted` is three-valued, and that is the whole point of the type.
+    `True` and `False` are claims about the source's listing; `None` is the
+    honest answer when the evidence supports neither. Collapsing `None` into
+    `False` would make "we could not tell" indistinguishable from "it is
+    there".
+
+    The field is `unlisted` rather than `absent` because it is read on its
+    own — in a log line, in a review comment, beside a filename — where
+    "absent" takes whatever object the reader has in mind, and the object
+    they have in mind is the performer's work. `unlisted` names the listing
+    as the subject and cannot be read as a claim about the world: an entry
+    nobody ever submitted is unlisted here and is not absent anywhere. The
+    scheme is unchanged; only the word that travels with the value is.
 
     The asymmetry with the rest of this project is worth stating: elsewhere a
     wrong answer costs a wrong write, which a later run can correct. This one
     is read by a person and acted on by a person, and a reviewer sent to look
-    for a mis-filing that does not exist has no undo.
+    for a mis-filing that does not exist has no undo. That is also why the
+    reason for `unlisted=True` carries the limit of the evidence inside the
+    sentence rather than leaving it to these docs: the sentence is what gets
+    quoted, and it is quoted without them.
 
-    `reason` is the part that actually gets read, so it carries the same rule:
-    it never claims a completeness that was not achieved.
+    `reason` is the part that actually gets read, so it carries the same
+    rules: it never claims a completeness that was not achieved, and never a
+    reach the source does not have.
     """
 
-    def __init__(self, absent, reason):
-        self.absent = absent
+    def __init__(self, unlisted, reason):
+        self.unlisted = unlisted
         self.reason = reason
 
     def __repr__(self):
-        return "Verdict(absent=%r, reason=%r)" % (self.absent, self.reason)
+        return "Verdict(unlisted=%r, reason=%r)" % (self.unlisted, self.reason)
 
 
-def absence_verdict(view, decision, *, attribution_certain=True):
-    """What `view` and `decision` together are allowed to claim about a file.
+def listing_verdict(listing, decision, *, attribution_certain=True):
+    """What `listing` and `decision` together are allowed to claim about a file.
 
-    `view` is a `Catalogue`; `decision` is a `cronicled.scoring.Decision` made
-    over candidates drawn from that catalogue. `attribution_certain` says
-    whether the performer whose catalogue was read is agreed to be this file's
-    creator — a caller working from `cronicled.artist.resolve` computes it as
-    `resolution.competing is None`, the resolver's own report that the folder
-    and the filename did not name different people.
+    `listing` is a `SourceListing`; `decision` is a
+    `cronicled.scoring.Decision` made over candidates drawn from it.
+    `attribution_certain` says whether the performer whose listing was read is
+    agreed to be this file's creator — a caller working from
+    `cronicled.artist.resolve` computes it as `resolution.competing is None`,
+    the resolver's own report that the folder and the filename did not name
+    different people.
 
-    Five things have to hold before a file may be called absent, and each one
-    that fails downgrades the claim rather than weakening it:
+    The strongest thing obtainable here is *this source does not list it*. It
+    is worth obtaining: a scorer must always pick a winner from what it is
+    handed, and against a real library it applied a wrong entry 6% of the time
+    when the right one was not in the candidate list at all. A read that is
+    known to be whole is the only evidence that separates those cases, and it
+    is the most useful signal available. It is still evidence about an index
+    somebody filled in by hand, never about what a performer released.
+
+    Five things have to hold before a file may be called unlisted, and each
+    one that fails downgrades the claim rather than weakening it:
 
     * **the attribution is not contested.** An enumeration of the wrong
-      performer's catalogue answers a question about the wrong person, and
+      performer's listing answers a question about the wrong person, and
       answering it confidently is worse than not answering. This blocks
-      `False` as well as `True`: a title match found in a catalogue that may
+      `False` as well as `True`: a title match found in a listing that may
       belong to someone else is a wrong identification, which is the exact
       failure the resolver's disagreement is warning about.
     * **the scorer did not find it.** A decided match is a presence, and it
@@ -187,29 +226,29 @@ def absence_verdict(view, decision, *, attribution_certain=True):
       gates only the negative claim.
     * **the refusal was for want of a candidate, not a surplus of them.** A
       refusal with contenders is a dilemma: entries that look like this file
-      are in the catalogue, and reporting that as an absence would send a
+      are in the listing, and reporting that as an absence would send a
       reviewer hunting a mis-filing while the candidates sit in the same
       reply. Read off `Decision.contenders` and never off `decision.reason` —
       `scan.py` states the rule and the reason for it.
-    * **the catalogue was interrogated.** `contenders == 0` is also what a
+    * **the listing was interrogated.** `contenders == 0` is also what a
       refusal that never weighed a single entry returns: a filename carrying
       no word that is not the artist's or generic is barred at any score, and
       a caller that offered no candidates asked nothing at all. Both come back
-      looking exactly like "nothing in this catalogue is close", and an
-      absence claimed from either is this function's own harm arriving through
-      the door built to prevent it — a reviewer sent to hunt a mis-filing the
-      scorer never looked for, against a catalogue it never questioned. The
-      one exception is a catalogue holding nothing: there is no entry to
-      weigh anything against, and the empty read is itself the evidence.
+      looking exactly like "nothing in this listing is close", and an absence
+      claimed from either is this function's own harm arriving through the
+      door built to prevent it — a reviewer sent to hunt a mis-filing the
+      scorer never looked for, against a listing it never questioned. The one
+      exception is a listing holding nothing: there is no entry to weigh
+      anything against, and the empty read is itself the evidence.
     * **the read finished.** The page that was never read is precisely where
-      the missing entry would be.
+      the matching entry would be.
 
     Ordering matters only for which reason a caller is shown, and it runs from
-    the most fundamental defect outward: not knowing whose catalogue this is
+    the most fundamental defect outward: not knowing whose listing this is
     beats anything measured inside it, and evidence in hand (a match, a set of
     contenders) is more use to a reviewer than the fact that more pages exist.
 
-    An un-interrogated catalogue is reported ahead of an unfinished read for a
+    An un-interrogated listing is reported ahead of an unfinished read for a
     sharper reason than tidiness: "stopped early" invites the caller to read
     the rest, and reading the rest cannot change an answer that was never
     asked. That is a retry which can never come good, and naming it would be
@@ -230,38 +269,49 @@ def absence_verdict(view, decision, *, attribution_certain=True):
     if not attribution_certain:
         return Verdict(None, (
             "the folder and the filename name different creators, so whose "
-            "catalogue was read is unsettled and neither answer is available"))
+            "listing was read is unsettled and neither answer is available"))
 
     if decision.match is not None:
-        return Verdict(False, "the catalogue has this file: %s" % (
-            decision.reason,))
+        return Verdict(False, (
+            "this source's listing for performer %s has this file: %s"
+            % (listing.performer_id, decision.reason)))
 
     if decision.contenders:
         return Verdict(None, (
-            "%d catalogue entries competed for this file and none of them "
-            "won, so nothing here says it is missing: %s"
-            % (decision.contenders, decision.reason)))
+            "%d entries in this source's listing for performer %s competed "
+            "for this file and none of them won, so nothing here says it is "
+            "missing: %s"
+            % (decision.contenders, listing.performer_id, decision.reason)))
 
-    # `view.scenes` and not `view.complete`: the exception is a catalogue with
-    # nothing in it, which is the strongest absence obtainable and the answer
-    # most worth acting on. A complete read of 500 entries that were never
-    # weighed is not an exception, it is the defect.
-    if not decision.interrogated and view.scenes:
+    # `listing.scenes` and not `listing.complete`: the exception is a listing
+    # with nothing in it, which is the strongest evidence obtainable here and
+    # the answer most worth acting on. A complete read of 500 entries that
+    # were never weighed is not an exception, it is the defect.
+    if not decision.interrogated and listing.scenes:
         return Verdict(None, (
-            "performer %s's %d catalogue entries were never weighed against "
-            "this file, so they are not grounds for calling it missing: %s"
-            % (view.performer_id, len(view.scenes), decision.reason)))
+            "performer %s's %d entries in this source's listing were never "
+            "weighed against this file, so they are not grounds for calling "
+            "it missing: %s"
+            % (listing.performer_id, len(listing.scenes), decision.reason)))
 
-    if not view.complete:
+    if not listing.complete:
         return Verdict(None, (
-            "the catalogue read for performer %s stopped early after %d "
-            "scenes, so the file is not ruled out by what was not read"
-            % (view.performer_id, len(view.scenes))))
+            "the read of this source's listing for performer %s stopped early "
+            "after %d scenes, so the file is not ruled out by what was not "
+            "read" % (listing.performer_id, len(listing.scenes))))
 
+    # The one sentence in this module a person acts on, so it carries its own
+    # limit: quoted into a ticket with none of these docs around it, it must
+    # still say that the source holds only what was submitted to it. Without
+    # that clause it reads as "this scene is not this performer's", which the
+    # read cannot show and which sends a reviewer hunting a mis-filing that
+    # was never there.
     return Verdict(True, (
-        "performer %s's catalogue was read in full (%d scenes) and this file "
-        "is not in it: %s" % (view.performer_id, len(view.scenes),
-                              decision.reason)))
+        "this source's listing for performer %s was read in full (%d entries) "
+        "and this file is not in it — but the listing holds only what "
+        "contributors have submitted, so a file missing from it may simply "
+        "never have been submitted: %s"
+        % (listing.performer_id, len(listing.scenes), decision.reason)))
 
 
 class StashBox:
@@ -273,24 +323,29 @@ class StashBox:
         self._client = Stash(url, api_key, transport=transport)
         self.url = self._client.url
 
-    def performer_catalogue(self, performer_id, per_page=PER_PAGE,
-                            max_pages=MAX_PAGES, timeout=DEFAULT_TIMEOUT):
-        """Read every scene credited to `performer_id`, and say whether that
-        was all of them.
+    def performer_listing(self, performer_id, per_page=PER_PAGE,
+                          max_pages=MAX_PAGES, timeout=DEFAULT_TIMEOUT):
+        """Read every scene *this source lists* against `performer_id`, and
+        say whether that was all of them.
+
+        All of them means all of the entries the source holds. Contributors
+        submit those entries by hand, so a whole read is a whole read of an
+        index and not of a performer's work, and `complete=True` licenses
+        nothing beyond "the source lists no more than these".
 
         A performer the source holds *nothing* for is a complete answer, not a
-        failed one — it is the strongest evidence of absence obtainable, and
-        the case a caller most wants to act on. So an empty catalogue is
-        `complete=True`, and `count` is what separates it from the read that
-        merely came back empty.
+        failed one — it is the strongest evidence obtainable here, and the case
+        a caller most wants to act on. So an empty listing is `complete=True`,
+        and `count` is what separates it from the read that merely came back
+        empty.
 
         Two things end the read short, and both return what was read with
         `complete=False` rather than raising: the page cap, and a page that
         comes back empty while `count` says there is more. Neither is an error
         a caller can do anything about — the scenes already in hand are still
-        worth having — but neither is a catalogue that can be used to say a
-        file is *absent*, which is why the flag and not an exception is how
-        they are reported.
+        worth having — but neither is a listing that can be used to say a file
+        is *unlisted*, which is why the flag and not an exception is how they
+        are reported.
 
         The empty page is the one that would otherwise be an infinite loop: a
         source whose `count` overstates what it will hand back (a deleted
@@ -320,11 +375,11 @@ class StashBox:
             block = result["queryScenes"]
             if not block["scenes"]:
                 nothing_to_read = block["count"] == 0 and not scenes
-                return Catalogue(performer_id, scenes, complete=nothing_to_read)
+                return SourceListing(performer_id, scenes, complete=nothing_to_read)
             scenes.extend(block["scenes"])
             if len(scenes) >= block["count"]:
-                return Catalogue(performer_id, scenes, complete=True)
-        return Catalogue(performer_id, scenes, complete=False)
+                return SourceListing(performer_id, scenes, complete=True)
+        return SourceListing(performer_id, scenes, complete=False)
 
     def known_by_fingerprint(self, fingerprints, timeout=DEFAULT_TIMEOUT):
         """Ask the source, in **one** request, which scenes carry each of
