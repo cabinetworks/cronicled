@@ -427,6 +427,33 @@ class SelectTest(unittest.TestCase):
             total=1, already_proposed=0, muted=1, filtered_out=0, selected=0,
             deferred=0))
 
+    def test_a_dismissed_proposal_does_not_suppress_its_file(self):
+        """Dismissing rejects ONE proposal; muting rejects the subject. A
+        dismissed file is scanned again, because a better proposal for it is
+        allowed to arrive tomorrow and cannot if the file is never looked at.
+
+        Today that holds only as a side effect of `items()` hiding dismissed
+        rows by default. Anyone "fixing" the inbox so a dismissed file stops
+        reappearing — by asking for `state="dismissed"` here as well — would
+        silently convert a one-proposal rejection into a permanent
+        subject-level block, which is the one thing muting is for and the one
+        thing dismissal is not.
+        """
+        dismissed = self.propose(1)
+        self.store.dismiss(dismissed)
+        self.store.mute(SUBJECT_TYPE, "2")
+
+        selected, counts = select(
+            [scene(1, "/library/one.mp4"), scene(2, "/library/two.mp4")],
+            store=self.store, folder=FOLDER)
+
+        # The muted file beside it, so the test cannot pass by treating every
+        # earlier decision as harmless.
+        self.assertEqual([s["id"] for s in selected], ["1"])
+        self.assertEqual(counts, Counts(
+            total=2, already_proposed=0, muted=1, filtered_out=0, selected=1,
+            deferred=0))
+
     def test_a_proposal_about_a_different_kind_of_subject_is_ignored(self):
         """Subject ids are only unique within a subject type, so a proposal
         (or a mute) about performer "1" must not suppress scene "1" — that
@@ -568,6 +595,32 @@ class ExamineTest(unittest.TestCase):
         ])
         self.assertEqual(MAX_RUNNERS_UP, 3)
 
+    def test_runners_up_on_the_same_score_are_ordered_by_title(self):
+        """Exact ties are a NORMAL outcome, not a rarity, so the order of
+        equal-scoring losers cannot be left to the order the catalogue
+        happened to return them in.
+
+        The three losers here score identically and are offered in reverse
+        alphabetical order, so a sort on score alone — which is stable, and
+        therefore keeps the input order — leaves the payload dependent on the
+        catalogue's ordering. The store hashes that payload, so the same file
+        re-proposes as a fresh row on any night the catalogue shuffles: an
+        inbox that refills with work already reviewed, which is the harm
+        `_runners_up` says it exists to prevent.
+        """
+        tied = [candidate("Lantern Copper", "lantern-copper"),
+                candidate("Harbour Errand", "harbour-errand"),
+                candidate("Copper Saffron", "copper-saffron")]
+        outcome, _ = self.run_examine(
+            "/library/Velvet Crane/Morning Ritual.mp4",
+            results=[self.MORNING] + tied)
+
+        self.assertEqual(outcome.proposal["payload"]["runners_up"], [
+            {"candidate": tied[2], "score": 0.092},
+            {"candidate": tied[1], "score": 0.092},
+            {"candidate": tied[0], "score": 0.092},
+        ])
+
     # -- the resolver's disagreement, which currently goes nowhere -------- #
 
     def test_a_folder_and_a_filename_naming_different_creators_reach_the_payload(self):
@@ -655,6 +708,23 @@ class ExamineTest(unittest.TestCase):
         self.assertEqual(outcome, Outcome(
             proposal=None, mute_reason=None, error=None,
             reason="nothing above the threshold (0.50); best score was 0.138"))
+
+    def test_a_score_resting_on_one_generic_word_yields_no_proposal_and_no_mute(self):
+        """The third of `decide`'s refusals to reach here, and the same
+        argument as the other two. A one-word name in a creator's folder is an
+        ordinary way to file a library, and 0.880 is a near miss: one rename,
+        or one nudge of the generic-word threshold, from resolving. Muting it
+        hides a nearly-identified file forever, and nothing revisits a mute.
+        """
+        outcome, search = self.run_examine(
+            "/library/Velvet Crane/Ritual.mp4",
+            results=[self.MORNING, self.EVENING])
+
+        self.assertEqual(search.queries, ["Velvet Crane"])
+        self.assertEqual(outcome, Outcome(
+            proposal=None, mute_reason=None, error=None,
+            reason="best score 0.880 rests on a single generic word "
+                   "(meaningful_count=1); needs 0.90 or above"))
 
     # -- the third kind: the network, not the file ------------------------ #
 
@@ -859,14 +929,34 @@ class ScriptedSearch:
 
 
 class FakeCtx:
-    """What the runner gives a producer: somewhere to log progress."""
+    """What the runner gives a producer: somewhere to log progress.
+
+    `message` is what production RETAINS. `JobRunner._log` assigns
+    `state.message = message` — one field, no history — so the last line a
+    producer logs is the whole of what the job record says once the run is
+    over. Every assertion about what a user reads off a finished job belongs
+    against `message`, and against nothing else: asserting an earlier line
+    proves a property the real collaborator does not keep, which is how the
+    scan came to report a fully-suppressed batch and an empty library in
+    byte-identical terms while this file was green.
+
+    `messages` is the stream as it was logged, in order. It is kept because
+    the per-file lines are real behaviour worth pinning — every file gets its
+    own line, naming the file it is about, as it completes — but it is a
+    recording of a stream, NOT what survives the run, and no conclusion about
+    a job's record may be drawn from it. The property that matters is pinned
+    against the real `JobRunner` instead; see
+    `test_the_closing_line_tells_a_suppressed_batch_from_an_empty_one`.
+    """
 
     def __init__(self):
+        self.message = ""
         self.messages = []
         self._lock = threading.Lock()
 
     def log(self, message):
         with self._lock:
+            self.message = message
             self.messages.append(message)
 
 
@@ -978,10 +1068,17 @@ class SingleFlightTest(unittest.TestCase):
 
         self.assertEqual(queries, ["Velvet Crane"])
 
-    def test_different_queries_are_not_collapsed(self):
-        """The other half of the boundary: a cache that answered everything
-        from one entry would satisfy every test above and attribute every file
-        in the library to one creator."""
+    def test_two_creators_sharing_a_first_name_are_not_collapsed(self):
+        """The other half of the boundary, and the harm the key's own
+        docstring names: collapsing two creators who are not the same person
+        means every file of the second is attributed from the FIRST one's
+        catalogue — a confident, wrong attribution nobody is shown.
+
+        They share a first name on purpose. Two names with no token in common
+        catch only a key that collapses everything to one entry; they cannot
+        catch a key that reads the first word and calls it identity, which is
+        the plausible mistake.
+        """
         queries = []
 
         def search(query):
@@ -990,11 +1087,81 @@ class SingleFlightTest(unittest.TestCase):
 
         flight = _SingleFlight(search)
         first = flight("Velvet Crane")
-        second = flight("Ivy Kingsley")
+        second = flight("Velvet Marsh")
 
-        self.assertEqual(queries, ["Velvet Crane", "Ivy Kingsley"])
+        self.assertEqual(queries, ["Velvet Crane", "Velvet Marsh"])
         self.assertEqual(first, [{"title": "Velvet Crane"}])
-        self.assertEqual(second, [{"title": "Ivy Kingsley"}])
+        self.assertEqual(second, [{"title": "Velvet Marsh"}])
+
+    def test_a_name_with_the_word_boundary_removed_is_a_different_query(self):
+        """Folding RUNS of whitespace is spelling; deleting the boundary
+        between two words is a guess about identity, and this cache is not the
+        place to make one.
+
+        The permissive side above and this one together fix the key at exactly
+        what it claims to be: a key that stripped punctuation and spacing
+        outright would satisfy every other test in this class while quietly
+        answering one creator's files from another's catalogue.
+        """
+        queries = []
+
+        def search(query):
+            queries.append(query)
+            return [{"title": query}]
+
+        flight = _SingleFlight(search)
+        flight("Velvet Crane")
+        flight("Velvetcrane")
+
+        self.assertEqual(queries, ["Velvet Crane", "Velvetcrane"])
+
+    def test_a_waiter_is_told_what_actually_ended_the_flight(self):
+        """The broad `except BaseException` is not what stops waiters hanging
+        — the `finally` beside it sets the event whatever happens. What it
+        buys is that a waiter is handed the failure that really ended the
+        flight.
+
+        Narrowed to `Exception`, an interrupt would leave the entry with
+        neither a result nor an error, and every waiting file would report
+        its own turn as having failed on an empty result: one outage
+        described as N unrelated bugs, none of them naming the cause.
+        """
+        entered = threading.Event()
+        release = threading.Event()
+        calling = threading.Event()
+
+        def search(query):
+            entered.set()
+            self.assertTrue(release.wait(WAIT))
+            raise KeyboardInterrupt("interrupted")
+
+        flight = _SingleFlight(search)
+        raised = {}
+
+        def call(which):
+            try:
+                flight("Velvet Crane")
+            except BaseException as exc:      # noqa: BLE001 - recorded, not handled
+                raised[which] = exc
+
+        one = threading.Thread(target=call, args=("first",))
+        one.start()
+        self.assertTrue(entered.wait(WAIT))
+
+        def second():
+            calling.set()
+            call("second")
+
+        two = threading.Thread(target=second)
+        two.start()
+        self.assertTrue(calling.wait(WAIT))
+        release.set()
+        one.join(WAIT)
+        two.join(WAIT)
+
+        self.assertEqual(sorted(raised), ["first", "second"])
+        self.assertIs(raised["first"], raised["second"])
+        self.assertIsInstance(raised["second"], KeyboardInterrupt)
 
 
 class ScanProducerTest(unittest.TestCase):
@@ -1028,6 +1195,20 @@ class ScanProducerTest(unittest.TestCase):
     def scan(self, scenes, search, **kwargs):
         """Run a whole batch and return the proposals it yielded."""
         return list(self.build(scenes, search, **kwargs).produce(self.ctx))
+
+    def run_under_the_runner(self, scenes, search, **kwargs):
+        """Run a whole batch through the real `JobRunner` and return the job.
+
+        A fresh runner per call: a runner refuses a second producer under a
+        name it already holds, and the scraping cost class allows one job at a
+        time, so two scans in one test are two runners.
+        """
+        producer = self.build(scenes, search, **kwargs)
+        runner = JobRunner(self.store)
+        runner.register(producer)
+        job = runner.start(producer.name)
+        self.assertTrue(runner.wait(job.id, WAIT))
+        return runner.job(job.id)
 
     def ids(self, proposals):
         return sorted(p["subject_id"] for p in proposals)
@@ -1320,6 +1501,81 @@ class ScanProducerTest(unittest.TestCase):
         self.assertEqual(self.store.muted_subjects(),
                          {(SUBJECT_TYPE, "1"), (SUBJECT_TYPE, "2")})
 
+    def test_the_mute_names_the_file_that_was_unidentifiable(self):
+        """The mute is bound to the scene that produced it, not to the place
+        in the completion order that scene happened to finish in.
+
+        Completion order is not input order — that is this module's headline
+        property — and the mute is its only write to the store, so the two
+        have to be bound. Here the unidentifiable file is held open so it
+        completes SECOND, behind a file that was proposed successfully. Keyed
+        off the completion index instead of off the future, the mute lands on
+        the GOOD file: suppressed permanently, while the hopeless one goes on
+        buying a lookup every night and every per-file line names the wrong
+        file.
+
+        The existing out-of-order test reads `subject_id` off the proposal
+        dict, which `examine` fills in from the scene it was handed, so it
+        cannot see this.
+        """
+        release = threading.Event()
+        search = ScriptedSearch(
+            {"Velvet Crane": [], "Ivy Kingsley": [self.LEDGER]},
+            gates={"Velvet Crane": release})
+        spy = MuteSpy(self.store)
+        producer = self.build(
+            [scene(1, self.MORNING_PATH), scene(2, self.LEDGER_PATH)],
+            search, store=spy)
+        stream = producer.produce(self.ctx)
+
+        # Scene 1 is still inside its gated lookup, so this is scene 2.
+        first = next(stream)
+        self.assertEqual(first["subject_id"], "2")
+        release.set()
+        self.assertEqual(list(stream), [])
+
+        self.assertEqual(spy.mutes, [(SUBJECT_TYPE, "1", MUTE_NO_CANDIDATES)])
+        self.assertEqual(self.store.muted_subjects(), {(SUBJECT_TYPE, "1")})
+        # The same binding as the log sees it: the file that finished first
+        # is named first, and each line names the file it is about.
+        self.assertEqual(self.ctx.messages[1:3], [
+            "1/2 scene 2: chosen with score 1.000",
+            "2/2 scene 1: " + MUTE_NO_CANDIDATES,
+        ])
+        # Without this the test passes for the wrong reason: a gate that gave
+        # up would make scene 1 an error rather than a mute, and an empty
+        # mute list would look like the same failure this test is aimed at.
+        self.assertEqual(search.timeouts, [])
+
+    def test_a_candidate_with_no_title_costs_that_file_and_no_more(self):
+        """One malformed catalogue row must not end the nightly batch.
+
+        `examine` documents itself as raising `KeyError` for a candidate with
+        no title, and that is pinned on `examine` directly — but whether it
+        costs one file or every remaining file is decided by the breadth of
+        the worker's isolation, which only a run through the producer can
+        see. Narrowed to the exception a malformed *scene* raises, this
+        `KeyError` escapes the worker and aborts the scan with the rest of
+        the batch unworked.
+        """
+        search = ScriptedSearch(
+            {"Velvet Crane": [{"url": "https://example.invalid/untitled"}],
+             "Ivy Kingsley": [self.LEDGER]})
+        proposals = self.scan(
+            [scene(1, self.MORNING_PATH), scene(2, self.LEDGER_PATH)], search)
+
+        self.assertEqual(self.ids(proposals), ["2"])
+        # Reported as an error, not a mute: a malformed row is evidence about
+        # the catalogue, not a verdict that the file is unidentifiable.
+        self.assertEqual(self.store.muted_subjects(), set())
+        self.assertTrue(any("KeyError: 'title'" in m for m in self.ctx.messages),
+                        self.ctx.messages)
+        self.assertEqual(
+            self.ctx.message,
+            "finished: 1 proposed, 0 muted, 0 refused, 1 errors; selected 2 "
+            "of 2 files (0 already proposed, 0 already muted, 0 outside the "
+            "filter, 0 deferred)")
+
     def test_an_error_never_mutes_and_does_not_end_the_scan(self):
         """A lookup that raised is evidence about the network, not about the
         file. Muting on it would hide a file permanently because a socket
@@ -1431,22 +1687,72 @@ class ScanProducerTest(unittest.TestCase):
 
         self.assertEqual(
             self.ctx.messages[0],
-            "selected 2 of 5 files (0 already proposed, 1 muted, "
+            "selected 2 of 5 files (0 already proposed, 1 already muted, "
             "1 outside the filter, 1 deferred)")
         self.assertEqual([m.split(" ", 1)[0] for m in self.ctx.messages[1:3]],
                          ["1/2", "2/2"])
-        self.assertEqual(self.ctx.messages[-1],
-                         "finished: 2 proposed, 0 muted, 0 refused, 0 errors")
+        # The last message, because the last message is the only one the
+        # runner keeps — so the breakdown has to be in it, not only in the
+        # opening line above.
+        self.assertEqual(
+            self.ctx.message,
+            "finished: 2 proposed, 0 muted, 0 refused, 0 errors; selected 2 "
+            "of 5 files (0 already proposed, 1 already muted, 1 outside the "
+            "filter, 1 deferred)")
 
     def test_each_completed_file_is_logged_with_what_it_concluded(self):
         self.scan([scene(9, self.LEDGER_PATH)], ScriptedSearch(self.SCRIPT))
 
         self.assertEqual(self.ctx.messages, [
-            "selected 1 of 1 files (0 already proposed, 0 muted, "
+            "selected 1 of 1 files (0 already proposed, 0 already muted, "
             "0 outside the filter, 0 deferred)",
             "1/1 scene 9: chosen with score 1.000",
-            "finished: 1 proposed, 0 muted, 0 refused, 0 errors",
+            "finished: 1 proposed, 0 muted, 0 refused, 0 errors; selected 1 "
+            "of 1 files (0 already proposed, 0 already muted, 0 outside the "
+            "filter, 0 deferred)",
         ])
+
+    def test_the_closing_line_tells_a_suppressed_batch_from_an_empty_one(self):
+        """Driven through the REAL runner, which keeps exactly one message.
+
+        The spec's named risk: `skipped` on the job distinguishes "suppressed
+        by your earlier decision" from "found nothing", and the scan must feed
+        that honestly rather than reporting muted files as absent. It cannot
+        feed `skipped` at all — a muted file is dropped in `select` and never
+        yielded, so it never reaches `_record` — which leaves the job's
+        message as the only place the difference can appear. `JobRunner._log`
+        assigns `state.message`, one field with no history, so the CLOSING
+        line is the whole of what a user reads off a finished job: an opening
+        line that was honest is gone by then.
+
+        Asserted through the runner and not through `FakeCtx` on purpose.
+        This is the one property the double cannot stand in for, because
+        keeping a history is exactly what the real collaborator does not do.
+        """
+        for subject_id in ("1", "2", "3"):
+            self.store.mute(SUBJECT_TYPE, subject_id)
+        suppressed = self.run_under_the_runner(
+            [scene(1, self.MORNING_PATH), scene(2, self.EVENING_PATH),
+             scene(3, self.LEDGER_PATH)], ScriptedSearch(self.SCRIPT))
+        empty = self.run_under_the_runner([], ScriptedSearch(self.SCRIPT))
+
+        self.assertEqual(
+            suppressed.message,
+            "finished: 0 proposed, 0 muted, 0 refused, 0 errors; selected 0 "
+            "of 3 files (0 already proposed, 3 already muted, 0 outside the "
+            "filter, 0 deferred)")
+        self.assertEqual(
+            empty.message,
+            "finished: 0 proposed, 0 muted, 0 refused, 0 errors; selected 0 "
+            "of 0 files (0 already proposed, 0 already muted, 0 outside the "
+            "filter, 0 deferred)")
+        # The residual, pinned rather than papered over: the two runs really
+        # are identical in the counted fields, so the message is carrying the
+        # whole of the distinction and a summary that dropped the breakdown
+        # would leave nothing behind it.
+        self.assertEqual(
+            (suppressed.recorded, suppressed.skipped, suppressed.state),
+            (empty.recorded, empty.skipped, empty.state))
 
     def test_the_closing_line_counts_every_kind_of_outcome(self):
         """Four outcomes, four counts. A summary that reported only proposals
@@ -1463,8 +1769,11 @@ class ScanProducerTest(unittest.TestCase):
 
         # Four different counts, on purpose: with any two of them equal, two
         # counters swapped by an edit would report the same line.
-        self.assertEqual(self.ctx.messages[-1],
-                         "finished: 1 proposed, 1 muted, 2 refused, 1 errors")
+        self.assertEqual(
+            self.ctx.message,
+            "finished: 1 proposed, 1 muted, 2 refused, 1 errors; selected 5 "
+            "of 5 files (0 already proposed, 0 already muted, 0 outside the "
+            "filter, 0 deferred)")
 
 
 if __name__ == "__main__":

@@ -460,9 +460,16 @@ class _SingleFlight:
             try:
                 flight.result = list(self._search(query))
             except BaseException as exc:
-                # Deliberately broader than `Exception`: whatever ends this
-                # call has to be published, or every waiter on this flight
-                # blocks on an event nothing will ever set.
+                # Deliberately broader than `Exception`, but NOT because a
+                # narrower clause would hang the waiters: the `finally` below
+                # sets the event on every path out of this call, interrupts
+                # included, so nobody blocks either way. What the breadth buys
+                # is that a waiter is handed the failure that actually ended
+                # the flight. Narrowed to `Exception`, an interrupt would
+                # leave this entry with neither a result nor an error, and
+                # every waiting file would report its own turn as having
+                # failed on an empty result — one outage described as N
+                # unrelated bugs, not one of them naming the cause.
                 flight.error = exc
             finally:
                 flight.done.set()
@@ -562,11 +569,22 @@ class ScanProducer:
         selected, counts = select(
             scenes, store=self._store, folder=self._folder,
             name_filter=self._name_filter, limit=self._limit)
-        ctx.log(
-            "selected %d of %d files (%d already proposed, %d muted, "
+        # Built once and logged twice, opening and closing, because the
+        # runner keeps ONE message: `JobRunner._log` assigns `state.message`,
+        # so by the time a job ends every line but its last has been
+        # overwritten. Logged only at the start, this breakdown is the record
+        # of how the batch was chosen right up until the moment anybody reads
+        # it. The spec asks the scan to distinguish "your earlier decisions
+        # suppressed these files" from "there was nothing to do"; the job's
+        # `skipped` cannot carry that (a muted file is dropped in `select`
+        # and never yielded, so it never reaches `_record` to be counted), so
+        # the closing line is the only place left for it.
+        selection = (
+            "selected %d of %d files (%d already proposed, %d already muted, "
             "%d outside the filter, %d deferred)" % (
                 counts.selected, counts.total, counts.already_proposed,
                 counts.muted, counts.filtered_out, counts.deferred))
+        ctx.log(selection)
 
         search = _SingleFlight(self._search)
         proposed = muted = refused = errors = 0
@@ -607,8 +625,13 @@ class ScanProducer:
             pool.shutdown(wait=False, cancel_futures=True)
         # Outside the `finally` on purpose: a run that was abandoned did not
         # finish, and a log line claiming it did would be the only record.
-        ctx.log("finished: %d proposed, %d muted, %d refused, %d errors"
-                % (proposed, muted, refused, errors))
+        # The counts describe what this run DID; the breakdown describes what
+        # it was given and why most of it may not have been worked. "0
+        # proposed" alone reads the same for a library nobody has decided
+        # anything about and for one whose every file a reviewer has already
+        # muted, and those call for opposite responses.
+        ctx.log("finished: %d proposed, %d muted, %d refused, %d errors; %s"
+                % (proposed, muted, refused, errors, selection))
 
     def _examine(self, scene, search):
         """One file's turn, with its exceptions kept to itself.
