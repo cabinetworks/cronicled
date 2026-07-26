@@ -297,13 +297,21 @@ def _filename_candidate(name):
     `feat` later in the same name is never consulted -- the left of the dash
     has already said who this belongs to. Failing a dash, a `feat` marker is
     read under the rule in `_featured_name`.
+
+    The left side is run through `clean_folder` before it is judged, the same
+    cleaning the folder side already gets. Without it, a qualifier that a
+    scraper tacks onto the filename but not the folder -- a bracketed site
+    tag, an encode marker -- makes the same person read as two: folder
+    "Velvet Crane" against filename "[SiteTag] Velvet Crane - Clip.mp4" would
+    disagree with themselves. Cleaning both sides the same way removes that
+    asymmetry without loosening `_same_name`'s identity rule.
     """
     text = strip_ext(name or "").strip()
     if not text:
         return None
     parts = _DASH_SPLIT_RE.split(text, 1)
     if len(parts) == 2:
-        left = parts[0].strip()
+        left = clean_folder(parts[0].strip())
         return left if _is_name(left) else None
     return _featured_name(text)
 

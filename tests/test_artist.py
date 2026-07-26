@@ -198,6 +198,18 @@ class Disagreement(unittest.TestCase):
         self.assertEqual(r.source, "folder")
         self.assertIsNone(r.competing)
 
+    def test_a_bracketed_site_tag_on_the_filename_does_not_manufacture_a_disagreement(self):
+        # the worked example: a scraper-inserted site tag ahead of the name
+        # must not make the same person compete with themselves
+        r = resolve("[SiteTag] Velvet Crane - Morning Ritual.mp4", "Velvet Crane")
+        self.assertEqual(r.name, "Velvet Crane")
+        self.assertIsNone(r.competing)
+
+    def test_an_encode_qualifier_on_the_filename_does_not_manufacture_a_disagreement(self):
+        r = resolve("Velvet Crane (h265) - Morning Ritual.mp4", "Velvet Crane")
+        self.assertEqual(r.name, "Velvet Crane")
+        self.assertIsNone(r.competing)
+
 
 class Guards(unittest.TestCase):
     def test_a_date_left_of_the_dash_is_not_a_creator(self):
