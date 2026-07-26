@@ -69,3 +69,91 @@ jobs:
         run: docker build --build-arg PYTHON_VERSION="$(cat .python-version)" -t cronicled:ci .
       - name: The package runs inside the image
         run: docker run --rm cronicled:ci python -m cronicled.selfcheck
+
+  # Build the documentation site on EVERY push and pull request, whether or not
+  # it will be published, so a broken page or a dead internal link fails here
+  # rather than on a deploy nobody is watching. mkdocs-material comes from the
+  # `docs` dependency group and from nowhere else: the project's runtime
+  # dependencies stay empty, and neither the `test` job above nor the image
+  # installs any of this.
+  docs:
+    needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Build the site
+        # --strict turns a warning into a failure, which is the point of
+        # running this on every commit: an internal link to a page that was
+        # renamed is exactly the kind of rot that otherwise ships.
+        run: uv run --frozen --group docs mkdocs build --strict
+      - name: Keep the built site for the deploy job
+        uses: actions/upload-artifact@v4
+        with:
+          name: site
+          path: site/
+          retention-days: 1
+
+  # Publish what the `docs` job built. Deliberately NOT a Cloudflare Pages Git
+  # integration: that would build on Cloudflare's side, outside this workflow,
+  # and publish without ./scripts/check_leaks ever running against the commit
+  # that produced the pages. Everything that reaches the open internet goes
+  # through the guard first, which is why this job needs it explicitly as well
+  # as through `docs`.
+  docs-deploy:
+    needs: [guard, docs]
+    runs-on: ubuntu-latest
+    env:
+      # Mapped into `env` rather than read inline, because the `secrets`
+      # context is not available to a step's `if:` condition and `env` is.
+      # That is what lets the skip below be a condition on the workflow rather
+      # than a failure inside the wrangler step.
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      # Same discriminator the guard job uses, for the same reason: a fork PR
+      # cannot read repository secrets at all, by GitHub's own design. It is
+      # not merely that the secret came through empty - that also happens when
+      # a secret is deleted, renamed, expired or mis-scoped, and those are a
+      # different situation reported differently below. `github.event.pull_
+      # request` does not exist on a `push`, so this is `false` there.
+      IS_FORK_PR: ${{ github.event.pull_request.head.repo.fork == true }}
+    steps:
+      # One place decides whether this run publishes, and it says out loud why
+      # not. A contributor's first pull request must not show a red X for a
+      # secret they were never going to have.
+      - name: Decide whether this run can publish
+        id: gate
+        run: |
+          if [ "${IS_FORK_PR}" = "true" ]; then
+            echo "publish=no" >> "$GITHUB_OUTPUT"
+            echo "::notice::Fork pull request: repository secrets are unavailable to fork PRs by GitHub's own design, so there is no preview deploy for this run. The site was still BUILT by the docs job, which is the check that catches a broken page. Nothing is wrong with this pull request."
+          elif [ -z "${CLOUDFLARE_API_TOKEN}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID}" ]; then
+            echo "publish=no" >> "$GITHUB_OUTPUT"
+            echo "::notice::CLOUDFLARE_API_TOKEN and/or CLOUDFLARE_ACCOUNT_ID are not set on this repository, so the site was built but not published. This job is INERT, not disabled: add both secrets and the very next run publishes, with no change to this workflow. Failing the build over a secret nobody has added yet would only teach everyone to ignore a red main."
+          else
+            echo "publish=yes" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Fetch the site the docs job built
+        if: steps.gate.outputs.publish == 'yes'
+        uses: actions/download-artifact@v4
+        with:
+          name: site
+          path: site
+      - name: Publish to Cloudflare Pages
+        if: steps.gate.outputs.publish == 'yes'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # The branch name is the whole of the production/preview decision:
+          # Pages treats a deploy of its configured production branch (main)
+          # as production and every other branch as a preview. So a push to
+          # main publishes the site, and a same-repo pull request publishes a
+          # preview under its own branch, from one invocation.
+          command: >-
+            pages deploy site
+            --project-name=cronicled
+            --branch=${{ github.head_ref || github.ref_name }}
