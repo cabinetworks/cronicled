@@ -10,15 +10,19 @@ from cronicled.text import clean_folder, strip_ext
 # name would otherwise be parsed (e.g. '2023 September 11 - Title'; a
 # filesystem/library convention, not a performer). Covers ISO-ish numeric and
 # spelled-out month forms.
-_MONTHS = (r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
-           r"jul(?:y)?|aug(?:ust)?|sep(?:t)?(?:ember)?|oct(?:ober)?|nov(?:ember)?|"
-           r"dec(?:ember)?")
+# Public because `artist` needs the same month spellings for a guard of its
+# own ("Sep 2023" is a filing convention, not a creator) and a second copy
+# would drift from this one.
+MONTH_PATTERN = (
+    r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:t)?(?:ember)?|oct(?:ober)?|nov(?:ember)?|"
+    r"dec(?:ember)?")
 _DATE_PATTERNS = (
     re.compile(r"^(?:19|20)\d{2}[-._/ ](?:0?[1-9]|1[0-2])[-._/ ](?:0?[1-9]|[12]\d|3[01])$"),
     re.compile(r"^(?:0?[1-9]|[12]\d|3[01])[-._/ ](?:0?[1-9]|1[0-2])[-._/ ](?:19|20)\d{2}$"),
-    re.compile(r"^(?:19|20)\d{2}\s+(?:%s)\s+\d{1,2}$" % _MONTHS, re.I),
-    re.compile(r"^(?:%s)\.?\s+\d{1,2},?\s+(?:19|20)\d{2}$" % _MONTHS, re.I),
-    re.compile(r"^\d{1,2}\s+(?:%s)\.?\s+(?:19|20)\d{2}$" % _MONTHS, re.I),
+    re.compile(r"^(?:19|20)\d{2}\s+(?:%s)\s+\d{1,2}$" % MONTH_PATTERN, re.I),
+    re.compile(r"^(?:%s)\.?\s+\d{1,2},?\s+(?:19|20)\d{2}$" % MONTH_PATTERN, re.I),
+    re.compile(r"^\d{1,2}\s+(?:%s)\.?\s+(?:19|20)\d{2}$" % MONTH_PATTERN, re.I),
 )
 
 
@@ -43,9 +47,9 @@ _YEAR = r"(20\d{2})"
 _ISO_SEARCH = re.compile(r"(?<!\d)%s[-._/](0[1-9]|1[0-2])[-._/]%s(?!\d)"
                          % (_YEAR, _DAY))                                 # 2021-06-20
 _SPELLED_SEARCH = (  # (pattern, index of year/month-token/day groups)
-    (re.compile(r"(?<!\d)%s\s+(%s)\.?\s+%s(?!\d)" % (_YEAR, _MONTHS, _DAY), re.I), (1, 2, 3)),
-    (re.compile(r"\b(%s)\.?\s+%s,?\s+%s\b" % (_MONTHS, _DAY, _YEAR), re.I), (3, 1, 2)),
-    (re.compile(r"(?<!\d)%s\s+(%s)\.?\s+%s\b" % (_DAY, _MONTHS, _YEAR), re.I), (3, 2, 1)),
+    (re.compile(r"(?<!\d)%s\s+(%s)\.?\s+%s(?!\d)" % (_YEAR, MONTH_PATTERN, _DAY), re.I), (1, 2, 3)),
+    (re.compile(r"\b(%s)\.?\s+%s,?\s+%s\b" % (MONTH_PATTERN, _DAY, _YEAR), re.I), (3, 1, 2)),
+    (re.compile(r"(?<!\d)%s\s+(%s)\.?\s+%s\b" % (_DAY, MONTH_PATTERN, _YEAR), re.I), (3, 2, 1)),
 )
 
 
