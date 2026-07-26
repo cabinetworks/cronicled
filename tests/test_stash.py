@@ -27,6 +27,40 @@ def _transport(responses):
     return send
 
 
+# -- what the server calls these things ------------------------------------ #
+#
+# Stated ONCE, here, and stated INDEPENDENTLY of cronicled/stash.py's own
+# `_FIELDS`/`_CREATE` maps: for each entity kind, the search field, the block
+# the rows come back in, the field that kind's ALIASES arrive in, the create
+# mutation and the input type that mutation takes. These are the media
+# server's names, not this project's — they are external facts, which is what
+# makes restating them a check rather than a mirror.
+#
+# Every fake in this file shapes its replies from this table. That matters: a
+# fake carrying its own private copy of the same map, or reading the client's
+# map at run time, agrees with the client no matter what the client's map says
+# — the copy travels WITH a mutation instead of contradicting it, and the fake
+# can then only ever confirm whatever the code does. One table, used by the
+# fakes and asserted against the client's maps by name, is the whole of the
+# fix.
+#
+# The one entry that cannot be guessed from its neighbours is the performer's
+# alias field: studios and tags use `aliases`, performers use `alias_list`.
+SERVER_ENTITY_API = {
+    "studio": ("findStudios", "studios", "aliases",
+               "studioCreate", "StudioCreateInput"),
+    "performer": ("findPerformers", "performers", "alias_list",
+                  "performerCreate", "PerformerCreateInput"),
+    "tag": ("findTags", "tags", "aliases",
+            "tagCreate", "TagCreateInput"),
+}
+
+# The two projections the fakes need: (search field, result block, alias field)
+# and the create mutation's name.
+SERVER_FIND = {kind: row[:3] for kind, row in SERVER_ENTITY_API.items()}
+SERVER_CREATE_MUTATION = {kind: row[3] for kind, row in SERVER_ENTITY_API.items()}
+
+
 class Gql(unittest.TestCase):
     def test_returns_the_data_block(self):
         t = _transport([{"data": {"version": {"version": "0.0.1"}}}])
@@ -258,11 +292,8 @@ class _SceneTransport:
     to simulate the server refusing the name, permanently or transiently).
     """
 
-    _FIND = {"studio": ("findStudios", "studios", "aliases"),
-             "performer": ("findPerformers", "performers", "alias_list"),
-             "tag": ("findTags", "tags", "aliases")}
-    _CREATE_MUTATION = {"studio": "studioCreate", "performer": "performerCreate",
-                        "tag": "tagCreate"}
+    _FIND = SERVER_FIND
+    _CREATE_MUTATION = SERVER_CREATE_MUTATION
 
     def __init__(self, existing, found=None, create=None):
         self.existing = existing
@@ -356,11 +387,8 @@ class _MutableScene:
     mutates like this, a revert test would only be checking the client
     against itself."""
 
-    _FIND = {"studio": ("findStudios", "studios", "aliases"),
-             "performer": ("findPerformers", "performers", "alias_list"),
-             "tag": ("findTags", "tags", "aliases")}
-    _CREATE_MUTATION = {"studio": "studioCreate", "performer": "performerCreate",
-                        "tag": "tagCreate"}
+    _FIND = SERVER_FIND
+    _CREATE_MUTATION = SERVER_CREATE_MUTATION
 
     def __init__(self, **fields):
         state = {"title": None, "details": None, "date": None, "urls": [],
@@ -1589,11 +1617,8 @@ class _ResolveTransport:
     it.
     """
 
-    _FIND = {"studio": ("findStudios", "studios", "aliases"),
-             "performer": ("findPerformers", "performers", "alias_list"),
-             "tag": ("findTags", "tags", "aliases")}
-    _CREATE_MUTATION = {"studio": "studioCreate", "performer": "performerCreate",
-                        "tag": "tagCreate"}
+    _FIND = SERVER_FIND
+    _CREATE_MUTATION = SERVER_CREATE_MUTATION
 
     def __init__(self, kind, results=None, create=None,
                  results_after_create=None):
@@ -2350,3 +2375,702 @@ class SceneReadSelection(unittest.TestCase):
         self.assertEqual(state["performer_ids"][0], "p1")
         self.assertEqual(len(state["tag_ids"]), 2)
         self.assertEqual(state["tag_ids"][0], "t1")
+
+
+# -- the query text the variables are bound into --------------------------- #
+#
+# Everything above asserts the VARIABLES a request carries, thoroughly and
+# verbatim. Almost none of it touches the query STRING those variables are
+# bound into — and a variable is worth exactly what the query binds it to.
+# Swap `findScenes(filter:$f, scene_filter:$s)` for `(filter:$s,
+# scene_filter:$f)` and every assertion above still passes, while every scan
+# request this client sends is malformed against a real server: a total
+# outage with no test signal at all. The same holds for `findTags(tag_filter:
+# $f)` becoming `(filter:$f)`, and for every `input:` on the write side.
+#
+# The pin is on STRUCTURE, not on wording. Comparing a query to a golden blob
+# breaks on every reformat and says nothing about what broke, so the helpers
+# below parse the query and the tests assert argument bindings BY NAME,
+# resolved through to the value each argument actually receives. Re-indent a
+# query, rename $f to $paging, reorder the arguments, add a field to a
+# selection set: all still pass, because none of it changes what the server is
+# sent. Swap two bindings and the failure names the argument that is wrong and
+# prints the value that arrived on it.
+
+
+def _argument_list(query, field):
+    """The source text inside `field`'s argument parentheses, with brackets and
+    braces balanced (an inline object argument contains commas of its own)."""
+    opener = re.search(r"\b%s\s*\(" % re.escape(field), query)
+    if opener is None:
+        raise AssertionError("this query never calls %r:\n%s" % (field, query))
+    depth = 0
+    for i in range(opener.end() - 1, len(query)):
+        if query[i] in "([{":
+            depth += 1
+        elif query[i] in ")]}":
+            depth -= 1
+            if depth == 0:
+                return query[opener.end():i]
+    raise AssertionError("unbalanced argument list for %r in:\n%s" % (field, query))
+
+
+def _arguments_of(query, field):
+    """{argument name: binding} for `field`'s call. A binding is "$name" for a
+    variable, or the argument's literal source text with whitespace removed for
+    an inline value. Order and formatting are discarded; names are not."""
+    args, depth, current = [], 0, ""
+    for ch in _argument_list(query, field):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            args.append(current)
+            current = ""
+        else:
+            current += ch
+    args.append(current)
+    out = {}
+    for arg in args:
+        if not arg.strip():
+            continue
+        name, sep, binding = arg.partition(":")
+        if not sep or not name.strip():
+            raise AssertionError("%r is not a name:value argument of %r"
+                                 % (arg, field))
+        name = name.strip()
+        if name in out:
+            raise AssertionError("%r binds the argument %r twice" % (field, name))
+        out[name] = re.sub(r"\s+", "", binding)
+    return out
+
+
+def _declared_variables(query):
+    """{"$f": "FindFilterType"} — the operation header's variable declarations,
+    so an argument can be checked against the TYPE it carries as well as
+    against the value it receives."""
+    return _arguments_of(
+        query, "mutation" if query.lstrip().startswith("mutation") else "query")
+
+
+def _bound_arguments(query, variables, field):
+    """`field`'s arguments with every variable binding RESOLVED to the value
+    the request actually sent for it — argument by argument, what the server
+    receives.
+
+    This is the assertion the variables-only tests above cannot make. Swapping
+    a pair of bindings leaves the variables dict byte-identical and changes
+    this one, which is precisely the gap: `{"f": paging, "s": cohort}` is
+    correct whichever way round the query binds it, and only one of the two
+    ways is a request a server will answer.
+    """
+    out = {}
+    for name, binding in _arguments_of(query, field).items():
+        if not binding.startswith("$"):
+            out[name] = binding          # an inline literal, kept as source text
+        elif binding[1:] in variables:
+            out[name] = variables[binding[1:]]
+        else:
+            raise AssertionError(
+                "%s's %r argument is bound to %s, which this request never sent "
+                "— it sent %s" % (field, name, binding,
+                                  sorted("$" + v for v in variables)))
+    return out
+
+
+def _declared_type_of(query, field, argument):
+    """The GraphQL type declared for whatever variable `field`'s `argument` is
+    bound to. Follows the binding rather than the variable's name, so renaming
+    a variable does not fail this and rebinding one does."""
+    binding = _arguments_of(query, field)[argument]
+    if not binding.startswith("$"):
+        raise AssertionError("%s's %r is an inline literal (%s), not a variable"
+                             % (field, argument, binding))
+    declared = _declared_variables(query)
+    if binding not in declared:
+        raise AssertionError(
+            "%s's %r is bound to %s, which the operation never declares — it "
+            "declares %s" % (field, argument, binding, sorted(declared)))
+    return declared[binding]
+
+
+class _QueryRecorder:
+    """Records the (query, variables) of every request and answers with canned
+    payloads in order, so any client method can be driven purely to see the
+    request it builds. Opens no socket."""
+
+    def __init__(self, *payloads):
+        self.calls = []
+        self.payloads = list(payloads) or [{"data": {}}]
+
+    def __call__(self, body, timeout):
+        self.calls.append((body["query"], body["variables"]))
+        return self.payloads[min(len(self.calls) - 1, len(self.payloads) - 1)]
+
+    def only(self):
+        """The single request sent — fails if it was not exactly one, so a test
+        cannot pass by inspecting the wrong call."""
+        if len(self.calls) != 1:
+            raise AssertionError("expected exactly 1 request, got %d"
+                                 % len(self.calls))
+        return self.calls[0]
+
+
+def _binding_stash(transport):
+    return Stash(SERVER_URL, API_KEY, transport=transport)
+
+
+# What _find_scenes is driven with below, and the paging block it builds for it.
+BOUND_SCENE_FILTER = {"tags": {"value": [COHORT_TAG_ID], "modifier": "INCLUDES"}}
+BOUND_SCENE_PAGING = {"per_page": 5, "page": 1, "sort": "id", "direction": "ASC"}
+
+
+def _scene_search_request():
+    t = _QueryRecorder({"data": {"findScenes": {"count": 0, "scenes": []}}})
+    _binding_stash(t)._find_scenes(BOUND_SCENE_FILTER, 5)
+    return t.only()
+
+
+class SceneSearchBindings(unittest.TestCase):
+    def test_paging_binds_to_filter_and_the_cohort_binds_to_scene_filter(self):
+        # HARM: the headline case. `filter` is the server's PAGING argument and
+        # `scene_filter` is its WHICH-SCENES argument; they take different input
+        # types and mean opposite things. Bound the wrong way round, every scan
+        # request — unorganized_scenes and tagged_scenes both come through here
+        # — is rejected by the server, so the tool stops working entirely on
+        # every install at once. Every existing assertion about this call is
+        # about the variables, and the variables are identical either way.
+        #
+        # Asserted as the whole argument map, so an argument added or dropped
+        # fails here too: a `filter` that quietly stopped being sent would send
+        # a full-library read where a 5-scene trial run was asked for.
+        query, variables = _scene_search_request()
+        self.assertEqual(_bound_arguments(query, variables, "findScenes"),
+                         {"filter": BOUND_SCENE_PAGING,
+                          "scene_filter": BOUND_SCENE_FILTER})
+
+    def test_each_argument_declares_the_type_the_server_expects_for_it(self):
+        # HARM: the other half of the swap. The operation header declares the
+        # types, and swapping THOSE — `$f: SceneFilterType, $s: FindFilterType`
+        # — leaves the bindings correct and the declarations wrong, which the
+        # server rejects at parse time just as flatly. Read through the
+        # binding, so renaming a variable is not a failure and rebinding it is.
+        query, _ = _scene_search_request()
+        self.assertEqual(_declared_type_of(query, "findScenes", "filter"),
+                         "FindFilterType")
+        self.assertEqual(_declared_type_of(query, "findScenes", "scene_filter"),
+                         "SceneFilterType")
+
+
+def _tag_lookup_request():
+    t = _QueryRecorder({"data": {"findTags": {"tags": []}}})
+    _binding_stash(t).tag_id_by_name(COHORT_TAG_NAME)
+    return t.only()
+
+
+class TagLookupBindings(unittest.TestCase):
+    def test_the_exact_name_binds_to_tag_filter_and_paging_stays_inline(self):
+        # HARM: this lookup is how a cohort scan finds the tag it is pointed
+        # at. `tag_filter` is where the EQUALS name match belongs; `filter`
+        # takes the paging block, inline here because there is nothing to vary.
+        # Bind the name to `filter` and the server is handed a name matcher
+        # where it expects paging: every tag lookup fails, so every tag-driven
+        # run reports "no such tag" and does nothing, quietly. The name match
+        # itself is asserted verbatim above; what was never asserted is which
+        # argument carries it.
+        query, variables = _tag_lookup_request()
+        self.assertEqual(
+            _bound_arguments(query, variables, "findTags"),
+            {"tag_filter": {"name": {"value": COHORT_TAG_NAME,
+                                     "modifier": "EQUALS"}},
+             "filter": "{per_page:5}"})
+
+    def test_the_name_match_declares_the_tag_filter_type(self):
+        # HARM: `TagFilterType` is what makes a `name`/`modifier` match legal
+        # here. Declared as FindFilterType the server refuses the query, with
+        # the same silent "no such tag" outcome.
+        query, _ = _tag_lookup_request()
+        self.assertEqual(_declared_type_of(query, "findTags", "tag_filter"),
+                         "TagFilterType")
+
+
+def _all_tags_request():
+    t = _QueryRecorder({"data": {"findTags": {"count": 0, "tags": []}}})
+    _binding_stash(t).all_tags()
+    return t.only()
+
+
+class AllTagsBindings(unittest.TestCase):
+    def test_the_tag_page_walk_binds_its_paging_to_filter(self):
+        # HARM: the mirror image of the lookup above — here `filter` is the
+        # right argument, because this call pages and does not match a name.
+        # Bound to `tag_filter` the walk fails outright, and consolidation
+        # (which deletes tags permanently via tagsMerge) can never run at all.
+        # Asserted whole: this call must send paging and NOTHING else, or the
+        # merge planner computes its merges from a filtered subset of the tags
+        # while believing it saw them all.
+        query, variables = _all_tags_request()
+        self.assertEqual(_bound_arguments(query, variables, "findTags"),
+                         {"filter": {"per_page": 500, "page": 1,
+                                     "sort": "name", "direction": "ASC"}})
+        self.assertEqual(_declared_type_of(query, "findTags", "filter"),
+                         "FindFilterType")
+
+
+def _entity_search_request(kind, name=STUDIO_NAME):
+    fn, field, _ = SERVER_FIND[kind]
+    t = _QueryRecorder({"data": {fn: {"count": 0, field: []}}})
+    _binding_stash(t)._find_first(kind, name)
+    return t.only()
+
+
+class EntitySearchBindings(unittest.TestCase):
+    def test_every_kind_binds_its_search_to_filter(self):
+        # HARM: this is the find half of find-or-create, for all three kinds.
+        # A search the server refuses is indistinguishable here from a search
+        # that found nothing — _find_first would raise, but the caller's own
+        # recovery treats a refusal as "create it" — so a wrong argument name
+        # turns every resolution into a CREATE: a duplicate studio, performer
+        # and tag per name per run, permanently, in the user's library.
+        #
+        # Driven per kind because the field name is interpolated from the
+        # client's own map: a kind whose search field is wrong never reaches
+        # the assertion, it fails in _arguments_of naming the field the query
+        # does not call.
+        for kind in sorted(SERVER_FIND):
+            with self.subTest(kind=kind):
+                fn = SERVER_FIND[kind][0]
+                query, variables = _entity_search_request(kind)
+                self.assertEqual(
+                    _bound_arguments(query, variables, fn),
+                    {"filter": {"q": STUDIO_NAME, "per_page": 100, "page": 1}})
+                self.assertEqual(_declared_type_of(query, fn, "filter"),
+                                 "FindFilterType")
+
+
+class SceneReadBindings(unittest.TestCase):
+    def test_the_scene_id_binds_to_the_id_argument(self):
+        # HARM: the read that supplies both the apply's union and its undo
+        # snapshot. `$id` bound to anything but `id` is a query the server
+        # refuses, so every apply fails — and the module already pins that the
+        # id travels as a variable rather than baked into the text, which is
+        # the assertion that looks like it covers this and does not.
+        body = _read_one_scene("sc-42")
+        self.assertEqual(
+            _bound_arguments(body["query"], body["variables"], "findScene"),
+            {"id": "sc-42"})
+
+    def test_the_id_is_declared_as_a_required_ID(self):
+        # HARM: `ID!` is what makes the server reject a null id rather than
+        # answer with some arbitrary scene. Declared nullable, a caller that
+        # loses the id somewhere upstream gets a query the server accepts.
+        self.assertEqual(_declared_type_of(_read_one_scene()["query"],
+                                           "findScene", "id"), "ID!")
+
+
+def _create_request(kind, name=STUDIO_NAME):
+    mut = SERVER_CREATE_MUTATION[kind]
+    t = _QueryRecorder({"data": {mut: {"id": "created-entity"}}})
+    _binding_stash(t)._create(kind, name)
+    return t.only()
+
+
+class CreateMutationBindings(unittest.TestCase):
+    def test_every_kind_sends_its_new_entity_as_the_input_argument(self):
+        # HARM: the create half of find-or-create. A rejected create is caught
+        # by _create's own recovery, which re-searches and — finding nothing,
+        # because nothing was created — re-raises. apply_scene then records the
+        # name as permanently skipped and marks the scene organized, so the
+        # scene looks done and is silently missing that studio/performer/tag
+        # forever. A wrong argument name does that to EVERY name that is not
+        # already in the library.
+        for kind in sorted(SERVER_CREATE_MUTATION):
+            with self.subTest(kind=kind):
+                query, variables = _create_request(kind)
+                self.assertEqual(
+                    _bound_arguments(query, variables,
+                                     SERVER_CREATE_MUTATION[kind]),
+                    {"input": {"name": STUDIO_NAME}})
+
+    def test_every_kind_declares_the_create_input_type_the_server_expects(self):
+        # HARM: each kind's create takes its OWN input type, and the three are
+        # not interchangeable. Declare a performer create as taking a
+        # StudioCreateInput and the server refuses it at parse time — with the
+        # same silent, permanent skip as above, on every performer the library
+        # does not already hold.
+        for kind, row in sorted(SERVER_ENTITY_API.items()):
+            with self.subTest(kind=kind):
+                mut, input_type = row[3], row[4]
+                query, _ = _create_request(kind)
+                self.assertEqual(_declared_type_of(query, mut, "input"),
+                                 input_type + "!")
+
+
+def _apply_update_request():
+    t = _QueryRecorder({"data": {"findScene": {"id": "sc-9"}}},
+                       {"data": {"sceneUpdate": {"id": "sc-9"}}})
+    _binding_stash(t).apply_scene("sc-9", {"title": "Harbour Fog"})
+    return t.calls[-1]
+
+
+def _revert_update_request():
+    t = _QueryRecorder({"data": {"sceneUpdate": {"id": "sc-9"}}})
+    _binding_stash(t).revert_scene("sc-9", {"title": "Old Title"})
+    return t.only()
+
+
+class SceneWriteBindings(unittest.TestCase):
+    """apply_scene and revert_scene each carry their OWN copy of the
+    sceneUpdate mutation text, so each needs its own pin — fixing one would
+    otherwise leave the other malformed."""
+
+    def test_the_apply_sends_its_update_as_the_input_argument(self):
+        # HARM: the write the whole module exists to make. A wrong argument
+        # name means every apply is refused; the failure is classified
+        # permanent (a GraphQL error, not a blip), so the run condemns every
+        # scene it touches rather than retrying, and a full pass over a library
+        # writes nothing while reporting each row as a permanent failure.
+        query, variables = _apply_update_request()
+        self.assertEqual(_bound_arguments(query, variables, "sceneUpdate"),
+                         {"input": {"id": "sc-9", "organized": True,
+                                    "title": "Harbour Fog"}})
+        self.assertEqual(_declared_type_of(query, "sceneUpdate", "input"),
+                         "SceneUpdateInput!")
+
+    def test_the_revert_sends_its_restore_as_the_input_argument(self):
+        # HARM: worse than the apply's, because undo is the recovery path. An
+        # apply that fails leaves the scene as it was; a REVERT that fails
+        # leaves the scene holding metadata the user asked to have taken back
+        # off it, and the only tool for taking it back off is the one that
+        # just failed.
+        query, variables = _revert_update_request()
+        self.assertEqual(_bound_arguments(query, variables, "sceneUpdate"),
+                         {"input": {"id": "sc-9", "title": "Old Title"}})
+        self.assertEqual(_declared_type_of(query, "sceneUpdate", "input"),
+                         "SceneUpdateInput!")
+
+
+class TagWriteBindings(unittest.TestCase):
+    def test_the_merge_sends_its_input_as_the_input_argument(self):
+        # HARM: tagsMerge deletes the source tags permanently and nothing in
+        # this module can undo it. A refused merge is the SAFE failure here —
+        # what this pins is that the call is well-formed, so the consolidation
+        # a user reviewed and approved is the one that actually runs, rather
+        # than every merge failing and the duplicates staying put run after run.
+        t = _QueryRecorder({"data": {"tagsMerge": {"id": CANONICAL_TAG_ID}}})
+        _binding_stash(t).merge_tags(CANONICAL_TAG_ID, [TYPO_TAG_ID])
+        query, variables = t.only()
+        self.assertEqual(_bound_arguments(query, variables, "tagsMerge"),
+                         {"input": {"source": [TYPO_TAG_ID],
+                                    "destination": CANONICAL_TAG_ID}})
+        self.assertEqual(_declared_type_of(query, "tagsMerge", "input"),
+                         "TagsMergeInput!")
+
+    def test_the_alias_write_sends_its_input_as_the_input_argument(self):
+        # HARM: an alias top-up that never lands is invisible — the caller is
+        # told it worked, so every later run recomputes the same "missing"
+        # aliases, and the duplicate spellings this write exists to absorb keep
+        # being recreated by every scrape.
+        t = _QueryRecorder({"data": {"tagUpdate": {"id": CANONICAL_TAG_ID}}})
+        _binding_stash(t).update_tag_aliases(CANONICAL_TAG_ID, MERGED_ALIASES)
+        query, variables = t.only()
+        self.assertEqual(_bound_arguments(query, variables, "tagUpdate"),
+                         {"input": {"id": CANONICAL_TAG_ID,
+                                    "aliases": MERGED_ALIASES}})
+        self.assertEqual(_declared_type_of(query, "tagUpdate", "input"),
+                         "TagUpdateInput!")
+
+
+# -- the entity-kind maps -------------------------------------------------- #
+
+
+class EntityKindMaps(unittest.TestCase):
+    """The two maps every find-or-create query is built out of, checked against
+    the server's own names as stated at the top of this file — not against a
+    copy that travels with them."""
+
+    def test_the_search_map_names_what_the_server_calls_these_things(self):
+        # HARM: the alias field is the entry that matters and the entry that
+        # differs. Point the performer row at `aliases` and performer alias
+        # resolution silently returns nothing: every name that exists only as
+        # an existing performer's alias falls through to a create, the server
+        # refuses it ("used as alias for..."), and that refusal fails the whole
+        # scene apply — costing the scene its title, date, cover and every
+        # other performer. The search field and result block are here too: get
+        # either wrong and the read raises on every call.
+        self.assertEqual(Stash._FIELDS, SERVER_FIND)
+
+    def test_the_create_map_names_what_the_server_calls_these_things(self):
+        # HARM: as CreateMutationBindings above, stated as a map rather than
+        # per query, so a wrong entry fails once and names the kind rather than
+        # failing three tests obliquely.
+        self.assertEqual(Stash._CREATE,
+                         {kind: row[3:] for kind, row in SERVER_ENTITY_API.items()})
+
+    def test_the_two_maps_cover_the_same_kinds(self):
+        # HARM: find_or_create reads both for one kind. A kind present in one
+        # and missing from the other raises KeyError mid-apply — after some of
+        # the match has already resolved, which is the one moment apply_scene
+        # is written to avoid failing at.
+        self.assertEqual(set(Stash._FIELDS), set(Stash._CREATE))
+
+
+# A name the server holds only as some other entity's alias, and the entity
+# that owns it. Deliberately kind-neutral: the same pair is driven through all
+# three kinds below, because the rule is the same for all three and only the
+# field name differs.
+ALIAS_SPELLING = "Harbourlight"
+ALIAS_OWNER_NAME = "Harbour Light"
+ALIAS_OWNER_ID = "entity-alias-owner"
+
+
+class AliasFieldPerKind(unittest.TestCase):
+    def test_a_name_held_only_as_an_alias_resolves_for_every_kind(self):
+        # HARM: the behavioural half of the map test above, and the reason the
+        # performer entry could be broken with a green suite. Each kind's alias
+        # list arrives under a different field name — performers `alias_list`,
+        # studios and tags `aliases` — so asking for the wrong one returns rows
+        # with no alias list at all and the alias hit is simply never seen.
+        # The existing alias tests all drive the TAG kind, whose field name is
+        # shared with studios; the one entry that cannot be guessed from its
+        # neighbours was the one entry nothing exercised.
+        #
+        # The fake shapes its rows from SERVER_FIND, which is this file's own
+        # independent statement of the server's names — so a mutation of the
+        # client's map is contradicted here rather than travelling with it.
+        for kind in sorted(SERVER_FIND):
+            with self.subTest(kind=kind):
+                t = _ResolveTransport(kind, results={ALIAS_SPELLING: [[
+                    {"id": ALIAS_OWNER_ID, "name": ALIAS_OWNER_NAME,
+                     "aliases": [ALIAS_SPELLING]}]]})
+                self.assertEqual(
+                    _resolve_stash(t)._find_first(kind, ALIAS_SPELLING),
+                    ALIAS_OWNER_ID)
+
+
+# -- the alias-clash pattern ----------------------------------------------- #
+#
+# _ALIAS_CLASH reads the alias owner's name out of the server's refusal. The
+# owner is quoted LAST, and an owner's name may itself contain an apostrophe,
+# so the match runs greedily up to a closing quote at the END of the message.
+# The only fixture that reached it used an owner name with no apostrophe in it,
+# which is the one case the greedy match exists for.
+APOSTROPHE_OWNER_NAME = "O'Hare's Lantern"
+APOSTROPHE_OWNER_ID = "tag-apostrophe-owner"
+
+
+class AliasClashPattern(unittest.TestCase):
+    def test_an_owner_name_containing_an_apostrophe_is_read_whole(self):
+        # HARM: the refusal message is the ONLY thing that names the owner —
+        # the re-search for the refused spelling already failed, which is why
+        # the create was attempted. Stop the match at the first apostrophe
+        # inside the owner's name and the client looks up "O" instead: that
+        # resolves to nothing (or, worse, to whatever a fuzzy search for a
+        # single letter ranks first), so the tag fails the whole scene apply —
+        # or attaches an unrelated entity to it.
+        #
+        # The searches are asserted, not just the result: a fixture that only
+        # checked the returned id would also pass if the client had found the
+        # owner some other way.
+        t = _ResolveTransport(
+            "tag",
+            results={APOSTROPHE_OWNER_NAME: [[{"id": APOSTROPHE_OWNER_ID,
+                                               "name": APOSTROPHE_OWNER_NAME}]]},
+            create=StashError("name '%s' is used as alias for '%s'"
+                              % (TYPO_TAG_NAME, APOSTROPHE_OWNER_NAME)))
+        self.assertEqual(_resolve_stash(t)._create("tag", TYPO_TAG_NAME),
+                         APOSTROPHE_OWNER_ID)
+        self.assertEqual(t.searches, [TYPO_TAG_NAME, APOSTROPHE_OWNER_NAME])
+
+    def test_a_refusal_that_does_not_end_at_the_owner_is_not_guessed_at(self):
+        # HARM: the end anchor is what confines this recovery to the one
+        # message shape the module documents. Without it the pattern pulls a
+        # quoted fragment out of the MIDDLE of any refusal that happens to
+        # contain the words, looks that fragment up, and attaches whatever it
+        # resolves to — a wrong performer or tag on the scene, from a message
+        # that was never the clash this code handles.
+        #
+        # Uncertainty may withhold evidence, never supply it: an unrecognised
+        # refusal is re-raised, apply_scene records the name as skipped, and
+        # the rest of the scene still lands. The fixture holds the quoted
+        # entity in the fake server, so an unanchored pattern would find it and
+        # return successfully — the raise is the assertion.
+        t = _ResolveTransport(
+            "tag",
+            results={CANONICAL_TAG_NAME: [[{"id": "tag-canonical",
+                                            "name": CANONICAL_TAG_NAME}]]},
+            create=StashError("name '%s' is used as alias for '%s' (tag 41); "
+                              "rename it first"
+                              % (TYPO_TAG_NAME, CANONICAL_TAG_NAME)))
+        with self.assertRaises(StashError) as ctx:
+            _resolve_stash(t)._create("tag", TYPO_TAG_NAME)
+        self.assertIn("rename it first", str(ctx.exception))  # the server's own
+
+
+# -- de-duplication of the ids an apply resolves --------------------------- #
+
+# The same performer and the same tag, each under TWO spellings the fake server
+# resolves to ONE id — a display name and a spelling it also answers to. Two
+# different names resolving to one entity is what makes the fixture pin
+# de-duplication BY THE RESOLVED ID: de-duplicating the names instead would let
+# both straight through.
+DOUBLE_SPELLING_FOUND = {
+    "studio": {STUDIO_NAME: STUDIO_ID},
+    "performer": {"Velvet Crane": "performer-velvet",
+                  "Crane, Velvet": "performer-velvet"},
+    "tag": {CANONICAL_TAG_NAME: "tag-canonical",
+            TYPO_TAG_NAME: "tag-canonical"},
+}
+
+
+class ResolvedIdDeduplication(unittest.TestCase):
+    def test_two_names_resolving_to_one_entity_are_written_once(self):
+        # HARM: sceneUpdate REPLACES the performer and tag arrays, so what goes
+        # out is the scene's whole cast, and a repeated id makes that a
+        # malformed set. The run's own report counts it twice (apply_scene
+        # returns len() of the merged lists), the `prior` snapshot records the
+        # doubled list as the state an undo should restore, and a server that
+        # refuses a duplicated id in a replace-array fails the entire apply
+        # over it — a scene that would otherwise have applied cleanly.
+        #
+        # A scrape naming one performer twice is ordinary: an adapter that
+        # reads both a credits list and a title line, or a tag that appears
+        # under its canonical name and its alias in the same match.
+        t = _shape_transport(found=DOUBLE_SPELLING_FOUND)
+        result = _shape_stash(t).apply_scene("sc-9", {
+            "performers": [{"name": "Velvet Crane"}, {"name": "Crane, Velvet"}],
+            "tags": [{"name": CANONICAL_TAG_NAME}, {"name": TYPO_TAG_NAME}]})
+        self.assertEqual(t.scene_update_input["performer_ids"],
+                         ["performer-existing", "performer-velvet"])
+        self.assertEqual(t.scene_update_input["tag_ids"],
+                         ["tag-existing", "tag-canonical"])
+        # ...and what the run reports back is what it wrote
+        self.assertEqual(result["performers"], 2)
+        self.assertEqual(result["tags"], 2)
+
+
+# -- the request worker thread --------------------------------------------- #
+
+
+class _RecordingThreading:
+    """The `threading` module as gql sees it, with Thread subclassed so the
+    worker it constructs is visible to a test. The real Thread still runs the
+    work and the real Event still ends the wait, so the call behaves exactly as
+    it does unpatched — only the construction is observed."""
+
+    Event = threading.Event
+
+    def __init__(self):
+        self.threads = []
+        recorder = self
+
+        class _Thread(threading.Thread):
+            def __init__(self, *args, **kwargs):
+                threading.Thread.__init__(self, *args, **kwargs)
+                recorder.threads.append(self)
+
+        self.Thread = _Thread
+
+
+class RequestWorkerThread(unittest.TestCase):
+    def test_the_request_worker_is_a_daemon(self):
+        # HARM: the hard deadline ABANDONS a wedged request — it returns to the
+        # caller and leaves the worker running, forever if the host never
+        # answers. That is only survivable because the worker is a daemon. A
+        # non-daemon thread is joined by the interpreter at exit, so a single
+        # wedged host turns "one transient error, retry next run" into a
+        # process that finishes all its work, prints its summary, and then
+        # never exits: no error, no output, nothing to retry. It is precisely
+        # the hang the deadline exists to prevent, relocated to shutdown where
+        # it is harder to attribute. The deadline's arithmetic is pinned above;
+        # the flag that makes abandoning safe was not.
+        #
+        # Asserted on the constructed thread's own `daemon`, not on the keyword
+        # it was passed, because the attribute is what the interpreter reads.
+        # Proving the exit behaviour itself would need a subprocess; this flag
+        # is the discriminator, and it is the only thing that differs between a
+        # worker the interpreter waits for and one it does not.
+        fake = _RecordingThreading()
+        with mock.patch("cronicled.stash.threading", fake):
+            Stash(SERVER_URL, API_KEY,
+                  transport=_transport([{"data": {}}])).gql("query{x}")
+        self.assertEqual(len(fake.threads), 1)
+        self.assertIs(fake.threads[0].daemon, True)
+
+
+# -- what the two irreversible tag writes put on the wire ------------------ #
+#
+# Every id this module READS arrives from the server as a string, so the
+# coercion below is only ever exercised by a caller that computed an id itself
+# — a merge plan built from a store, a number typed on the command line.
+NUMERIC_DESTINATION_ID = 41
+NUMERIC_SOURCE_IDS = [42, 43]
+
+
+class IrreversibleTagWriteTypes(unittest.TestCase):
+    """merge_tags and update_tag_aliases have no read-back and no undo, so the
+    request body is the only thing a test can check — and the only description
+    of what the module claims to send."""
+
+    def test_the_merge_sends_every_id_as_a_string(self):
+        # PINS CURRENT BEHAVIOUR, with a stated residual: a spec-compliant
+        # GraphQL server coerces an Int given for an `ID` argument to a String
+        # itself, so sending 41 rather than "41" is not a proven outage. What
+        # this pins is that the body is the shape the module says it sends, and
+        # — the part that is load-bearing — that the destination id is sent
+        # IDENTICALLY in the two places it appears. `destination` names the tag
+        # that survives and `values.id` names the tag whose alias list is
+        # replaced; the existing merge tests assert those two are equal, and
+        # coercing only one of them would make them unequal in type while a
+        # sloppier comparison still passed.
+        #
+        # Asserted as the whole input, so a key added to an irreversible
+        # mutation is caught here as well.
+        t = _TagTransport()
+        _tag_stash(t).merge_tags(NUMERIC_DESTINATION_ID, NUMERIC_SOURCE_IDS,
+                                 aliases=MERGED_ALIASES)
+        self.assertEqual(t.only(),
+                         {"source": ["42", "43"], "destination": "41",
+                          "values": {"id": "41", "aliases": MERGED_ALIASES}})
+
+    def test_the_alias_write_sends_its_id_as_a_string(self):
+        # PINS CURRENT BEHAVIOUR, same residual as above.
+        t = _TagTransport()
+        _tag_stash(t).update_tag_aliases(NUMERIC_DESTINATION_ID, MERGED_ALIASES)
+        self.assertEqual(t.only(), {"id": "41", "aliases": MERGED_ALIASES})
+
+    def test_an_alias_collection_that_is_not_a_list_is_copied_into_one(self):
+        # HARM: this one is not cosmetic. A caller computing an alias top-up
+        # naturally produces a set or a generator — the spellings a merge
+        # folded in, the ones an external source knows about — and json.dumps
+        # refuses both outright. Without the copy the alias write does not go
+        # out malformed, it does not go out AT ALL: the call raises from inside
+        # the transport, or the body serialises as something the server cannot
+        # read, while the caller has already recorded the top-up as done.
+        #
+        # json.dumps is called on the recorded input as well, because "it is a
+        # list" and "it would survive the wire" are the same claim here and the
+        # fake transport does not serialise anything itself.
+        for label, supplied in (("generator", (a for a in MERGED_ALIASES)),
+                                ("tuple", tuple(MERGED_ALIASES))):
+            with self.subTest(supplied=label):
+                t = _TagTransport()
+                _tag_stash(t).update_tag_aliases(CANONICAL_TAG_ID, supplied)
+                self.assertEqual(t.only(), {"id": CANONICAL_TAG_ID,
+                                            "aliases": MERGED_ALIASES})
+                json.dumps(t.only())
+
+    def test_the_merge_copies_its_alias_collection_too(self):
+        # HARM: the same harm through the other write, which carries its own
+        # copy of the same coercion — fixing one would leave the other broken.
+        # And this one is the more expensive: the aliases travel WITH a merge
+        # that permanently deletes the source tags, so a body the server
+        # refuses either loses the merge or loses the spellings the merge was
+        # run to preserve.
+        t = _TagTransport()
+        _tag_stash(t).merge_tags(CANONICAL_TAG_ID, [TYPO_TAG_ID],
+                                 aliases=(a for a in MERGED_ALIASES))
+        self.assertEqual(t.only()["values"],
+                         {"id": CANONICAL_TAG_ID, "aliases": MERGED_ALIASES})
+        json.dumps(t.only())
