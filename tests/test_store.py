@@ -409,3 +409,72 @@ class Has(_StoreCase):
         fp = self._record(subject_id="1")
         self.store.mute("scene", "1", reason="never identifiable")
         self.assertFalse(self.store.has(fp))
+
+
+class MutedSubjects(_StoreCase):
+    """`muted_subjects()` answers from the `mute` table.
+
+    That is the whole point of the read: `mute` accepts a subject that has
+    never had a proposal, so any answer derived from `item` rows cannot see a
+    pre-emptive mute. A caller that asks before spending a lookup — a scan
+    choosing its batch — needs the answer the store itself will use when it
+    later refuses the proposal.
+
+    Every assertion below compares the WHOLE set, not membership: a read that
+    reported an extra subject would starve a scan of files nothing was ever
+    decided about, and membership assertions cannot see that.
+    """
+
+    def test_a_subject_muted_before_any_proposal_is_reported(self):
+        """The case no other public read can observe. `items(state='muted')`
+        sees a mute only through the row it moved; there is no row here."""
+        self.store.mute("scene", "7", reason="never identifiable")
+        self.assertEqual(self.store.muted_subjects(), {("scene", "7")})
+
+    def test_a_subject_muted_after_a_proposal_is_reported_too(self):
+        self._record(subject_id="1")
+        self.store.mute("scene", "1")
+        self.assertEqual(self.store.muted_subjects(), {("scene", "1")})
+
+    def test_an_unmuted_subject_is_not_reported(self):
+        self._record(subject_id="1")
+        self.assertEqual(self.store.muted_subjects(), set())
+
+    def test_the_answer_does_not_depend_on_an_item_row_existing(self):
+        """Two mutes, identical but for whether a proposal preceded them, are
+        reported identically. Pinned together so a read that quietly answered
+        from `item` rows could not pass by covering only the common case."""
+        self._record(subject_id="1")
+        self.store.mute("scene", "1")
+        self.store.mute("scene", "2")
+        self.assertEqual(self.store.muted_subjects(),
+                         {("scene", "1"), ("scene", "2")})
+
+    def test_the_subject_type_is_part_of_the_answer(self):
+        """Subject ids are only unique within a type, so a muted performer "1"
+        must not read as a muted scene "1"."""
+        self.store.mute("performer", "1")
+        self.assertEqual(self.store.muted_subjects(), {("performer", "1")})
+
+    def test_a_dismissed_proposal_does_not_mute_its_subject(self):
+        """Dismissal rejects one proposal; a better one for the same subject
+        may still arrive. Reporting it as muted would stop it being looked at
+        at all — the opposite of what dismissal means."""
+        fp = self._record(subject_id="1")
+        self.store.dismiss(fp, reason="wrong match")
+        self.assertEqual(self.store.muted_subjects(), set())
+
+    def test_an_integer_subject_id_reads_back_as_a_string(self):
+        """The caller-facing contract: ids come back as strings whatever they
+        went in as, so a caller comparing `str(id)` from an API gets a match
+        rather than a set it can never hit.
+
+        This pins the contract, not any one mechanism for it — `mute`'s own
+        `str()` and the column's TEXT affinity each deliver it independently,
+        so removing either alone leaves this passing.
+        """
+        self.store.mute("scene", 7)
+        self.assertEqual(self.store.muted_subjects(), {("scene", "7")})
+
+    def test_nothing_muted_is_an_empty_set(self):
+        self.assertEqual(self.store.muted_subjects(), set())
