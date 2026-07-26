@@ -268,8 +268,71 @@ class DateShapes(unittest.TestCase):
         self.assertEqual(r.name, "March Hollis")
 
     def test_a_month_word_used_as_a_folder_name_still_resolves(self):
-        r = resolve("clip01.mp4", "May Winters")
-        self.assertEqual(r.name, "May Winters")
+        # a plain invented surname -- not "Winters", which pairs a month with
+        # a season and reads as a deliberate stage name rather than a case
+        # the month-word guard has to stay clear of
+        r = resolve("clip01.mp4", "May Fenwick")
+        self.assertEqual(r.name, "May Fenwick")
+
+    def test_a_compact_month_year_is_not_a_creator(self):
+        # no whitespace at all between the month and the year -- one
+        # character away from the guard already in place, and the same
+        # filing family: "Sep2023 - Title.mp4" is a date, not a person
+        r = resolve("Sep2023 - Morning Ritual.mp4", "")
+        self.assertIsNone(r.name)
+
+    def test_a_compact_month_year_with_the_longer_abbreviation_is_not_a_creator(self):
+        r = resolve("Sept2023 - Morning Ritual.mp4", "")
+        self.assertIsNone(r.name)
+
+    def test_bare_month_names_still_resolve_as_names(self):
+        # closing the compact-date gap must not start swallowing a real
+        # creator whose whole name is a month word
+        for candidate in ("April", "June", "July", "Jan"):
+            with self.subTest(candidate=candidate):
+                r = resolve("clip01.mp4", candidate)
+                self.assertEqual(r.name, candidate)
+
+    def test_month_led_names_still_resolve_as_names(self):
+        for candidate in ("June Carter", "August Rain"):
+            with self.subTest(candidate=candidate):
+                r = resolve(candidate + " - Morning Ritual.mp4", "")
+                self.assertEqual(r.name, candidate)
+
+
+class DateGuardEdges(unittest.TestCase):
+    """Three edges of the month-year and all-digit date guards that the
+    existing suite happens not to pin.
+
+    Each is a one-line narrowing that a mutation survives today: the guard
+    still rejects every fixture already in the suite, just not by the same
+    mechanism, so nothing catches the drift until a fixture built for that
+    exact edge is added.
+    """
+
+    def test_the_month_year_match_is_anchored_at_both_ends(self):
+        # without the trailing '$' this would match on the leading "September
+        # 2023" and reject a real name -- the over-strict direction, and the
+        # one that scopes a real creator's files to nothing
+        r = resolve("September 2023 Hollis - Morning Ritual.mp4", "")
+        self.assertEqual(r.name, "September 2023 Hollis")
+
+    def test_the_month_year_match_survives_repeated_whitespace(self):
+        # the guard matches against a whitespace-collapsed copy of the text.
+        # The dash-split path already collapses via `clean_folder`, so this
+        # has to go through a `feat` marker instead -- the one path whose
+        # captured text isn't cleaned -- to actually exercise the guard's own
+        # collapse: without it, "Sep  2023" (two spaces) would slip past the
+        # optional single-space separator and resolve as a name.
+        r = resolve("Sep  2023 Feat Sep  2023.mp4", "")
+        self.assertIsNone(r.name)
+
+    def test_the_all_digit_guard_ignores_separators(self):
+        # `spaceless` folds "-" to nothing before the digit check runs, so
+        # "2023-09" is caught; narrowing that to a plain `.isdigit()` on the
+        # raw text would miss the separator and let it through
+        r = resolve("clip01.mp4", "2023-09")
+        self.assertIsNone(r.name)
 
 
 class GuardBoundaries(unittest.TestCase):

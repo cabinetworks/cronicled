@@ -129,8 +129,13 @@ ARTICLE_LEADS = frozenset({"a", "an", "the", "my", "your", "no",
 MIN_NAME_CHARS = 3
 MAX_NAME_WORDS = 4
 
-# A month with a year and no day -- "Sep 2023", "2023 September". A filing
-# style, not a person.
+# A month with a year and no day -- "Sep 2023", "2023 September", and the
+# same two shapes with no space at all ("Sep2023", "2023September"). A filing
+# style, not a person. The separator is optional rather than absent because a
+# single space still has to be recognised -- only its presence, not its
+# length, is variable here: the whitespace collapse below already reduces any
+# run of spaces to one before this matches, so `\s?` (zero or one) is enough
+# and deliberately narrower than `\s*`.
 #
 # This and the all-digits check in `_is_name` cover two date shapes
 # `dates.looks_like_date` deliberately does not, and they are kept here rather
@@ -141,8 +146,8 @@ MAX_NAME_WORDS = 4
 # name", which is safe to widen. The month spellings come from `dates` so the
 # two cannot drift apart.
 _MONTH_YEAR_RE = re.compile(
-    r"^(?:(?:%(month)s)\.?\s+(?:19|20)\d{2}"
-    r"|(?:19|20)\d{2}\s+(?:%(month)s)\.?)$" % {"month": MONTH_PATTERN}, re.I)
+    r"^(?:(?:%(month)s)\.?\s?(?:19|20)\d{2}"
+    r"|(?:19|20)\d{2}\s?(?:%(month)s)\.?)$" % {"month": MONTH_PATTERN}, re.I)
 
 # "Creator - Title". Only a single dash with whitespace on both sides splits,
 # so a hyphenated name ("Wren-Copper Marchcroft.mp4") is left whole. En and em
