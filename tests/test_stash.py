@@ -1,7 +1,13 @@
+import io
 import json
+import re
+import threading
 import unittest
+import urllib.error
+from unittest import mock
 
-from cronicled.stash import Stash, StashError
+from cronicled.stash import (DEFAULT_TIMEOUT, HARD_DEADLINE_SLACK, Stash,
+                             StashError)
 
 
 def _transport(responses):
@@ -81,10 +87,15 @@ class _SceneTransport:
         self.found = found or {}
         self.create = create or {}
         self.scene_update_input = None
+        # the variables of every findScene read, in order: the apply's merge
+        # and its undo snapshot both come from that read, so WHICH scene it
+        # asked about is part of what a test needs to be able to see
+        self.scene_read_variables = []
 
     def __call__(self, body, timeout):
         q = body["query"]
         if "findScene(" in q:
+            self.scene_read_variables.append(body["variables"])
             return {"data": {"findScene": self.existing}}
         for kind, (fn, field, alias_field) in self._FIND.items():
             if fn + "(" in q:
@@ -450,3 +461,1610 @@ class RevertRoundTrip(unittest.TestCase):
         stash = Stash("http://example.test", "k", transport=_scene_transport())
         with self.assertRaises(ValueError):
             stash.revert_scene("s1", None)
+
+
+# -- tag writes (irreversible) -------------------------------------------- #
+
+class _TagTransport:
+    """Fake transport for the tag-write tests, in the style of
+    _SceneTransport: it recognizes the two tag mutations, records the exact
+    input each one was sent, and answers with a minimal payload shaped like
+    the real server's. Opens no socket.
+
+    The recording is the point. merge_tags and update_tag_aliases have no
+    read-back and no undo — once the mutation body leaves the client the
+    damage is done on the server — so the only thing a test can check is the
+    body itself.
+    """
+
+    def __init__(self, merged=None):
+        self.calls = []  # (query, input) for every mutation sent, in order
+        self.merged = merged or {"id": "tag-canonical", "name": "Lantern Drift",
+                                 "aliases": []}
+
+    def __call__(self, body, timeout):
+        q = body["query"]
+        inp = body["variables"]["in"]
+        self.calls.append((q, inp))
+        if "tagsMerge" in q:
+            return {"data": {"tagsMerge": self.merged}}
+        if "tagUpdate" in q:
+            return {"data": {"tagUpdate": {"id": inp["id"],
+                                           "aliases": inp.get("aliases")}}}
+        raise AssertionError("test transport does not recognize query: %s" % q)
+
+    def only(self):
+        """The single mutation input sent — fails if it was not exactly one."""
+        if len(self.calls) != 1:
+            raise AssertionError("expected exactly 1 mutation, got %d"
+                                 % len(self.calls))
+        return self.calls[0][1]
+
+
+# Invented tag vocabulary: a canonical tag, a misspelling of it that a scrape
+# created, and the alias set that should survive the merge.
+CANONICAL_TAG_ID = "tag-canonical"
+TYPO_TAG_ID = "tag-typo"
+SECOND_TYPO_TAG_ID = "tag-typo-2"
+MERGED_ALIASES = ["Lantren Drift", "lantern-drift", "Lanterndrift"]
+
+
+def _tag_stash(transport):
+    return Stash("http://example.test", "k", transport=transport)
+
+
+class MergeTags(unittest.TestCase):
+    def test_sources_go_in_source_and_the_destination_in_destination(self):
+        # HARM: swapping these deletes the canonical tag and keeps the typo,
+        # dragging every scene association onto the misspelling. tagsMerge is
+        # a permanent server-side delete — nothing in this module can undo it,
+        # and the only evidence of the mistake is which id landed in which
+        # role in this one mutation body.
+        t = _TagTransport()
+        _tag_stash(t).merge_tags(CANONICAL_TAG_ID,
+                                 [TYPO_TAG_ID, SECOND_TYPO_TAG_ID])
+        inp = t.only()
+        self.assertEqual(inp["destination"], CANONICAL_TAG_ID)
+        self.assertEqual(inp["source"], [TYPO_TAG_ID, SECOND_TYPO_TAG_ID])
+        # and, explicitly: the tag being kept is never among those being
+        # destroyed, whatever else the input holds
+        self.assertNotIn(CANONICAL_TAG_ID, inp["source"])
+
+    def test_the_alias_set_is_sent_with_the_merge(self):
+        # HARM: without it the merged-away spellings are lost with the tags
+        # that carried them, and the next scrape recreates the very duplicates
+        # this merge was run to remove.
+        t = _TagTransport()
+        _tag_stash(t).merge_tags(CANONICAL_TAG_ID, [TYPO_TAG_ID],
+                                 aliases=MERGED_ALIASES)
+        inp = t.only()
+        self.assertEqual(inp["values"],
+                         {"id": CANONICAL_TAG_ID, "aliases": MERGED_ALIASES})
+        # the alias write must target the tag that survives, not one being
+        # merged away, or it lands on a tag the same call is deleting
+        self.assertEqual(inp["values"]["id"], inp["destination"])
+
+    def test_an_empty_alias_list_is_sent_as_an_explicit_clear(self):
+        # HARM: a truthiness check (`if aliases:`) collapses [] into None, so
+        # deliberately clearing a tag's aliases becomes a silent no-op — the
+        # caller is told it worked and the stale aliases stay on the server.
+        t = _TagTransport()
+        _tag_stash(t).merge_tags(CANONICAL_TAG_ID, [TYPO_TAG_ID], aliases=[])
+        inp = t.only()
+        self.assertIn("values", inp)
+        self.assertEqual(inp["values"]["aliases"], [])
+
+    def test_aliases_none_omits_the_values_block_entirely(self):
+        # HARM: the other half of the same distinction. `values` REPLACES the
+        # destination's alias list, so sending it when the caller passed
+        # nothing would wipe the destination's existing aliases as a side
+        # effect of a merge that was never asked to touch them.
+        t = _TagTransport()
+        _tag_stash(t).merge_tags(CANONICAL_TAG_ID, [TYPO_TAG_ID])
+        self.assertNotIn("values", t.only())
+
+    def test_the_merge_actually_issues_a_mutation(self):
+        # HARM: a no-op merge leaves the duplicate tags in place while the
+        # caller records the consolidation as done, so the pair is never
+        # revisited.
+        t = _TagTransport()
+        _tag_stash(t).merge_tags(CANONICAL_TAG_ID, [TYPO_TAG_ID])
+        self.assertEqual(len(t.calls), 1)
+        self.assertIn("tagsMerge", t.calls[0][0])
+
+
+class UpdateTagAliases(unittest.TestCase):
+    def test_it_writes_the_list_it_was_given(self):
+        # HARM: writing [] (or any list other than the caller's) instead
+        # replaces the tag's aliases with nothing — one call wipes every
+        # spelling variant a user curated by hand, with no snapshot taken and
+        # no undo path in this module.
+        t = _TagTransport()
+        _tag_stash(t).update_tag_aliases(CANONICAL_TAG_ID, MERGED_ALIASES)
+        inp = t.only()
+        self.assertEqual(inp["aliases"], MERGED_ALIASES)
+        self.assertEqual(inp["id"], CANONICAL_TAG_ID)
+
+    def test_it_actually_issues_a_mutation(self):
+        # HARM: making this a no-op survives the rest of the suite, so an
+        # alias top-up would silently never persist — every later run would
+        # recompute the same "missing" aliases and believe it had written them.
+        t = _TagTransport()
+        _tag_stash(t).update_tag_aliases(CANONICAL_TAG_ID, MERGED_ALIASES)
+        self.assertEqual(len(t.calls), 1)
+        self.assertIn("tagUpdate", t.calls[0][0])
+
+
+# -- which scenes a bulk run writes to ------------------------------------- #
+
+class _ReadTransport:
+    """Fake transport for the read paths that choose which scenes a bulk run
+    writes to, in the style of _TagTransport: it recognizes the two find
+    queries, records the variables each one was sent, and answers with a
+    minimal payload shaped like the real server's. Opens no socket.
+
+    Recording the variables verbatim is the point. These reads produce the
+    worklist a later apply writes to, and the only description of "which
+    scenes" is the filter dictionary in the request body — by the time a wrong
+    filter is visible in the results, the scenes have already been written to.
+
+    `tag_pages` is a list of findTags result pages, served by the requested
+    page number, so paging can be observed rather than assumed. By default the
+    reported `count` is the true total across those pages; `tag_count`
+    overrides it, which is how a fixture makes the two arms of all_tags' stop
+    condition DISAGREE (a real server's count can over-report — rows deleted
+    between pages, a count computed before a filter). While they agree, either
+    arm alone ends the read and neither is really pinned.
+
+    Past the last page it serves empty pages, and refuses after
+    `max_tag_pages` requests: a client that never stops would otherwise walk
+    empty pages forever, and a test that hangs is not a test that fails.
+    """
+
+    def __init__(self, scenes=None, count=None, tag_pages=None, tag_count=None,
+                 max_tag_pages=6):
+        self.calls = []  # (query, variables) for every request sent, in order
+        self.scenes = [] if scenes is None else scenes
+        self.count = len(self.scenes) if count is None else count
+        self.tag_pages = [[]] if tag_pages is None else tag_pages
+        self.tag_count = tag_count
+        self.max_tag_pages = max_tag_pages
+        self.tag_requests = 0
+
+    def __call__(self, body, timeout):
+        q, variables = body["query"], body["variables"]
+        self.calls.append((q, variables))
+        if "findScenes(" in q:
+            return {"data": {"findScenes": {"count": self.count,
+                                            "scenes": self.scenes}}}
+        if "findTags(" in q:
+            self.tag_requests += 1
+            if self.tag_requests > self.max_tag_pages:
+                raise AssertionError(
+                    "the client is still asking for tag pages after %d requests "
+                    "— it never stopped" % self.max_tag_pages)
+            page = (variables.get("f") or {}).get("page", 1)
+            rows = self.tag_pages[page - 1] if page <= len(self.tag_pages) else []
+            total = sum(len(p) for p in self.tag_pages)
+            return {"data": {"findTags": {
+                "count": total if self.tag_count is None else self.tag_count,
+                "tags": rows}}}
+        raise AssertionError("test transport does not recognize query: %s" % q)
+
+    def only(self):
+        """The variables of the single request sent — fails if it was not
+        exactly one, so a test cannot pass by inspecting the wrong call."""
+        if len(self.calls) != 1:
+            raise AssertionError("expected exactly 1 request, got %d"
+                                 % len(self.calls))
+        return self.calls[0][1]
+
+    def scene_filter(self):
+        """The `scene_filter` of the single request — the WHOLE dictionary, so
+        an assertion against it notices an added key as well as a changed one."""
+        return self.only()["s"]
+
+    def find_filter(self):
+        """The paging/sort `filter` of the single request, whole."""
+        return self.only()["f"]
+
+
+# Invented cohort: one tag a scan is pointed at, and two scenes carrying it.
+COHORT_TAG_ID = "tag-cohort"
+COHORT_TAG_NAME = "Lantern Drift"
+SCENE_ROWS = [{"id": "sc-1", "title": "Harbour Fog", "date": "2021-03-04",
+               "files": [{"basename": "harbour-fog.mp4", "path": "/m/harbour-fog.mp4"}],
+               "studio": None, "performers": [], "tags": []},
+              {"id": "sc-2", "title": "Quiet Tide", "date": None,
+               "files": [{"basename": "quiet-tide.mp4", "path": "/m/quiet-tide.mp4"}],
+               "studio": None, "performers": [], "tags": []}]
+
+# Mirrors the page size all_tags() requests; a page shorter than this is what
+# tells it to stop.
+TAG_PAGE_SIZE = 500
+
+
+def _tag_rows(n, prefix):
+    return [{"id": "%s-%d" % (prefix, i), "name": "%s %d" % (prefix, i),
+             "aliases": [], "scene_count": 0} for i in range(n)]
+
+
+def _read_stash(transport):
+    return Stash("http://example.test", "k", transport=transport)
+
+
+class FindScenes(unittest.TestCase):
+    def test_limit_none_asks_the_server_for_every_page_in_one_read(self):
+        # HARM: per_page -1 is the server's "all of them"; any positive number
+        # silently truncates the worklist, so a full-library scan quietly
+        # covers only the first slice and the rest is reported as done.
+        #
+        # PINS CURRENT BEHAVIOUR, and the behaviour carries a known risk:
+        # _find_scenes does NOT page. It sends ONE request with per_page -1 and
+        # trusts the server to return everything, where all_tags() loops until
+        # a page comes back short. If a server (or a proxy in front of it) caps
+        # -1 at some maximum, this read is silently truncated and nothing in
+        # the client can tell — unlike all_tags, which would at least keep
+        # asking. A "full library" scan would then cover only the cap and
+        # report itself complete. Flagged, not fixed: changing the read is a
+        # behaviour change and this ticket only pins what is here today.
+        t = _ReadTransport(scenes=SCENE_ROWS)
+        _read_stash(t)._find_scenes({"organized": False}, None)
+        self.assertEqual(t.find_filter(),
+                         {"per_page": -1, "page": 1, "sort": "id", "direction": "ASC"})
+
+    def test_a_limit_is_passed_through_as_the_page_size(self):
+        # HARM: ignoring the caller's limit turns a deliberately small trial
+        # run ("do 5 and let me check them") into a library-wide one.
+        t = _ReadTransport(scenes=SCENE_ROWS)
+        _read_stash(t)._find_scenes({"organized": False}, 5)
+        self.assertEqual(t.find_filter(),
+                         {"per_page": 5, "page": 1, "sort": "id", "direction": "ASC"})
+
+    def test_the_scene_filter_is_forwarded_unchanged(self):
+        # HARM: this is the seam every selector below relies on. If the filter
+        # is edited on the way through, each caller's carefully-scoped cohort
+        # becomes something else entirely.
+        t = _ReadTransport(scenes=SCENE_ROWS)
+        sent = {"tags": {"value": [COHORT_TAG_ID], "modifier": "INCLUDES"}}
+        _read_stash(t)._find_scenes(sent, 10)
+        self.assertEqual(t.scene_filter(), sent)
+
+    def test_it_returns_the_count_and_the_rows(self):
+        # HARM: returning the page length as the count hides from the caller
+        # that a limited read left scenes behind.
+        t = _ReadTransport(scenes=SCENE_ROWS, count=97)
+        count, scenes = _read_stash(t)._find_scenes({"organized": False}, 2)
+        self.assertEqual(count, 97)
+        self.assertEqual(scenes, SCENE_ROWS)
+
+
+class UnorganizedScenes(unittest.TestCase):
+    def test_it_asks_only_for_scenes_the_user_has_not_organized(self):
+        # HARM: this filter is the ONLY thing keeping a bulk apply off scenes
+        # the user curated by hand. Inverting it aims the run squarely at
+        # them; dropping it aims the run at the whole library. Either way
+        # human-entered metadata is overwritten with scraped guesses, at
+        # scale, and apply's undo is per-scene. Asserted as the whole
+        # dictionary: an extra key here would narrow or widen the cohort just
+        # as effectively as a changed one.
+        t = _ReadTransport(scenes=SCENE_ROWS)
+        _read_stash(t).unorganized_scenes(None)
+        self.assertEqual(t.scene_filter(), {"organized": False})
+        # False, not 0/None/"" — the value is sent to a GraphQL Boolean
+        self.assertIs(t.scene_filter()["organized"], False)
+
+    def test_the_limit_reaches_the_server(self):
+        # HARM: the same trial-run harm as above, via the public entry point
+        # the CLI actually calls.
+        t = _ReadTransport(scenes=SCENE_ROWS)
+        _read_stash(t).unorganized_scenes(3)
+        self.assertEqual(t.find_filter()["per_page"], 3)
+
+
+class TaggedScenes(unittest.TestCase):
+    def test_it_selects_the_scenes_that_carry_the_tag(self):
+        # HARM: INCLUDES -> EXCLUDES inverts the cohort — the run then applies
+        # one cohort's metadata to every scene OUTSIDE it, which is the whole
+        # library minus the handful that were meant to be touched. Asserted
+        # whole, so a stray extra key cannot ride along unnoticed.
+        t = _ReadTransport(scenes=SCENE_ROWS)
+        _read_stash(t).tagged_scenes(COHORT_TAG_ID, None)
+        self.assertEqual(t.scene_filter(),
+                         {"tags": {"value": [COHORT_TAG_ID], "modifier": "INCLUDES"}})
+
+    def test_it_sends_no_organized_key_at_all(self):
+        # HARM: the method exists to REVISIT a cohort, and a cohort worth
+        # revisiting was usually marked organized by an earlier guessed-
+        # metadata pass. Adding `organized: False` silently empties the run;
+        # adding `organized: True` narrows it to the already-done ones. The
+        # absence is load-bearing, so pin the absence, not just what is there.
+        t = _ReadTransport(scenes=SCENE_ROWS)
+        _read_stash(t).tagged_scenes(COHORT_TAG_ID, 10)
+        self.assertNotIn("organized", t.scene_filter())
+
+    def test_the_limit_reaches_the_server(self):
+        # HARM: as above — a capped trial run must stay capped.
+        t = _ReadTransport(scenes=SCENE_ROWS)
+        _read_stash(t).tagged_scenes(COHORT_TAG_ID, 7)
+        self.assertEqual(t.find_filter()["per_page"], 7)
+
+
+class TagIdByName(unittest.TestCase):
+    def test_the_name_is_matched_exactly(self):
+        # HARM: EQUALS -> MATCHES (or INCLUDES) resolves a short tag name to a
+        # longer one that merely contains it, and the whole cohort scan then
+        # runs against the wrong tag — writing one cohort's metadata onto
+        # another's scenes. Asserted whole: an extra key in the tag filter
+        # would re-scope the lookup just as silently.
+        t = _ReadTransport(tag_pages=[[{"id": COHORT_TAG_ID,
+                                        "name": COHORT_TAG_NAME,
+                                        "scene_count": 2}]])
+        _read_stash(t).tag_id_by_name(COHORT_TAG_NAME)
+        self.assertEqual(t.only()["f"],
+                         {"name": {"value": COHORT_TAG_NAME, "modifier": "EQUALS"}})
+
+    def test_it_returns_the_id_of_the_first_row(self):
+        # HARM: returning the name (or the row) instead of the id sends a
+        # string where the scene filter expects an id, and the cohort read
+        # comes back empty — a scan that reports "nothing to do" rather than
+        # failing. Picking a later row picks a different tag.
+        #
+        # PINS CURRENT BEHAVIOUR, and the behaviour carries a known risk: the
+        # lookup asks for per_page 5 and then reads row 0 only, discarding the
+        # other four without looking at them. With an EQUALS filter a second
+        # row should not exist, so today the extra four are merely fetched and
+        # thrown away — but if the server ever returns more than one row for an
+        # exact name (case-differing duplicates, an alias hit), "first row
+        # wins" silently picks one of them by search rank and the whole cohort
+        # scan runs against whichever that was, with nothing logged. Flagged,
+        # not fixed: the fixture below deliberately supplies a second row, and
+        # the test pins that the FIRST is taken.
+        t = _ReadTransport(tag_pages=[[
+            {"id": COHORT_TAG_ID, "name": COHORT_TAG_NAME, "scene_count": 2},
+            {"id": "tag-other", "name": "Lantern Drift II", "scene_count": 9}]])
+        self.assertEqual(_read_stash(t).tag_id_by_name(COHORT_TAG_NAME),
+                         COHORT_TAG_ID)
+
+    def test_it_returns_none_when_the_server_has_no_such_tag(self):
+        # HARM: an IndexError here would abort the run; a truthy stand-in
+        # would point it at a tag that does not exist.
+        t = _ReadTransport(tag_pages=[[]])
+        self.assertIsNone(_read_stash(t).tag_id_by_name("No Such Tag"))
+
+
+class AllTags(unittest.TestCase):
+    def test_it_pages_past_the_first_page(self):
+        # HARM: consolidation computes its merges from this list. Stopping at
+        # the first page means it only ever sees the alphabetically-first 500
+        # tags, so a duplicate whose twin sorts later looks unique — and the
+        # merges it does compute are made against a partial view, then written
+        # with tagsMerge, which deletes tags permanently and cannot be undone.
+        pages = [_tag_rows(TAG_PAGE_SIZE, "alpha"), _tag_rows(3, "omega")]
+        t = _ReadTransport(tag_pages=pages)
+        got = _read_stash(t).all_tags()
+        self.assertEqual(len(got), TAG_PAGE_SIZE + 3)
+        self.assertEqual(got, pages[0] + pages[1])
+        self.assertEqual([v["f"]["page"] for _, v in t.calls], [1, 2])
+
+    def test_every_page_is_requested_with_the_same_size_and_ordering(self):
+        # HARM: an unstable or differing sort between pages makes the server
+        # return overlapping or skipped windows, so consolidation sees some
+        # tags twice and others never. Asserted whole, per page.
+        pages = [_tag_rows(TAG_PAGE_SIZE, "alpha"), _tag_rows(1, "omega")]
+        t = _ReadTransport(tag_pages=pages)
+        _read_stash(t).all_tags()
+        self.assertEqual([v["f"] for _, v in t.calls],
+                         [{"per_page": TAG_PAGE_SIZE, "page": 1,
+                           "sort": "name", "direction": "ASC"},
+                          {"per_page": TAG_PAGE_SIZE, "page": 2,
+                           "sort": "name", "direction": "ASC"}])
+
+    def test_a_short_first_page_ends_the_read(self):
+        # HARM: the other half of the paging contract. Not stopping means an
+        # endless walk of empty pages against a live server.
+        #
+        # NOTE: the stop condition has TWO arms (a short page, or the running
+        # total reaching the server's `count`), and this fixture makes them
+        # agree — 4 rows out of a reported 4 — so it does not distinguish
+        # them: either arm alone passes this test. The two tests below drive
+        # the arms apart so each is pinned on its own.
+        t = _ReadTransport(tag_pages=[_tag_rows(4, "alpha")])
+        got = _read_stash(t).all_tags()
+        self.assertEqual(len(got), 4)
+        self.assertEqual(len(t.calls), 1)
+
+    def test_a_short_page_ends_the_read_even_when_the_count_over_reports(self):
+        # HARM: pins the short-page arm ALONE, by making the count arm unable
+        # to fire — the server claims far more tags than it hands back. A count
+        # can over-report on a real server (rows deleted between pages, a total
+        # computed before a filter), and then the short page is the only thing
+        # that ends the walk: without that arm the client asks for page after
+        # empty page forever, against a live server, and all_tags never
+        # returns — the consolidation run hangs rather than failing.
+        #
+        # Driven at a plainly-short page AND at the boundary one (exactly one
+        # row less than the page size), because "short" means short OF THE
+        # REQUESTED PAGE SIZE: an arm testing some other threshold would still
+        # end a 4-row read, and only the boundary case notices.
+        for short in (4, TAG_PAGE_SIZE - 1):
+            with self.subTest(rows=short):
+                t = _ReadTransport(tag_pages=[_tag_rows(short, "alpha")],
+                                   tag_count=TAG_PAGE_SIZE * 3)
+                got = _read_stash(t).all_tags()
+                self.assertEqual(len(got), short)
+                self.assertEqual(len(t.calls), 1)
+
+    def test_a_full_page_that_completes_the_count_ends_the_read(self):
+        # HARM: pins the count arm ALONE, by making the short-page arm unable
+        # to fire — exactly 500 rows, which is indistinguishable from "there
+        # is more" by length. `count` is what stops it, and without that arm
+        # every read spends an extra round trip past the end of the tag list;
+        # against a server that answers an over-run page by repeating the last
+        # one (rather than returning nothing), the walk never terminates and
+        # the returned list grows duplicates of tags the merge planner would
+        # then plan merges between.
+        t = _ReadTransport(tag_pages=[_tag_rows(TAG_PAGE_SIZE, "alpha")])
+        got = _read_stash(t).all_tags()
+        self.assertEqual(len(got), TAG_PAGE_SIZE)
+        self.assertEqual(len(t.calls), 1)
+
+
+# -- the request path: what would actually go on the wire ----------------- #
+
+# Invented server. `.invalid` is a reserved TLD that can never resolve, so if
+# any test below ever escaped its substituted urlopen it would fail loudly
+# rather than dial a real host. Neither the host nor the key belongs to any
+# install, real or plausible.
+SERVER_URL = "http://media-server.invalid:9999"
+SERVER_GRAPHQL_URL = "http://media-server.invalid:9999/graphql"
+API_KEY = "invented-api-key-0000"
+
+
+class _CannedResponse:
+    """What urlopen hands back: a context manager whose read() yields the raw
+    body bytes. There is no socket behind it."""
+
+    def __init__(self, body):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def read(self):
+        return self._body
+
+
+class _UrlopenRecorder:
+    """Stands in for urllib.request.urlopen. Captures the Request object and
+    the timeout it was handed, and answers with a canned JSON body — so every
+    assertion below is about what WOULD have gone on the wire, with nothing on
+    the other end of it. Opens no socket.
+
+    `raises` makes the call fail the way a real one does (an HTTPError for a
+    non-200, a URLError for an unreachable host, a TimeoutError for a socket
+    that gave up) instead of answering.
+    """
+
+    def __init__(self, payload=None, raises=None):
+        self.payload = {"data": {"ok": True}} if payload is None else payload
+        self.raises = raises
+        self.calls = []  # (Request, timeout) per call, in order
+
+    def __call__(self, req, timeout=None):
+        self.calls.append((req, timeout))
+        if self.raises is not None:
+            raise self.raises
+        return _CannedResponse(json.dumps(self.payload).encode())
+
+    def _only(self):
+        """The single call made — fails if it was not exactly one, so a test
+        cannot pass by inspecting the wrong request."""
+        if len(self.calls) != 1:
+            raise AssertionError("expected exactly 1 request, got %d"
+                                 % len(self.calls))
+        return self.calls[0]
+
+    @property
+    def request(self):
+        return self._only()[0]
+
+    @property
+    def timeout(self):
+        return self._only()[1]
+
+
+def _http_error(code, detail=b"server said no"):
+    """The exception a real urlopen raises for a non-200."""
+    return urllib.error.HTTPError(SERVER_GRAPHQL_URL, code, "nope", {},
+                                  io.BytesIO(detail))
+
+
+class PerformRequest(unittest.TestCase):
+    """`_perform` is the only code in this client that ever touches a real
+    server, and the injected-transport seam that makes everything above it
+    testable is exactly why nothing exercised it. These tests substitute
+    urlopen itself, so the request is built for real and simply never sent."""
+
+    BODY = {"query": "query{version{version}}", "variables": {}}
+
+    def setUp(self):
+        # Belt and braces for the whole class: if the request path ever stopped
+        # going through the substituted urlopen, these tests must fail rather
+        # than quietly dial a host from a unit test run.
+        patcher = mock.patch(
+            "socket.socket",
+            side_effect=AssertionError("no test may open a socket"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _send(self, recorder, url=SERVER_URL, api_key=API_KEY, timeout=11,
+              body=None):
+        with mock.patch("urllib.request.urlopen", recorder):
+            return Stash(url, api_key)._perform(
+                self.BODY if body is None else body, timeout)
+
+    def test_it_sends_a_POST(self):
+        # HARM: GraphQL is POST-only here. A GET (urllib's default when no data
+        # is set, and what a careless edit produces) is refused by the server or
+        # answered from a cache, so every call fails — or worse, silently
+        # returns a stale read that a write is then computed from.
+        rec = _UrlopenRecorder()
+        self._send(rec)
+        self.assertEqual(rec.request.get_method(), "POST")
+
+    def test_it_posts_to_the_graphql_endpoint_of_the_configured_base(self):
+        # HARM: the base URL a user configures is the server's root, not its
+        # API. Posting to the root (or to any other suffix) 404s every call on
+        # every install — the whole tool stops working and no test notices.
+        rec = _UrlopenRecorder()
+        self._send(rec)
+        self.assertEqual(rec.request.full_url, SERVER_GRAPHQL_URL)
+
+    def test_a_trailing_slash_on_the_configured_base_is_not_doubled(self):
+        # HARM: users paste the URL out of a browser bar, where it carries a
+        # trailing slash. Appending blindly gives "//graphql", which some
+        # servers 404 — a config that looks identical to a working one fails.
+        rec = _UrlopenRecorder()
+        self._send(rec, url=SERVER_URL + "/")
+        self.assertEqual(rec.request.full_url, SERVER_GRAPHQL_URL)
+
+    def test_the_api_key_travels_in_the_ApiKey_header(self):
+        # HARM: this header IS the authentication. Rename it, misspell it, send
+        # something other than the configured key, or drop it altogether, and
+        # every call against a secured install comes back unauthorized — a
+        # total outage that the injected-transport tests above cannot see.
+        rec = _UrlopenRecorder()
+        self._send(rec)
+        # urllib title-cases stored header names; the wire name is
+        # case-insensitive, so "Apikey" here is the "ApiKey" the code sets.
+        self.assertEqual(rec.request.get_header("Apikey"), API_KEY)
+
+    def test_the_body_is_declared_as_json(self):
+        # HARM: the body is JSON. Without this content type the server parses it
+        # as form data and rejects the query, so every call fails.
+        rec = _UrlopenRecorder()
+        self._send(rec)
+        self.assertEqual(rec.request.get_header("Content-type"),
+                         "application/json")
+
+    def test_those_are_the_only_two_headers_set(self):
+        # HARM: asserted whole so an ADDED header is caught too — a second
+        # header carrying the key copies the credential somewhere it was never
+        # meant to go, and a duplicate content type can override the real one.
+        rec = _UrlopenRecorder()
+        self._send(rec)
+        self.assertEqual(dict(rec.request.header_items()),
+                         {"Content-type": "application/json", "Apikey": API_KEY})
+
+    def test_no_configured_key_means_no_auth_header_at_all(self):
+        # HARM: an install with authentication switched off configures no key.
+        # Sending the header anyway with an empty or literal-None value is a
+        # credential the server may reject outright, locking out precisely the
+        # setup that needs no credential.
+        rec = _UrlopenRecorder()
+        self._send(rec, api_key="")
+        self.assertFalse(rec.request.has_header("Apikey"))
+        self.assertEqual(dict(rec.request.header_items()),
+                         {"Content-type": "application/json"})
+
+    def test_the_body_is_the_json_encoded_query_and_variables(self):
+        # HARM: the body is the request. Sent as text rather than bytes urlopen
+        # refuses it; re-shaped or with either key missing, the server rejects
+        # every query. Read back through json.loads because that is what the
+        # server does with it.
+        rec = _UrlopenRecorder()
+        body = {"query": "query($a:ID){x}", "variables": {"a": "sc-1"}}
+        self._send(rec, body=body)
+        self.assertIsInstance(rec.request.data, bytes)
+        self.assertEqual(json.loads(rec.request.data.decode()), body)
+
+    def test_a_query_sent_through_gql_carries_both_keys(self):
+        # HARM: the pair above is assembled by gql, and `variables` must be
+        # present even when there are none — a body missing the key is a
+        # protocol error on servers that require it. This is the one test that
+        # runs the whole path, gql through to the built request.
+        rec = _UrlopenRecorder(payload={"data": {"ok": True}})
+        with mock.patch("urllib.request.urlopen", rec):
+            Stash(SERVER_URL, API_KEY).gql("query{version{version}}")
+        self.assertEqual(json.loads(rec.request.data.decode()),
+                         {"query": "query{version{version}}", "variables": {}})
+
+    def test_it_returns_the_parsed_payload_untouched(self):
+        # HARM: interpreting the payload is gql's job, not the transport's — an
+        # injected transport must be able to hand back exactly what this one
+        # does. A transport that unwrapped "data" itself, or swallowed
+        # "errors", would make every server rejection look like a success.
+        payload = {"data": {"findScene": {"id": "sc-1"}},
+                   "errors": [{"message": "partial"}]}
+        rec = _UrlopenRecorder(payload=payload)
+        self.assertEqual(self._send(rec), payload)
+
+    def test_a_5xx_becomes_a_transient_StashError(self):
+        # HARM: a server having a bad minute is worth retrying. Escaping as a
+        # bare HTTPError skips every caller's error handling; marked permanent,
+        # a whole run is condemned over a blip.
+        rec = _UrlopenRecorder(raises=_http_error(503, b"overloaded"))
+        with self.assertRaises(StashError) as ctx:
+            self._send(rec)
+        self.assertTrue(ctx.exception.transient)
+        self.assertIn("503", str(ctx.exception))
+        self.assertIn("overloaded", str(ctx.exception))
+
+    def test_a_4xx_becomes_a_permanent_StashError(self):
+        # HARM: a rejected request will be rejected again. Marked transient, the
+        # caller retries a bad key or a bad query forever.
+        rec = _UrlopenRecorder(raises=_http_error(401, b"bad api key"))
+        with self.assertRaises(StashError) as ctx:
+            self._send(rec)
+        self.assertFalse(ctx.exception.transient)
+        self.assertIn("401", str(ctx.exception))
+
+    def test_an_unreachable_host_becomes_a_transient_StashError(self):
+        # HARM: a server that is down or a name that will not resolve is the
+        # single most common real failure. A bare URLError out of here is not
+        # the StashError callers catch, so it aborts the run instead of failing
+        # one retryable row.
+        rec = _UrlopenRecorder(raises=urllib.error.URLError("no route to host"))
+        with self.assertRaises(StashError) as ctx:
+            self._send(rec)
+        self.assertTrue(ctx.exception.transient)
+        self.assertIn(SERVER_GRAPHQL_URL, str(ctx.exception))
+
+    def test_a_socket_timeout_becomes_a_transient_StashError(self):
+        # HARM: a socket timeout is a TimeoutError — an OSError, but NOT a
+        # URLError. Without the OSError arm it escapes uncaught, so the very
+        # failure the timeout exists to produce is the one callers cannot
+        # handle.
+        rec = _UrlopenRecorder(raises=TimeoutError("timed out"))
+        with self.assertRaises(StashError) as ctx:
+            self._send(rec)
+        self.assertTrue(ctx.exception.transient)
+
+    def test_the_per_call_timeout_reaches_urlopen(self):
+        # HARM: a timeout that is computed and then not passed on leaves urlopen
+        # on its default of "no timeout", so a half-open connection to a
+        # rebooted server holds the caller forever. Nothing above this line can
+        # observe it — the argument only exists at this boundary.
+        rec = _UrlopenRecorder()
+        self._send(rec, timeout=7)
+        self.assertEqual(rec.timeout, 7)
+
+
+# How long the wedged-call test waits for gql to come back before calling it a
+# hang. Hundreds of times the 10ms deadline it is watching, so a healthy run
+# never approaches it — it exists only so a regression that removes the
+# deadline FAILS in a few seconds instead of hanging the suite forever.
+WEDGED_CALL_WATCHDOG = 5
+
+
+class _FakeThreading:
+    """Stands in for the `threading` module as gql sees it, and only for what
+    gql uses: the REAL Thread (so the worker still runs), plus an Event that
+    records the deadline it was asked to wait for and always reports "not
+    finished". That makes the deadline arithmetic readable directly, without
+    any test having to wait out a real deadline. Thread's own internal Event
+    use is untouched — it resolves inside the genuine threading module."""
+
+    Thread = threading.Thread
+
+    def __init__(self):
+        self.waits = []
+        recorder = self
+
+        class _Event:
+            def set(self):
+                pass
+
+            def wait(self, timeout=None):
+                recorder.waits.append(timeout)
+                return False
+
+        self.Event = _Event
+
+
+class Deadlines(unittest.TestCase):
+    """How long a call is given, and what happens when it never comes back."""
+
+    def test_the_default_timeout_is_generous_on_purpose(self):
+        # HARM: this is not a latency budget, it is the point at which a read is
+        # abandoned. Some calls here page through everything the server holds
+        # (unorganized_scenes(limit=None), all_tags()) and a real library can
+        # hold thousands of scenes under one tag. A short timeout abandons a
+        # slow but perfectly healthy read of a large library and reports it as a
+        # server fault, which it is not — and on a big install it does so every
+        # single run. Pinned to the documented value so shrinking it is a
+        # deliberate act with a test to change, not a tidy-up.
+        self.assertEqual(DEFAULT_TIMEOUT, 180)
+
+    def test_gql_hands_the_default_timeout_to_the_transport(self):
+        # HARM: the transport cannot bound anything it is not told about. A
+        # default that stops here means every call runs unbounded.
+        t = _transport([{"data": {}}])
+        Stash(SERVER_URL, API_KEY, transport=t).gql("query{x}")
+        self.assertEqual(t.calls[0][1], DEFAULT_TIMEOUT)
+
+    def test_gql_hands_an_explicit_per_call_timeout_to_the_transport(self):
+        # HARM: callers that know a call is cheap (or unusually expensive) pass
+        # their own bound. Ignoring it silently substitutes the default.
+        t = _transport([{"data": {}}])
+        Stash(SERVER_URL, API_KEY, transport=t).gql("query{x}", timeout=42)
+        self.assertEqual(t.calls[0][1], 42)
+
+    def test_the_slack_above_the_socket_timeout_is_the_documented_value(self):
+        # HARM: the hard deadline must sit ABOVE the socket timeout so a normal
+        # slow call ends via the clean urlopen timeout rather than an abandoned
+        # thread. Zero or negative slack makes the deadline fire first on every
+        # slow-but-healthy call, permanently leaking a wedged-looking worker
+        # thread each time.
+        self.assertEqual(HARD_DEADLINE_SLACK, 30)
+        self.assertGreater(HARD_DEADLINE_SLACK, 0)
+
+    def test_the_hard_deadline_is_the_call_timeout_plus_the_slack(self):
+        # HARM: the arithmetic itself. Waiting only the slack abandons every
+        # healthy call after 30s; waiting only the timeout races the socket
+        # timeout it is supposed to sit above. Read off the wait() argument, so
+        # no test has to wait for a deadline to observe its size.
+        for asked, expected in ((None, DEFAULT_TIMEOUT + HARD_DEADLINE_SLACK),
+                                (5, 5 + HARD_DEADLINE_SLACK)):
+            fake = _FakeThreading()
+            kwargs = {} if asked is None else {"timeout": asked}
+            with mock.patch("cronicled.stash.threading", fake):
+                with self.assertRaises(StashError) as ctx:
+                    Stash(SERVER_URL, API_KEY,
+                          transport=_transport([{"data": {}}])).gql(
+                              "query{x}", **kwargs)
+            self.assertEqual(fake.waits, [expected])
+            self.assertTrue(ctx.exception.transient)
+            self.assertIn("hard deadline", str(ctx.exception))
+
+    def test_a_call_that_never_returns_is_abandoned_rather_than_hanging(self):
+        # HARM: urlopen's timeout bounds socket operations but NOT name
+        # resolution, so a wedged host can hold a request open forever. Without
+        # this deadline the caller never comes back — and under any concurrency
+        # a pool joining that stuck worker on shutdown hangs the whole process,
+        # with no error, no output and nothing to retry.
+        #
+        # The transport blocks on an event this test never sets: no sleeping,
+        # and the wait ends only because the deadline fires. The slack is
+        # patched to 0 (its size is pinned above) so the deadline under test is
+        # 10ms rather than 210s.
+        #
+        # The call itself is made on a watched thread, because the failure this
+        # guards against is a hang: assert-and-wait would hang the suite instead
+        # of reporting it, which is the same silence in a different place.
+        never = threading.Event()
+        self.addCleanup(never.set)  # release the abandoned worker on the way out
+
+        def wedged(body, timeout):
+            never.wait()  # never set while this test runs
+            return {"data": {}}
+
+        box = {}
+
+        def call():
+            try:
+                with mock.patch("cronicled.stash.HARD_DEADLINE_SLACK", 0):
+                    Stash(SERVER_URL, API_KEY, transport=wedged).gql(
+                        "query{x}", timeout=0.01)
+            except BaseException as e:  # noqa: BLE001 — relayed to the assertions
+                box["exc"] = e
+
+        caller = threading.Thread(target=call, daemon=True)
+        caller.start()
+        caller.join(WEDGED_CALL_WATCHDOG)
+        self.assertFalse(caller.is_alive(),
+                         "gql never came back from a wedged transport: the hard "
+                         "deadline did not fire")
+        self.assertIsInstance(box.get("exc"), StashError)
+        self.assertTrue(box["exc"].transient)
+        self.assertIn("hard deadline", str(box["exc"]))
+        self.assertIn(SERVER_GRAPHQL_URL, str(box["exc"]))
+
+
+# -- which entity a name resolves to --------------------------------------- #
+
+class _ResolveTransport:
+    """Fake transport for the entity-resolution tests, in the style of
+    _ReadTransport: it recognizes one kind's find query and its create
+    mutation, records every request, and answers with a minimal payload
+    shaped like the real server's. Opens no socket.
+
+    `results` maps a SEARCHED name to the list of result PAGES the server
+    answers with (each page a list of `{"id", "name", "aliases"}` rows,
+    `aliases` optional and renamed to whichever field this kind uses), so
+    paging and result ordering can be observed rather than assumed. A name
+    absent from `results` comes back with no rows at all.
+
+    `create` is what the create mutation does: an id it returns, or an
+    exception instance it raises (the server refusing the name). When
+    `results_after_create` is given it REPLACES `results` the moment a create
+    raises — that is how the server looks to the recovery search that runs
+    after a clash, which is a different moment in time from the search before
+    it.
+    """
+
+    _FIND = {"studio": ("findStudios", "studios", "aliases"),
+             "performer": ("findPerformers", "performers", "alias_list"),
+             "tag": ("findTags", "tags", "aliases")}
+    _CREATE_MUTATION = {"studio": "studioCreate", "performer": "performerCreate",
+                        "tag": "tagCreate"}
+
+    def __init__(self, kind, results=None, create=None,
+                 results_after_create=None):
+        self.kind = kind
+        self.results = results or {}
+        self.create = create
+        self.results_after_create = results_after_create
+        self.calls = []      # (query, variables) for every request, in order
+        self.searches = []   # the `q` of every find, in order
+        self.creates = []    # the input of every create mutation, in order
+
+    def __call__(self, body, timeout):
+        q, variables = body["query"], body["variables"]
+        self.calls.append((q, variables))
+        fn, field, alias_field = self._FIND[self.kind]
+        if fn + "(" in q:
+            return self._find(fn, field, alias_field, variables)
+        if self._CREATE_MUTATION[self.kind] in q:
+            return self._create(variables)
+        raise AssertionError("test transport does not recognize query: %s" % q)
+
+    def _find(self, fn, field, alias_field, variables):
+        f = variables["f"]
+        name, page = f["q"], f["page"]
+        self.searches.append(name)
+        pages = self.results.get(name, [])
+        rows = pages[page - 1] if page <= len(pages) else []
+        count = sum(len(p) for p in pages)
+        shaped = [{"id": r["id"], "name": r["name"],
+                   alias_field: list(r.get("aliases") or [])} for r in rows]
+        return {"data": {fn: {"count": count, field: shaped}}}
+
+    def _create(self, variables):
+        self.creates.append(variables["in"])
+        if isinstance(self.create, Exception):
+            if self.results_after_create is not None:
+                self.results = self.results_after_create
+            raise self.create
+        mut = self._CREATE_MUTATION[self.kind]
+        return {"data": {mut: {"id": self.create}}}
+
+
+# Mirrors the page size _find_first requests; a page shorter than this is what
+# tells it to stop, so a full page is what makes it ask for another.
+RESOLVE_PAGE_SIZE = 100
+
+# Invented entities. A studio whose name a scrape spells three ways, and a tag
+# the server holds under one spelling with the other as its alias.
+STUDIO_NAME = "Harbour Light Pictures"
+STUDIO_ID = "studio-harbour-light"
+CANONICAL_TAG_NAME = "Lantern Drift"
+TYPO_TAG_NAME = "Lanterndrift"
+
+
+def _rows(n, prefix):
+    """Filler rows: the near-misses a server's fuzzy `q` search returns
+    alongside (or instead of) the row actually wanted."""
+    return [{"id": "%s-%d" % (prefix, i), "name": "%s %d" % (prefix, i)}
+            for i in range(n)]
+
+
+def _resolve_stash(transport):
+    return Stash("http://example.test", "k", transport=transport)
+
+
+class FindOrCreate(unittest.TestCase):
+    def test_a_stored_id_is_returned_without_searching_at_all(self):
+        # PINS CURRENT BEHAVIOUR — and the behaviour is a FLAGGED RISK, not a
+        # rule this test endorses. A `stored_id` is returned as-is: no
+        # existence check, no name cross-check, no fallback to a search if it
+        # is stale or was never an id on this server. Entity ids here are
+        # explicitly installation-specific (see tag_id_by_name's docstring), so
+        # the moment an adapter populates stored_id from anything remote — a
+        # StashBox id, a cached id from another install, a stale export — every
+        # scene that match touches gets a WRONG performer/studio/tag attached,
+        # silently, with no error and no search that could have caught it. The
+        # write is a union, so the wrong entity is added rather than replacing
+        # anything, and only the undo snapshot's performer_ids/tag_ids records
+        # that it happened.
+        #
+        # Nothing in this repo sets stored_id today (it appears only inside
+        # stash.py), so the hazard is latent, not live — which is why it is
+        # pinned rather than changed by this tests-only ticket. If a caller
+        # ever starts supplying it, this test is the one to revisit FIRST:
+        # verifying the id would break it, and that break is the intended
+        # signal, not a regression.
+        #
+        # What the current shortcut buys, and why it is not simply wrong: the
+        # stored id names the entity the scrape actually identified, so
+        # searching by name instead would let a fuzzy match override it.
+        # Asserted as "no request was sent", because a search that happens is a
+        # search whose result can win.
+        t = _ResolveTransport("performer", results={
+            "Velvet Crane": [[{"id": "performer-other", "name": "Velvet Crane"}]]})
+        got = _resolve_stash(t).find_or_create("performer", "Velvet Crane",
+                                               stored_id="performer-stored")
+        self.assertEqual(got, "performer-stored")
+        self.assertEqual(t.calls, [])
+
+    def test_a_blank_name_resolves_to_nothing_and_creates_nothing(self):
+        # HARM: a scrape with a missing field hands this an empty (or
+        # whitespace-only) name. Falling through to create makes a blank-named
+        # studio/performer/tag on the server — permanent library clutter that
+        # then gets attached to scenes, and every later blank resolves to it.
+        for name in (None, "", "   ", "\t\n"):
+            with self.subTest(name=repr(name)):
+                t = _ResolveTransport("tag", create="tag-blank")
+                self.assertIsNone(_resolve_stash(t).find_or_create("tag", name))
+                self.assertEqual(t.calls, [])
+
+    def test_an_existing_name_is_reused_rather_than_created(self):
+        # HARM: creating before searching duplicates an entity the library
+        # already has, splitting one studio's scenes across two studio records.
+        t = _ResolveTransport("studio",
+                              results={STUDIO_NAME: [[{"id": STUDIO_ID,
+                                                       "name": STUDIO_NAME}]]},
+                              create="studio-duplicate")
+        got = _resolve_stash(t).find_or_create("studio", STUDIO_NAME)
+        self.assertEqual(got, STUDIO_ID)
+        self.assertEqual(t.creates, [])
+
+    def test_a_name_the_server_does_not_have_is_created_once_trimmed(self):
+        # HARM: two harms in one. Not creating at all silently drops the
+        # entity from the apply; creating with the untrimmed name puts a
+        # padded duplicate (" Harbour Light Pictures ") in the library that no
+        # later exact lookup ever matches, so every run creates another.
+        t = _ResolveTransport("studio", create=STUDIO_ID)
+        got = _resolve_stash(t).find_or_create("studio", "  %s  " % STUDIO_NAME)
+        self.assertEqual(got, STUDIO_ID)
+        self.assertEqual(t.creates, [{"name": STUDIO_NAME}])
+        self.assertEqual(t.searches, [STUDIO_NAME])
+
+
+class FindFirst(unittest.TestCase):
+    def test_an_exact_name_match_beats_a_fuzzy_row_ranked_above_it(self):
+        # HARM: the server's `q` search is fuzzy and ranks the rows itself, so
+        # the first row is routinely NOT the name asked for. Taking it attaches
+        # a neighbouring studio ("Harbour Light Pictures International") to
+        # every scene of the one actually matched — and apply's undo is
+        # per-scene.
+        t = _ResolveTransport("studio", results={STUDIO_NAME: [[
+            {"id": "studio-neighbour", "name": STUDIO_NAME + " International"},
+            {"id": STUDIO_ID, "name": STUDIO_NAME}]]})
+        self.assertEqual(_resolve_stash(t)._find_first("studio", STUDIO_NAME),
+                         STUDIO_ID)
+
+    def test_an_exact_name_match_beats_an_alias_hit_found_first(self):
+        # HARM: an alias is a weaker claim on a name than the name itself. If
+        # an alias hit short-circuits the walk, a tag that genuinely exists
+        # under the searched spelling is passed over in favour of whichever
+        # other tag merely lists it as an alias, and scenes are tagged with the
+        # wrong one.
+        t = _ResolveTransport("tag", results={TYPO_TAG_NAME: [[
+            {"id": "tag-alias-owner", "name": CANONICAL_TAG_NAME,
+             "aliases": [TYPO_TAG_NAME]},
+            {"id": "tag-exact", "name": TYPO_TAG_NAME}]]})
+        self.assertEqual(_resolve_stash(t)._find_first("tag", TYPO_TAG_NAME),
+                         "tag-exact")
+
+    def test_an_exact_match_on_a_later_page_beats_an_alias_hit_on_the_first(self):
+        # HARM: the same precedence, across the page boundary — the case a
+        # "return as soon as we have something" shortcut gets wrong. Returning
+        # the page-1 alias owner means the exact tag on page 2 is never seen.
+        page1 = _rows(RESOLVE_PAGE_SIZE - 1, "tag-near") + [
+            {"id": "tag-alias-owner", "name": CANONICAL_TAG_NAME,
+             "aliases": [TYPO_TAG_NAME]}]
+        t = _ResolveTransport("tag", results={TYPO_TAG_NAME: [
+            page1, [{"id": "tag-exact", "name": TYPO_TAG_NAME}]]})
+        self.assertEqual(_resolve_stash(t)._find_first("tag", TYPO_TAG_NAME),
+                         "tag-exact")
+
+    def test_matching_ignores_case_and_surrounding_whitespace(self):
+        # HARM: this is what stops one studio becoming several. Scrapes spell
+        # the same name with different capitalisation and stray padding; an
+        # exact-string comparison misses the existing record every time and
+        # creates another, so the library ends up with "harbour light
+        # pictures", "Harbour Light Pictures" and " Harbour Light Pictures"
+        # as three separate studios, each holding a slice of the scenes.
+        for spelling in (STUDIO_NAME.lower(), STUDIO_NAME.upper(),
+                         "  %s  " % STUDIO_NAME):
+            with self.subTest(spelling=spelling):
+                t = _ResolveTransport("studio", results={spelling: [[
+                    {"id": STUDIO_ID, "name": "  %s " % STUDIO_NAME}]]})
+                self.assertEqual(
+                    _resolve_stash(t)._find_first("studio", spelling), STUDIO_ID)
+
+    def test_an_alias_match_ignores_case_and_whitespace_too(self):
+        # HARM: same harm on the alias side — the alias list is exactly where
+        # hand-entered spellings with odd casing and padding accumulate.
+        t = _ResolveTransport("tag", results={TYPO_TAG_NAME: [[
+            {"id": "tag-alias-owner", "name": CANONICAL_TAG_NAME,
+             "aliases": ["  %s  " % TYPO_TAG_NAME.upper()]}]]})
+        self.assertEqual(_resolve_stash(t)._find_first("tag", TYPO_TAG_NAME),
+                         "tag-alias-owner")
+
+    def test_a_name_held_only_as_an_alias_resolves_to_its_owner(self):
+        # HARM: the server refuses to create a name that is already someone's
+        # alias, so not resolving it here turns one alias into a hard failure
+        # of the whole scene apply. Resolving it to the owner is also the point
+        # of aliases: it is the server's own "same thing, different spelling".
+        t = _ResolveTransport("tag", results={TYPO_TAG_NAME: [[
+            {"id": "tag-alias-owner", "name": CANONICAL_TAG_NAME,
+             "aliases": [TYPO_TAG_NAME]}]]})
+        self.assertEqual(_resolve_stash(t)._find_first("tag", TYPO_TAG_NAME),
+                         "tag-alias-owner")
+
+    def test_the_search_continues_past_the_first_page(self):
+        # HARM: a fuzzy search for a common word fills its first page with
+        # near-misses. Stopping there reports "not found" for an entity the
+        # library already has, and the caller then CREATES it — a duplicate
+        # studio/performer/tag per run, each holding some of the scenes.
+        t = _ResolveTransport("studio", results={STUDIO_NAME: [
+            _rows(RESOLVE_PAGE_SIZE, "studio-near"),
+            [{"id": STUDIO_ID, "name": STUDIO_NAME}]]})
+        self.assertEqual(_resolve_stash(t)._find_first("studio", STUDIO_NAME),
+                         STUDIO_ID)
+        self.assertEqual([v["f"]["page"] for _, v in t.calls], [1, 2])
+
+    def test_a_genuine_miss_still_resolves_to_nothing(self):
+        # HARM: the other half of the walk. Returning some near-miss row when
+        # nothing matched attaches an unrelated entity; never terminating walks
+        # empty pages against a live server forever.
+        t = _ResolveTransport("studio", results={
+            STUDIO_NAME: [_rows(3, "studio-near")]})
+        self.assertIsNone(_resolve_stash(t)._find_first("studio", STUDIO_NAME))
+
+
+class CreateRecovery(unittest.TestCase):
+    def test_a_refused_create_falls_back_to_the_entity_that_now_exists(self):
+        # HARM: the server refuses a create whose name is already taken — a
+        # concurrent run, or a row the earlier search did not rank highly
+        # enough to reach. Letting that refusal escape fails the WHOLE scene
+        # apply over one tag, costing the scene its title, date, cover and
+        # every other performer, for a name that does exist.
+        t = _ResolveTransport(
+            "tag",
+            results={},  # the search before the create finds nothing
+            create=StashError("tag with name '%s' already exists" % CANONICAL_TAG_NAME),
+            results_after_create={CANONICAL_TAG_NAME: [[
+                {"id": "tag-canonical", "name": CANONICAL_TAG_NAME}]]})
+        self.assertEqual(_resolve_stash(t)._create("tag", CANONICAL_TAG_NAME),
+                         "tag-canonical")
+
+    def test_a_name_refused_as_someone_elses_alias_resolves_to_that_owner(self):
+        # HARM: the alias clash the module's own docstring quotes. The refusal
+        # message is the only thing that names the owner, and the re-search for
+        # the refused spelling does not find it (that is why the create was
+        # attempted at all), so without reading the owner out of the message
+        # this one tag fails the entire scene apply.
+        owner_msg = ("name '%s' is used as alias for '%s'"
+                     % (TYPO_TAG_NAME, CANONICAL_TAG_NAME))
+        t = _ResolveTransport(
+            "tag",
+            results={CANONICAL_TAG_NAME: [[{"id": "tag-canonical",
+                                            "name": CANONICAL_TAG_NAME}]]},
+            create=StashError(owner_msg))
+        self.assertEqual(_resolve_stash(t)._create("tag", TYPO_TAG_NAME),
+                         "tag-canonical")
+        # and it got there by looking up the owner the server named
+        self.assertEqual(t.searches, [TYPO_TAG_NAME, CANONICAL_TAG_NAME])
+
+    def test_a_refusal_that_resolves_to_nothing_is_re_raised(self):
+        # HARM: a name the server permanently refuses for its own reasons must
+        # reach the caller, which records it as skipped. Swallowing it and
+        # returning None makes the entity vanish from the write with no report
+        # — the scene looks applied and is quietly missing a performer.
+        t = _ResolveTransport("tag", results={},
+                              create=StashError("name is not allowed"))
+        with self.assertRaises(StashError) as ctx:
+            _resolve_stash(t)._create("tag", "Some Tag")
+        self.assertIn("not allowed", str(ctx.exception))
+
+
+# -- the exact shape of an apply's write ----------------------------------- #
+
+# A scene the library already holds metadata for, and a match that supplies
+# every field apply_scene can write. Invented throughout.
+SHAPE_EXISTING = {"id": "sc-9", "studio": None,
+                  "performers": [{"id": "performer-existing"}],
+                  "tags": [{"id": "tag-existing"}]}
+SHAPE_MATCH = {
+    "title": "Harbour Fog",
+    "details": "Filmed on the quay at dawn.",
+    "date": "2021-03-04",
+    "urls": ["http://scene-source.invalid/harbour-fog"],
+    "stash_ids": [{"endpoint": "http://scene-source.invalid",
+                   "stash_id": "invented-scene-id"}],
+    "image": "data:image/jpeg;base64,aW52ZW50ZWQtY292ZXI=",
+    "studio": {"name": STUDIO_NAME},
+    "performers": [{"name": "Velvet Crane"}],
+    "tags": [{"name": CANONICAL_TAG_NAME}],
+}
+
+# Exactly what a sceneUpdate for SHAPE_MATCH is allowed to contain. Every key
+# here is one this module was written to send; anything else in the input is a
+# field being written that nothing asked for.
+SHAPE_KEYS = {"id", "organized", "title", "details", "date", "urls",
+              "stash_ids", "studio_id", "performer_ids", "tag_ids",
+              "cover_image"}
+
+
+def _shape_transport(existing=None, **kwargs):
+    found = {"studio": {STUDIO_NAME: STUDIO_ID},
+             "performer": {"Velvet Crane": "performer-velvet"},
+             "tag": {CANONICAL_TAG_NAME: "tag-canonical"}}
+    return _SceneTransport(dict(SHAPE_EXISTING if existing is None else existing),
+                           found=kwargs.pop("found", found), **kwargs)
+
+
+def _shape_stash(transport):
+    return Stash("http://example.test", "k", transport=transport)
+
+
+class ApplyWriteShape(unittest.TestCase):
+    def test_the_update_input_holds_exactly_these_keys_and_no_others(self):
+        # HARM: this is the assertion that catches a field nobody listed. The
+        # server's SceneUpdateInput accepts far more than this module writes,
+        # and every extra key is a field REPLACED on a scene the user may have
+        # curated by hand — a stray `rating100` (or `code`, or `director`)
+        # blanks that field on every scene a bulk run touches, and it is not in
+        # the undo snapshot's writable set either. Asserting individual fields
+        # cannot see an added one; asserting the whole key set can.
+        t = _shape_transport()
+        _shape_stash(t).apply_scene("sc-9", SHAPE_MATCH)
+        self.assertEqual(set(t.scene_update_input), SHAPE_KEYS)
+
+    def test_an_empty_match_writes_only_the_id_and_the_organized_flag(self):
+        # HARM: the other half of the same guard. A field written
+        # unconditionally rather than only when supplied shows up here as an
+        # empty/None value overwriting whatever the scene already had — a match
+        # that knows nothing must not erase anything.
+        t = _shape_transport(existing={"id": "sc-9", "studio": None,
+                                       "performers": [], "tags": []})
+        _shape_stash(t).apply_scene("sc-9", {})
+        self.assertEqual(set(t.scene_update_input), {"id", "organized"})
+
+    def test_it_writes_the_scalars_it_was_given(self):
+        # HARM: these five are the payload of the whole apply. Today they are
+        # killed only incidentally, by a snapshot-completeness test over in the
+        # revert suite — refactor that and all five are unguarded. Dropping any
+        # one makes the apply silently not apply it; the run reports success
+        # and the field stays as it was, on every scene.
+        t = _shape_transport()
+        _shape_stash(t).apply_scene("sc-9", SHAPE_MATCH)
+        inp = t.scene_update_input
+        self.assertEqual(inp["id"], "sc-9")
+        self.assertEqual(inp["title"], SHAPE_MATCH["title"])
+        self.assertEqual(inp["details"], SHAPE_MATCH["details"])
+        self.assertEqual(inp["date"], SHAPE_MATCH["date"])
+        self.assertEqual(inp["urls"], SHAPE_MATCH["urls"])
+        self.assertEqual(inp["stash_ids"], SHAPE_MATCH["stash_ids"])
+
+    def test_it_marks_the_scene_organized(self):
+        # HARM: `organized` is what takes a scene OUT of the unorganized
+        # worklist. Without it every applied scene is picked up again by the
+        # next run and rewritten, forever — and the flag is a GraphQL Boolean,
+        # so a truthy stand-in is not the same value.
+        t = _shape_transport()
+        _shape_stash(t).apply_scene("sc-9", SHAPE_MATCH)
+        self.assertIs(t.scene_update_input["organized"], True)
+
+    def test_free_text_is_html_stripped_for_both_title_and_details(self):
+        # HARM: scraped free text arrives with raw markup in it. Written
+        # through, the tags land in the library and are displayed literally by
+        # every client — and both fields go through the same sanitizer, so
+        # sanitizing only one is the easy half-fix this catches.
+        t = _shape_transport()
+        _shape_stash(t).apply_scene("sc-9", {
+            "title": "<b>Harbour Fog</b>",
+            "details": "<p>Filmed on the quay.<br>At dawn.</p>"})
+        self.assertEqual(t.scene_update_input["title"], "Harbour Fog")
+        self.assertEqual(t.scene_update_input["details"],
+                         "Filmed on the quay. At dawn.")
+
+    def test_a_single_url_falls_back_into_urls(self):
+        # HARM: adapters hand back either shape. Reading only `urls` drops the
+        # source link of every match that supplies the singular `url` — the one
+        # field that records WHERE this metadata came from, and so the only way
+        # to check a scene's data later.
+        t = _shape_transport()
+        _shape_stash(t).apply_scene(
+            "sc-9", {"url": "http://scene-source.invalid/harbour-fog"})
+        self.assertEqual(t.scene_update_input["urls"],
+                         ["http://scene-source.invalid/harbour-fog"])
+
+    def test_the_plural_urls_wins_when_a_match_carries_both(self):
+        # PINS CURRENT BEHAVIOUR: `urls` is used whole and the singular `url`
+        # is ignored rather than appended. HARM of changing it silently: a
+        # match carrying both would write a different set of links than the
+        # adapter's list, without anything saying so.
+        t = _shape_transport()
+        _shape_stash(t).apply_scene("sc-9", {
+            "urls": ["http://scene-source.invalid/a"],
+            "url": "http://scene-source.invalid/b"})
+        self.assertEqual(t.scene_update_input["urls"],
+                         ["http://scene-source.invalid/a"])
+
+    def test_the_cover_is_written_only_when_an_image_was_supplied(self):
+        # HARM: the single irreversible field in this write. A scene's current
+        # cover is exposed only as a URL, never as the base64 payload
+        # `cover_image` takes, so there is nothing to snapshot it with and an
+        # applied cover CANNOT be undone (apply_scene's own docstring says so).
+        # Writing it unconditionally replaces the artwork of every scene a bulk
+        # run touches — with None or "" when the match had no image, which is
+        # the library's cover art permanently gone.
+        for image in (None, "", {}):
+            with self.subTest(image=repr(image)):
+                t = _shape_transport()
+                _shape_stash(t).apply_scene("sc-9", {"image": image})
+                self.assertNotIn("cover_image", t.scene_update_input)
+        t = _shape_transport()
+        _shape_stash(t).apply_scene("sc-9", {"image": SHAPE_MATCH["image"]})
+        self.assertEqual(t.scene_update_input["cover_image"],
+                         SHAPE_MATCH["image"])
+
+    def test_apply_writes_once(self):
+        # HARM: mirrors test_revert_writes_once. Everything is resolved before
+        # the single sceneUpdate so a mid-apply failure leaves the scene
+        # untouched; splitting the write means a failure between the parts
+        # leaves a scene half-applied, with a `prior` snapshot that no longer
+        # describes it and an undo that restores the wrong thing.
+        server = _mutable_scene(title="Old Title")
+        stash = Stash("http://example.test", "k", transport=server.transport)
+        stash.apply_scene("sc-9", RICH_MATCH, overwrite_studio=True)
+        self.assertEqual(server.writes, 1)
+
+
+# -- the write shape, across EVERY match shape ----------------------------- #
+
+# The whole-key-set assertion above is the right assertion — it fails on an
+# added key and on a removed one alike — but it only ever evaluates two match
+# shapes: the full SHAPE_MATCH and {}. A rule about what an apply may write is
+# a rule about ALL match shapes, and a write gated on a key neither of those
+# two carries slips straight past it. This costs nothing on either shape:
+#
+#     if match.get("rating"):
+#         inp["rating100"] = match["rating"]
+#
+# ...and blanks or overwrites rating100 on every scene an adapter that does
+# carry `rating` touches — a field that is not in the undo snapshot's writable
+# set, so the damage is not even reversible. `rating`, `code`, `director` and
+# `studio_code` are all things a scraper plausibly hands back. One shape cannot
+# pin a rule about all shapes, so the sweep below drives the same assertion
+# over many, including a match carrying every plausible adapter key at once and
+# each of those keys on its own.
+#
+# Every value here is invented; none of these keys is read by apply_scene
+# today, which is exactly the property being pinned.
+ADAPTER_NOISE = {
+    "rating": 100,
+    "rating100": 100,
+    "code": "HRB-014",
+    "director": "Wren Ashby",
+    "studio_code": "HRB",
+    "organized": False,
+    "id": "sc-somewhere-else",
+    "cover_image": "data:image/jpeg;base64,aW52ZW50ZWQtd3Jvbmc=",
+    "o_counter": 3,
+    "play_count": 9,
+    "phash": "invented-phash-0000",
+    "duration": 1234,
+    "index": 2,
+    "endpoint": "http://scene-source.invalid",
+    "stash_id": "invented-scene-id",
+    "source": "invented-adapter",
+    "score": 0.97,
+    "aliases": ["Harbour Fog (2021)"],
+    "movies": [{"movie_id": "movie-1"}],
+    "groups": [{"group_id": "group-1"}],
+    "galleries": [{"id": "gallery-1"}],
+    "files": [{"basename": "harbour-fog.mp4"}],
+    "path": "/m/harbour-fog.mp4",
+    "director_url": "http://scene-source.invalid/wren-ashby",
+}
+
+# Every sceneUpdate carries these two whatever the match holds: the scene it is
+# about, and the flag that takes it out of the unorganized worklist.
+BASE_WRITE_KEYS = {"id", "organized"}
+
+# A match whose every field is present but empty. Nothing may be written from
+# one: a match that knows nothing must not erase anything.
+EMPTY_VALUED_MATCH = {"title": "", "details": None, "date": "", "urls": [],
+                      "url": "", "stash_ids": [], "image": None, "studio": {},
+                      "performers": [], "tags": []}
+
+
+def _shape_sweep():
+    """(label, match, the EXACT key set its sceneUpdate may hold).
+
+    Exact rather than "a subset of SHAPE_KEYS", so each case fails on a
+    dropped key as well as an added one — the same both-directions property
+    the single-shape assertion has, now held across the range of shapes an
+    adapter can actually produce.
+    """
+    m = SHAPE_MATCH
+    cases = [
+        ("everything", dict(m), SHAPE_KEYS),
+        ("nothing", {}, BASE_WRITE_KEYS),
+        ("every field present but empty", dict(EMPTY_VALUED_MATCH), BASE_WRITE_KEYS),
+        ("title only", {"title": m["title"]}, BASE_WRITE_KEYS | {"title"}),
+        ("details only", {"details": m["details"]}, BASE_WRITE_KEYS | {"details"}),
+        ("date only", {"date": m["date"]}, BASE_WRITE_KEYS | {"date"}),
+        ("urls only", {"urls": m["urls"]}, BASE_WRITE_KEYS | {"urls"}),
+        ("singular url only", {"url": m["urls"][0]}, BASE_WRITE_KEYS | {"urls"}),
+        ("stash_ids only", {"stash_ids": m["stash_ids"]},
+         BASE_WRITE_KEYS | {"stash_ids"}),
+        ("image only", {"image": m["image"]}, BASE_WRITE_KEYS | {"cover_image"}),
+        ("studio only", {"studio": m["studio"]}, BASE_WRITE_KEYS | {"studio_id"}),
+        ("performers only", {"performers": m["performers"]},
+         BASE_WRITE_KEYS | {"performer_ids"}),
+        ("tags only", {"tags": m["tags"]}, BASE_WRITE_KEYS | {"tag_ids"}),
+        ("every plausible adapter key and nothing else",
+         dict(ADAPTER_NOISE), BASE_WRITE_KEYS),
+        ("everything plus every plausible adapter key",
+         dict(ADAPTER_NOISE, **m), SHAPE_KEYS),
+    ]
+    # each adapter key on its own: a write gated on one key is not visible in
+    # the combined shape above if some earlier key already added its own
+    cases += [("only the adapter key %r" % k, {k: v}, BASE_WRITE_KEYS)
+              for k, v in sorted(ADAPTER_NOISE.items())]
+    return cases
+
+
+class ApplyWriteShapeOverEveryMatchShape(unittest.TestCase):
+    def test_no_match_shape_can_put_an_unlisted_key_in_the_update_input(self):
+        # HARM: verbatim the harm this module's key-set assertion was written
+        # for — a field written that nothing asked for, replacing whatever the
+        # user had on every scene a bulk run touches — reached through the one
+        # door a single-shape assertion leaves open: a match key no fixture
+        # happens to carry.
+        for label, match, expected in _shape_sweep():
+            with self.subTest(match=label):
+                t = _shape_transport()
+                _shape_stash(t).apply_scene("sc-9", match)
+                self.assertEqual(set(t.scene_update_input), expected)
+                self.assertLessEqual(set(t.scene_update_input), SHAPE_KEYS)
+
+    def test_the_sweep_reaches_every_key_this_module_is_allowed_to_write(self):
+        # HARM: the sweep is only as good as its coverage. If SHAPE_KEYS ever
+        # grows a key no shape above produces, that key is listed as allowed
+        # but never actually exercised — the sweep would keep passing while
+        # saying nothing about it. This fails when that happens.
+        seen = set()
+        for label, match, _ in _shape_sweep():
+            t = _shape_transport()
+            _shape_stash(t).apply_scene("sc-9", match)
+            seen |= set(t.scene_update_input)
+        self.assertEqual(seen, SHAPE_KEYS)
+
+
+# -- the read that makes the merge and the undo possible ------------------- #
+
+# Every scene fake above answers a findScene by keying on the string
+# "findScene(" and handing back its canned row whole, so what the query
+# actually SELECTED is invisible to them: drop `urls` from the selection set
+# and the fake still returns urls. That blind spot is one layer above the write
+# assertions — apply_scene's union and its entire `prior` snapshot are built
+# out of this read, so a field the client stops asking for reads back as
+# None/[] and the snapshot records THAT as the scene's real state. revert_scene
+# then writes the empty value back, wiping the field it existed to restore.
+# The helpers below read the selection set out of the query text so it can be
+# asserted on directly, and answer by it so the harm is reproducible.
+
+
+def _selection_block(query, field):
+    """The text between `field`'s selection braces, braces balanced."""
+    start = query.index("{", query.index(field))
+    depth = 0
+    for i in range(start, len(query)):
+        if query[i] == "{":
+            depth += 1
+        elif query[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return query[start + 1:i]
+    raise AssertionError("unbalanced selection set for %r in: %s" % (field, query))
+
+
+def _selection_of(query, field):
+    """What `field`'s selection set asks for: {name: None} for a scalar,
+    {name: [nested names]} for a block. One level of nesting is enough — that
+    is all this client's scene read uses."""
+    fields, depth, last, owner = {}, 0, None, None
+    for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*|[{}]",
+                            _selection_block(query, field)):
+        if token == "{":
+            depth += 1
+            if depth == 1:
+                owner = last
+                fields[owner] = []
+        elif token == "}":
+            depth -= 1
+            if depth == 0:
+                owner = None
+        elif depth == 0:
+            fields.setdefault(token, None)
+            last = token
+        elif depth == 1 and owner is not None:
+            fields[owner].append(token)
+    return fields
+
+
+def _project(row, selection):
+    """`row` reduced to exactly what `selection` asked for — what a real
+    GraphQL server returns, and what none of the other fakes here do."""
+    out = {}
+    for field, nested in selection.items():
+        if field not in row:
+            raise AssertionError("the scene read selected %r, which this fake "
+                                 "scene does not have" % field)
+        value = row[field]
+        if nested is None:
+            out[field] = value
+        elif isinstance(value, list):
+            out[field] = [{k: r.get(k) for k in nested} for r in value]
+        elif value is None:
+            out[field] = None
+        else:
+            out[field] = {k: value.get(k) for k in nested}
+    return out
+
+
+class _SelectiveScene(_MutableScene):
+    """_MutableScene, except its findScene answers with ONLY the fields the
+    query actually selected. That one difference is what makes the selection
+    set testable: against this server, a field the client stops asking for is
+    a field it stops getting, exactly as on a real one."""
+
+    def __init__(self, **fields):
+        _MutableScene.__init__(self, **fields)
+        self.scene_read_variables = []
+
+    def _handle(self, body, timeout):
+        if "findScene(" in body["query"]:
+            self.scene_read_variables.append(body["variables"])
+            return {"data": {"findScene": _project(
+                self._read_scene(), _selection_of(body["query"], "findScene"))}}
+        return _MutableScene._handle(self, body, timeout)
+
+
+# Exactly what scene_existing must select. `studio`/`performers`/`tags` feed
+# apply_scene's union (keep what the scene already has, add what was
+# resolved); the rest are copied into the `prior` snapshot verbatim and are
+# the whole of what an undo has to replay.
+SCENE_READ_FIELDS = {"id", "title", "details", "date", "urls", "organized",
+                     "rating100", "code", "director", "stash_ids",
+                     "studio", "performers", "tags"}
+
+
+def _read_one_scene(scene_id="sc-42"):
+    """Run scene_existing and hand back the request it sent."""
+    t = _transport([{"data": {"findScene": {"id": scene_id}}}])
+    _read_stash(t).scene_existing(scene_id)
+    body, _ = t.calls[0]
+    return body
+
+
+class SceneReadTarget(unittest.TestCase):
+    def test_the_read_asks_about_the_scene_it_was_given(self):
+        # HARM: reading a DIFFERENT scene than the one being written is
+        # invisible to every assertion about the write — the update still goes
+        # to the right scene, carrying the wrong scene's performers and tags
+        # unioned in, and a `prior` snapshot describing a scene that was never
+        # written. The undo then restores one scene's metadata onto another.
+        # Two ids, because one fixture cannot tell "sends the id it was given"
+        # apart from "always sends sc-42".
+        for scene_id in ("sc-42", "sc-7"):
+            with self.subTest(scene_id=scene_id):
+                body = _read_one_scene(scene_id)
+                self.assertEqual(body["variables"], {"id": scene_id})
+
+    def test_the_id_travels_as_a_variable_not_baked_into_the_query(self):
+        # HARM: an id interpolated into the query text instead of bound as a
+        # variable is both unescaped and unpinnable — the assertion above
+        # would pass while the server was sent something else entirely.
+        body = _read_one_scene("sc-42")
+        self.assertIn("$id", body["query"])
+        self.assertNotIn("sc-42", body["query"])
+
+    def test_the_apply_reads_the_scene_it_is_about_to_write(self):
+        # HARM: the same wrong-scene harm, reached through the caller that
+        # matters. The read and the write must name the same scene: this is
+        # the seam where the merge's "existing" ids and the undo snapshot come
+        # from, and nothing downstream can tell they came from elsewhere.
+        t = _shape_transport()
+        _shape_stash(t).apply_scene("sc-9", SHAPE_MATCH)
+        self.assertEqual(t.scene_read_variables, [{"id": "sc-9"}])
+        self.assertEqual(t.scene_update_input["id"], "sc-9")
+
+
+class SceneReadSelection(unittest.TestCase):
+    def test_the_selection_set_is_exactly_the_fields_the_snapshot_needs(self):
+        # HARM: this selection set is the sole source of both the apply's
+        # union and the undo snapshot. Dropping `urls` makes prior["urls"]
+        # always [], and revert_scene writes that back — the scene's links,
+        # gone. Dropping `stash_ids` loses the canonical external id the same
+        # way. Asserted as the whole set, so a field going missing fails here
+        # rather than several layers downstream, and every field is named once
+        # in a place that says why it is needed.
+        selection = _selection_of(_read_one_scene()["query"], "findScene")
+        self.assertEqual(set(selection), SCENE_READ_FIELDS)
+
+    def test_the_nested_selections_carry_the_ids_the_merge_needs(self):
+        # HARM: studio/performers/tags come back as objects, and it is their
+        # `id` the apply unions and the snapshot stores. A block that selects
+        # only `name` reads back ids of None, so the merge appends nothing
+        # sensible and the undo has nothing to restore.
+        selection = _selection_of(_read_one_scene()["query"], "findScene")
+        for block in ("studio", "performers", "tags"):
+            with self.subTest(block=block):
+                self.assertEqual(selection[block], ["id", "name"])
+
+    def test_the_snapshot_holds_what_the_read_selected_and_nothing_more(self):
+        # HARM: the same rule again, proved end to end instead of by reading
+        # the query — against a server that answers ONLY what was selected,
+        # every field the read stops asking for turns up in the snapshot as
+        # None or [], claiming the scene had nothing there. Compared whole:
+        # `prior` and this fake's state are deliberately the same shape.
+        server = _SelectiveScene(**RICH_STATE)
+        before = server.snapshot()
+        stash = Stash("http://example.test", "k", transport=server.transport)
+        prior = stash.apply_scene("s1", {})["prior"]
+        self.assertEqual(prior, before)
+
+    def test_the_round_trip_holds_only_while_the_read_selects_everything(self):
+        # HARM: the full chain, against a server that honours the selection
+        # set — apply, then undo, and the scene must come back exactly as it
+        # was. A field missing from the read is snapshotted as empty and
+        # WRITTEN BACK empty by the revert, which is how a dropped `urls`
+        # turns into wiped urls on every reverted scene. This also covers
+        # rating100/code/director, which the apply never writes and the other
+        # round-trip test therefore cannot see (_NOT_WRITABLE_BY_APPLY_SCENE).
+        server = _SelectiveScene(**RICH_STATE)
+        before = server.snapshot()
+        stash = Stash("http://example.test", "k", transport=server.transport)
+        info = stash.apply_scene("s1", RICH_MATCH, overwrite_studio=True)
+        self.assertNotEqual(server.snapshot(), before)  # the apply really changed it
+        stash.revert_scene("s1", info["prior"])
+        self.assertEqual(server.snapshot(), before)
+
+    def test_the_existing_cast_survives_only_because_the_read_selects_it(self):
+        # HARM: sceneUpdate REPLACES the performer and tag arrays, so the
+        # union depends entirely on the read seeing what is already there.
+        # Drop `performers` from the selection and a bulk run stops adding to
+        # the cast and starts REPLACING it — every scene it touches loses the
+        # performers a human attached, at scale, and the tag arm does the same
+        # to tags.
+        server = _SelectiveScene(performers=[{"id": "p1"}], tags=[{"id": "t1"}])
+        stash = Stash("http://example.test", "k", transport=server.transport)
+        stash.apply_scene("s1", {"performers": [{"name": "Velvet Crane"}],
+                                 "tags": [{"name": CANONICAL_TAG_NAME}]})
+        state = server.snapshot()
+        self.assertEqual(len(state["performer_ids"]), 2)
+        self.assertEqual(state["performer_ids"][0], "p1")
+        self.assertEqual(len(state["tag_ids"]), 2)
+        self.assertEqual(state["tag_ids"][0], "t1")
