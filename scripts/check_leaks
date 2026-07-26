@@ -206,12 +206,17 @@ def scan_untracked_content(names: list[str], pattern: str) -> list[str]:
     return hits
 
 
+# Deliberately by exact name, never by extension: *.yml and *.toml stay data
+# file types, because a .yml is a perfectly good place for library data to
+# hide. Each entry here is a specific configuration file the project cannot
+# work without, mirroring the negations in .gitignore.
 ALLOWED_TRACKED_PATTERNS = (
     "*.example.json",
     ".github/workflows/*.yml",
     ".github/workflows/*.yaml",
     "pyproject.toml",
     "uv.lock",
+    "mkdocs.yml",
 )
 
 
