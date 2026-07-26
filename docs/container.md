@@ -93,3 +93,28 @@ varies between installs is mounted, not copied in:
 
 A read-only mount for the library itself will be documented here once the
 metadata-enrichment path that needs it exists.
+
+## The published image
+
+Every push to the default branch publishes a multi-architecture image
+(`linux/amd64` and `linux/arm64`) to `ghcr.io/cabinetworks/cronicled`, tagged
+with the commit SHA. A release tag `vX.Y.Z` additionally publishes the version
+declared in `pyproject.toml`, and fails the build if the two disagree rather
+than labelling an image with a version it was not built from.
+
+**There is no `latest` tag, and its absence is deliberate — please do not add
+one.** `latest` is read as "the one you want", and nobody reaches for it
+expecting a program that prints a line and exits. A commit SHA or a released
+version makes no such promise. The reasoning is repeated in a comment in
+`.github/workflows/ci.yml` and pinned by a test, because an omission is
+otherwise indistinguishable from an oversight.
+
+```sh
+docker pull ghcr.io/cabinetworks/cronicled:<commit-sha>
+```
+
+Publishing runs only after the leak guard has passed, and never from a pull
+request. Everything that reaches the image is tracked source the guard has
+already scanned: the Dockerfile copies `cronicled/` and nothing else, and
+`.dockerignore` excludes the rest. A new `COPY` line has to be checked against
+`.dockerignore` before it ships.
