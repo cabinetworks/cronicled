@@ -18,10 +18,20 @@ store. Persistence, and the dismissal/mute rules that make a reviewer's past
 decisions stick, belong to the runner alone — a producer that wrote to the
 store directly could bypass them, and could not be tested without a runner
 and a store to go with it.
+
+A runner is built to outlive the work it is handed, which costs it two things
+that a process living for minutes never notices. It forgets finished jobs past
+a cap, so an always-on process does not accumulate one record per job for as
+long as it is up, and admits how many it has forgotten rather than returning a
+truncated history that reads like a complete one. And `close()` stops it
+accepting work and waits for what is in flight, so a restart can tell whether
+it is safe to go. Neither is cancellation: nothing here interrupts a producer,
+and nothing asks one to stop early.
 """
 import collections
 import inspect
 import threading
+import time
 import traceback
 import uuid
 from dataclasses import dataclass
@@ -97,6 +107,19 @@ class JobHistory(list):
     def __init__(self, jobs=(), evicted=0):
         super().__init__(jobs)
         self.evicted = evicted
+
+
+class RunnerClosed(Exception):
+    """Raised by `start()` on a runner that has been closed.
+
+    Deliberately *not* a `JobRejected`, though both refuse a start. A caller
+    catching `JobRejected` has been told "not now" about a cost class that
+    frees up on its own, and the reasonable response is to try again later.
+    A closed runner never frees up, so that same handler would retry until
+    the process died. A separate exception means the handler does not catch
+    it, and a scheduler that has not thought about shutdown fails where it
+    needs to rather than spinning quietly.
+    """
 
 
 class JobRejected(Exception):
@@ -258,6 +281,11 @@ class JobRunner:
         # here, which is the whole of why a running job cannot be evicted.
         self._finished = collections.deque()
         self._evicted = 0
+        # Set by `close()`, read by `start()`, and — like the cost-class
+        # bookkeeping — only ever touched under `_lock`, because the refusal
+        # it drives and the reservation `start()` makes have to be one
+        # decision. See `close()`.
+        self._closed = False
         # cost class -> {job_id: producer_name} for every job of that class
         # currently running. Guarded by `_lock`, same as everything else:
         # the saturation check in `start()` and the reservation of a slot
@@ -314,6 +342,24 @@ class JobRunner:
             )
         limit = COST_CLASS_LIMITS[producer.cost]
         with self._lock:
+            if self._closed:
+                # Inside the same lock acquisition that makes the
+                # reservation below, and for the same reason the saturation
+                # check is: a check that released the lock before reserving
+                # could be passed by a `start()` that then reserves a slot
+                # after `close()` has already taken its list of jobs to wait
+                # for. The drain would report everything finished with that
+                # job running behind it, which is the one thing `close()`
+                # exists to rule out.
+                #
+                # Ahead of the saturation check, because a closed runner is
+                # a permanent no and a saturated one is not: told the class
+                # is busy, a caller retries, and every retry gets the same
+                # misleading answer.
+                raise RunnerClosed(
+                    f"the runner is closed and is not accepting work; "
+                    f"{producer.name!r} was not started"
+                )
             running = self._running_by_cost[producer.cost]
             if limit is not None and len(running) >= limit:
                 # Refuse explicitly rather than queue: a caller who believes
@@ -587,3 +633,72 @@ class JobRunner:
             if done is None:
                 raise self._missing(job_id)
         return done.wait(timeout)
+
+    def close(self, timeout=None):
+        """Stop accepting work and wait for what is already running.
+
+        Returns `True` if every in-flight job finished, `False` if the
+        timeout expired with work still running. This is **not**
+        cancellation: nothing interrupts a producer, and nothing is asked
+        to stop early. It is the wait that was never specified — a service
+        restarting on deploy wants to know when it is safe to go.
+
+        **A bool, not an exception, for the timeout.** The caller that most
+        needs this calls it from a `finally` or a signal handler, and an
+        exception raised there replaces whatever was already unwinding —
+        the deploy would lose the original failure and gain a shutdown
+        one. The two answers are genuinely different and do lead to
+        different actions, which is why it is not `None`: `True` means the
+        process can be killed with nothing in flight; `False` means work is
+        still running, and the caller decides between waiting longer and
+        accepting the consequence below. `jobs()` still answers afterwards,
+        so "which ones" is one call away.
+
+        **What happens to a job still running when the timeout expires.**
+        Nothing, here: it is a daemon thread and it keeps going, so the job
+        finishes normally if the process lives long enough — a second
+        `close()` will wait for it. But daemon is exactly what it sounds
+        like at process exit: the interpreter does not wait, and the worker
+        is killed wherever it happens to be. Because the runner records
+        each proposal as it is yielded, that costs at most the proposal in
+        flight; what is lost is the rest of the scan and the job's own
+        record of how it ended, which live only in memory. A `False` return
+        is therefore a real decision to make, not a warning to log.
+
+        **Idempotent, and re-entrant across calls.** Called twice — the
+        signal handler and the `finally` both firing is the normal case,
+        not the exceptional one — the second call is not an error and does
+        not replay the first answer: it waits again on whatever is still
+        running and reports what it finds. So a `False` followed later by a
+        `True` is the ordinary shape of "give it a bit longer".
+
+        The store is left open. The runner was handed one it did not
+        create and does not own; a caller still has to read the proposals
+        these jobs recorded, and closing it here would break that. Closing
+        it is the owner's to do, after this returns.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._lock:
+            # The flag and the list of jobs to wait for are taken in one
+            # acquisition. Any `start()` that reserved a slot before this
+            # point is in `_jobs` and therefore waited for; any that arrives
+            # after is refused. There is no third case, which is what makes
+            # the answer below mean anything.
+            self._closed = True
+            pending = [self._done[job_id]
+                       for job_id, state in self._jobs.items()
+                       if state.state == "running"]
+        drained = True
+        for done in pending:
+            # A single deadline across all of them, not `timeout` each: the
+            # caller asked to wait this long in total, and a per-job timeout
+            # would multiply it by however many jobs happen to be running.
+            remaining = (None if deadline is None
+                         else max(0.0, deadline - time.monotonic()))
+            # Every event is still checked once the deadline has passed —
+            # `wait(0)` returns immediately with the event's real state — so
+            # the answer reflects all of the jobs rather than stopping at
+            # the first one that was not finished.
+            if not done.wait(remaining):
+                drained = False
+        return drained
