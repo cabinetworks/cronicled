@@ -1,7 +1,12 @@
+import io
 import json
+import threading
 import unittest
+import urllib.error
+from unittest import mock
 
-from cronicled.stash import Stash, StashError
+from cronicled.stash import (DEFAULT_TIMEOUT, HARD_DEADLINE_SLACK, Stash,
+                             StashError)
 
 
 def _transport(responses):
@@ -815,3 +820,378 @@ class AllTags(unittest.TestCase):
         got = _read_stash(t).all_tags()
         self.assertEqual(len(got), 4)
         self.assertEqual(len(t.calls), 1)
+
+
+# -- the request path: what would actually go on the wire ----------------- #
+
+# Invented server. `.invalid` is a reserved TLD that can never resolve, so if
+# any test below ever escaped its substituted urlopen it would fail loudly
+# rather than dial a real host. Neither the host nor the key belongs to any
+# install, real or plausible.
+SERVER_URL = "http://media-server.invalid:9999"
+SERVER_GRAPHQL_URL = "http://media-server.invalid:9999/graphql"
+API_KEY = "invented-api-key-0000"
+
+
+class _CannedResponse:
+    """What urlopen hands back: a context manager whose read() yields the raw
+    body bytes. There is no socket behind it."""
+
+    def __init__(self, body):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def read(self):
+        return self._body
+
+
+class _UrlopenRecorder:
+    """Stands in for urllib.request.urlopen. Captures the Request object and
+    the timeout it was handed, and answers with a canned JSON body — so every
+    assertion below is about what WOULD have gone on the wire, with nothing on
+    the other end of it. Opens no socket.
+
+    `raises` makes the call fail the way a real one does (an HTTPError for a
+    non-200, a URLError for an unreachable host, a TimeoutError for a socket
+    that gave up) instead of answering.
+    """
+
+    def __init__(self, payload=None, raises=None):
+        self.payload = {"data": {"ok": True}} if payload is None else payload
+        self.raises = raises
+        self.calls = []  # (Request, timeout) per call, in order
+
+    def __call__(self, req, timeout=None):
+        self.calls.append((req, timeout))
+        if self.raises is not None:
+            raise self.raises
+        return _CannedResponse(json.dumps(self.payload).encode())
+
+    def _only(self):
+        """The single call made — fails if it was not exactly one, so a test
+        cannot pass by inspecting the wrong request."""
+        if len(self.calls) != 1:
+            raise AssertionError("expected exactly 1 request, got %d"
+                                 % len(self.calls))
+        return self.calls[0]
+
+    @property
+    def request(self):
+        return self._only()[0]
+
+    @property
+    def timeout(self):
+        return self._only()[1]
+
+
+def _http_error(code, detail=b"server said no"):
+    """The exception a real urlopen raises for a non-200."""
+    return urllib.error.HTTPError(SERVER_GRAPHQL_URL, code, "nope", {},
+                                  io.BytesIO(detail))
+
+
+class PerformRequest(unittest.TestCase):
+    """`_perform` is the only code in this client that ever touches a real
+    server, and the injected-transport seam that makes everything above it
+    testable is exactly why nothing exercised it. These tests substitute
+    urlopen itself, so the request is built for real and simply never sent."""
+
+    BODY = {"query": "query{version{version}}", "variables": {}}
+
+    def setUp(self):
+        # Belt and braces for the whole class: if the request path ever stopped
+        # going through the substituted urlopen, these tests must fail rather
+        # than quietly dial a host from a unit test run.
+        patcher = mock.patch(
+            "socket.socket",
+            side_effect=AssertionError("no test may open a socket"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _send(self, recorder, url=SERVER_URL, api_key=API_KEY, timeout=11,
+              body=None):
+        with mock.patch("urllib.request.urlopen", recorder):
+            return Stash(url, api_key)._perform(
+                self.BODY if body is None else body, timeout)
+
+    def test_it_sends_a_POST(self):
+        # HARM: GraphQL is POST-only here. A GET (urllib's default when no data
+        # is set, and what a careless edit produces) is refused by the server or
+        # answered from a cache, so every call fails — or worse, silently
+        # returns a stale read that a write is then computed from.
+        rec = _UrlopenRecorder()
+        self._send(rec)
+        self.assertEqual(rec.request.get_method(), "POST")
+
+    def test_it_posts_to_the_graphql_endpoint_of_the_configured_base(self):
+        # HARM: the base URL a user configures is the server's root, not its
+        # API. Posting to the root (or to any other suffix) 404s every call on
+        # every install — the whole tool stops working and no test notices.
+        rec = _UrlopenRecorder()
+        self._send(rec)
+        self.assertEqual(rec.request.full_url, SERVER_GRAPHQL_URL)
+
+    def test_a_trailing_slash_on_the_configured_base_is_not_doubled(self):
+        # HARM: users paste the URL out of a browser bar, where it carries a
+        # trailing slash. Appending blindly gives "//graphql", which some
+        # servers 404 — a config that looks identical to a working one fails.
+        rec = _UrlopenRecorder()
+        self._send(rec, url=SERVER_URL + "/")
+        self.assertEqual(rec.request.full_url, SERVER_GRAPHQL_URL)
+
+    def test_the_api_key_travels_in_the_ApiKey_header(self):
+        # HARM: this header IS the authentication. Rename it, misspell it, send
+        # something other than the configured key, or drop it altogether, and
+        # every call against a secured install comes back unauthorized — a
+        # total outage that the injected-transport tests above cannot see.
+        rec = _UrlopenRecorder()
+        self._send(rec)
+        # urllib title-cases stored header names; the wire name is
+        # case-insensitive, so "Apikey" here is the "ApiKey" the code sets.
+        self.assertEqual(rec.request.get_header("Apikey"), API_KEY)
+
+    def test_the_body_is_declared_as_json(self):
+        # HARM: the body is JSON. Without this content type the server parses it
+        # as form data and rejects the query, so every call fails.
+        rec = _UrlopenRecorder()
+        self._send(rec)
+        self.assertEqual(rec.request.get_header("Content-type"),
+                         "application/json")
+
+    def test_those_are_the_only_two_headers_set(self):
+        # HARM: asserted whole so an ADDED header is caught too — a second
+        # header carrying the key copies the credential somewhere it was never
+        # meant to go, and a duplicate content type can override the real one.
+        rec = _UrlopenRecorder()
+        self._send(rec)
+        self.assertEqual(dict(rec.request.header_items()),
+                         {"Content-type": "application/json", "Apikey": API_KEY})
+
+    def test_no_configured_key_means_no_auth_header_at_all(self):
+        # HARM: an install with authentication switched off configures no key.
+        # Sending the header anyway with an empty or literal-None value is a
+        # credential the server may reject outright, locking out precisely the
+        # setup that needs no credential.
+        rec = _UrlopenRecorder()
+        self._send(rec, api_key="")
+        self.assertFalse(rec.request.has_header("Apikey"))
+        self.assertEqual(dict(rec.request.header_items()),
+                         {"Content-type": "application/json"})
+
+    def test_the_body_is_the_json_encoded_query_and_variables(self):
+        # HARM: the body is the request. Sent as text rather than bytes urlopen
+        # refuses it; re-shaped or with either key missing, the server rejects
+        # every query. Read back through json.loads because that is what the
+        # server does with it.
+        rec = _UrlopenRecorder()
+        body = {"query": "query($a:ID){x}", "variables": {"a": "sc-1"}}
+        self._send(rec, body=body)
+        self.assertIsInstance(rec.request.data, bytes)
+        self.assertEqual(json.loads(rec.request.data.decode()), body)
+
+    def test_a_query_sent_through_gql_carries_both_keys(self):
+        # HARM: the pair above is assembled by gql, and `variables` must be
+        # present even when there are none — a body missing the key is a
+        # protocol error on servers that require it. This is the one test that
+        # runs the whole path, gql through to the built request.
+        rec = _UrlopenRecorder(payload={"data": {"ok": True}})
+        with mock.patch("urllib.request.urlopen", rec):
+            Stash(SERVER_URL, API_KEY).gql("query{version{version}}")
+        self.assertEqual(json.loads(rec.request.data.decode()),
+                         {"query": "query{version{version}}", "variables": {}})
+
+    def test_it_returns_the_parsed_payload_untouched(self):
+        # HARM: interpreting the payload is gql's job, not the transport's — an
+        # injected transport must be able to hand back exactly what this one
+        # does. A transport that unwrapped "data" itself, or swallowed
+        # "errors", would make every server rejection look like a success.
+        payload = {"data": {"findScene": {"id": "sc-1"}},
+                   "errors": [{"message": "partial"}]}
+        rec = _UrlopenRecorder(payload=payload)
+        self.assertEqual(self._send(rec), payload)
+
+    def test_a_5xx_becomes_a_transient_StashError(self):
+        # HARM: a server having a bad minute is worth retrying. Escaping as a
+        # bare HTTPError skips every caller's error handling; marked permanent,
+        # a whole run is condemned over a blip.
+        rec = _UrlopenRecorder(raises=_http_error(503, b"overloaded"))
+        with self.assertRaises(StashError) as ctx:
+            self._send(rec)
+        self.assertTrue(ctx.exception.transient)
+        self.assertIn("503", str(ctx.exception))
+        self.assertIn("overloaded", str(ctx.exception))
+
+    def test_a_4xx_becomes_a_permanent_StashError(self):
+        # HARM: a rejected request will be rejected again. Marked transient, the
+        # caller retries a bad key or a bad query forever.
+        rec = _UrlopenRecorder(raises=_http_error(401, b"bad api key"))
+        with self.assertRaises(StashError) as ctx:
+            self._send(rec)
+        self.assertFalse(ctx.exception.transient)
+        self.assertIn("401", str(ctx.exception))
+
+    def test_an_unreachable_host_becomes_a_transient_StashError(self):
+        # HARM: a server that is down or a name that will not resolve is the
+        # single most common real failure. A bare URLError out of here is not
+        # the StashError callers catch, so it aborts the run instead of failing
+        # one retryable row.
+        rec = _UrlopenRecorder(raises=urllib.error.URLError("no route to host"))
+        with self.assertRaises(StashError) as ctx:
+            self._send(rec)
+        self.assertTrue(ctx.exception.transient)
+        self.assertIn(SERVER_GRAPHQL_URL, str(ctx.exception))
+
+    def test_a_socket_timeout_becomes_a_transient_StashError(self):
+        # HARM: a socket timeout is a TimeoutError — an OSError, but NOT a
+        # URLError. Without the OSError arm it escapes uncaught, so the very
+        # failure the timeout exists to produce is the one callers cannot
+        # handle.
+        rec = _UrlopenRecorder(raises=TimeoutError("timed out"))
+        with self.assertRaises(StashError) as ctx:
+            self._send(rec)
+        self.assertTrue(ctx.exception.transient)
+
+    def test_the_per_call_timeout_reaches_urlopen(self):
+        # HARM: a timeout that is computed and then not passed on leaves urlopen
+        # on its default of "no timeout", so a half-open connection to a
+        # rebooted server holds the caller forever. Nothing above this line can
+        # observe it — the argument only exists at this boundary.
+        rec = _UrlopenRecorder()
+        self._send(rec, timeout=7)
+        self.assertEqual(rec.timeout, 7)
+
+
+# How long the wedged-call test waits for gql to come back before calling it a
+# hang. Hundreds of times the 10ms deadline it is watching, so a healthy run
+# never approaches it — it exists only so a regression that removes the
+# deadline FAILS in a few seconds instead of hanging the suite forever.
+WEDGED_CALL_WATCHDOG = 5
+
+
+class _FakeThreading:
+    """Stands in for the `threading` module as gql sees it, and only for what
+    gql uses: the REAL Thread (so the worker still runs), plus an Event that
+    records the deadline it was asked to wait for and always reports "not
+    finished". That makes the deadline arithmetic readable directly, without
+    any test having to wait out a real deadline. Thread's own internal Event
+    use is untouched — it resolves inside the genuine threading module."""
+
+    Thread = threading.Thread
+
+    def __init__(self):
+        self.waits = []
+        recorder = self
+
+        class _Event:
+            def set(self):
+                pass
+
+            def wait(self, timeout=None):
+                recorder.waits.append(timeout)
+                return False
+
+        self.Event = _Event
+
+
+class Deadlines(unittest.TestCase):
+    """How long a call is given, and what happens when it never comes back."""
+
+    def test_the_default_timeout_is_generous_on_purpose(self):
+        # HARM: this is not a latency budget, it is the point at which a read is
+        # abandoned. Some calls here page through everything the server holds
+        # (unorganized_scenes(limit=None), all_tags()) and a real library can
+        # hold thousands of scenes under one tag. A short timeout abandons a
+        # slow but perfectly healthy read of a large library and reports it as a
+        # server fault, which it is not — and on a big install it does so every
+        # single run. Pinned to the documented value so shrinking it is a
+        # deliberate act with a test to change, not a tidy-up.
+        self.assertEqual(DEFAULT_TIMEOUT, 180)
+
+    def test_gql_hands_the_default_timeout_to_the_transport(self):
+        # HARM: the transport cannot bound anything it is not told about. A
+        # default that stops here means every call runs unbounded.
+        t = _transport([{"data": {}}])
+        Stash(SERVER_URL, API_KEY, transport=t).gql("query{x}")
+        self.assertEqual(t.calls[0][1], DEFAULT_TIMEOUT)
+
+    def test_gql_hands_an_explicit_per_call_timeout_to_the_transport(self):
+        # HARM: callers that know a call is cheap (or unusually expensive) pass
+        # their own bound. Ignoring it silently substitutes the default.
+        t = _transport([{"data": {}}])
+        Stash(SERVER_URL, API_KEY, transport=t).gql("query{x}", timeout=42)
+        self.assertEqual(t.calls[0][1], 42)
+
+    def test_the_slack_above_the_socket_timeout_is_the_documented_value(self):
+        # HARM: the hard deadline must sit ABOVE the socket timeout so a normal
+        # slow call ends via the clean urlopen timeout rather than an abandoned
+        # thread. Zero or negative slack makes the deadline fire first on every
+        # slow-but-healthy call, permanently leaking a wedged-looking worker
+        # thread each time.
+        self.assertEqual(HARD_DEADLINE_SLACK, 30)
+        self.assertGreater(HARD_DEADLINE_SLACK, 0)
+
+    def test_the_hard_deadline_is_the_call_timeout_plus_the_slack(self):
+        # HARM: the arithmetic itself. Waiting only the slack abandons every
+        # healthy call after 30s; waiting only the timeout races the socket
+        # timeout it is supposed to sit above. Read off the wait() argument, so
+        # no test has to wait for a deadline to observe its size.
+        for asked, expected in ((None, DEFAULT_TIMEOUT + HARD_DEADLINE_SLACK),
+                                (5, 5 + HARD_DEADLINE_SLACK)):
+            fake = _FakeThreading()
+            kwargs = {} if asked is None else {"timeout": asked}
+            with mock.patch("cronicled.stash.threading", fake):
+                with self.assertRaises(StashError) as ctx:
+                    Stash(SERVER_URL, API_KEY,
+                          transport=_transport([{"data": {}}])).gql(
+                              "query{x}", **kwargs)
+            self.assertEqual(fake.waits, [expected])
+            self.assertTrue(ctx.exception.transient)
+            self.assertIn("hard deadline", str(ctx.exception))
+
+    def test_a_call_that_never_returns_is_abandoned_rather_than_hanging(self):
+        # HARM: urlopen's timeout bounds socket operations but NOT name
+        # resolution, so a wedged host can hold a request open forever. Without
+        # this deadline the caller never comes back — and under any concurrency
+        # a pool joining that stuck worker on shutdown hangs the whole process,
+        # with no error, no output and nothing to retry.
+        #
+        # The transport blocks on an event this test never sets: no sleeping,
+        # and the wait ends only because the deadline fires. The slack is
+        # patched to 0 (its size is pinned above) so the deadline under test is
+        # 10ms rather than 210s.
+        #
+        # The call itself is made on a watched thread, because the failure this
+        # guards against is a hang: assert-and-wait would hang the suite instead
+        # of reporting it, which is the same silence in a different place.
+        never = threading.Event()
+        self.addCleanup(never.set)  # release the abandoned worker on the way out
+
+        def wedged(body, timeout):
+            never.wait()  # never set while this test runs
+            return {"data": {}}
+
+        box = {}
+
+        def call():
+            try:
+                with mock.patch("cronicled.stash.HARD_DEADLINE_SLACK", 0):
+                    Stash(SERVER_URL, API_KEY, transport=wedged).gql(
+                        "query{x}", timeout=0.01)
+            except BaseException as e:  # noqa: BLE001 — relayed to the assertions
+                box["exc"] = e
+
+        caller = threading.Thread(target=call, daemon=True)
+        caller.start()
+        caller.join(WEDGED_CALL_WATCHDOG)
+        self.assertFalse(caller.is_alive(),
+                         "gql never came back from a wedged transport: the hard "
+                         "deadline did not fire")
+        self.assertIsInstance(box.get("exc"), StashError)
+        self.assertTrue(box["exc"].transient)
+        self.assertIn("hard deadline", str(box["exc"]))
+        self.assertIn(SERVER_GRAPHQL_URL, str(box["exc"]))
