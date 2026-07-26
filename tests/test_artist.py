@@ -160,6 +160,12 @@ class RejectedFolder(unittest.TestCase):
         r = resolve("Velvet Crane - Morning Ritual.mp4", "")
         self.assertIsNone(r.rejected_folder)
 
+    def test_a_rejected_folder_is_reported_cleaned_not_raw(self):
+        # a deliberate choice, pinned: rejected_folder shows what the guards
+        # judged, and the guards never see the bracketed qualifier at all
+        r = resolve("clip01.mp4", "Downloads (2024)")
+        self.assertEqual(r.rejected_folder, "Downloads")
+
 
 class Disagreement(unittest.TestCase):
     """`competing` is suppressed by identity, not by containment.
@@ -467,6 +473,15 @@ class AliasWiring(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("vcrane", message)      # both keys named, so the
         self.assertIn("v crane", message)     # operator knows what to delete
+
+    def test_a_collision_is_refused_even_when_both_keys_agree_on_the_name(self):
+        # the docstring's claim, pinned: the rule an operator can hold in
+        # their head is one key per normalised form, not "unless it wouldn't
+        # have mattered" -- so two spellings of the same key are refused even
+        # when they'd have resolved to the same creator either way
+        with self.assertRaises(ValueError):
+            resolve("clip01.mp4", "vcrane",
+                    aliases={"vcrane": "Velvet Crane", "v crane": "Velvet Crane"})
 
     def test_a_collision_is_refused_whoever_is_being_resolved(self):
         # the map is wrong regardless of this file; finding out only when the

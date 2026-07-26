@@ -177,11 +177,18 @@ class Resolution:
 
     The two are kept apart on purpose. `competing` is a *name*: something a
     consumer may legitimately search a catalogue for, or offer as the other
-    reading. `rejected_folder` is raw folder text that failed the guards --
+    reading. `rejected_folder` is folder text that failed the guards --
     "Downloads", "AB", "2023 September 11" -- and treating it as a name is
     the mistake this module exists to prevent. Folding it into `competing`
     would make that field mean two incompatible things and force every
     consumer to re-run the guards to tell which it had.
+
+    `rejected_folder` is the *cleaned* folder text -- the same `clean_folder`
+    pass the folder candidate itself goes through, so a bracketed qualifier
+    is already stripped -- not the raw, on-disk directory name. Both
+    readings are defensible; this one is picked because `rejected_folder`
+    exists to show what the guards judged, and the guards themselves never
+    see the qualifier at all.
 
     Both disagreements are the most useful signal available, so both are
     reported rather than dropped. A library where they show up often is one
@@ -412,9 +419,8 @@ def resolve(name, folder, aliases=None):
     same person by `_same_name` (so "Velvet Crane" and "velvetcrane" agree,
     while "Ivy" and "Ivy Kingsley Waters" do not), the folder wins and the
     filename's name is returned in `competing`. When the folder yields text
-    that no guard will accept as a
-    name, it is returned in `rejected_folder`. Neither is ever silently
-    dropped -- see `Resolution`.
+    that no guard will accept as a name, it is returned in `rejected_folder`.
+    Neither is ever silently dropped -- see `Resolution`.
 
     Returns a `Resolution`; all of its fields are None when nothing resolved
     and there was no folder to reject, which is a real answer and not an
