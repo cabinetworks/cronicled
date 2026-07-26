@@ -435,6 +435,37 @@ class Store:
             ).fetchone()
         return row is not None
 
+    def muted_subjects(self):
+        """Every muted subject, as a set of `(subject_type, subject_id)`.
+
+        This reads the `mute` table, NOT the `item` rows a mute moved into the
+        `muted` state, and that distinction is the reason the method exists.
+        `mute` deliberately accepts a subject that has never had a proposal
+        (see its docstring), and such a subject has no row — so
+        `items(state="muted")` reports it as unmuted while `record()` goes on
+        refusing proposals for it. Anything asking "would the store refuse
+        this?" must ask the same table `record()` asks.
+
+        The set form, rather than a per-subject `is_muted`, because the caller
+        this exists for is a scan choosing a batch: it asks about every
+        candidate at once, and N round trips to answer one question per file
+        is the cost the batch is trying to avoid. A caller with a single
+        subject can test membership; a caller with a batch cannot cheaply
+        undo N queries.
+
+        `record()` deliberately does NOT route through this. Its check must
+        happen inside the same lock as its INSERT, or a `mute` landing in
+        between would be checked-then-ignored; calling a method that takes
+        and releases the lock on its own would open exactly that window.
+
+        `subject_id` comes back as the string `mute` stored it as, so a caller
+        holding ids from an API can compare `str(id)` and get a match.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT subject_type, subject_id FROM mute").fetchall()
+        return {(subject_type, subject_id) for subject_type, subject_id in rows}
+
     def items(self, folder=None, state=None, limit=None, offset=0):
         """Proposals in the store, as dicts with `payload` (and
         `prior_state`, when present) decoded back into the Python object

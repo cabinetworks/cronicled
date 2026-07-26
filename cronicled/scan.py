@@ -31,19 +31,28 @@ class Counts:
     """Why a scan's input became the batch it became.
 
     `total` is everything offered; `selected` is what will actually be worked;
-    the middle three are the reasons a file was dropped, each file counted
-    under exactly one of them (see `select` for the precedence).
+    `already_proposed`, `muted` and `filtered_out` are the reasons a file was
+    dropped, each file counted under exactly one of them (see `select` for the
+    precedence); `deferred` is the files that survived every one of those
+    narrowings and were then cut by the limit — nothing was decided against
+    them, they simply did not fit in this budget and a later run may take them.
 
-    When the limit does not bind, the four sum to `total` — every file
-    accounted for. When it does bind, they sum to LESS than `total`, and the
-    shortfall is files deferred to a later run rather than dropped: nothing
-    decided against them, they simply did not fit in this budget.
+    `deferred` exists so that
+
+        total == already_proposed + muted + filtered_out + selected + deferred
+
+    holds ALWAYS, not just while the limit fails to bind. That identity is one
+    assertion catching a file that vanished for a reason nobody named, which is
+    a failure no per-field check can see — it can only look for the reasons it
+    already knows about. Without the sixth field the identity lapses exactly
+    when a scan is busiest, which is when a miscount matters most.
     """
     total: int
     already_proposed: int
     muted: int
     filtered_out: int
     selected: int
+    deferred: int
 
 
 def _paths(scene):
@@ -91,30 +100,28 @@ def select(scenes, *, store, folder, name_filter=None, limit=None):
 
     Only then does `limit` take the first `limit` survivors. `limit=None`
     takes all of them; `limit=0` takes none, which is a distinct (and
-    honoured) instruction, not a missing limit.
+    honoured) instruction, not a missing limit. Survivors the limit did not
+    reach are counted as `deferred` rather than dropped — no reason was found
+    against them, so a later run may take them.
 
     Scope note, mirroring what the store actually enforces: a mute is keyed by
     subject alone and blocks a proposal in any folder, so the muted check is
     not scoped to `folder`. An existing proposal is a row *in* a folder, so
     that check is.
 
-    Both store questions are asked at the SUBJECT level, via `store.items()`,
-    not at the fingerprint level via `store.has()`. That is forced, not
-    preferred: a fingerprint covers a proposal's payload, and at selection
-    time — before any scoring or lookup — there is no payload to hash. The
-    question selection actually needs to ask is "has this file already been
-    decided about", which is about the subject.
+    Both store questions are asked at the SUBJECT level, not at the
+    fingerprint level via `store.has()`. That is forced, not preferred: a
+    fingerprint covers a proposal's payload, and at selection time — before
+    any scoring or lookup — there is no payload to hash. The question
+    selection actually needs to ask is "has this file already been decided
+    about", which is about the subject.
 
-    One known hole, in the muted check specifically. The store's `mute` table
-    has no public read, so muted subjects are read from the `item` rows the
-    mute moved into the `muted` state. A subject muted PRE-EMPTIVELY — before
-    any proposal for it existed, which the store explicitly allows — has no
-    such row and is therefore invisible here: this scan will spend a lookup on
-    it, and `record()` will then refuse the result. That is the wasteful case
-    this module exists to avoid, and closing it needs a read accessor on the
-    store (e.g. `muted_subjects()`), which is a change to `Store` rather than
-    to this module. The failure is at least in the safe direction: a wasted
-    lookup, not a proposal that escapes a mute.
+    The muted check reads `store.muted_subjects()` — the `mute` table — rather
+    than the `item` rows a mute moved into the `muted` state. A subject muted
+    PRE-EMPTIVELY, before any proposal for it existed, has no such row, so
+    reading rows would miss it: the scan would spend a lookup on a file
+    `record()` was always going to refuse. Asking the same table `record()`
+    asks is what makes selection's answer agree with the store's.
 
     A dismissed proposal does NOT suppress its file here. Dismissal rejects
     one proposal, not the subject — a better proposal for the same file is
@@ -128,7 +135,8 @@ def select(scenes, *, store, folder, name_filter=None, limit=None):
 
     scenes = list(scenes)
     pattern = (name_filter or "").casefold()
-    muted = _subjects(store.items(state="muted"))
+    muted = {subject_id for subject_type, subject_id in store.muted_subjects()
+             if subject_type == SUBJECT_TYPE}
     proposed = _subjects(store.items(folder=folder))
 
     narrowed = []
@@ -152,4 +160,8 @@ def select(scenes, *, store, folder, name_filter=None, limit=None):
         muted=muted_count,
         filtered_out=filtered_out,
         selected=len(selected),
+        # Measured against `narrowed`, not `scenes`: a file dropped by a
+        # narrowing already has a reason, and counting it here as well would
+        # double-count it and break the identity `deferred` exists to hold.
+        deferred=len(narrowed) - len(selected),
     )
