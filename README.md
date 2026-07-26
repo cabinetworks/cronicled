@@ -105,7 +105,7 @@ own diagram on the [architecture](docs/index.md) page.
 
 ## Documentation
 
-The reference material lives on the site at <https://cronicled.pages.dev>, and
+The reference material lives on the site at <https://cabinetworks.github.io/cronicled/>, and
 in [`docs/`](docs/) in this repository. This README is the overview; each fact
 below is documented in exactly one of those pages, not in both.
 
@@ -116,10 +116,6 @@ below is documented in exactly one of those pages, not in both.
   test invocations, the image and its mounts
 - [Leak guard](docs/leak-guard.md) — what `scripts/check_leaks` scans, and the
   local `commit-msg` hook
-
-## License
-
-MIT
 
 ## The published image
 
@@ -134,3 +130,7 @@ docker pull ghcr.io/cabinetworks/cronicled:<commit-sha>
 pinned runtime for a library with no entry point yet — its default command
 prints one line and exits — and `latest` is read as "the one you want".
 [The container page](docs/container.md) has the tagging scheme and the mounts.
+
+## License
+
+MIT

@@ -107,60 +107,48 @@ jobs:
   # that produced the pages. Everything that reaches the open internet goes
   # through the guard first, which is why this job needs it explicitly as well
   # as through `docs`.
+  # Publish what the `docs` job built, to GitHub Pages.
+  #
+  # Deliberately NOT a Pages "build from a branch" setting: that would run
+  # Jekyll on Cloudflare's or GitHub's side, outside this workflow, and
+  # publish without ./scripts/check_leaks ever running against the commit
+  # that produced the pages. Everything that reaches the open internet goes
+  # through the guard first, which is why this needs it explicitly as well as
+  # through `docs`.
+  #
+  # No secret is involved. Pages authenticates with the workflow's own OIDC
+  # token, which is why this cannot be skipped for want of configuration the
+  # way the previous Cloudflare deploy could - and why a fork PR is handled by
+  # not running the job at all rather than by explaining an absent secret.
+  #
+  # There are no preview deploys, because GitHub Pages has exactly one site
+  # per repository and no concept of one. A pull request still BUILDS the site
+  # in the `docs` job above, which is the check that catches a broken page or
+  # a dead link; what it does not get is a URL to look at.
   docs-deploy:
     needs: [guard, docs]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    env:
-      # Mapped into `env` rather than read inline, because the `secrets`
-      # context is not available to a step's `if:` condition and `env` is.
-      # That is what lets the skip below be a condition on the workflow rather
-      # than a failure inside the wrangler step.
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      # Same discriminator the guard job uses, for the same reason: a fork PR
-      # cannot read repository secrets at all, by GitHub's own design. It is
-      # not merely that the secret came through empty - that also happens when
-      # a secret is deleted, renamed, expired or mis-scoped, and those are a
-      # different situation reported differently below. `github.event.pull_
-      # request` does not exist on a `push`, so this is `false` there.
-      IS_FORK_PR: ${{ github.event.pull_request.head.repo.fork == true }}
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      # One place decides whether this run publishes, and it says out loud why
-      # not. A contributor's first pull request must not show a red X for a
-      # secret they were never going to have.
-      - name: Decide whether this run can publish
-        id: gate
-        run: |
-          if [ "${IS_FORK_PR}" = "true" ]; then
-            echo "publish=no" >> "$GITHUB_OUTPUT"
-            echo "::notice::Fork pull request: repository secrets are unavailable to fork PRs by GitHub's own design, so there is no preview deploy for this run. The site was still BUILT by the docs job, which is the check that catches a broken page. Nothing is wrong with this pull request."
-          elif [ -z "${CLOUDFLARE_API_TOKEN}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID}" ]; then
-            echo "publish=no" >> "$GITHUB_OUTPUT"
-            echo "::notice::CLOUDFLARE_API_TOKEN and/or CLOUDFLARE_ACCOUNT_ID are not set on this repository, so the site was built but not published. This job is INERT, not disabled: add both secrets and the very next run publishes, with no change to this workflow. Failing the build over a secret nobody has added yet would only teach everyone to ignore a red main."
-          else
-            echo "publish=yes" >> "$GITHUB_OUTPUT"
-          fi
+      - uses: actions/configure-pages@v5
       - name: Fetch the site the docs job built
-        if: steps.gate.outputs.publish == 'yes'
         uses: actions/download-artifact@v4
         with:
           name: site
           path: site
-      - name: Publish to Cloudflare Pages
-        if: steps.gate.outputs.publish == 'yes'
-        uses: cloudflare/wrangler-action@v3
+      - name: Package it the way Pages expects
+        uses: actions/upload-pages-artifact@v3
         with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          # The branch name is the whole of the production/preview decision:
-          # Pages treats a deploy of its configured production branch (main)
-          # as production and every other branch as a preview. So a push to
-          # main publishes the site, and a same-repo pull request publishes a
-          # preview under its own branch, from one invocation.
-          command: >-
-            pages deploy site
-            --project-name=cronicled
-            --branch=${{ github.head_ref || github.ref_name }}
+          path: site
+      - name: Publish
+        id: deploy
+        uses: actions/deploy-pages@v4
 
   publish:
     # `needs: guard` is the one that must never be dropped: it is what makes

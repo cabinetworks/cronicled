@@ -10,10 +10,11 @@ edit away from drifting, and none of them fails anything when it does:
   instead of by good intentions.
 * the self-check transcript quotes a module count. It said 12 while the
   program printed 16.
-* the site's deploy step is inert until two Cloudflare secrets are added to
-  the repository. "Inert" has to mean the job still passes: a red main for a
-  secret nobody has added yet teaches everyone to ignore a red main. That
-  behaviour is tested by running the workflow's own shell, not by reading it.
+* the site publishes from the default branch and nowhere else, after the
+  leak guard has run. That used to be a gate deciding whether a Cloudflare
+  deploy could go ahead without its secrets; GitHub Pages needs no secret, so
+  what is left to protect is that a pull request cannot publish and that
+  nothing reaches the internet ahead of the guard.
 
 None of this needs a YAML parser or a Markdown parser, and deliberately so -
 the suite runs on a bare interpreter with nothing installed.
@@ -186,97 +187,65 @@ class TheDocsBuildRunsOnEveryCommit(unittest.TestCase):
                 "`%s` must declare needs: guard" % job)
 
 
-class TheDeployIsInertNotBroken(unittest.TestCase):
-    """Neither Cloudflare secret exists on the repository yet. Until they do,
-    the deploy must skip with a visible notice and a passing job.
+class TheDeployGoesOnlyToTheDefaultBranch(unittest.TestCase):
+    """The site publishes from `main` and from nowhere else, after the guard.
 
-    This runs the gate step's own shell rather than reading its text: the
-    thing that matters is what it decides for a given set of inputs, and a
-    condition can be reworded a dozen ways that all read fine and one of
-    which is wrong."""
+    This replaced a gate that decided whether a Cloudflare deploy could run,
+    given two repository secrets that might be absent. GitHub Pages needs no
+    secret - it authenticates with the workflow's own OIDC token - so there is
+    nothing to be absent, and the skip-with-a-notice mechanism went with it.
+    What is left to protect is narrower and more important: that nothing
+    reaches the open internet without the leak guard having run, and that a
+    pull request cannot publish.
+
+    Note what a fork pull request gets now. Previously it was skipped with an
+    explaining notice, because it could not read a secret. Now it simply does
+    not match the `if`, like any other pull request. The site is still BUILT
+    for it by the `docs` job, which is the check that catches a broken page;
+    what it does not get is a preview URL, because GitHub Pages has one site
+    per repository and no concept of one."""
 
     @classmethod
     def setUpClass(cls):
-        ci = _read(CI_YML)
-        # Deliberately not re.DOTALL across the whole pattern: `.` staying
-        # line-bound is what keeps this a linear scan instead of a
-        # backtracking one.
-        m = re.search(
-            r"^      - name: Decide whether this run can publish\n"
-            r"((?:        .*\n|\n)*)",
-            ci, re.M)
-        assert m, "no 'Decide whether this run can publish' step in %s" % CI_YML
-        body = m.group(1)
-        run = re.search(r"^        run: \|\n((?:          .*\n|\n)*)", body, re.M)
-        assert run, "that step has no `run: |` script"
-        cls.script = run.group(1)
-        cls.ci = ci
+        cls.ci = _read(CI_YML)
+        m = re.search(r"^  docs-deploy:\n((?:    .*\n|\n)*)", cls.ci, re.M)
+        assert m, "no docs-deploy job in %s" % CI_YML
+        cls.job = m.group(1)
 
-    def _decide(self, is_fork_pr, token, account_id):
-        with tempfile.TemporaryDirectory() as tmp:
-            out_path = os.path.join(tmp, "gh_output")
-            open(out_path, "w").close()
-            env = dict(os.environ)
-            env.update({
-                "GITHUB_OUTPUT": out_path,
-                "IS_FORK_PR": is_fork_pr,
-                "CLOUDFLARE_API_TOKEN": token,
-                "CLOUDFLARE_ACCOUNT_ID": account_id,
-            })
-            proc = subprocess.run(
-                ["sh", "-c", self.script], env=env,
-                capture_output=True, text=True)
-            with open(out_path) as fh:
-                written = fh.read()
-        return proc, written
+    def test_it_waits_for_the_guard(self):
+        # The whole reason this is a workflow job rather than a Pages branch
+        # setting: a build on GitHub's side would publish without the guard
+        # ever running against the commit that produced the pages.
+        self.assertRegex(self.job, r"needs:\s*\[[^]]*\bguard\b")
 
-    def test_a_missing_token_skips_the_deploy_without_failing_the_job(self):
-        proc, written = self._decide("false", "", "an-account-id")
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("publish=no", written)
-        self.assertIn("::notice::", proc.stdout)
+    def test_it_runs_only_on_a_push_to_the_default_branch(self):
+        # Both halves are load-bearing. Without the event check, a
+        # `pull_request_target` run - which carries the base repository's
+        # permissions - reports `refs/heads/main` and would let a fork's pull
+        # request publish. Without the ref check, any pushed branch would
+        # overwrite the published site.
+        m = re.search(r"^    if: (.*)$", self.job, re.M)
+        self.assertIsNotNone(m, "docs-deploy has no `if:` gate at all")
+        gate = m.group(1)
+        self.assertIn("github.event_name == 'push'", gate)
+        self.assertIn("refs/heads/main", gate)
 
-    def test_a_missing_account_id_skips_it_too(self):
-        # Deploying with one of the two present is not a partial success -
-        # wrangler would fail mid-publish instead of never starting.
-        proc, written = self._decide("false", "a-token", "")
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("publish=no", written)
+    def test_it_asks_for_no_more_permission_than_publishing_needs(self):
+        m = re.search(r"^    permissions:\n((?:      .*\n)*)", self.job, re.M)
+        self.assertIsNotNone(m, "docs-deploy declares no permissions block")
+        granted = dict(re.findall(r"^      (\S+):\s*(\S+)$", m.group(1), re.M))
+        self.assertEqual(
+            granted, {"pages": "write", "id-token": "write"},
+            "publishing to Pages needs exactly these two: `pages` to write "
+            "the site and `id-token` for the OIDC exchange. Anything else "
+            "here is scope this job does not use")
 
-    def test_a_fork_pull_request_skips_it_and_says_why(self):
-        proc, written = self._decide("true", "a-token", "an-account-id")
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("publish=no", written)
-        self.assertIn("fork", proc.stdout.lower())
-
-    def test_a_run_with_both_secrets_does_publish(self):
-        # The other half, and the one a "skip cleanly" change would quietly
-        # break: a gate that never says yes is not cautious, it is broken,
-        # and nothing else in this file would notice.
-        proc, written = self._decide("false", "a-token", "an-account-id")
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("publish=yes", written)
-        self.assertNotIn("publish=no", written)
-
-    def test_nothing_publishes_except_through_that_decision(self):
-        m = re.search(r"^  docs-deploy:\n((?:    .*\n|\n)*)", self.ci, re.M)
-        self.assertIsNotNone(m)
-        job = m.group(1)
-        # Every step that could touch Cloudflare, or fetch what would be
-        # sent there, has to be gated on the decision above. An ungated
-        # wrangler step would fail the job with a missing token - the exact
-        # outcome the gate exists to avoid.
-        steps = re.split(r"^      - ", job, flags=re.M)[1:]
-        publishing = [s for s in steps if "wrangler" in s or "download-artifact" in s]
-        self.assertGreaterEqual(
-            len(publishing), 2,
-            "expected the artifact download and the wrangler publish step")
-        for step in publishing:
-            self.assertRegex(
-                step, r"if:\s*steps\.gate\.outputs\.publish == 'yes'",
-                "this step runs regardless of whether the run can publish:\n%s"
-                % step)
-
+    def test_no_cloudflare_credential_survives_anywhere(self):
+        # The switch is only finished when nothing still reaches for the old
+        # secrets. A leftover reference reads as configuration the repository
+        # is missing, rather than one it deliberately dropped.
+        self.assertNotIn("CLOUDFLARE", self.ci)
+        self.assertNotIn("wrangler", self.ci.lower())
 
 if __name__ == "__main__":
     unittest.main()
