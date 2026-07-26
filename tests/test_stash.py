@@ -1195,3 +1195,437 @@ class Deadlines(unittest.TestCase):
         self.assertTrue(box["exc"].transient)
         self.assertIn("hard deadline", str(box["exc"]))
         self.assertIn(SERVER_GRAPHQL_URL, str(box["exc"]))
+
+
+# -- which entity a name resolves to --------------------------------------- #
+
+class _ResolveTransport:
+    """Fake transport for the entity-resolution tests, in the style of
+    _ReadTransport: it recognizes one kind's find query and its create
+    mutation, records every request, and answers with a minimal payload
+    shaped like the real server's. Opens no socket.
+
+    `results` maps a SEARCHED name to the list of result PAGES the server
+    answers with (each page a list of `{"id", "name", "aliases"}` rows,
+    `aliases` optional and renamed to whichever field this kind uses), so
+    paging and result ordering can be observed rather than assumed. A name
+    absent from `results` comes back with no rows at all.
+
+    `create` is what the create mutation does: an id it returns, or an
+    exception instance it raises (the server refusing the name). When
+    `results_after_create` is given it REPLACES `results` the moment a create
+    raises — that is how the server looks to the recovery search that runs
+    after a clash, which is a different moment in time from the search before
+    it.
+    """
+
+    _FIND = {"studio": ("findStudios", "studios", "aliases"),
+             "performer": ("findPerformers", "performers", "alias_list"),
+             "tag": ("findTags", "tags", "aliases")}
+    _CREATE_MUTATION = {"studio": "studioCreate", "performer": "performerCreate",
+                        "tag": "tagCreate"}
+
+    def __init__(self, kind, results=None, create=None,
+                 results_after_create=None):
+        self.kind = kind
+        self.results = results or {}
+        self.create = create
+        self.results_after_create = results_after_create
+        self.calls = []      # (query, variables) for every request, in order
+        self.searches = []   # the `q` of every find, in order
+        self.creates = []    # the input of every create mutation, in order
+
+    def __call__(self, body, timeout):
+        q, variables = body["query"], body["variables"]
+        self.calls.append((q, variables))
+        fn, field, alias_field = self._FIND[self.kind]
+        if fn + "(" in q:
+            return self._find(fn, field, alias_field, variables)
+        if self._CREATE_MUTATION[self.kind] in q:
+            return self._create(variables)
+        raise AssertionError("test transport does not recognize query: %s" % q)
+
+    def _find(self, fn, field, alias_field, variables):
+        f = variables["f"]
+        name, page = f["q"], f["page"]
+        self.searches.append(name)
+        pages = self.results.get(name, [])
+        rows = pages[page - 1] if page <= len(pages) else []
+        count = sum(len(p) for p in pages)
+        shaped = [{"id": r["id"], "name": r["name"],
+                   alias_field: list(r.get("aliases") or [])} for r in rows]
+        return {"data": {fn: {"count": count, field: shaped}}}
+
+    def _create(self, variables):
+        self.creates.append(variables["in"])
+        if isinstance(self.create, Exception):
+            if self.results_after_create is not None:
+                self.results = self.results_after_create
+            raise self.create
+        mut = self._CREATE_MUTATION[self.kind]
+        return {"data": {mut: {"id": self.create}}}
+
+
+# Mirrors the page size _find_first requests; a page shorter than this is what
+# tells it to stop, so a full page is what makes it ask for another.
+RESOLVE_PAGE_SIZE = 100
+
+# Invented entities. A studio whose name a scrape spells three ways, and a tag
+# the server holds under one spelling with the other as its alias.
+STUDIO_NAME = "Harbour Light Pictures"
+STUDIO_ID = "studio-harbour-light"
+CANONICAL_TAG_NAME = "Lantern Drift"
+TYPO_TAG_NAME = "Lanterndrift"
+
+
+def _rows(n, prefix):
+    """Filler rows: the near-misses a server's fuzzy `q` search returns
+    alongside (or instead of) the row actually wanted."""
+    return [{"id": "%s-%d" % (prefix, i), "name": "%s %d" % (prefix, i)}
+            for i in range(n)]
+
+
+def _resolve_stash(transport):
+    return Stash("http://example.test", "k", transport=transport)
+
+
+class FindOrCreate(unittest.TestCase):
+    def test_a_stored_id_is_returned_without_searching_at_all(self):
+        # HARM: the stored id came from the match itself — it is the entity the
+        # scrape actually identified. Searching anyway lets a fuzzy name match
+        # override it, attaching a different (or newly created) performer to
+        # every scene the match is applied to. Asserted as "no request was
+        # sent", because a search that happens is a search whose result can win.
+        t = _ResolveTransport("performer", results={
+            "Velvet Crane": [[{"id": "performer-other", "name": "Velvet Crane"}]]})
+        got = _resolve_stash(t).find_or_create("performer", "Velvet Crane",
+                                               stored_id="performer-stored")
+        self.assertEqual(got, "performer-stored")
+        self.assertEqual(t.calls, [])
+
+    def test_a_blank_name_resolves_to_nothing_and_creates_nothing(self):
+        # HARM: a scrape with a missing field hands this an empty (or
+        # whitespace-only) name. Falling through to create makes a blank-named
+        # studio/performer/tag on the server — permanent library clutter that
+        # then gets attached to scenes, and every later blank resolves to it.
+        for name in (None, "", "   ", "\t\n"):
+            with self.subTest(name=repr(name)):
+                t = _ResolveTransport("tag", create="tag-blank")
+                self.assertIsNone(_resolve_stash(t).find_or_create("tag", name))
+                self.assertEqual(t.calls, [])
+
+    def test_an_existing_name_is_reused_rather_than_created(self):
+        # HARM: creating before searching duplicates an entity the library
+        # already has, splitting one studio's scenes across two studio records.
+        t = _ResolveTransport("studio",
+                              results={STUDIO_NAME: [[{"id": STUDIO_ID,
+                                                       "name": STUDIO_NAME}]]},
+                              create="studio-duplicate")
+        got = _resolve_stash(t).find_or_create("studio", STUDIO_NAME)
+        self.assertEqual(got, STUDIO_ID)
+        self.assertEqual(t.creates, [])
+
+    def test_a_name_the_server_does_not_have_is_created_once_trimmed(self):
+        # HARM: two harms in one. Not creating at all silently drops the
+        # entity from the apply; creating with the untrimmed name puts a
+        # padded duplicate (" Harbour Light Pictures ") in the library that no
+        # later exact lookup ever matches, so every run creates another.
+        t = _ResolveTransport("studio", create=STUDIO_ID)
+        got = _resolve_stash(t).find_or_create("studio", "  %s  " % STUDIO_NAME)
+        self.assertEqual(got, STUDIO_ID)
+        self.assertEqual(t.creates, [{"name": STUDIO_NAME}])
+        self.assertEqual(t.searches, [STUDIO_NAME])
+
+
+class FindFirst(unittest.TestCase):
+    def test_an_exact_name_match_beats_a_fuzzy_row_ranked_above_it(self):
+        # HARM: the server's `q` search is fuzzy and ranks the rows itself, so
+        # the first row is routinely NOT the name asked for. Taking it attaches
+        # a neighbouring studio ("Harbour Light Pictures International") to
+        # every scene of the one actually matched — and apply's undo is
+        # per-scene.
+        t = _ResolveTransport("studio", results={STUDIO_NAME: [[
+            {"id": "studio-neighbour", "name": STUDIO_NAME + " International"},
+            {"id": STUDIO_ID, "name": STUDIO_NAME}]]})
+        self.assertEqual(_resolve_stash(t)._find_first("studio", STUDIO_NAME),
+                         STUDIO_ID)
+
+    def test_an_exact_name_match_beats_an_alias_hit_found_first(self):
+        # HARM: an alias is a weaker claim on a name than the name itself. If
+        # an alias hit short-circuits the walk, a tag that genuinely exists
+        # under the searched spelling is passed over in favour of whichever
+        # other tag merely lists it as an alias, and scenes are tagged with the
+        # wrong one.
+        t = _ResolveTransport("tag", results={TYPO_TAG_NAME: [[
+            {"id": "tag-alias-owner", "name": CANONICAL_TAG_NAME,
+             "aliases": [TYPO_TAG_NAME]},
+            {"id": "tag-exact", "name": TYPO_TAG_NAME}]]})
+        self.assertEqual(_resolve_stash(t)._find_first("tag", TYPO_TAG_NAME),
+                         "tag-exact")
+
+    def test_an_exact_match_on_a_later_page_beats_an_alias_hit_on_the_first(self):
+        # HARM: the same precedence, across the page boundary — the case a
+        # "return as soon as we have something" shortcut gets wrong. Returning
+        # the page-1 alias owner means the exact tag on page 2 is never seen.
+        page1 = _rows(RESOLVE_PAGE_SIZE - 1, "tag-near") + [
+            {"id": "tag-alias-owner", "name": CANONICAL_TAG_NAME,
+             "aliases": [TYPO_TAG_NAME]}]
+        t = _ResolveTransport("tag", results={TYPO_TAG_NAME: [
+            page1, [{"id": "tag-exact", "name": TYPO_TAG_NAME}]]})
+        self.assertEqual(_resolve_stash(t)._find_first("tag", TYPO_TAG_NAME),
+                         "tag-exact")
+
+    def test_matching_ignores_case_and_surrounding_whitespace(self):
+        # HARM: this is what stops one studio becoming several. Scrapes spell
+        # the same name with different capitalisation and stray padding; an
+        # exact-string comparison misses the existing record every time and
+        # creates another, so the library ends up with "harbour light
+        # pictures", "Harbour Light Pictures" and " Harbour Light Pictures"
+        # as three separate studios, each holding a slice of the scenes.
+        for spelling in (STUDIO_NAME.lower(), STUDIO_NAME.upper(),
+                         "  %s  " % STUDIO_NAME):
+            with self.subTest(spelling=spelling):
+                t = _ResolveTransport("studio", results={spelling: [[
+                    {"id": STUDIO_ID, "name": "  %s " % STUDIO_NAME}]]})
+                self.assertEqual(
+                    _resolve_stash(t)._find_first("studio", spelling), STUDIO_ID)
+
+    def test_an_alias_match_ignores_case_and_whitespace_too(self):
+        # HARM: same harm on the alias side — the alias list is exactly where
+        # hand-entered spellings with odd casing and padding accumulate.
+        t = _ResolveTransport("tag", results={TYPO_TAG_NAME: [[
+            {"id": "tag-alias-owner", "name": CANONICAL_TAG_NAME,
+             "aliases": ["  %s  " % TYPO_TAG_NAME.upper()]}]]})
+        self.assertEqual(_resolve_stash(t)._find_first("tag", TYPO_TAG_NAME),
+                         "tag-alias-owner")
+
+    def test_a_name_held_only_as_an_alias_resolves_to_its_owner(self):
+        # HARM: the server refuses to create a name that is already someone's
+        # alias, so not resolving it here turns one alias into a hard failure
+        # of the whole scene apply. Resolving it to the owner is also the point
+        # of aliases: it is the server's own "same thing, different spelling".
+        t = _ResolveTransport("tag", results={TYPO_TAG_NAME: [[
+            {"id": "tag-alias-owner", "name": CANONICAL_TAG_NAME,
+             "aliases": [TYPO_TAG_NAME]}]]})
+        self.assertEqual(_resolve_stash(t)._find_first("tag", TYPO_TAG_NAME),
+                         "tag-alias-owner")
+
+    def test_the_search_continues_past_the_first_page(self):
+        # HARM: a fuzzy search for a common word fills its first page with
+        # near-misses. Stopping there reports "not found" for an entity the
+        # library already has, and the caller then CREATES it — a duplicate
+        # studio/performer/tag per run, each holding some of the scenes.
+        t = _ResolveTransport("studio", results={STUDIO_NAME: [
+            _rows(RESOLVE_PAGE_SIZE, "studio-near"),
+            [{"id": STUDIO_ID, "name": STUDIO_NAME}]]})
+        self.assertEqual(_resolve_stash(t)._find_first("studio", STUDIO_NAME),
+                         STUDIO_ID)
+        self.assertEqual([v["f"]["page"] for _, v in t.calls], [1, 2])
+
+    def test_a_genuine_miss_still_resolves_to_nothing(self):
+        # HARM: the other half of the walk. Returning some near-miss row when
+        # nothing matched attaches an unrelated entity; never terminating walks
+        # empty pages against a live server forever.
+        t = _ResolveTransport("studio", results={
+            STUDIO_NAME: [_rows(3, "studio-near")]})
+        self.assertIsNone(_resolve_stash(t)._find_first("studio", STUDIO_NAME))
+
+
+class CreateRecovery(unittest.TestCase):
+    def test_a_refused_create_falls_back_to_the_entity_that_now_exists(self):
+        # HARM: the server refuses a create whose name is already taken — a
+        # concurrent run, or a row the earlier search did not rank highly
+        # enough to reach. Letting that refusal escape fails the WHOLE scene
+        # apply over one tag, costing the scene its title, date, cover and
+        # every other performer, for a name that does exist.
+        t = _ResolveTransport(
+            "tag",
+            results={},  # the search before the create finds nothing
+            create=StashError("tag with name '%s' already exists" % CANONICAL_TAG_NAME),
+            results_after_create={CANONICAL_TAG_NAME: [[
+                {"id": "tag-canonical", "name": CANONICAL_TAG_NAME}]]})
+        self.assertEqual(_resolve_stash(t)._create("tag", CANONICAL_TAG_NAME),
+                         "tag-canonical")
+
+    def test_a_name_refused_as_someone_elses_alias_resolves_to_that_owner(self):
+        # HARM: the alias clash the module's own docstring quotes. The refusal
+        # message is the only thing that names the owner, and the re-search for
+        # the refused spelling does not find it (that is why the create was
+        # attempted at all), so without reading the owner out of the message
+        # this one tag fails the entire scene apply.
+        owner_msg = ("name '%s' is used as alias for '%s'"
+                     % (TYPO_TAG_NAME, CANONICAL_TAG_NAME))
+        t = _ResolveTransport(
+            "tag",
+            results={CANONICAL_TAG_NAME: [[{"id": "tag-canonical",
+                                            "name": CANONICAL_TAG_NAME}]]},
+            create=StashError(owner_msg))
+        self.assertEqual(_resolve_stash(t)._create("tag", TYPO_TAG_NAME),
+                         "tag-canonical")
+        # and it got there by looking up the owner the server named
+        self.assertEqual(t.searches, [TYPO_TAG_NAME, CANONICAL_TAG_NAME])
+
+    def test_a_refusal_that_resolves_to_nothing_is_re_raised(self):
+        # HARM: a name the server permanently refuses for its own reasons must
+        # reach the caller, which records it as skipped. Swallowing it and
+        # returning None makes the entity vanish from the write with no report
+        # — the scene looks applied and is quietly missing a performer.
+        t = _ResolveTransport("tag", results={},
+                              create=StashError("name is not allowed"))
+        with self.assertRaises(StashError) as ctx:
+            _resolve_stash(t)._create("tag", "Some Tag")
+        self.assertIn("not allowed", str(ctx.exception))
+
+
+# -- the exact shape of an apply's write ----------------------------------- #
+
+# A scene the library already holds metadata for, and a match that supplies
+# every field apply_scene can write. Invented throughout.
+SHAPE_EXISTING = {"id": "sc-9", "studio": None,
+                  "performers": [{"id": "performer-existing"}],
+                  "tags": [{"id": "tag-existing"}]}
+SHAPE_MATCH = {
+    "title": "Harbour Fog",
+    "details": "Filmed on the quay at dawn.",
+    "date": "2021-03-04",
+    "urls": ["http://scene-source.invalid/harbour-fog"],
+    "stash_ids": [{"endpoint": "http://scene-source.invalid",
+                   "stash_id": "invented-scene-id"}],
+    "image": "data:image/jpeg;base64,aW52ZW50ZWQtY292ZXI=",
+    "studio": {"name": STUDIO_NAME},
+    "performers": [{"name": "Velvet Crane"}],
+    "tags": [{"name": CANONICAL_TAG_NAME}],
+}
+
+# Exactly what a sceneUpdate for SHAPE_MATCH is allowed to contain. Every key
+# here is one this module was written to send; anything else in the input is a
+# field being written that nothing asked for.
+SHAPE_KEYS = {"id", "organized", "title", "details", "date", "urls",
+              "stash_ids", "studio_id", "performer_ids", "tag_ids",
+              "cover_image"}
+
+
+def _shape_transport(existing=None, **kwargs):
+    found = {"studio": {STUDIO_NAME: STUDIO_ID},
+             "performer": {"Velvet Crane": "performer-velvet"},
+             "tag": {CANONICAL_TAG_NAME: "tag-canonical"}}
+    return _SceneTransport(dict(SHAPE_EXISTING if existing is None else existing),
+                           found=kwargs.pop("found", found), **kwargs)
+
+
+def _shape_stash(transport):
+    return Stash("http://example.test", "k", transport=transport)
+
+
+class ApplyWriteShape(unittest.TestCase):
+    def test_the_update_input_holds_exactly_these_keys_and_no_others(self):
+        # HARM: this is the assertion that catches a field nobody listed. The
+        # server's SceneUpdateInput accepts far more than this module writes,
+        # and every extra key is a field REPLACED on a scene the user may have
+        # curated by hand — a stray `rating100` (or `code`, or `director`)
+        # blanks that field on every scene a bulk run touches, and it is not in
+        # the undo snapshot's writable set either. Asserting individual fields
+        # cannot see an added one; asserting the whole key set can.
+        t = _shape_transport()
+        _shape_stash(t).apply_scene("sc-9", SHAPE_MATCH)
+        self.assertEqual(set(t.scene_update_input), SHAPE_KEYS)
+
+    def test_an_empty_match_writes_only_the_id_and_the_organized_flag(self):
+        # HARM: the other half of the same guard. A field written
+        # unconditionally rather than only when supplied shows up here as an
+        # empty/None value overwriting whatever the scene already had — a match
+        # that knows nothing must not erase anything.
+        t = _shape_transport(existing={"id": "sc-9", "studio": None,
+                                       "performers": [], "tags": []})
+        _shape_stash(t).apply_scene("sc-9", {})
+        self.assertEqual(set(t.scene_update_input), {"id", "organized"})
+
+    def test_it_writes_the_scalars_it_was_given(self):
+        # HARM: these five are the payload of the whole apply. Today they are
+        # killed only incidentally, by a snapshot-completeness test over in the
+        # revert suite — refactor that and all five are unguarded. Dropping any
+        # one makes the apply silently not apply it; the run reports success
+        # and the field stays as it was, on every scene.
+        t = _shape_transport()
+        _shape_stash(t).apply_scene("sc-9", SHAPE_MATCH)
+        inp = t.scene_update_input
+        self.assertEqual(inp["id"], "sc-9")
+        self.assertEqual(inp["title"], SHAPE_MATCH["title"])
+        self.assertEqual(inp["details"], SHAPE_MATCH["details"])
+        self.assertEqual(inp["date"], SHAPE_MATCH["date"])
+        self.assertEqual(inp["urls"], SHAPE_MATCH["urls"])
+        self.assertEqual(inp["stash_ids"], SHAPE_MATCH["stash_ids"])
+
+    def test_it_marks_the_scene_organized(self):
+        # HARM: `organized` is what takes a scene OUT of the unorganized
+        # worklist. Without it every applied scene is picked up again by the
+        # next run and rewritten, forever — and the flag is a GraphQL Boolean,
+        # so a truthy stand-in is not the same value.
+        t = _shape_transport()
+        _shape_stash(t).apply_scene("sc-9", SHAPE_MATCH)
+        self.assertIs(t.scene_update_input["organized"], True)
+
+    def test_free_text_is_html_stripped_for_both_title_and_details(self):
+        # HARM: scraped free text arrives with raw markup in it. Written
+        # through, the tags land in the library and are displayed literally by
+        # every client — and both fields go through the same sanitizer, so
+        # sanitizing only one is the easy half-fix this catches.
+        t = _shape_transport()
+        _shape_stash(t).apply_scene("sc-9", {
+            "title": "<b>Harbour Fog</b>",
+            "details": "<p>Filmed on the quay.<br>At dawn.</p>"})
+        self.assertEqual(t.scene_update_input["title"], "Harbour Fog")
+        self.assertEqual(t.scene_update_input["details"],
+                         "Filmed on the quay. At dawn.")
+
+    def test_a_single_url_falls_back_into_urls(self):
+        # HARM: adapters hand back either shape. Reading only `urls` drops the
+        # source link of every match that supplies the singular `url` — the one
+        # field that records WHERE this metadata came from, and so the only way
+        # to check a scene's data later.
+        t = _shape_transport()
+        _shape_stash(t).apply_scene(
+            "sc-9", {"url": "http://scene-source.invalid/harbour-fog"})
+        self.assertEqual(t.scene_update_input["urls"],
+                         ["http://scene-source.invalid/harbour-fog"])
+
+    def test_the_plural_urls_wins_when_a_match_carries_both(self):
+        # PINS CURRENT BEHAVIOUR: `urls` is used whole and the singular `url`
+        # is ignored rather than appended. HARM of changing it silently: a
+        # match carrying both would write a different set of links than the
+        # adapter's list, without anything saying so.
+        t = _shape_transport()
+        _shape_stash(t).apply_scene("sc-9", {
+            "urls": ["http://scene-source.invalid/a"],
+            "url": "http://scene-source.invalid/b"})
+        self.assertEqual(t.scene_update_input["urls"],
+                         ["http://scene-source.invalid/a"])
+
+    def test_the_cover_is_written_only_when_an_image_was_supplied(self):
+        # HARM: the single irreversible field in this write. A scene's current
+        # cover is exposed only as a URL, never as the base64 payload
+        # `cover_image` takes, so there is nothing to snapshot it with and an
+        # applied cover CANNOT be undone (apply_scene's own docstring says so).
+        # Writing it unconditionally replaces the artwork of every scene a bulk
+        # run touches — with None or "" when the match had no image, which is
+        # the library's cover art permanently gone.
+        for image in (None, "", {}):
+            with self.subTest(image=repr(image)):
+                t = _shape_transport()
+                _shape_stash(t).apply_scene("sc-9", {"image": image})
+                self.assertNotIn("cover_image", t.scene_update_input)
+        t = _shape_transport()
+        _shape_stash(t).apply_scene("sc-9", {"image": SHAPE_MATCH["image"]})
+        self.assertEqual(t.scene_update_input["cover_image"],
+                         SHAPE_MATCH["image"])
+
+    def test_apply_writes_once(self):
+        # HARM: mirrors test_revert_writes_once. Everything is resolved before
+        # the single sceneUpdate so a mid-apply failure leaves the scene
+        # untouched; splitting the write means a failure between the parts
+        # leaves a scene half-applied, with a `prior` snapshot that no longer
+        # describes it and an undo that restores the wrong thing.
+        server = _mutable_scene(title="Old Title")
+        stash = Stash("http://example.test", "k", transport=server.transport)
+        stash.apply_scene("sc-9", RICH_MATCH, overwrite_studio=True)
+        self.assertEqual(server.writes, 1)
