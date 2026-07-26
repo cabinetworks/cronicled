@@ -187,6 +187,20 @@ class JobRunner:
             )
         self._producers[producer.name] = producer
 
+    def producers(self):
+        """Every registered producer, in the order they were registered.
+
+        The objects themselves, not their names: a schedule reads a
+        producer's own declared cadence off it, and registration is the only
+        place those objects exist. A new list each call, so a caller holding
+        onto the answer cannot rewire the runner by mutating it.
+
+        Registration is wiring-time and single-threaded, in the same sense
+        `start()`'s own read of this mapping is; the runner's lock guards the
+        per-job bookkeeping that a worker thread writes, which this is not.
+        """
+        return list(self._producers.values())
+
     def start(self, name):
         producer = self._producers[name]  # KeyError on an unknown producer
         job_id = str(uuid.uuid4())
