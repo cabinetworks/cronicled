@@ -11,11 +11,17 @@ exists as a separate fact from the scenes themselves: a view that stopped
 early is not evidence of absence, and must never be reported as though it
 were.
 
+The other question worth asking a source is "do you already have this exact
+file?", which `findScenesBySceneFingerprints` answers for a whole batch of
+hashes at once. Its answers are a different kind of evidence from a title
+match and are kept in a different type for that reason: a hash *identifies*,
+a title only *scores*, and the two must not end up in the same field.
+
 Like `cronicled.stash`, every call goes through an injected transport, so the
 whole surface is testable without a network.
 """
 
-from cronicled.stash import DEFAULT_TIMEOUT, Stash
+from cronicled.stash import DEFAULT_TIMEOUT, Stash, StashError
 
 # stash-box's own default is 25. A catalogue read is a whole-catalogue read,
 # so it pays for itself in round trips saved.
@@ -36,6 +42,78 @@ query($input: SceneQueryInput!) {
   }
 }
 """
+
+
+# The endpoint takes a LIST of fingerprint sets and answers with one block of
+# scenes per set, in the order they were submitted. That is the whole reason
+# it exists: a scan holding hundreds of hashes asks once. Asking per
+# fingerprint instead is a rate-limit incident against a public service, and
+# nothing about the answers would look any different, which is why the batch
+# is pinned by a test rather than by intent.
+SCENES_BY_FINGERPRINT = """
+query($fingerprints: [[FingerprintQueryInput!]!]!) {
+  findScenesBySceneFingerprints(fingerprints: $fingerprints) {
+    id title date urls { url }
+  }
+}
+"""
+
+# The algorithms stash-box's `FingerprintAlgorithm` enum accepts, spelled its
+# way. Checked here rather than left to the server because the enum is
+# case-sensitive and unknown values are rejected at parse time, which fails
+# the WHOLE batch: one typo would take every well-formed fingerprint beside it
+# down. Both halves of a fingerprint are strings, so this is also the only
+# thing that can notice a transposed pair.
+FINGERPRINT_ALGORITHMS = ("MD5", "OSHASH", "PHASH")
+
+
+def _checked_fingerprint(fingerprint):
+    """`(algorithm, hash)`, or `ValueError`.
+
+    A malformed entry is never quietly dropped from the batch: the caller
+    would get back a mapping with no key for a fingerprint it did submit,
+    which reads as "never asked" about something that was asked. Raising is
+    the visible failure; skipping is the silent one.
+    """
+    try:
+        algorithm, value = fingerprint
+    except (TypeError, ValueError):
+        raise ValueError("a fingerprint must be an (algorithm, hash) pair, got %r"
+                         % (fingerprint,))
+    if algorithm not in FINGERPRINT_ALGORITHMS:
+        raise ValueError("unknown fingerprint algorithm %r — the source accepts %s"
+                         % (algorithm, ", ".join(FINGERPRINT_ALGORITHMS)))
+    if not isinstance(value, str) or not value:
+        raise ValueError("fingerprint %s has no hash: %r" % (algorithm, value))
+    return (algorithm, value)
+
+
+class FingerprintHit:
+    """A scene the source says carries a fingerprint that was submitted.
+
+    Deliberately **not** a `cronicled.scoring.Match`, and deliberately without
+    a `value`. A hash match *identifies*; a title match *scores*, and the two
+    are different kinds of evidence. The legacy tool wrote a flat `1.0` for a
+    fingerprint hit into the same field a computed similarity goes in, after
+    which nothing downstream could tell an identity from a very good guess —
+    and every threshold, margin and ambiguity rule that reads that field was
+    silently being asked to arbitrate between the two.
+
+    `algorithm` rides on the hit rather than being left to the key it came
+    from, because the claim differs by algorithm and a hit gets separated from
+    its key the moment a caller pools the hits for one file: an `OSHASH` match
+    says *these are the same bytes*, a `PHASH` match only says *these look
+    alike*.
+    """
+
+    def __init__(self, scene, algorithm, hash):
+        self.scene = scene
+        self.algorithm = algorithm
+        self.hash = hash
+
+    def __repr__(self):
+        return "FingerprintHit(scene=%r, algorithm=%r, hash=%r)" % (
+            self.scene.get("id"), self.algorithm, self.hash)
 
 
 class Catalogue:
@@ -120,3 +198,53 @@ class StashBox:
             if len(scenes) >= block["count"]:
                 return Catalogue(performer_id, scenes, complete=True)
         return Catalogue(performer_id, scenes, complete=False)
+
+    def known_by_fingerprint(self, fingerprints, timeout=DEFAULT_TIMEOUT):
+        """Ask the source, in **one** request, which scenes carry each of
+        `fingerprints`.
+
+        `fingerprints` is an iterable of `(algorithm, hash)` pairs; the result
+        maps each submitted pair — as a tuple, whatever it arrived as — to the
+        list of `FingerprintHit`s the source returned for it.
+
+        Every fingerprint submitted appears in the result, and one that
+        matched nothing maps to an empty list rather than being left out.
+        "I asked and there is nothing" and "I never asked" are the two facts
+        this client exists to keep apart, and an absent key collapses them
+        into the same `dict.get` returning `None`. For the same reason a
+        transport failure raises rather than returning everything mapped to
+        empty: that would report a question that was never answered as an
+        answered one, and throw away `StashError.transient` on the way.
+
+        A repeated fingerprint is asked about once — identical hashes are one
+        question, and a scan's batch will hold duplicates whenever two files
+        are the same bytes.
+
+        Nothing is asked at all for an empty batch. There is no question in
+        it, and the round trip could only spend rate limit.
+
+        The endpoint answers positionally and says nothing about which block
+        belongs to which set, so a reply of a different length than the batch
+        makes the alignment unknowable and raises. Zipping would truncate to
+        the shorter of the two silently and file scenes under hashes that
+        never matched them — a wrong identification, which is worse than no
+        answer, and the only outcome here that nothing downstream could catch.
+        """
+        wanted = [_checked_fingerprint(fp) for fp in fingerprints]
+        # first-seen order, asked once; the request order is what the reply is
+        # matched back against below
+        unique = list(dict.fromkeys(wanted))
+        if not unique:
+            return {}
+        variables = {"fingerprints": [[{"hash": value, "algorithm": algorithm}]
+                                      for algorithm, value in unique]}
+        result = self._client.gql(SCENES_BY_FINGERPRINT, variables, timeout=timeout)
+        blocks = result["findScenesBySceneFingerprints"]
+        if len(blocks) != len(unique):
+            raise StashError(
+                "the source answered %d fingerprint sets for a batch of %d — "
+                "which block belongs to which fingerprint is unknowable"
+                % (len(blocks), len(unique)))
+        return {(algorithm, value): [FingerprintHit(scene, algorithm, value)
+                                     for scene in block]
+                for (algorithm, value), block in zip(unique, blocks)}
