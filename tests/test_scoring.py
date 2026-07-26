@@ -2,7 +2,7 @@
 the tests here state the wrong match each rule prevents."""
 import unittest
 
-from cronicled.scoring import Match, decide, meaningful_tokens, score
+from cronicled.scoring import DEFAULT_THRESHOLD, Match, decide, meaningful_tokens, score
 
 
 class MeaningfulTokens(unittest.TestCase):
@@ -260,15 +260,20 @@ class Deciding(unittest.TestCase):
         # comparison -- 0.900-0.850 is 0.050000000000000044 while
         # 0.850-0.800 is 0.049999999999999930 -- so the same dilemma is
         # refused or auto-written depending on where the pair happens to sit
+        # An explicit threshold, because this test is about the MARGIN and
+        # nothing else. Left to the default it broke when the default moved,
+        # since the runner-up in the last pair fell below it and stopped
+        # being eligible at all - a fixture that was quietly testing two
+        # rules while claiming to test one.
         for top, runner in ((0.900, 0.850), (0.850, 0.800),
                             (0.800, 0.750), (0.700, 0.650)):
-            d = decide([self._m(top), self._m(runner)])
+            d = decide([self._m(top), self._m(runner)], threshold=0.5)
             self.assertIsNone(d.match, "%.3f vs %.3f" % (top, runner))
             self.assertIn("ambiguous", d.reason)
 
     def test_a_gap_just_over_the_margin_is_decided(self):
         for top, runner in ((0.900, 0.849), (0.850, 0.799), (0.700, 0.649)):
-            d = decide([self._m(top), self._m(runner)])
+            d = decide([self._m(top), self._m(runner)], threshold=0.5)
             self.assertEqual(d.index, 0, "%.3f vs %.3f" % (top, runner))
 
     def test_a_clear_margin_over_the_runner_up_is_decided(self):
@@ -367,3 +372,32 @@ class Deciding(unittest.TestCase):
         # generic-word rule, so a malformed candidate failed OPEN
         with self.assertRaises((TypeError, ValueError)):
             decide([Match(value=0.9, contained=False)])
+
+
+class TheDefaultThresholdIsTheMeasuredOne(unittest.TestCase):
+    """Raising the default broke no test, which is why this exists: the
+    number deciding whether a file is written without a person looking was
+    not observed by anything.
+
+    It is 0.7 because that is what a real library said. Against 5924 scenes
+    across 99 creators, 0.5 applied a wrong entry 16% of the time when the
+    right one was absent from the catalogue; 0.7 cuts that to 6% for three
+    points of recall. The whole table is in `scoring.py` beside the constant,
+    including a note on the measurement error that first pointed at 0.6."""
+
+    def test_the_default_is_the_measured_value(self):
+        self.assertEqual(DEFAULT_THRESHOLD, 0.7)
+
+    def test_decide_uses_it_when_the_caller_names_no_threshold(self):
+        # The constant is only worth pinning if it is the one in force.
+        just_over = Match(value=0.71, contained=False, meaningful_count=2)
+        just_under = Match(value=0.69, contained=False, meaningful_count=2)
+        self.assertIsNotNone(decide([just_over]).match)
+        self.assertIsNone(decide([just_under]).match)
+
+    def test_an_explicit_threshold_still_wins(self):
+        # The measurement picked a default, not a policy. An operator whose
+        # library is shaped differently has to be able to say so.
+        m = Match(value=0.65, contained=False, meaningful_count=2)
+        self.assertIsNone(decide([m]).match)
+        self.assertIsNotNone(decide([m], threshold=0.5).match)

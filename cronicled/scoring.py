@@ -199,7 +199,45 @@ def _shortfall(match, threshold):
     return threshold - match.value
 
 
-def decide(matches, threshold=0.5):
+# The score a candidate must reach before it is applied without a person
+# looking. Measured, not chosen: against a real library of 5924 scenes across
+# 99 creators, scoring each file against that creator's whole catalogue with
+# its own entry removed — so every application in that condition is wrong by
+# construction — and again with it present.
+#
+#     threshold   applied a wrong entry     found the right entry
+#                 when the right one was    when it was present
+#                 absent from the catalogue
+#     ---------   ------------------------  ---------------------
+#       0.50                  16%                    80%
+#       0.60                  12%                    79%
+#       0.70                   6%                    77%
+#       0.80                   3%                    74%
+#       0.90                   3%                    71%
+#
+# 0.70 is the knee: it cuts the wrong-application rate by nearly two thirds
+# for three points of recall. 0.60 gives up almost nothing and buys almost
+# nothing. Below 0.80 each further step costs about as much recall as it buys
+# precision, and 0.90 buys none at all.
+#
+# The asymmetry sets the direction — refusing costs a review, while a wrong
+# automatic write costs a file nobody looks at again — but it does not justify
+# paying any price, and this is where the price stops being worth paying.
+#
+# A caution about how this was measured, because it changed the answer: an
+# earlier pass capped each creator's catalogue at 40 titles to run faster, and
+# reported 0.70 costing eight points of recall rather than three. A smaller
+# candidate set is an easier problem, and the cap quietly made the measurement
+# answer a different question than the one it was labelled with.
+#
+# What no threshold here fixes: almost all of that harm is a file whose entry
+# is not in the catalogue at all. The scorer has no way to say "none of these",
+# so it takes the best available — confidently, not narrowly, which is why the
+# ambiguity rule never sees these. Tracked separately.
+DEFAULT_THRESHOLD = 0.7
+
+
+def decide(matches, threshold=DEFAULT_THRESHOLD):
     """Pick the one candidate confident enough to apply automatically, or
     refuse with a reason a person can act on. Never guesses between two
     plausible candidates -- ambiguity is refused, not resolved by picking

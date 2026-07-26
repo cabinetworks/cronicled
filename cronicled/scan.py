@@ -32,7 +32,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from cronicled.artist import creator_folder, resolve
-from cronicled.scoring import decide, score
+from cronicled.scoring import DEFAULT_THRESHOLD, decide, score
 
 # Selection deals in one kind of subject. It is named rather than inlined so
 # a test and the store agree on the same string, and so a future second kind
@@ -257,7 +257,7 @@ def _primary_path(scene):
     return files[0]["path"]
 
 
-def examine(scene, *, search, folder, threshold=0.5, aliases=None):
+def examine(scene, *, search, folder, threshold=DEFAULT_THRESHOLD, aliases=None):
     """Work out what `scene` is, and return what that concluded.
 
     `search` is the injected lookup: called with the resolved creator's name
@@ -516,7 +516,7 @@ class ScanProducer:
     cost = "scraping"
 
     def __init__(self, stash, search, *, store, folder="library", limit=None,
-                 name_filter=None, threshold=0.5, aliases=None, workers=4):
+                 name_filter=None, threshold=DEFAULT_THRESHOLD, aliases=None, workers=4):
         if workers < 1:
             # A pool of nothing would do nothing at all, forever. Refuse it
             # where the mistake was made rather than on a background thread
