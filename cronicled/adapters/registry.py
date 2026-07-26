@@ -1,7 +1,11 @@
 """Adapters are loaded from the user's config, never compiled in.
 
 A fresh install has no config: `load_adapters` returns an empty mapping rather
-than raising, so the app starts and can tell the user what to configure.
+than raising, so the app starts and can tell the user what to configure. That
+is the "absence is a legitimate state" half of the rule stated in
+`cronicled.config`'s module docstring; `config.load_server` is the other half
+and raises. Read that rule before adding a third loader — the difference
+between these two is deliberate.
 """
 import json
 import os
