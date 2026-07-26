@@ -138,6 +138,53 @@ class PerformerCatalogue(unittest.TestCase):
         self.assertFalse(catalogue.complete)
         self.assertEqual(len(t.calls), 3, "stopped at the empty page")
 
+    def test_a_short_page_is_not_the_end_of_the_read(self):
+        # The COUNT is the authority on completeness, not the page length.
+        # Every other test here is also consistent with the ordinary
+        # pagination idiom -- `len(page) < per_page` means the last page --
+        # and that idiom is wrong for this source: three scenes on a page of
+        # five while the count says nine is the "permission filter applied
+        # after counting" shape this module's docstring anticipates.
+        #
+        # Under the page-length rule the read stops here and returns three
+        # scenes as complete=True. A truncated catalogue reported as read in
+        # full is the one input that turns every downstream absence into a
+        # confident lie, so both the scene count and the number of requests
+        # are pinned.
+        t = _transport([
+            _page(9, [{"id": "s1"}, {"id": "s2"}, {"id": "s3"}]),
+            _page(9, [{"id": "s%d" % n} for n in range(4, 9)]),
+            _page(9, [{"id": "s9"}]),
+        ])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        catalogue = box.performer_catalogue("p1", per_page=5, max_pages=10)
+
+        self.assertEqual(len(catalogue.scenes), 9)
+        self.assertTrue(catalogue.complete)
+        self.assertEqual(len(t.calls), 3, "kept asking past the short page")
+
+    def test_a_short_page_the_source_never_makes_up_is_not_complete(self):
+        # The same short page, and this time the source never delivers the
+        # rest: it hands back three of a promised nine and then nothing. The
+        # read is over -- an empty page always ends it -- but three scenes are
+        # not nine, and nothing here may be called complete.
+        #
+        # The disjoint witness for the test above. A page-length rule returns
+        # complete=True from the FIRST page in both, so a mutation cannot
+        # satisfy one by breaking the other.
+        t = _transport([
+            _page(9, [{"id": "s1"}, {"id": "s2"}, {"id": "s3"}]),
+            _page(9, []),
+        ])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        catalogue = box.performer_catalogue("p1", per_page=5, max_pages=10)
+
+        self.assertEqual(len(catalogue.scenes), 3)
+        self.assertFalse(catalogue.complete)
+        self.assertEqual(len(t.calls), 2, "stopped at the empty page")
+
     def test_a_transport_failure_part_way_through_raises(self):
         # Pages one and two are discarded rather than returned with
         # complete=False. The two short reads the flag covers are answers a
