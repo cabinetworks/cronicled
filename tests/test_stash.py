@@ -516,6 +516,106 @@ class ApplyScene(unittest.TestCase):
         self.assertIsNone(t.scene_update_input)  # no partial write
 
 
+# -- what the caller does with the flag ------------------------------------ #
+#
+# Classification only matters through its consequence, and apply_scene is where
+# the consequence lands: a permanently refused name is dropped from the write
+# and reported in `skipped` (the rest of the scene still gets its title, date
+# and every other performer), while a transient failure raises so the row can
+# be retried whole and nothing partial is written.
+#
+# The tests above pin those two behaviours; what they do NOT show is what the
+# choice between them is made from. So the fixture below is built ONCE and
+# driven twice, with `transient` as the only difference: same scene, same
+# match, same performer name, same exception class, same message, refused at
+# the same call. Anything a future refactor might key off instead — the
+# message text, the exception type, which name it was, how far into the match
+# the failure happened — is held identical across the two runs, so keying off
+# any of them collapses the two outcomes into one and fails a test here.
+
+# One refusal message, used verbatim for BOTH outcomes. It deliberately reads
+# like neither a timeout nor a validation error: nothing in the text hints at
+# which side of the line it belongs on, so only the flag can say.
+REFUSAL_MESSAGE = "the media server said no to 'Bad Name'"
+
+
+def _refused_apply(transient):
+    """The identical apply, refused the identical way, differing ONLY in
+    `transient`. Returns (stash, transport, match) so the caller drives the
+    call and asserts on the outcome — result or raise.
+
+    "Harbor Fox" resolves normally alongside the refused name, so the
+    permanent run has something left to write (and so it cannot reach
+    apply_scene's separate "every name was refused" raise), and so the
+    transient run is genuinely choosing to abandon a row that was otherwise
+    resolving fine."""
+    existing = {"id": "1", "studio": None, "performers": [], "tags": []}
+    t = _SceneTransport(
+        existing,
+        found={"performer": {"Harbor Fox": "2"}},
+        create={("performer", "Bad Name"): StashError(REFUSAL_MESSAGE,
+                                                      transient=transient)})
+    match = {"title": "A Title",
+             "performers": [{"name": "Harbor Fox"}, {"name": "Bad Name"}]}
+    return Stash("http://example.test", "k", transport=t), t, match
+
+
+class SkipOrRaiseTurnsOnTheFlag(unittest.TestCase):
+    """The retry flag alone decides whether a failed name is skipped or the
+    whole row raises."""
+
+    def test_a_permanent_refusal_drops_that_name_and_writes_the_rest(self):
+        # HARM: failing the whole row on a name the server will never accept
+        # means the scene never gets its title, date, cover or any of its
+        # other performers — for one bad name that no retry can fix.
+        stash, t, match = _refused_apply(transient=False)
+        result = stash.apply_scene("1", match)
+        self.assertEqual([s["name"] for s in result["skipped"]], ["Bad Name"])
+        self.assertEqual(result["skipped"][0]["error"], REFUSAL_MESSAGE)
+        self.assertEqual(t.scene_update_input["performer_ids"], ["2"])
+        self.assertEqual(t.scene_update_input["title"], "A Title")
+
+    def test_a_transient_failure_of_the_same_name_raises_instead(self):
+        # HARM: swallowing a blip writes the scene WITHOUT that performer and
+        # marks it organized. Nothing revisits a scene that already looks
+        # done, so a momentary wobble costs it that name permanently.
+        stash, t, match = _refused_apply(transient=True)
+        with self.assertRaises(StashError) as ctx:
+            stash.apply_scene("1", match)
+        self.assertTrue(ctx.exception.transient)  # the flag survives the raise
+        self.assertIsNone(t.scene_update_input,
+                          "the row must be retryable whole — nothing partial "
+                          "may land on the server")
+
+    def test_only_the_flag_distinguishes_the_two(self):
+        # THE test: it is what fails if a future refactor starts deciding from
+        # the exception's message text or its type rather than from the flag.
+        permanent, perm_t, perm_match = _refused_apply(transient=False)
+        transient, trans_t, trans_match = _refused_apply(transient=True)
+
+        # everything except the flag is held identical between the two runs
+        perm_err = perm_t.create[("performer", "Bad Name")]
+        trans_err = trans_t.create[("performer", "Bad Name")]
+        self.assertEqual(str(perm_err), str(trans_err))       # same message
+        self.assertIs(type(perm_err), type(trans_err))        # same type
+        self.assertEqual(perm_match, trans_match)             # same call
+        self.assertEqual(perm_t.found, trans_t.found)         # same fixture
+        self.assertEqual(perm_t.existing, trans_t.existing)
+        self.assertNotEqual(perm_err.transient, trans_err.transient)  # only this
+
+        result = permanent.apply_scene("1", perm_match)
+        with self.assertRaises(StashError) as ctx:
+            transient.apply_scene("1", trans_match)
+
+        # ...and the outcomes are opposites
+        self.assertEqual([s["name"] for s in result["skipped"]], ["Bad Name"])
+        self.assertIsNotNone(perm_t.scene_update_input,
+                             "a permanent refusal must still write the scene")
+        self.assertTrue(ctx.exception.transient)
+        self.assertIsNone(trans_t.scene_update_input,
+                          "a transient failure must write nothing at all")
+
+
 class PriorStateSnapshot(unittest.TestCase):
     def test_apply_returns_the_state_it_replaced(self):
         # the snapshot is what makes an apply reversible; it must describe the
