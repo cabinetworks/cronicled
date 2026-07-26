@@ -42,9 +42,26 @@ class Match(NamedTuple):
 
 
 class Decision(NamedTuple):
+    """The one candidate confident enough to apply, or a refusal.
+
+    `contenders` counts the candidates that were trustworthy enough to compete
+    for the win. It exists because `match=None` covers two refusals that mean
+    opposite things: nothing cleared the bar (consistent with the file having
+    no entry in the catalogue at all), or several did and which one is right
+    could not be decided (entries that look like this file are right there).
+    A consumer that treats a refusal as evidence of absence has to tell those
+    apart, and the only other thing that distinguishes them is the wording of
+    `reason` -- which `scan.py` already refuses to read facts off, because the
+    wording is free to change and nothing would notice.
+
+    It has no default. 0 is not a neutral value here: it is precisely the one
+    that licenses a downstream absence claim, so a Decision assembled without
+    a count must fail rather than assert that nothing competed.
+    """
     match: Optional[Match]
     index: Optional[int]
     reason: str
+    contenders: int
 
 
 # A one-generic-word match (e.g. a single common word shared with some other
@@ -243,7 +260,8 @@ def decide(matches, threshold=DEFAULT_THRESHOLD):
     plausible candidates -- ambiguity is refused, not resolved by picking
     whichever came first."""
     if not matches:
-        return Decision(match=None, index=None, reason="no candidates offered")
+        return Decision(match=None, index=None,
+                        reason="no candidates offered", contenders=0)
 
     eligible = [(m.value, i, m) for i, m in enumerate(matches) if _is_eligible(m, threshold)]
 
@@ -268,7 +286,7 @@ def decide(matches, threshold=DEFAULT_THRESHOLD):
             reason = "nothing above the threshold (%.2f); best score was %.3f" % (
                 threshold, best.value,
             )
-        return Decision(match=None, index=None, reason=reason)
+        return Decision(match=None, index=None, reason=reason, contenders=0)
 
     eligible.sort(key=lambda t: t[0], reverse=True)
     top_value, top_index, top_match = eligible[0]
@@ -285,7 +303,9 @@ def decide(matches, threshold=DEFAULT_THRESHOLD):
             reason = "ambiguous: %.3f vs %.3f are too close to call" % (
                 top_value, runner_value,
             )
-            return Decision(match=None, index=None, reason=reason)
+            return Decision(match=None, index=None, reason=reason,
+                            contenders=len(eligible))
 
     reason = "chosen with score %.3f" % (top_value,)
-    return Decision(match=top_match, index=top_index, reason=reason)
+    return Decision(match=top_match, index=top_index, reason=reason,
+                    contenders=len(eligible))

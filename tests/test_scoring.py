@@ -2,7 +2,8 @@
 the tests here state the wrong match each rule prevents."""
 import unittest
 
-from cronicled.scoring import DEFAULT_THRESHOLD, Match, decide, meaningful_tokens, score
+from cronicled.scoring import (
+    DEFAULT_THRESHOLD, Decision, Match, decide, meaningful_tokens, score)
 
 
 class MeaningfulTokens(unittest.TestCase):
@@ -372,6 +373,38 @@ class Deciding(unittest.TestCase):
         # generic-word rule, so a malformed candidate failed OPEN
         with self.assertRaises((TypeError, ValueError)):
             decide([Match(value=0.9, contained=False)])
+
+    def test_a_decision_says_how_many_candidates_competed(self):
+        # Two refusals arrive as match=None and mean opposite things. "Nothing
+        # cleared the bar" is consistent with the file having no entry in the
+        # catalogue at all; "two cleared it and I cannot say which" is the
+        # opposite -- entries that look like this file are RIGHT THERE. A
+        # consumer that treats a refusal as evidence of absence
+        # (stashbox.absence_verdict) has to tell them apart, and the only
+        # thing that currently distinguishes them is the wording of `reason`.
+        # scan.py already refuses to read a fact off that prose, for the
+        # reason stated there: the wording is free to change and nothing would
+        # notice. So the count is carried as a number.
+        self.assertEqual(decide([]).contenders, 0)
+        self.assertEqual(decide([self._m(0.4)]).contenders, 0)
+        self.assertEqual(decide([self._m(0.9, meaningful_count=0)]).contenders, 0)
+        self.assertEqual(decide([self._m(0.7, meaningful_count=1)]).contenders, 0)
+        # refused as ambiguous -- both cleared the bar
+        self.assertEqual(decide([self._m(0.80), self._m(0.78)]).contenders, 2)
+        # a winner, and the loser it beat by more than the margin. The count
+        # is of candidates that COMPETED, not of the one that won, so a
+        # decision that names a winner still reports both.
+        self.assertEqual(decide([self._m(0.9), self._m(0.2)]).contenders, 1)
+        self.assertEqual(
+            decide([self._m(0.9), self._m(0.75), self._m(0.2)]).contenders, 2)
+
+    def test_a_missing_contender_count_raises(self):
+        # Same shape as the meaningful_count guard above, and the same reason:
+        # 0 is not a neutral default here, it is precisely the value that
+        # licenses a downstream absence claim. A Decision assembled without
+        # one must fail loudly rather than assert "nothing competed".
+        with self.assertRaises(TypeError):
+            Decision(match=None, index=None, reason="nothing above the threshold")
 
 
 class TheDefaultThresholdIsTheMeasuredOne(unittest.TestCase):

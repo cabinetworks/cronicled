@@ -137,6 +137,107 @@ class Catalogue:
             self.performer_id, len(self.scenes), self.complete)
 
 
+class Verdict:
+    """Whether a file is absent from a catalogue, and why that is the answer.
+
+    `absent` is three-valued, and that is the whole point of the type. `True`
+    and `False` are claims about the source; `None` is the honest answer when
+    the evidence supports neither. Collapsing `None` into `False` would make
+    "we could not tell" indistinguishable from "it is there".
+
+    The asymmetry with the rest of this project is worth stating: elsewhere a
+    wrong answer costs a wrong write, which a later run can correct. This one
+    is read by a person and acted on by a person, and a reviewer sent to look
+    for a mis-filing that does not exist has no undo.
+
+    `reason` is the part that actually gets read, so it carries the same rule:
+    it never claims a completeness that was not achieved.
+    """
+
+    def __init__(self, absent, reason):
+        self.absent = absent
+        self.reason = reason
+
+    def __repr__(self):
+        return "Verdict(absent=%r, reason=%r)" % (self.absent, self.reason)
+
+
+def absence_verdict(view, decision, *, attribution_certain=True):
+    """What `view` and `decision` together are allowed to claim about a file.
+
+    `view` is a `Catalogue`; `decision` is a `cronicled.scoring.Decision` made
+    over candidates drawn from that catalogue. `attribution_certain` says
+    whether the performer whose catalogue was read is agreed to be this file's
+    creator — a caller working from `cronicled.artist.resolve` computes it as
+    `resolution.competing is None`, the resolver's own report that the folder
+    and the filename did not name different people.
+
+    Four things have to hold before a file may be called absent, and each one
+    that fails downgrades the claim rather than weakening it:
+
+    * **the attribution is not contested.** An enumeration of the wrong
+      performer's catalogue answers a question about the wrong person, and
+      answering it confidently is worse than not answering. This blocks
+      `False` as well as `True`: a title match found in a catalogue that may
+      belong to someone else is a wrong identification, which is the exact
+      failure the resolver's disagreement is warning about.
+    * **the scorer did not find it.** A decided match is a presence, and it
+      stays a presence whether or not the read finished — a page that was
+      never fetched cannot un-find an entry already in hand. Completeness
+      gates only the negative claim.
+    * **the refusal was for want of a candidate, not a surplus of them.** A
+      refusal with contenders is a dilemma: entries that look like this file
+      are in the catalogue, and reporting that as an absence would send a
+      reviewer hunting a mis-filing while the candidates sit in the same
+      reply. Read off `Decision.contenders` and never off `decision.reason` —
+      `scan.py` states the rule and the reason for it.
+    * **the read finished.** The page that was never read is precisely where
+      the missing entry would be.
+
+    Ordering matters only for which reason a caller is shown, and it runs from
+    the most fundamental defect outward: not knowing whose catalogue this is
+    beats anything measured inside it, and evidence in hand (a match, a set of
+    contenders) is more use to a reviewer than the fact that more pages exist.
+    """
+    # A bool and nothing else. The mis-wiring this exists to catch is
+    # `attribution_certain=resolution.competing`, where `competing` holds the
+    # losing NAME when the attribution is contested — a truthy string, which
+    # would switch the guard off by exactly the value that should switch it
+    # on. Defaulting a non-bool to "contested" instead would be fail-closed
+    # but silent, and would leave the mis-wired caller with a verdict that
+    # simply never claims anything and no clue why.
+    if attribution_certain is not True and attribution_certain is not False:
+        raise TypeError(
+            "attribution_certain must be True or False, got %r"
+            % (attribution_certain,))
+
+    if not attribution_certain:
+        return Verdict(None, (
+            "the folder and the filename name different creators, so whose "
+            "catalogue was read is unsettled and neither answer is available"))
+
+    if decision.match is not None:
+        return Verdict(False, "the catalogue has this file: %s" % (
+            decision.reason,))
+
+    if decision.contenders:
+        return Verdict(None, (
+            "%d catalogue entries competed for this file and none of them "
+            "won, so nothing here says it is missing: %s"
+            % (decision.contenders, decision.reason)))
+
+    if not view.complete:
+        return Verdict(None, (
+            "the catalogue read for performer %s stopped early after %d "
+            "scenes, so the file is not ruled out by what was not read"
+            % (view.performer_id, len(view.scenes))))
+
+    return Verdict(True, (
+        "performer %s's catalogue was read in full (%d scenes) and this file "
+        "is not in it: %s" % (view.performer_id, len(view.scenes),
+                              decision.reason)))
+
+
 class StashBox:
     def __init__(self, url, api_key, transport=None):
         # The GraphQL plumbing — hard deadline, error mapping, "data"

@@ -1,9 +1,10 @@
 import unittest
 
-from cronicled.scoring import Match
+from cronicled.scoring import Decision, Match, decide
 from cronicled.stash import StashError
 from cronicled.stashbox import (
-    PERFORMER_SCENES, SCENES_BY_FINGERPRINT, StashBox)
+    PERFORMER_SCENES, SCENES_BY_FINGERPRINT, Catalogue, StashBox,
+    absence_verdict)
 
 
 def _transport(responses):
@@ -416,6 +417,220 @@ class RequestShape(unittest.TestCase):
         self.assertTrue(t.calls, "the surface was actually exercised")
         for body, _ in t.calls:
             self.assertNotIn("mutation", body["query"].lower())
+
+
+PERFORMER = "pf-8821"
+
+
+def _catalogue(scenes=2, complete=True, performer_id=PERFORMER):
+    return Catalogue(performer_id,
+                     [{"id": "s%d" % n} for n in range(scenes)], complete)
+
+
+def _m(value, contained=False, meaningful_count=2):
+    return Match(value=value, contained=contained,
+                 meaningful_count=meaningful_count)
+
+
+def _refused():
+    """A scoring refusal with nothing that came close: no candidate in the
+    catalogue was a plausible entry for this file."""
+    return decide([_m(0.41)])
+
+
+def _decided():
+    return decide([_m(0.9)])
+
+
+def _ambiguous():
+    """A refusal of the OTHER kind: two candidates both cleared the bar."""
+    return decide([_m(0.80), _m(0.78)])
+
+
+class AbsenceVerdict(unittest.TestCase):
+    """What an absence is allowed to claim.
+
+    The scorer must always pick a winner from what it is handed, and against a
+    real library it applied a wrong entry 6% of the time when the right one
+    was not in the catalogue at all. A catalogue read in full lets a refusal
+    say something the scorer never can -- "this performer's catalogue was read
+    whole and this file is not in it" -- which tells a reviewer the file is
+    either filed under the wrong performer or genuinely not at the source.
+
+    That claim is made to a person, and a wrong one has no undo. So every test
+    here is about the conditions under which it may NOT be made.
+    """
+
+    def test_a_complete_read_and_a_refusal_is_an_absence(self):
+        # The case the whole ticket exists for. The catalogue was read whole,
+        # nothing in it is this file, and the reason says so in those terms --
+        # naming the performer, because "not in it" is worthless to a reviewer
+        # who cannot tell whose catalogue was searched.
+        verdict = absence_verdict(_catalogue(complete=True), _refused())
+
+        self.assertIs(verdict.absent, True)
+        self.assertIn("in full", verdict.reason)
+        self.assertIn(PERFORMER, verdict.reason)
+
+    def test_an_empty_catalogue_read_in_full_is_still_an_absence(self):
+        # A performer the source holds nothing for, and therefore no candidate
+        # to score. This is the strongest evidence of absence obtainable and
+        # the answer most worth acting on; an implementation that needed
+        # scenes in hand before it would commit would refuse exactly here.
+        verdict = absence_verdict(_catalogue(scenes=0, complete=True), decide([]))
+
+        self.assertIs(verdict.absent, True)
+        self.assertIn("in full", verdict.reason)
+
+    def test_a_partial_read_can_never_be_an_absence(self):
+        # THE test. `absent` is three-valued on purpose: True and False are
+        # claims, None is the honest answer when the evidence supports
+        # neither. Collapsing None into False makes "we could not tell"
+        # indistinguishable from "it is there", and the page the read never
+        # reached is exactly where the file's entry would be.
+        #
+        # Both shapes of partial read are here. The empty one matters most: it
+        # is byte-for-byte the same view as the genuinely-empty catalogue
+        # above apart from one flag, so anything that reads the scene list
+        # instead of the flag passes the case above and gets this one
+        # catastrophically wrong.
+        for scenes in (0, 2):
+            with self.subTest(scenes=scenes):
+                verdict = absence_verdict(
+                    _catalogue(scenes=scenes, complete=False), _refused())
+
+                self.assertIsNone(
+                    verdict.absent,
+                    "a partial read reported as a definite answer")
+                self.assertIsNot(verdict.absent, False)
+                self.assertIn("stopped early", verdict.reason)
+                self.assertNotIn("in full", verdict.reason)
+
+    def test_a_decided_match_is_not_an_absence(self):
+        verdict = absence_verdict(_catalogue(complete=True), _decided())
+
+        self.assertIs(verdict.absent, False)
+        self.assertIn("has this file", verdict.reason)
+        self.assertNotIn("in full", verdict.reason)
+
+    def test_a_partial_read_that_found_the_file_still_found_it(self):
+        # Completeness gates the NEGATIVE claim only. A page that was never
+        # fetched cannot un-find an entry already in hand, so "it is there"
+        # survives a short read -- and an implementation that checked the flag
+        # before looking at the decision would downgrade this to None and
+        # report a found file as unknown.
+        verdict = absence_verdict(_catalogue(complete=False), _decided())
+
+        self.assertIs(verdict.absent, False)
+
+    def test_a_contested_attribution_never_claims_an_absence(self):
+        # The resolver reports it when a folder names one creator and the
+        # filename names another, and this is that signal's first consumer.
+        # A contested attribution means the catalogue that was enumerated may
+        # belong to someone else entirely -- so "not in it" answers a question
+        # about the wrong person, confidently, which is worse than not
+        # answering. The view here is COMPLETE: completeness is not the thing
+        # in doubt, whose catalogue it is is.
+        verdict = absence_verdict(_catalogue(complete=True), _refused(),
+                                  attribution_certain=False)
+
+        self.assertIsNone(verdict.absent)
+        self.assertIsNot(verdict.absent, False)
+        self.assertIn("different creators", verdict.reason)
+        self.assertNotIn("in full", verdict.reason)
+
+    def test_a_contested_attribution_does_not_claim_a_presence_either(self):
+        # The mirror. A match found in a catalogue that may be the wrong
+        # person's is a wrong identification, not a confirmation -- it is the
+        # very failure the resolver's disagreement is warning about. Neither
+        # direction is claimable when it is unknown whose catalogue was read.
+        verdict = absence_verdict(_catalogue(complete=True), _decided(),
+                                  attribution_certain=False)
+
+        self.assertIsNone(verdict.absent)
+        self.assertIn("different creators", verdict.reason)
+
+    def test_a_refusal_between_two_contenders_is_not_an_absence(self):
+        # A refusal is not one thing. "Nothing cleared the bar" is consistent
+        # with the file having no entry here; "two cleared it and I cannot say
+        # which" is the opposite claim -- entries that look like this file are
+        # right there in the catalogue. Both arrive as match=None, and
+        # reporting the second as an absence would send a reviewer hunting a
+        # mis-filing while the two candidate entries sit in the same reply.
+        verdict = absence_verdict(_catalogue(complete=True), _ambiguous())
+
+        self.assertIsNone(verdict.absent)
+        self.assertIsNot(verdict.absent, True)
+        self.assertIn("competed", verdict.reason)
+        self.assertNotIn("in full", verdict.reason)
+
+    def test_the_kind_of_refusal_is_read_from_the_count_not_the_prose(self):
+        # scan.py already states the rule: a fact worth acting on is asked of
+        # the data, never inferred from a reason string, because the wording
+        # is free to change and nothing would notice. Here the wording is
+        # deliberately set to contradict the count -- a refusal whose prose
+        # reads like a near miss but which had two contenders, and one whose
+        # prose reads ambiguous but had none. The count wins both times.
+        looks_like_a_near_miss = Decision(
+            match=None, index=None,
+            reason="nothing above the threshold (0.70); best score was 0.410",
+            contenders=2)
+        looks_ambiguous = Decision(
+            match=None, index=None,
+            reason="ambiguous: 0.800 vs 0.780 are too close to call",
+            contenders=0)
+
+        self.assertIsNone(
+            absence_verdict(_catalogue(), looks_like_a_near_miss).absent)
+        self.assertIs(
+            absence_verdict(_catalogue(), looks_ambiguous).absent, True)
+
+    def test_only_the_completed_read_claims_a_completed_read(self):
+        # A reason that claims completeness it did not achieve is the same
+        # wrong assertion as the flag itself, made in the part a person
+        # actually reads. Exactly one of the branches may say "in full", and
+        # a single catch-all string that satisfied every assertion above
+        # cannot also satisfy this.
+        reasons = [
+            absence_verdict(_catalogue(), _refused()).reason,
+            absence_verdict(_catalogue(complete=False), _refused()).reason,
+            absence_verdict(_catalogue(), _decided()).reason,
+            absence_verdict(_catalogue(), _ambiguous()).reason,
+            absence_verdict(_catalogue(), _refused(),
+                            attribution_certain=False).reason,
+        ]
+
+        self.assertEqual([r for r in reasons if "in full" in r],
+                         [reasons[0]])
+        self.assertEqual(len(set(reasons)), len(reasons), reasons)
+
+    def test_the_verdict_carries_a_claim_and_a_reason_and_nothing_else(self):
+        # Asserted whole rather than probed key by key: the failure worth
+        # preventing is a field being ADDED -- a confidence, a score, a
+        # candidate -- which would re-create the thing this layer exists to
+        # replace, and a sampled assertion is blind to exactly that.
+        verdict = absence_verdict(_catalogue(), _refused())
+
+        self.assertEqual(sorted(vars(verdict)), ["absent", "reason"])
+
+    def test_certainty_cannot_be_passed_positionally(self):
+        # The natural mis-wiring is `absence_verdict(view, decision,
+        # resolution.competing)` -- and `competing` holds a NAME when the
+        # attribution is contested, which is truthy, so the guard would be
+        # switched off by exactly the value that should switch it on.
+        with self.assertRaises(TypeError):
+            absence_verdict(_catalogue(), _refused(), False)
+
+    def test_a_certainty_that_is_not_a_boolean_raises(self):
+        # Same mis-wiring, spelled as a keyword. Silently treating a truthy
+        # name as "certain" is the fail-open direction, and treating it as
+        # contested would hide the wiring bug behind a verdict that simply
+        # never claims anything.
+        for bad in ("Velvet Crane", 1, 0, None, ""):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    absence_verdict(_catalogue(), _refused(),
+                                    attribution_certain=bad)
 
 
 if __name__ == "__main__":
