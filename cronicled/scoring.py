@@ -44,24 +44,39 @@ class Match(NamedTuple):
 class Decision(NamedTuple):
     """The one candidate confident enough to apply, or a refusal.
 
-    `contenders` counts the candidates that were trustworthy enough to compete
-    for the win. It exists because `match=None` covers two refusals that mean
-    opposite things: nothing cleared the bar (consistent with the file having
-    no entry in the catalogue at all), or several did and which one is right
-    could not be decided (entries that look like this file are right there).
-    A consumer that treats a refusal as evidence of absence has to tell those
-    apart, and the only other thing that distinguishes them is the wording of
-    `reason` -- which `scan.py` already refuses to read facts off, because the
-    wording is free to change and nothing would notice.
+    Two of these fields exist for a single consumer: a caller deciding whether
+    a refusal is evidence that a file has no entry in the catalogue at all.
+    `match=None` cannot answer that, because it covers at least four refusals
+    and only one of them is a statement about the catalogue.
 
-    It has no default. 0 is not a neutral value here: it is precisely the one
-    that licenses a downstream absence claim, so a Decision assembled without
-    a count must fail rather than assert that nothing competed.
+    `contenders` counts the candidates that were trustworthy enough to compete
+    for the win. It separates "nothing cleared the bar" -- consistent with the
+    file having no entry -- from "several did and which one is right could not
+    be decided", where entries that look like this file are right there.
+
+    `interrogated` says whether the catalogue was actually questioned at all.
+    `contenders == 0` is also what comes back when the *filename* carried no
+    word that is not the artist's or generic, which `_is_eligible` bars at any
+    score so that not one candidate title was ever weighed, and when the
+    *caller* offered no candidates. Those two are statements about the file
+    and about the caller; neither says anything about the source, and an
+    absence built on either is fabricated -- it sends a reviewer to hunt a
+    mis-filing the scorer never looked for.
+
+    Both are read as data and never off `reason` -- `scan.py` states that rule
+    and the reason for it: the wording is free to change and nothing would
+    notice.
+
+    Neither has a default. 0 and True are not neutral values here: they are
+    precisely the pair that licenses a downstream absence claim, so a Decision
+    assembled without them must fail rather than assert that nothing competed
+    or that a look happened.
     """
     match: Optional[Match]
     index: Optional[int]
     reason: str
     contenders: int
+    interrogated: bool
 
 
 # A one-generic-word match (e.g. a single common word shared with some other
@@ -261,7 +276,21 @@ def decide(matches, threshold=DEFAULT_THRESHOLD):
     whichever came first."""
     if not matches:
         return Decision(match=None, index=None,
-                        reason="no candidates offered", contenders=0)
+                        reason="no candidates offered", contenders=0,
+                        interrogated=False)
+
+    # Whether the catalogue was actually questioned with this file's evidence.
+    # A candidate with no meaningful token is barred by `_is_eligible` at any
+    # score, so it is never weighed against anything -- the refusal it produces
+    # is a fact about the filename, not about the titles it was handed.
+    #
+    # `meaningful_count` is computed from the name, the folder and the artist
+    # and never from the candidate title, so it is the same for every entry of
+    # a list built for one file. `all` rather than `any` for the list that is
+    # somehow not: a mixed list is a caller pooling candidates scored for
+    # different files, and there is no reading of it that supports an absence.
+    # Uncertainty may withhold evidence, never supply it.
+    interrogated = all(m.meaningful_count > 0 for m in matches)
 
     eligible = [(m.value, i, m) for i, m in enumerate(matches) if _is_eligible(m, threshold)]
 
@@ -286,7 +315,8 @@ def decide(matches, threshold=DEFAULT_THRESHOLD):
             reason = "nothing above the threshold (%.2f); best score was %.3f" % (
                 threshold, best.value,
             )
-        return Decision(match=None, index=None, reason=reason, contenders=0)
+        return Decision(match=None, index=None, reason=reason, contenders=0,
+                        interrogated=interrogated)
 
     eligible.sort(key=lambda t: t[0], reverse=True)
     top_value, top_index, top_match = eligible[0]
@@ -304,8 +334,9 @@ def decide(matches, threshold=DEFAULT_THRESHOLD):
                 top_value, runner_value,
             )
             return Decision(match=None, index=None, reason=reason,
-                            contenders=len(eligible))
+                            contenders=len(eligible),
+                            interrogated=interrogated)
 
     reason = "chosen with score %.3f" % (top_value,)
     return Decision(match=top_match, index=top_index, reason=reason,
-                    contenders=len(eligible))
+                    contenders=len(eligible), interrogated=interrogated)

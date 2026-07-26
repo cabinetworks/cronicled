@@ -172,7 +172,7 @@ def absence_verdict(view, decision, *, attribution_certain=True):
     `resolution.competing is None`, the resolver's own report that the folder
     and the filename did not name different people.
 
-    Four things have to hold before a file may be called absent, and each one
+    Five things have to hold before a file may be called absent, and each one
     that fails downgrades the claim rather than weakening it:
 
     * **the attribution is not contested.** An enumeration of the wrong
@@ -191,6 +191,16 @@ def absence_verdict(view, decision, *, attribution_certain=True):
       reviewer hunting a mis-filing while the candidates sit in the same
       reply. Read off `Decision.contenders` and never off `decision.reason` —
       `scan.py` states the rule and the reason for it.
+    * **the catalogue was interrogated.** `contenders == 0` is also what a
+      refusal that never weighed a single entry returns: a filename carrying
+      no word that is not the artist's or generic is barred at any score, and
+      a caller that offered no candidates asked nothing at all. Both come back
+      looking exactly like "nothing in this catalogue is close", and an
+      absence claimed from either is this function's own harm arriving through
+      the door built to prevent it — a reviewer sent to hunt a mis-filing the
+      scorer never looked for, against a catalogue it never questioned. The
+      one exception is a catalogue holding nothing: there is no entry to
+      weigh anything against, and the empty read is itself the evidence.
     * **the read finished.** The page that was never read is precisely where
       the missing entry would be.
 
@@ -198,6 +208,12 @@ def absence_verdict(view, decision, *, attribution_certain=True):
     the most fundamental defect outward: not knowing whose catalogue this is
     beats anything measured inside it, and evidence in hand (a match, a set of
     contenders) is more use to a reviewer than the fact that more pages exist.
+
+    An un-interrogated catalogue is reported ahead of an unfinished read for a
+    sharper reason than tidiness: "stopped early" invites the caller to read
+    the rest, and reading the rest cannot change an answer that was never
+    asked. That is a retry which can never come good, and naming it would be
+    worse than saying nothing.
     """
     # A bool and nothing else. The mis-wiring this exists to catch is
     # `attribution_certain=resolution.competing`, where `competing` holds the
@@ -225,6 +241,16 @@ def absence_verdict(view, decision, *, attribution_certain=True):
             "%d catalogue entries competed for this file and none of them "
             "won, so nothing here says it is missing: %s"
             % (decision.contenders, decision.reason)))
+
+    # `view.scenes` and not `view.complete`: the exception is a catalogue with
+    # nothing in it, which is the strongest absence obtainable and the answer
+    # most worth acting on. A complete read of 500 entries that were never
+    # weighed is not an exception, it is the defect.
+    if not decision.interrogated and view.scenes:
+        return Verdict(None, (
+            "performer %s's %d catalogue entries were never weighed against "
+            "this file, so they are not grounds for calling it missing: %s"
+            % (view.performer_id, len(view.scenes), decision.reason)))
 
     if not view.complete:
         return Verdict(None, (

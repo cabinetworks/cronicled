@@ -447,6 +447,23 @@ def _ambiguous():
     return decide([_m(0.80), _m(0.78)])
 
 
+def _nothing_to_ask_with(scenes=2):
+    """A refusal of a THIRD kind, and the one that looks most like the first.
+
+    The filename carried no word that is not the artist's or generic, so every
+    candidate is barred at any score and not one catalogue title was ever
+    weighed. The scores are deliberately high: nothing about the numbers
+    distinguishes this from a near miss, and `contenders` is 0 for both."""
+    return decide([_m(0.95, meaningful_count=0) for _ in range(scenes)])
+
+
+def _one_generic_word():
+    """A refusal that DID interrogate the catalogue, on thin evidence. The one
+    meaningful token was compared against every title and fell short of a bar
+    a higher score would have cleared."""
+    return decide([_m(0.7, meaningful_count=1)])
+
+
 class AbsenceVerdict(unittest.TestCase):
     """What an absence is allowed to claim.
 
@@ -574,16 +591,119 @@ class AbsenceVerdict(unittest.TestCase):
         looks_like_a_near_miss = Decision(
             match=None, index=None,
             reason="nothing above the threshold (0.70); best score was 0.410",
-            contenders=2)
+            contenders=2, interrogated=True)
         looks_ambiguous = Decision(
             match=None, index=None,
             reason="ambiguous: 0.800 vs 0.780 are too close to call",
-            contenders=0)
+            contenders=0, interrogated=True)
 
         self.assertIsNone(
             absence_verdict(_catalogue(), looks_like_a_near_miss).absent)
         self.assertIs(
             absence_verdict(_catalogue(), looks_ambiguous).absent, True)
+
+    def test_a_file_with_nothing_to_ask_with_is_not_an_absence(self):
+        # The ticket's own harm, arriving through the door built to stop it.
+        # `contenders == 0` here does NOT mean "500 entries were checked and
+        # none is close" -- it means the filename carried no word that is not
+        # the artist's or generic, which bars every candidate at any score, so
+        # not one of those 500 titles was ever weighed. The right entry could
+        # be sitting in them and the outcome would be identical.
+        #
+        # Reported as an absence, the reason contradicts itself -- "read in
+        # full (500 scenes) and this file is not in it: nothing to match on"
+        # -- and the first clause is the one a reviewer acts on. They get sent
+        # to hunt a mis-filing the tool never looked for.
+        verdict = absence_verdict(_catalogue(scenes=500, complete=True),
+                                  _nothing_to_ask_with(500))
+
+        self.assertIsNone(verdict.absent)
+        self.assertIsNot(verdict.absent, True)
+        self.assertIn("never weighed", verdict.reason)
+        self.assertNotIn("in full", verdict.reason)
+        # Whose catalogue, how much of it, and which refusal -- the same three
+        # facts the absence branch carries, for the same reason: a reviewer
+        # who cannot see what was skipped cannot judge whether it mattered.
+        self.assertIn(PERFORMER, verdict.reason)
+        self.assertIn("500", verdict.reason)
+        self.assertIn("meaningful_count=0", verdict.reason)
+
+    def test_a_caller_that_offered_no_candidates_is_not_an_absence(self):
+        # The same defect from the other side, and it is a statement about the
+        # CALLER: candidate-building that silently produced nothing looks
+        # identical to a catalogue that holds nothing close. The view here is
+        # stocked and complete, which is exactly what makes the wrong answer
+        # so confident.
+        verdict = absence_verdict(_catalogue(scenes=500, complete=True),
+                                  decide([]))
+
+        self.assertIsNone(verdict.absent)
+        self.assertIsNot(verdict.absent, True)
+        self.assertIn("never weighed", verdict.reason)
+        self.assertNotIn("in full", verdict.reason)
+        self.assertIn("no candidates offered", verdict.reason)
+
+    def test_candidates_in_hand_are_reported_ahead_of_a_thin_interrogation(self):
+        # Both refusals block the absence, so only the reason separates them,
+        # and the reason is the whole output here. Entries that competed for
+        # this file are sitting in the reply and a reviewer can look at them;
+        # "nothing was weighed" says there is nothing to look at, which is
+        # false while two candidates are in hand. Evidence in hand beats a
+        # complaint about the evidence that was not.
+        competed_on_thin_ground = Decision(
+            match=None, index=None,
+            reason="ambiguous: 0.800 vs 0.780 are too close to call",
+            contenders=2, interrogated=False)
+
+        verdict = absence_verdict(_catalogue(complete=True),
+                                  competed_on_thin_ground)
+
+        self.assertIsNone(verdict.absent)
+        self.assertIn("competed", verdict.reason)
+        self.assertNotIn("never weighed", verdict.reason)
+
+    def test_an_unasked_question_cannot_un_find_a_found_file(self):
+        # The mirror of the partial-read case, and the regression this fix is
+        # most likely to introduce: the interrogation check gates the NEGATIVE
+        # claim only. An entry in hand is a presence however thin the rest of
+        # the list was, and a guard placed one branch too early would downgrade
+        # a found file to "unknown" -- withholding an answer that was already
+        # obtained, which is the opposite of what this function is for.
+        found_on_thin_ground = Decision(
+            match=_m(0.9), index=0, reason="chosen with score 0.900",
+            contenders=1, interrogated=False)
+
+        verdict = absence_verdict(_catalogue(complete=True),
+                                  found_on_thin_ground)
+
+        self.assertIs(verdict.absent, False)
+        self.assertIn("has this file", verdict.reason)
+
+    def test_thin_evidence_is_still_evidence(self):
+        # The loose side of the same boundary, and the quieter failure. One
+        # meaningful token IS an interrogation: it was compared against every
+        # title and fell short of a bar a higher score would have cleared,
+        # which is a fact about the catalogue. A guard that swept this in with
+        # the two cases above would stop answering for every short filename
+        # and nothing would say why.
+        verdict = absence_verdict(_catalogue(complete=True), _one_generic_word())
+
+        self.assertIs(verdict.absent, True)
+        self.assertIn("in full", verdict.reason)
+
+    def test_a_question_never_asked_is_reported_before_a_read_never_finished(self):
+        # Both defects at once, and only the reason distinguishes them -- so
+        # the ordering is the whole test. "Stopped early after 3 scenes"
+        # invites the caller to raise the page cap and read the rest, and
+        # reading the rest cannot change an answer that was never asked. That
+        # is a retry which can never come good, and pointing at it is worse
+        # than saying nothing.
+        verdict = absence_verdict(_catalogue(scenes=3, complete=False),
+                                  _nothing_to_ask_with(3))
+
+        self.assertIsNone(verdict.absent)
+        self.assertIn("never weighed", verdict.reason)
+        self.assertNotIn("stopped early", verdict.reason)
 
     def test_only_the_completed_read_claims_a_completed_read(self):
         # A reason that claims completeness it did not achieve is the same
@@ -598,6 +718,7 @@ class AbsenceVerdict(unittest.TestCase):
             absence_verdict(_catalogue(), _ambiguous()).reason,
             absence_verdict(_catalogue(), _refused(),
                             attribution_certain=False).reason,
+            absence_verdict(_catalogue(), _nothing_to_ask_with()).reason,
         ]
 
         self.assertEqual([r for r in reasons if "in full" in r],
