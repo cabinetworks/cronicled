@@ -1,21 +1,29 @@
 """Which producers are due, why the others are not, and starting the ones that
 are.
 
-This is arithmetic and rules over data: no thread, no sleep, no wall clock.
-`now` and the last-run times are arguments, so every scheduling rule — the
-exact second a cadence elapses, a machine whose clock jumped, a service that
-was off for a week — is an ordinary unit test rather than something that needs
-a fake clock inside a running loop. `Scheduler.tick` keeps that property: it
-is called directly, once, and returns what it did. The loop that calls it on a
-timer is a separate concern and deliberately holds none of the rules.
+The rules are arithmetic over data: no thread, no sleep, no wall clock. `now`
+and the last-run times are arguments, so every scheduling rule — the exact
+second a cadence elapses, a machine whose clock jumped, a service that was off
+for a week — is an ordinary unit test rather than something that needs a fake
+clock inside a running loop. `Scheduler.tick` keeps that property: it is called
+directly, once, and returns what it did.
+
+The loop that calls it on a timer lives here too, at the bottom, and it holds
+none of the rules — `start`, `close` and `status` know about a thread, an
+event and a count, and nothing about cadences. That separation is the reason
+every test above this line can be a plain function call, and the reason the
+loop's own tests are only about surviving and being seen to.
 
 Two answers come back from `due`, not one: what to run, and a reason for each
 producer that is being left alone. An operator asking "why has the nightly
 scrape not run?" is asking about the second answer, and a scheduler that only
 returns the first can only be debugged by re-deriving its arithmetic by hand.
-`TickResult` carries the same shape one layer up.
+`TickResult` carries the same shape one layer up, and `LoopStatus` one layer
+above that.
 """
-from dataclasses import dataclass
+import threading
+import traceback
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -23,6 +31,12 @@ from .jobs import JobRejected
 
 # What a schedule override may say. Anything else is a typo — see `resolve`.
 OVERRIDE_KEYS = ("every", "enabled")
+
+# How long the loop waits between ticks when nobody says otherwise. This is
+# the resolution of the whole schedule, not a cadence: a producer due at
+# 03:00:00 on a minute-resolution loop starts by 03:01, and the cost of the
+# resolution is one `runs()` query and one `jobs()` snapshot per minute.
+DEFAULT_INTERVAL = 60.0
 
 
 @dataclass(frozen=True)
@@ -56,6 +70,29 @@ def _check_every(value, producer, source):
         raise ValueError(
             f"cadence for producer {producer!r} ({source}) must be greater "
             f"than zero seconds, got {value!r}"
+        )
+    return value
+
+
+def _check_interval(value):
+    """The loop's wait between ticks: a number of seconds, never negative.
+
+    `bool` is excluded for the reason `_check_every` excludes it — `True` is
+    an `int`, so a config typo would otherwise become a one-second loop.
+
+    **Zero is allowed**, and means the loop starts the next tick the instant
+    the last one ends. That is a hot loop and not a setting for a running
+    service; it exists because it is how a test drives the loop deterministically
+    without sleeping, which is worth more than refusing a value nobody would
+    configure by accident. A negative is a typo and is refused.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"the loop's interval must be a number of seconds, got {value!r}"
+        )
+    if value < 0:
+        raise ValueError(
+            f"the loop's interval must not be negative, got {value!r}"
         )
     return value
 
@@ -298,6 +335,45 @@ class TickResult:
     failed_to_start: dict
 
 
+@dataclass(frozen=True)
+class LoopStatus:
+    """What the background loop has been doing, for somebody who was not
+    watching.
+
+    This exists because of the one failure mode a scheduler must not have. An
+    exception on a thread fails nothing visible — it prints, and the thread
+    dies — so a loop that died three days ago is indistinguishable from a
+    scheduler with nothing to do, and the only symptom is an inbox that
+    stopped filling. Every field here is a way of telling those two apart:
+
+    - `running` and `closed` together say *why* it is not ticking. Not running
+      and closed is a clean shutdown; not running and **not** closed is a loop
+      that died, and that combination is the whole point of keeping both.
+    - `ticks` and `failures` count the ticks that finished and the ticks that
+      raised. `consecutive_failures` is the one that says whether it is
+      failing *now* rather than having failed once in the small hours.
+    - `last_error`, `last_error_at` and `last_traceback` are the only record
+      of what went wrong that will ever exist — nothing re-raises and nothing
+      logs — so, as in the runner, the error names its type as well as its
+      message and the frames are kept.
+    - `failing_to_start` is a producer name to the number of consecutive ticks
+      in which the runner refused to start it. A tick can only see its own
+      refusal; it takes the loop to notice the same one on every tick since
+      the process began.
+    """
+
+    running: bool
+    closed: bool
+    ticks: int
+    failures: int
+    consecutive_failures: int
+    last_tick_at: Optional[str]
+    last_error: Optional[str]
+    last_error_at: Optional[str]
+    last_traceback: Optional[str]
+    failing_to_start: dict = field(default_factory=dict)
+
+
 class Scheduler:
     """Starts the producers that are due, and reports why the others were not.
 
@@ -331,16 +407,52 @@ class Scheduler:
     The schedule is resolved once, in the constructor, from the producers the
     runner has registered. A producer with no cadence and no override is a
     `ValueError` there — at start-up, where an operator reads it as a stack
-    trace, rather than at 3am as a producer that quietly never ran. The
-    consequence to know about: a producer registered *after* the scheduler
-    was built is not scheduled, because the schedule was already decided.
+    trace, rather than at 3am as a producer that quietly never ran.
+
+    The consequence is that **a producer registered after the scheduler was
+    built is not in the schedule**, so `start()` refuses to run a loop while
+    one exists rather than leaving it unscheduled and unmentioned. The loop
+    deliberately does not re-resolve instead: re-resolving would move
+    `resolve`'s wiring-mistake `ValueError` out of start-up and onto the loop
+    thread, where it is either a dead loop or a failure recorded once a
+    minute, and it would let the schedule change under a running loop with
+    nothing to say that it had. Registering a producer *after* `start()` is
+    the residual, and it is a wiring rule rather than a check: register
+    everything, then build the scheduler, then start it.
+
+    The loop
+    --------
+    `start()` ticks in the background until `close()`. Everything the loop
+    knows is in `LoopStatus`, and the reason it keeps any of it is that an
+    exception on a thread fails nothing visible. See `_loop`.
     """
 
-    def __init__(self, runner, store, *, overrides=None, clock=None):
+    def __init__(self, runner, store, *, overrides=None, clock=None,
+                 interval=DEFAULT_INTERVAL):
         self._runner = runner
         self._store = store
         self._clock = _utcnow if clock is None else clock
         self._entries = resolve(runner.producers(), overrides)
+        self._interval = _check_interval(interval)
+
+        # Held for the whole of a tick, so two ticks cannot run at once. See
+        # `tick` for why that matters and why one loop thread is not an
+        # answer to it.
+        self._tick_lock = threading.Lock()
+        # Guards the loop's own bookkeeping below: the loop thread writes it
+        # and `status()` reads it from whatever thread asked.
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+        self._closed = False
+        self._ticks = 0
+        self._failures = 0
+        self._consecutive_failures = 0
+        self._last_tick_at = None
+        self._last_error = None
+        self._last_error_at = None
+        self._last_traceback = None
+        self._failing_to_start = {}
 
     def tick(self, now=None):
         """Start everything due, once, and return a `TickResult`.
@@ -383,7 +495,25 @@ class Scheduler:
         `KeyboardInterrupt` has somewhere to go and should go there — unlike
         the runner's worker, which catches `BaseException` precisely because
         nothing is above it to notice.
+
+        **One tick at a time.** The whole body is held under a lock, so a
+        caller ticking by hand while the loop is running waits for the loop's
+        tick instead of interleaving with it. That there is a single loop
+        thread today is not a reason to leave it out: `tick` is public, an
+        interface calling it by hand is the obvious next use, and the rule it
+        protects is the one thing a tick promises. `jobs()` is a snapshot, so
+        two ticks reading it at the same moment would both see a producer
+        idle and both start it — a doubled scrape against the media server,
+        arriving through the door the cost classes cannot watch, because both
+        starts are legitimate as far as the runner can tell. The cost of the
+        lock is that a hand tick waits out a loop tick, which is a bounded
+        wait for a pair of store reads.
         """
+        with self._tick_lock:
+            return self._tick(now)
+
+    def _tick(self, now):
+        """The body of `tick`, always called with `_tick_lock` held."""
         if now is None:
             now = self._clock()
         # `due` validates `now`, so `_moment` below cannot return None.
@@ -432,3 +562,221 @@ class Scheduler:
 
         return TickResult(at=at, due=due_names, started=started,
                           skipped=skipped, failed_to_start=failed_to_start)
+
+    def start(self):
+        """Begin ticking in the background until `close()`.
+
+        The first tick happens straight away rather than after an interval: a
+        process that has just restarted is the most likely one to be holding
+        an overdue producer, and waiting a full interval before so much as
+        looking would be the wrong way round.
+
+        Refuses three things, all of them for the same reason — each would
+        otherwise be a scheduler that looks like it is ticking and is not, or
+        is ticking twice:
+
+        - **starting twice**, which would run two loops against one schedule
+          and double every producer's rate for as long as nobody noticed;
+        - **starting after `close()`**, because the stop event stays set and
+          the new loop would exit on its first wait, leaving a scheduler that
+          reports itself as started and never ticks again;
+        - **a producer the schedule does not cover**, which is the one the
+          constructor cannot catch: registered after the scheduler was built,
+          it would be a producer nobody runs and nothing mentions. This is
+          the last moment it can be said out loud.
+
+        The thread is a daemon, as the runner's workers are: an operator who
+        kills the process should not have to close the scheduler first, and a
+        loop that outlived the interpreter would be worse than one that stops
+        abruptly — nothing it does is a write anybody is waiting on.
+        """
+        with self._lock:
+            if self._closed:
+                raise RuntimeError(
+                    "this scheduler has been closed and will not tick again; "
+                    "build another one rather than restarting this one"
+                )
+            if self._thread is not None:
+                raise RuntimeError(
+                    "this scheduler is already ticking; a second loop would "
+                    "run every producer at twice its cadence"
+                )
+            unscheduled = sorted(
+                producer.name for producer in self._runner.producers()
+                if producer.name not in self._entries
+            )
+            if unscheduled:
+                raise ValueError(
+                    f"producer(s) {unscheduled} are registered but not in the "
+                    "schedule, so nothing would ever run them: the schedule is "
+                    "resolved when the scheduler is built, so register every "
+                    "producer before building it"
+                )
+            thread = threading.Thread(target=self._loop, daemon=True,
+                                      name="cronicled-scheduler")
+            self._thread = thread
+            try:
+                thread.start()
+            except Exception:
+                # No loop exists, so nothing can be running: unwinding is
+                # safe, and leaving `_thread` set would wedge this scheduler
+                # as "already ticking" for ever over a loop that never began.
+                self._thread = None
+                raise
+
+    def close(self, timeout=None):
+        """Stop ticking, and say whether the loop has actually stopped.
+
+        Returns `True` once the loop thread has finished — including when
+        there was never a loop to stop, so closing a scheduler that was never
+        started is an ordinary answer rather than an error. `False` means the
+        `timeout` elapsed with the loop still going, which is a tick wedged in
+        the store or the runner; the return value is the only way to find that
+        out, so it is a value worth looking at rather than a formality.
+
+        Idempotent: closing twice sets the same event and joins the same
+        finished thread. Once closed, a scheduler stays closed — `start()`
+        refuses rather than trying to reuse a stop event that is already set.
+
+        **It stops the ticking, not the producers.** There is no
+        cancellation, so a job started by an earlier tick keeps running and
+        this does not wait for it. Claiming otherwise would be the stronger
+        promise this module deliberately does not make; the runner owns those
+        jobs and is the thing to ask about them.
+        """
+        with self._lock:
+            self._closed = True
+            thread = self._thread
+        self._stop.set()
+        if thread is None:
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
+
+    def status(self):
+        """What the loop has been doing, as a `LoopStatus`.
+
+        Safe to call from any thread, and from before `start()` — the answer
+        for a scheduler that never started and one whose loop died differ in
+        `closed`, which is exactly the distinction worth having.
+        """
+        with self._lock:
+            thread = self._thread
+            return LoopStatus(
+                running=thread is not None and thread.is_alive(),
+                closed=self._closed,
+                ticks=self._ticks,
+                failures=self._failures,
+                consecutive_failures=self._consecutive_failures,
+                last_tick_at=self._last_tick_at,
+                last_error=self._last_error,
+                last_error_at=self._last_error_at,
+                last_traceback=self._last_traceback,
+                # A copy: a caller holding the answer must not be able to
+                # edit the loop's own counts by mutating it.
+                failing_to_start=dict(self._failing_to_start),
+            )
+
+    def _loop(self):
+        """Tick, wait, repeat, until `close()` — surviving whatever a tick
+        does short of ending the interpreter.
+
+        **The catch is the point of this whole method.** An exception on a
+        thread does not fail anything a caller can see: it prints to stderr
+        and the thread quietly dies. A scheduler whose loop died three days
+        ago looks exactly like a scheduler with nothing to do, and the only
+        symptom is an inbox that stopped filling. So a tick that raises is
+        recorded and the loop comes round again — including for the failures
+        a tick cannot recover from itself, such as a store that cannot record
+        a run and therefore abandons the producers after the first.
+
+        Recorded, not swallowed: without `LoopStatus` this would be a loop
+        that survives invisibly, which is only marginally better than one
+        that dies invisibly.
+
+        A `BaseException` that is not an `Exception` — `SystemExit`, an
+        injected interrupt — ends the loop, because it is not this module's
+        to override, but it is recorded on the way out for the same reason.
+        `status()` then reads `running=False, closed=False`, which is the
+        signature of a loop that died rather than one that was stopped.
+
+        The wait is on the stop event, never `sleep`. `close()` sets it, so a
+        scheduler on an hourly interval stops in the time it takes to join a
+        thread rather than in an hour — and a shutdown that takes an hour is a
+        shutdown somebody replaces with a kill signal, which is how a service
+        loses whatever it was doing.
+        """
+        while True:
+            try:
+                result = self.tick()
+            except BaseException as exc:
+                self._note_failure(exc)
+                if not isinstance(exc, Exception):
+                    return
+            else:
+                self._note_tick(result)
+            if self._stop.wait(self._interval):
+                return
+
+    def _note_tick(self, result):
+        """Record a tick that finished, and keep the count of producers the
+        runner will not start.
+
+        The count is of *consecutive* ticks: a producer that started, or that
+        was merely skipped this time, comes off the list. A count that only
+        ever went up would say "failing on every tick" about a producer that
+        failed once at breakfast and has been fine since, which is the kind of
+        number an operator learns to ignore.
+        """
+        with self._lock:
+            self._ticks += 1
+            self._last_tick_at = result.at
+            self._consecutive_failures = 0
+            self._failing_to_start = {
+                name: self._failing_to_start.get(name, 0) + 1
+                for name in result.failed_to_start
+            }
+
+    def _note_failure(self, exc):
+        """Record a tick that raised. Called from inside the `except` block,
+        so `format_exc` still has the exception being handled.
+
+        The type as well as the message, and the frames as well as the type,
+        for the reason the runner keeps both: `str(exc)` is `''` for a bare
+        `raise SomeError()` and a lone key name for a `KeyError`, and a
+        failure an operator cannot act on is barely better than none.
+
+        `failing_to_start` is deliberately left alone here. A tick that raised
+        never reached the runner for some or all of its producers, so it is
+        evidence of nothing either way, and resetting the count on it would
+        let a store failing every other tick keep clearing the record of a
+        producer that has not started in a week.
+        """
+        detail = f"{type(exc).__name__}: {exc}"
+        frames = traceback.format_exc()
+        at = self._stamp()
+        with self._lock:
+            self._failures += 1
+            self._consecutive_failures += 1
+            self._last_error = detail
+            self._last_error_at = at
+            self._last_traceback = frames
+
+    def _stamp(self):
+        """The moment to record a failure against.
+
+        The injected clock, so a test says something exact and an operator
+        reads failure times in the same frame as run times — but never at the
+        cost of the record itself. A clock that raises, or that hands back a
+        naive datetime, is one of the things that makes a tick fail in the
+        first place, and trusting it here would lose the failure at exactly
+        the moment there is most to say about it. So it falls back to the real
+        UTC clock, which cannot be broken by wiring.
+        """
+        try:
+            moment = _moment(self._clock())
+        except Exception:
+            moment = None
+        if moment is None:
+            moment = _utcnow()
+        return moment.isoformat()
