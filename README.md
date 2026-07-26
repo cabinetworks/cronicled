@@ -4,12 +4,14 @@ A foundation for an always-on companion to a
 [Stash](https://github.com/stashapp/stash) media library. What is here today:
 string and filename normalization, date extraction, a client for the media
 server's own API, a pluggable site-adapter interface for matching against a
-clip store, and a leak guard for the repo itself.
+clip store, candidate scoring, creator attribution, a durable store for
+proposed changes, a background job runner, and a leak guard for the repo
+itself.
 
-**Not yet built:** there is no scheduler, no inbox of proposed changes, no
-persistence, and no entry point that runs any of this continuously. The
-pieces above are library code, called directly (including by tests); nothing
-here watches a library or writes to it on its own.
+**Not yet built:** there is no scheduler, no inbox of proposed changes, and no
+entry point that runs any of this continuously. The pieces above are library
+code, called directly (including by tests); nothing here watches a library or
+writes to it on its own.
 
 Zero runtime dependencies: Python standard library only.
 
@@ -17,156 +19,92 @@ Zero runtime dependencies: Python standard library only.
 
 Early. The foundation layer described above is what exists; the always-on
 service built on top of it — scheduled scans, a review/confirm inbox, writes
-gated on user approval — has not been built yet.
+gated on user approval — has not been built yet. It has its own diagram, kept
+separate from the ones describing what is built, on the
+[architecture](docs/index.md#the-service-that-does-not-exist-yet) page.
 
-## Running it
+## Quickstart
 
-The runtime version is pinned in [`.python-version`](.python-version), which the
-container build and CI both read. That file is the only place it is declared.
-
-The service has zero runtime dependencies — standard library only — so a local
-checkout runs with nothing installed beyond a matching Python:
+The runtime version is pinned in [`.python-version`](.python-version). There
+are no runtime dependencies, so a checkout runs its own tests with nothing
+installed beyond a matching Python:
 
 ```sh
 python3 -m unittest discover -s tests -t . -v
 ```
 
-Development and CI drive the suite through [uv](https://docs.astral.sh/uv/)
-instead, which reads the pinned version out of `.python-version` automatically
-and supplies that exact interpreter regardless of what else is on `PATH`:
+There is no entry point to run yet. The container's default command is a
+self-check that proves the pinned interpreter can import and run the package;
+see [Running it, and the container](docs/container.md).
 
-```sh
-uv run python -m unittest discover -s tests -t . -v
+## The module map
+
+Every module under `cronicled/`, and which of them import which. An arrow
+points from a module to the module it imports, so it reads "depends on".
+
+```mermaid
+flowchart TD
+    subgraph pure["Pure string helpers, no I/O"]
+        vocab["vocab<br/>stopwords, junk tokens, video extensions"]
+        text["text<br/>normalize, tokens, strip_ext, strip_html"]
+        dates["dates<br/>date extraction, date-shaped guards"]
+        censorship["censorship<br/>search_variants, decensor"]
+    end
+
+    subgraph matching["Matching logic"]
+        scoring["scoring<br/>score, decide"]
+        artist["artist<br/>creator_folder, resolve"]
+    end
+
+    subgraph adapters["Site adapters, configured and never compiled in"]
+        base["adapters.base<br/>the SiteAdapter interface"]
+        declarative["adapters.declarative<br/>an adapter built from a config dict"]
+        registry["adapters.registry<br/>load_adapters"]
+    end
+
+    subgraph configuration["Configuration, read from the operator's files"]
+        config["config<br/>server connection, config_dir"]
+    end
+
+    stash["stash<br/>the media server's GraphQL API"]
+
+    subgraph recording["Recording what was found"]
+        store["store<br/>proposals, dismissals, mutes"]
+        jobs["jobs<br/>JobRunner, cost classes"]
+    end
+
+    selfcheck["selfcheck<br/>imports every module in the package;<br/>the container's default command"]
+
+    text --> vocab
+    dates --> text
+    censorship --> text
+    scoring --> text
+    artist --> text
+    artist --> dates
+    declarative --> base
+    declarative --> text
+    registry --> declarative
+    registry --> config
+    stash --> text
+    jobs -. "holds a Store it is given" .-> store
 ```
 
-uv is a development and CI convenience only — it is not a project dependency.
-`pyproject.toml` declares no runtime dependencies, and the container image
-ships without uv installed in it: the command above still works for anyone
-without uv, on any interpreter meeting the `requires-python` constraint,
-because the project must never require a tool to run its own tests.
+The matching path, the job lifecycle, and the planned service each have their
+own diagram on the [architecture](docs/index.md) page.
 
-### Container
+## Documentation
 
-Build the image, passing the declared version explicitly (this is exactly
-what CI does):
+The reference material lives on the site at <https://cronicled.pages.dev>, and
+in [`docs/`](docs/) in this repository. This README is the overview; each fact
+below is documented in exactly one of those pages, not in both.
 
-```sh
-docker build --build-arg PYTHON_VERSION="$(cat .python-version)" -t cronicled .
-```
-
-There is no service yet for the container to run (see "Status" above), so
-its default command is a self-check: it imports every module in the package
-and exercises a handful of pure functions end to end, proving the pinned
-interpreter actually runs this project's code. Running the image today
-builds and self-checks the runtime — it is not yet a way to run the tool:
-
-```sh
-docker run --rm \
-  -v /path/to/config:/config \
-  -v /path/to/state:/var/lib/cronicled \
-  cronicled
-```
-
-```
-cronicled selfcheck ready (12 modules imported)
-```
-
-The image bakes in nothing specific to any one installation; everything that
-varies between installs is mounted, not copied in:
-
-- `/config` — server and adapter configuration (see "Site adapters" below).
-  The container sets `$CRONICLED_CONFIG_DIR=/config`, which both `server.json`
-  and `adapters.json` are read from by default (see `cronicled/config.py`'s
-  `config_dir`); a local checkout with no such directory set falls back to a
-  `config/` directory relative to the working directory instead.
-
-  This is deliberately a separate mechanism from `$STASH_URL`/`$STASH_API_KEY`:
-  those two name the *media server* being managed, not this project, and an
-  operator may already have them set for their own reasons — a decision, not
-  an inconsistency.
-- `/var/lib/cronicled` — the database
-
-A read-only mount for the library itself will be documented here once the
-metadata-enrichment path that needs it exists.
-
-## Site adapters
-
-Matching against a clip store is done through a *site adapter*, configured in
-`config/adapters.json`, which is not tracked by this repo. See
-`config/adapters.example.json` for the shape. No store is built in.
-
-Every adapter entry sets `owner_source`, which selects how the creator's name
-is found for a given clip result. There are three mechanisms; an adapter uses
-exactly one:
-
-- **`url_segment`** — the creator's name is a path segment of the clip's URL.
-  `owner_segment` gives the index of that segment, and that index counts from
-  the **host**, not from the start of the path. For example, given
-  `owner_segment: 2` and the URL
-  `https://example.test/store/velvetcrane/copper-kettle`, the segments are
-  `["example.test", "store", "velvetcrane", "copper-kettle"]`, so index 2 is
-  `"velvetcrane"` — the third segment, not the second path component. This is
-  the detail most likely to catch you out when writing a new adapter spec.
-
-  ```json
-  {
-    "name": "examplestore",
-    "owner_source": "url_segment",
-    "owner_segment": 2
-  }
-  ```
-
-- **`result_field`** — the creator's name is a field on the clip's search
-  result, addressed by `owner_field`, a list of keys walked in order to reach
-  a (possibly nested) value. HTML in the field is stripped automatically.
-
-  ```json
-  {
-    "name": "examplestore",
-    "owner_source": "result_field",
-    "owner_field": ["studio", "name"]
-  }
-  ```
-
-  For a result shaped like `{"studio": {"name": "Velvet Crane"}}`, this reads
-  `"Velvet Crane"`.
-
-- **`none`** — the store never exposes an owner directly; every candidate
-  match must instead be confirmed by scraping the clip page. Set
-  `catalog_resolvable: false` alongside it, since a name search cannot resolve
-  a creator on a store shaped this way.
-
-  ```json
-  {
-    "name": "examplestore",
-    "owner_source": "none",
-    "catalog_resolvable": false
-  }
-  ```
-
-## Leak guard
-
-`scripts/check_leaks` fails the build if a forbidden string (configured out
-of band — see the script header — never committed to this repo) shows up in
-tracked file contents or filenames, in untracked-but-not-ignored files, in
-tracked file contents anywhere in history, or in a commit message anywhere in
-history. CI runs it (`./scripts/check_leaks`) on every push and pull request.
-
-To also block a bad commit message locally, *before* it is ever written,
-enable the accompanying `commit-msg` hook. This repo's `core.hooksPath` is
-owned by a different, unrelated mechanism, so the hook is not installed via
-that — copy or symlink it into `.git/hooks/commit-msg` instead:
-
-```sh
-cp scripts/hooks/commit-msg .git/hooks/commit-msg
-chmod +x .git/hooks/commit-msg
-```
-
-or, to track upstream changes to the hook automatically:
-
-```sh
-ln -sf ../../scripts/hooks/commit-msg .git/hooks/commit-msg
-```
+- [Architecture](docs/index.md) — the four diagrams and the reasoning around
+  them
+- [Site adapters](docs/adapters.md) — the `owner_source` reference
+- [Running it, and the container](docs/container.md) — the pinned runtime, the
+  test invocations, the image and its mounts
+- [Leak guard](docs/leak-guard.md) — what `scripts/check_leaks` scans, and the
+  local `commit-msg` hook
 
 ## License
 
