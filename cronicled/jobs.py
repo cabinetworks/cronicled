@@ -19,6 +19,7 @@ decisions stick, belong to the runner alone — a producer that wrote to the
 store directly could bypass them, and could not be tested without a runner
 and a store to go with it.
 """
+import collections
 import inspect
 import threading
 import traceback
@@ -26,6 +27,76 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
+
+
+# How many *finished* jobs a runner remembers by default. Running jobs are
+# never counted against it — see `JobRunner._retire`.
+#
+# The number is a compromise between two things a caller wants and cannot
+# have at once. A person debugging wants the history to reach back past
+# whatever they were doing an hour ago; a process that stays up for weeks
+# wants a ceiling that does not depend on how long it has been up. Two
+# hundred sub-kilobyte records is a few hundred kilobytes at worst — noise
+# next to the interpreter itself — and at the rate a schedule realistically
+# starts producers (a handful an hour, not a handful a second) it covers
+# days rather than minutes. It is a constructor argument because that rate
+# is the operator's, not this module's: someone running a producer every
+# minute should raise it, and nothing here can guess that for them.
+DEFAULT_HISTORY = 200
+
+
+class JobForgotten(KeyError):
+    """Raised by `job()`/`wait()` for an id the runner no longer holds, when
+    it has evicted at least one finished job.
+
+    Deliberately distinct from the plain `KeyError` an id that never existed
+    raises, because the two send a caller to different places. "I never had
+    that id" is the caller's own bug — a typo, a stale link, an id from a
+    previous process. "That job ran, finished, and has since been forgotten"
+    is not a bug at all: the work happened, and only the record of how it
+    went is gone. Returning one answer for both would leave a caller polling
+    a job id unable to tell whether to fix its id or to accept that it asked
+    too late.
+
+    It cannot be per-id certain, and says so in its message rather than
+    pretending otherwise: keeping the ids of evicted jobs in order to
+    recognise them later would rebuild, one id at a time, the unbounded
+    growth the eviction exists to stop. So the runner keeps a count instead
+    of a set, and this exception means "not held, and N finished jobs have
+    been forgotten, so it may have been one of them". When nothing has been
+    evicted yet, that ambiguity does not exist and the plain `KeyError`
+    still stands for "this never ran here".
+
+    Subclasses `KeyError` so callers written against the older behaviour —
+    where an unknown id was always a `KeyError` — keep working unchanged.
+    """
+
+
+class JobHistory(list):
+    """What `jobs()` returns: the job snapshots it still holds, plus
+    `evicted`, the number of finished jobs it has dropped.
+
+    A plain list would be an introspection API that quietly claims to be
+    complete. A caller reading four jobs out of a runner that has run four
+    thousand would conclude nothing else ever ran, and there would be
+    nothing in the value to suggest otherwise.
+
+    It is a `list` subclass rather than a second method for two reasons.
+    Existing callers keep an ordinary list — indexing, iteration, and
+    equality against a plain list all behave exactly as before. And the
+    count comes out of the same lock acquisition as the snapshots, so it
+    describes *this* list: an `evicted()` method called separately could be
+    answered after another job had been evicted, quietly reporting a total
+    that matches neither call.
+
+    Note that `evicted` takes no part in equality, because list equality is
+    element-wise: two histories with the same jobs compare equal whatever
+    each has forgotten. A test that cares about the count has to read it.
+    """
+
+    def __init__(self, jobs=(), evicted=0):
+        super().__init__(jobs)
+        self.evicted = evicted
 
 
 class JobRejected(Exception):
@@ -147,12 +218,46 @@ class JobRunner:
     neither side may observe the other mid-update.
     """
 
-    def __init__(self, store):
+    def __init__(self, store, history=DEFAULT_HISTORY):
+        """`history` caps how many *finished* jobs the runner remembers.
+
+        Refused below 1, and refused for a `bool`. A cap of zero would drop
+        every job at the instant it finished, turning the ordinary
+        `wait(id)` then `job(id)` into a race against the runner's own
+        bookkeeping — there is no reading of it that anyone wants, so it is
+        not quietly accepted. `True` is 1 to every integer test in Python,
+        so `history=True` — a plausible way to write "yes, keep history" —
+        would silently keep exactly one job and throw the rest away.
+
+        There is deliberately no way to ask for an unbounded history. That
+        is the behaviour this cap exists to remove, and an opt-out would
+        just be the same leak with a flag in front of it.
+        """
+        if isinstance(history, bool) or not isinstance(history, int):
+            raise ValueError(
+                f"history must be an int, not {type(history).__name__} "
+                f"({history!r}); it caps how many finished jobs are kept"
+            )
+        if history < 1:
+            raise ValueError(
+                f"history must be at least 1, not {history}: a runner that "
+                f"forgets a job the moment it finishes cannot answer job() "
+                f"for a job that just ended"
+            )
         self._store = store
+        self._history = history
         self._producers = {}
         self._lock = threading.Lock()
         self._jobs = {}
         self._done = {}
+        # Job ids in the order they reached a terminal state, which is not
+        # the order they started in: a job started first can finish last.
+        # Eviction takes from the left, so the oldest *finished* job goes
+        # first — a caller asking about history is nearly always asking
+        # what happened recently. Only ids that have finished are ever put
+        # here, which is the whole of why a running job cannot be evicted.
+        self._finished = collections.deque()
+        self._evicted = 0
         # cost class -> {job_id: producer_name} for every job of that class
         # currently running. Guarded by `_lock`, same as everything else:
         # the saturation check in `start()` and the reservation of a slot
@@ -360,6 +465,7 @@ class JobRunner:
             # nothing in the logs to say why the tool stopped working.
             with self._lock:
                 self._running_by_cost[state.cost].pop(state.id, None)
+                self._retire(state.id)
             done.set()
 
     def _log(self, state, message):
@@ -406,18 +512,78 @@ class JobRunner:
             else:
                 state.skipped += 1
 
+    def _retire(self, job_id):
+        """Record that a job has finished, and drop the oldest finished jobs
+        while there are more than `history` of them.
+
+        Called from `_run`'s `finally`, with `_lock` held, and only ever for
+        a job that has just reached a terminal state. Nothing else appends
+        to `_finished`, so a running job is not a candidate for eviction —
+        not because a check excludes it, but because it is not in the
+        structure eviction reads. Running jobs are already bounded by the
+        per-cost-class limits; it is the finished ones that accumulate for
+        the life of the process.
+        """
+        self._finished.append(job_id)
+        while len(self._finished) > self._history:
+            stale = self._finished.popleft()
+            self._jobs.pop(stale, None)
+            self._done.pop(stale, None)
+            self._evicted += 1
+
+    def _missing(self, job_id):
+        """The exception for an id the runner does not hold. Requires
+        `_lock`, because it reads the eviction count.
+
+        Returns rather than raises so the caller raises it, keeping the
+        traceback pointed at the method the caller actually called.
+        """
+        if self._evicted:
+            return JobForgotten(
+                f"job {job_id} is not held: it either never ran here or was "
+                f"one of the {self._evicted} finished jobs forgotten to keep "
+                f"history at {self._history}"
+            )
+        return KeyError(job_id)
+
     def job(self, job_id):
+        """The snapshot for one job.
+
+        Raises `KeyError` for an id that never ran here, and `JobForgotten`
+        (itself a `KeyError`) once eviction has begun and the id may have
+        been dropped — see `JobForgotten` for why the runner cannot be
+        certain which, and why buying that certainty would cost the bound
+        this eviction exists to hold.
+        """
         with self._lock:
-            return self._jobs[job_id].snapshot()
+            state = self._jobs.get(job_id)
+            if state is None:
+                raise self._missing(job_id)
+            return state.snapshot()
 
     def jobs(self):
+        """Every job the runner still holds, oldest start first, as a
+        `JobHistory` — a list that also carries how many finished jobs have
+        been evicted, so a truncated history cannot be mistaken for the
+        whole of what has ever run."""
         with self._lock:
-            return [state.snapshot() for state in self._jobs.values()]
+            return JobHistory(
+                (state.snapshot() for state in self._jobs.values()),
+                evicted=self._evicted,
+            )
 
     def wait(self, job_id, timeout=None):
         """Block until the job finishes (or `timeout` elapses), for tests.
         Never sleeps to poll — it waits on the same `threading.Event` the
-        worker thread sets when it is done."""
+        worker thread sets when it is done.
+
+        Raises for an id the runner does not hold, on the same terms as
+        `job()`. An evicted job's `Event` goes with the rest of its record,
+        and returning `False` for one — the answer that means "still
+        running" — would be a lie about a job that finished long ago.
+        """
         with self._lock:
-            done = self._done[job_id]
+            done = self._done.get(job_id)
+            if done is None:
+                raise self._missing(job_id)
         return done.wait(timeout)

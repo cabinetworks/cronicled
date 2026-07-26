@@ -192,6 +192,18 @@ Two details worth knowing before writing a producer:
   reviewer's past decisions stick, belong to the runner alone — a producer
   writing to the store directly could bypass them.
 
+The runner also forgets. It holds every running job and the most recent
+finished ones — two hundred by default, a constructor argument — because a
+process that stays up for weeks would otherwise keep a record of every job it
+has ever run, and `jobs()` would grow with it. Running jobs are never dropped:
+they are already bounded by the cost-class limits, and dropping one would erase
+the only record of work still in flight. What is dropped is admitted rather
+than hidden — `jobs()` carries the number of finished jobs evicted alongside
+the snapshots, so a truncated history cannot be read as the whole of what ever
+ran, and asking for an evicted job raises `JobForgotten` rather than the plain
+`KeyError` of an id that never existed. "That ran and I no longer remember it"
+and "that never happened" send a caller to different places.
+
 ## The service that does not exist yet
 
 Everything below is **planned**. None of it is in the repository. It is drawn
