@@ -73,18 +73,36 @@ class StashBox:
         """Read every scene credited to `performer_id`, and say whether that
         was all of them.
 
+        A performer the source holds *nothing* for is a complete answer, not a
+        failed one — it is the strongest evidence of absence obtainable, and
+        the case a caller most wants to act on. So an empty catalogue is
+        `complete=True`, and `count` is what separates it from the read that
+        merely came back empty.
+
         Two things end the read short, and both return what was read with
         `complete=False` rather than raising: the page cap, and a page that
-        comes back empty while the count says there is more. Neither is an
-        error a caller can do anything about — the scenes already in hand are
-        still worth having — but neither is a catalogue that can be used to
-        say a file is *absent*, which is why the flag and not an exception is
-        how they are reported.
+        comes back empty while `count` says there is more. Neither is an error
+        a caller can do anything about — the scenes already in hand are still
+        worth having — but neither is a catalogue that can be used to say a
+        file is *absent*, which is why the flag and not an exception is how
+        they are reported.
 
         The empty page is the one that would otherwise be an infinite loop: a
         source whose `count` overstates what it will hand back (a deleted
         scene still in the tally, a permission filter applied after counting)
-        would be asked for page after page for ever.
+        would be asked for page after page for ever. An empty page is
+        therefore always the end of the read; only whether it counts as a
+        whole one varies, and that needs both halves of the claim — nothing
+        promised *and* nothing read. A `count` that says 0 after earlier pages
+        already handed scenes back is a source contradicting itself, and a
+        source whose tally cannot be trusted cannot be used to vouch for what
+        it did not send.
+
+        A transport failure part way through raises rather than returning the
+        pages already read with `complete=False`. That is the one short read a
+        caller *can* act on: `StashError.transient` says whether retrying is
+        worth it, and folding it into the flag would throw that away and make
+        a wedged host indistinguishable from an honest partial read.
         """
         scenes = []
         for page in range(1, max_pages + 1):
@@ -96,7 +114,8 @@ class StashBox:
             result = self._client.gql(PERFORMER_SCENES, variables, timeout=timeout)
             block = result["queryScenes"]
             if not block["scenes"]:
-                break
+                nothing_to_read = block["count"] == 0 and not scenes
+                return Catalogue(performer_id, scenes, complete=nothing_to_read)
             scenes.extend(block["scenes"])
             if len(scenes) >= block["count"]:
                 return Catalogue(performer_id, scenes, complete=True)
