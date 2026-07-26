@@ -582,3 +582,236 @@ class UpdateTagAliases(unittest.TestCase):
         _tag_stash(t).update_tag_aliases(CANONICAL_TAG_ID, MERGED_ALIASES)
         self.assertEqual(len(t.calls), 1)
         self.assertIn("tagUpdate", t.calls[0][0])
+
+
+# -- which scenes a bulk run writes to ------------------------------------- #
+
+class _ReadTransport:
+    """Fake transport for the read paths that choose which scenes a bulk run
+    writes to, in the style of _TagTransport: it recognizes the two find
+    queries, records the variables each one was sent, and answers with a
+    minimal payload shaped like the real server's. Opens no socket.
+
+    Recording the variables verbatim is the point. These reads produce the
+    worklist a later apply writes to, and the only description of "which
+    scenes" is the filter dictionary in the request body — by the time a wrong
+    filter is visible in the results, the scenes have already been written to.
+
+    `tag_pages` is a list of findTags result pages, served by the requested
+    page number, so paging can be observed rather than assumed.
+    """
+
+    def __init__(self, scenes=None, count=None, tag_pages=None):
+        self.calls = []  # (query, variables) for every request sent, in order
+        self.scenes = [] if scenes is None else scenes
+        self.count = len(self.scenes) if count is None else count
+        self.tag_pages = [[]] if tag_pages is None else tag_pages
+
+    def __call__(self, body, timeout):
+        q, variables = body["query"], body["variables"]
+        self.calls.append((q, variables))
+        if "findScenes(" in q:
+            return {"data": {"findScenes": {"count": self.count,
+                                            "scenes": self.scenes}}}
+        if "findTags(" in q:
+            page = (variables.get("f") or {}).get("page", 1)
+            rows = self.tag_pages[page - 1] if page <= len(self.tag_pages) else []
+            total = sum(len(p) for p in self.tag_pages)
+            return {"data": {"findTags": {"count": total, "tags": rows}}}
+        raise AssertionError("test transport does not recognize query: %s" % q)
+
+    def only(self):
+        """The variables of the single request sent — fails if it was not
+        exactly one, so a test cannot pass by inspecting the wrong call."""
+        if len(self.calls) != 1:
+            raise AssertionError("expected exactly 1 request, got %d"
+                                 % len(self.calls))
+        return self.calls[0][1]
+
+    def scene_filter(self):
+        """The `scene_filter` of the single request — the WHOLE dictionary, so
+        an assertion against it notices an added key as well as a changed one."""
+        return self.only()["s"]
+
+    def find_filter(self):
+        """The paging/sort `filter` of the single request, whole."""
+        return self.only()["f"]
+
+
+# Invented cohort: one tag a scan is pointed at, and two scenes carrying it.
+COHORT_TAG_ID = "tag-cohort"
+COHORT_TAG_NAME = "Lantern Drift"
+SCENE_ROWS = [{"id": "sc-1", "title": "Harbour Fog", "date": "2021-03-04",
+               "files": [{"basename": "harbour-fog.mp4", "path": "/m/harbour-fog.mp4"}],
+               "studio": None, "performers": [], "tags": []},
+              {"id": "sc-2", "title": "Quiet Tide", "date": None,
+               "files": [{"basename": "quiet-tide.mp4", "path": "/m/quiet-tide.mp4"}],
+               "studio": None, "performers": [], "tags": []}]
+
+# Mirrors the page size all_tags() requests; a page shorter than this is what
+# tells it to stop.
+TAG_PAGE_SIZE = 500
+
+
+def _tag_rows(n, prefix):
+    return [{"id": "%s-%d" % (prefix, i), "name": "%s %d" % (prefix, i),
+             "aliases": [], "scene_count": 0} for i in range(n)]
+
+
+def _read_stash(transport):
+    return Stash("http://example.test", "k", transport=transport)
+
+
+class FindScenes(unittest.TestCase):
+    def test_limit_none_asks_the_server_for_every_page_in_one_read(self):
+        # HARM: per_page -1 is the server's "all of them"; any positive number
+        # silently truncates the worklist, so a full-library scan quietly
+        # covers only the first slice and the rest is reported as done.
+        t = _ReadTransport(scenes=SCENE_ROWS)
+        _read_stash(t)._find_scenes({"organized": False}, None)
+        self.assertEqual(t.find_filter(),
+                         {"per_page": -1, "page": 1, "sort": "id", "direction": "ASC"})
+
+    def test_a_limit_is_passed_through_as_the_page_size(self):
+        # HARM: ignoring the caller's limit turns a deliberately small trial
+        # run ("do 5 and let me check them") into a library-wide one.
+        t = _ReadTransport(scenes=SCENE_ROWS)
+        _read_stash(t)._find_scenes({"organized": False}, 5)
+        self.assertEqual(t.find_filter(),
+                         {"per_page": 5, "page": 1, "sort": "id", "direction": "ASC"})
+
+    def test_the_scene_filter_is_forwarded_unchanged(self):
+        # HARM: this is the seam every selector below relies on. If the filter
+        # is edited on the way through, each caller's carefully-scoped cohort
+        # becomes something else entirely.
+        t = _ReadTransport(scenes=SCENE_ROWS)
+        sent = {"tags": {"value": [COHORT_TAG_ID], "modifier": "INCLUDES"}}
+        _read_stash(t)._find_scenes(sent, 10)
+        self.assertEqual(t.scene_filter(), sent)
+
+    def test_it_returns_the_count_and_the_rows(self):
+        # HARM: returning the page length as the count hides from the caller
+        # that a limited read left scenes behind.
+        t = _ReadTransport(scenes=SCENE_ROWS, count=97)
+        count, scenes = _read_stash(t)._find_scenes({"organized": False}, 2)
+        self.assertEqual(count, 97)
+        self.assertEqual(scenes, SCENE_ROWS)
+
+
+class UnorganizedScenes(unittest.TestCase):
+    def test_it_asks_only_for_scenes_the_user_has_not_organized(self):
+        # HARM: this filter is the ONLY thing keeping a bulk apply off scenes
+        # the user curated by hand. Inverting it aims the run squarely at
+        # them; dropping it aims the run at the whole library. Either way
+        # human-entered metadata is overwritten with scraped guesses, at
+        # scale, and apply's undo is per-scene. Asserted as the whole
+        # dictionary: an extra key here would narrow or widen the cohort just
+        # as effectively as a changed one.
+        t = _ReadTransport(scenes=SCENE_ROWS)
+        _read_stash(t).unorganized_scenes(None)
+        self.assertEqual(t.scene_filter(), {"organized": False})
+        # False, not 0/None/"" — the value is sent to a GraphQL Boolean
+        self.assertIs(t.scene_filter()["organized"], False)
+
+    def test_the_limit_reaches_the_server(self):
+        # HARM: the same trial-run harm as above, via the public entry point
+        # the CLI actually calls.
+        t = _ReadTransport(scenes=SCENE_ROWS)
+        _read_stash(t).unorganized_scenes(3)
+        self.assertEqual(t.find_filter()["per_page"], 3)
+
+
+class TaggedScenes(unittest.TestCase):
+    def test_it_selects_the_scenes_that_carry_the_tag(self):
+        # HARM: INCLUDES -> EXCLUDES inverts the cohort — the run then applies
+        # one cohort's metadata to every scene OUTSIDE it, which is the whole
+        # library minus the handful that were meant to be touched. Asserted
+        # whole, so a stray extra key cannot ride along unnoticed.
+        t = _ReadTransport(scenes=SCENE_ROWS)
+        _read_stash(t).tagged_scenes(COHORT_TAG_ID, None)
+        self.assertEqual(t.scene_filter(),
+                         {"tags": {"value": [COHORT_TAG_ID], "modifier": "INCLUDES"}})
+
+    def test_it_sends_no_organized_key_at_all(self):
+        # HARM: the method exists to REVISIT a cohort, and a cohort worth
+        # revisiting was usually marked organized by an earlier guessed-
+        # metadata pass. Adding `organized: False` silently empties the run;
+        # adding `organized: True` narrows it to the already-done ones. The
+        # absence is load-bearing, so pin the absence, not just what is there.
+        t = _ReadTransport(scenes=SCENE_ROWS)
+        _read_stash(t).tagged_scenes(COHORT_TAG_ID, 10)
+        self.assertNotIn("organized", t.scene_filter())
+
+    def test_the_limit_reaches_the_server(self):
+        # HARM: as above — a capped trial run must stay capped.
+        t = _ReadTransport(scenes=SCENE_ROWS)
+        _read_stash(t).tagged_scenes(COHORT_TAG_ID, 7)
+        self.assertEqual(t.find_filter()["per_page"], 7)
+
+
+class TagIdByName(unittest.TestCase):
+    def test_the_name_is_matched_exactly(self):
+        # HARM: EQUALS -> MATCHES (or INCLUDES) resolves a short tag name to a
+        # longer one that merely contains it, and the whole cohort scan then
+        # runs against the wrong tag — writing one cohort's metadata onto
+        # another's scenes. Asserted whole: an extra key in the tag filter
+        # would re-scope the lookup just as silently.
+        t = _ReadTransport(tag_pages=[[{"id": COHORT_TAG_ID,
+                                        "name": COHORT_TAG_NAME,
+                                        "scene_count": 2}]])
+        _read_stash(t).tag_id_by_name(COHORT_TAG_NAME)
+        self.assertEqual(t.only()["f"],
+                         {"name": {"value": COHORT_TAG_NAME, "modifier": "EQUALS"}})
+
+    def test_it_returns_the_id_of_the_first_row(self):
+        # HARM: returning the name (or the row) instead of the id sends a
+        # string where the scene filter expects an id, and the cohort read
+        # comes back empty — a scan that reports "nothing to do" rather than
+        # failing. Picking a later row picks a different tag.
+        t = _ReadTransport(tag_pages=[[
+            {"id": COHORT_TAG_ID, "name": COHORT_TAG_NAME, "scene_count": 2},
+            {"id": "tag-other", "name": "Lantern Drift II", "scene_count": 9}]])
+        self.assertEqual(_read_stash(t).tag_id_by_name(COHORT_TAG_NAME),
+                         COHORT_TAG_ID)
+
+    def test_it_returns_none_when_the_server_has_no_such_tag(self):
+        # HARM: an IndexError here would abort the run; a truthy stand-in
+        # would point it at a tag that does not exist.
+        t = _ReadTransport(tag_pages=[[]])
+        self.assertIsNone(_read_stash(t).tag_id_by_name("No Such Tag"))
+
+
+class AllTags(unittest.TestCase):
+    def test_it_pages_past_the_first_page(self):
+        # HARM: consolidation computes its merges from this list. Stopping at
+        # the first page means it only ever sees the alphabetically-first 500
+        # tags, so a duplicate whose twin sorts later looks unique — and the
+        # merges it does compute are made against a partial view, then written
+        # with tagsMerge, which deletes tags permanently and cannot be undone.
+        pages = [_tag_rows(TAG_PAGE_SIZE, "alpha"), _tag_rows(3, "omega")]
+        t = _ReadTransport(tag_pages=pages)
+        got = _read_stash(t).all_tags()
+        self.assertEqual(len(got), TAG_PAGE_SIZE + 3)
+        self.assertEqual(got, pages[0] + pages[1])
+        self.assertEqual([v["f"]["page"] for _, v in t.calls], [1, 2])
+
+    def test_every_page_is_requested_with_the_same_size_and_ordering(self):
+        # HARM: an unstable or differing sort between pages makes the server
+        # return overlapping or skipped windows, so consolidation sees some
+        # tags twice and others never. Asserted whole, per page.
+        pages = [_tag_rows(TAG_PAGE_SIZE, "alpha"), _tag_rows(1, "omega")]
+        t = _ReadTransport(tag_pages=pages)
+        _read_stash(t).all_tags()
+        self.assertEqual([v["f"] for _, v in t.calls],
+                         [{"per_page": TAG_PAGE_SIZE, "page": 1,
+                           "sort": "name", "direction": "ASC"},
+                          {"per_page": TAG_PAGE_SIZE, "page": 2,
+                           "sort": "name", "direction": "ASC"}])
+
+    def test_a_short_first_page_ends_the_read(self):
+        # HARM: the other half of the paging contract. Not stopping means an
+        # endless walk of empty pages against a live server.
+        t = _ReadTransport(tag_pages=[_tag_rows(4, "alpha")])
+        got = _read_stash(t).all_tags()
+        self.assertEqual(len(got), 4)
+        self.assertEqual(len(t.calls), 1)
