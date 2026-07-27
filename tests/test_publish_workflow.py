@@ -3,8 +3,9 @@ that job are each one line away from being wrong, and none of them fails
 visibly:
 
 - a `latest` tag would be published, and `latest` is read as "the one you
-  want" — this image has no service in it, so nothing about it deserves that
-  name until there is one;
+  want" — this image's default command serves an unauthenticated page whose
+  buttons write to a library, and nobody wants that pulled without knowing
+  which build it is;
 - a dropped `needs: guard` publishes an image the leak guard never scanned;
 - a widened `if:` lets a pull request push into the project's own namespace;
 - a dropped `--build-arg` publishes an image built on whatever interpreter the
@@ -25,6 +26,8 @@ import re
 import subprocess
 import tempfile
 import unittest
+
+from cronicled.web.app import DEFAULT_HOST, DEFAULT_PORT
 
 CI_YML = ".github/workflows/ci.yml"
 REGISTRY_IMAGE = "ghcr.io/cabinetworks/cronicled"
@@ -333,12 +336,53 @@ class ImageMetadata(unittest.TestCase):
         self.assertEqual(self.labels.get("org.opencontainers.image.licenses"),
                          declared)
 
-    def test_the_description_says_there_is_no_service_in_the_image(self):
+    def test_the_description_says_the_default_command_now_serves_something(self):
         # This is the substance of publishing at all: on the registry there is
         # no README next to the image, and a published container reads as a
-        # runnable thing. Deleting this sentence is the regression.
+        # runnable thing. The image used to falsify that by exiting at once;
+        # now that it does not, the description has to say so, or a stranger
+        # who finds it here still has no idea it starts anything.
         description = self.labels.get("org.opencontainers.image.description", "")
-        self.assertIn("no service", description.lower())
+        self.assertIn("inbox", description.lower())
+        self.assertNotIn("not a way to run the tool", description.lower())
+        self.assertNotIn("there is no service", description.lower())
+
+    def test_the_image_does_not_buffer_away_its_startup_warnings(self):
+        # Found by running the built image, not by reading it: `docker logs`
+        # returned NOTHING. Python block-buffers stdout when it is not a
+        # terminal, and a container's stdout is a pipe, so a long-running
+        # server never fills or flushes the buffer and every startup line sits
+        # in it invisibly.
+        #
+        # That matters here more than it usually would. One of those lines is
+        # the binding warning, which tells an operator that what protects this
+        # unauthenticated page is their `-p` flag rather than the bind address
+        # -- and container.md states the warning prints on every container
+        # start. A security warning nobody can see is not a warning, and the
+        # documentation would have been describing output that never appeared.
+        # Matched per line (re.M). `assertRegex` uses a bare `re.search`, where
+        # `^` anchors to the start of the whole file rather than of a line --
+        # written that way first, this could never pass, and it failed
+        # identically with and without the directive present. A mutation
+        # "caught" by a test that was already failing is not caught at all.
+        directive = re.compile(r"^ENV\s+PYTHONUNBUFFERED=1\s*$", re.M)
+        self.assertIsNotNone(
+            directive.search(self.dockerfile),
+            "the image must not buffer away its startup warnings")
+
+    def test_the_description_warns_the_page_has_no_authentication(self):
+        # The one fact a stranger pulling this image most needs before they
+        # publish the port to more than loopback.
+        description = self.labels.get("org.opencontainers.image.description", "")
+        self.assertIn("no authentication", description.lower())
+
+    def test_the_description_still_says_what_does_not_work_yet(self):
+        # Not overclaiming in the other direction: this does not scan, and
+        # nothing populates the store on its own. A stranger starting it will
+        # notice an empty inbox immediately; the description should have
+        # already told them why.
+        description = self.labels.get("org.opencontainers.image.description", "")
+        self.assertIn("scan", description.lower())
 
     def test_the_description_is_not_left_to_the_registry_default(self):
         self.assertGreater(len(self.labels.get(

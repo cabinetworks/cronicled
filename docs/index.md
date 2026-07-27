@@ -54,7 +54,7 @@ flowchart TD
         schedule["schedule<br/>cadence, due-ness, the tick"]
     end
 
-    selfcheck["selfcheck<br/>imports every module in the package;<br/>the container's default command"]
+    selfcheck["selfcheck<br/>imports every module in the package;<br/>still runnable explicitly in the container"]
 
     text --> vocab
     dates --> text

@@ -60,9 +60,12 @@ python -m cronicled --db /path/to/cronicled.sqlite3 \
 
 It binds to loopback only (`127.0.0.1:8571` by default) — there is no
 authentication, so the binding is the only thing standing between the page's
-buttons and anyone who can reach the host. The container's default command is
-still a self-check, not this entry point; see
-[Running it, and the container](docs/container.md).
+buttons and anyone who can reach the host. The container's default command
+now starts this same inbox, bound to every interface *inside* the container
+instead — loopback there would be unreachable from `docker run -p` — which
+moves the actual protection to how that port is published; see
+[Running it, and the container](docs/container.md) for the form that keeps
+it local and what the other form exposes.
 
 ## The module map
 
@@ -101,7 +104,7 @@ flowchart TD
         schedule["schedule<br/>cadence, due-ness, the tick"]
     end
 
-    selfcheck["selfcheck<br/>imports every module in the package;<br/>the container's default command"]
+    selfcheck["selfcheck<br/>imports every module in the package;<br/>still runnable explicitly in the container"]
 
     text --> vocab
     dates --> text
@@ -146,10 +149,12 @@ docker pull ghcr.io/cabinetworks/cronicled:<commit-sha>
 ```
 
 **There is no `latest` tag, and its absence is deliberate.** The image's
-default command still prints one line and exits — the package's entry point
-exists now, but the image does not run it by default — and `latest` is read as
-"the one you want". [The container page](docs/container.md) has the tagging
-scheme and the mounts.
+default command now serves an unauthenticated page whose buttons write to a
+library — `latest` is read as "the one you want", and nobody who reaches for
+it expects the version running to have changed since they last checked, with
+no version number in the reference to say so. A commit SHA or a released
+version makes no such promise. [The container page](docs/container.md) has
+the tagging scheme and the mounts.
 
 ## License
 

@@ -51,18 +51,52 @@ what CI does):
 docker build --build-arg PYTHON_VERSION="$(cat .python-version)" -t cronicled .
 ```
 
-There is no service yet for the container to run (see the
-[architecture](index.md) page), so its default command is a self-check: it
-imports every module in the package and exercises a handful of pure functions
-end to end, proving the pinned interpreter actually runs this project's code.
-Running the image today builds and self-checks the runtime — it is not yet a
-way to run the tool:
+The default command starts the inbox — the same one `python -m cronicled`
+serves outside a container (see the [architecture](index.md) page). **Run it
+with the port published to loopback only:**
 
 ```sh
 docker run --rm \
+  -p 127.0.0.1:8571:8571 \
   -v /path/to/config:/config \
   -v /path/to/state:/var/lib/cronicled \
+  -e CRONICLED_SERVER=http://your-stash-host:9999 \
+  -e CRONICLED_API_KEY="$STASH_API_KEY" \
   cronicled
+```
+
+This is THE documented way to run it. `-e CRONICLED_SERVER`/`-e
+CRONICLED_API_KEY` are optional: without them the inbox still starts and a
+person can browse, dismiss and mute what a scan already produced, but Approve
+and Undo refuse until a media server is configured (see
+`cronicled/__main__.py`).
+
+The inbox has no authentication of its own, so the `-p` form above is the
+only thing standing between its buttons and anyone who can reach this host.
+Inside the container it binds `0.0.0.0`, not the host-side default of
+`127.0.0.1` — a container's own loopback answers nothing that `docker run -p`
+forwards to it, so the bind host cannot be the protection here the way it is
+outside a container. `-p 127.0.0.1:8571:8571` keeps that reachable only from
+this machine, exactly as `127.0.0.1:8571` does when running `python -m
+cronicled` directly. Writing `-p 8571:8571` (or `-P`) instead publishes this
+same unauthenticated page — and the write access its buttons have to the
+media library — to every interface this host has, which usually means every
+machine on the same network. `serve()` prints a loud warning every time it
+binds off its host-side default for exactly this reason; inside a container
+that is every start, not just a mistake, and the warning says so.
+
+**This still does not scan anything, and nothing populates the store on its
+own.** The inbox only shows proposals a scan run elsewhere already wrote —
+starting the container is not yet a way to get new proposals, only to review
+ones that already exist.
+
+The self-check that used to be this image's only default command is still
+reachable by naming it explicitly — it imports every module in the package
+and exercises a handful of pure functions end to end, proving the pinned
+interpreter actually runs this project's code:
+
+```sh
+docker run --rm cronicled python -m cronicled.selfcheck
 ```
 
 ```
@@ -93,7 +127,11 @@ varies between installs is mounted, not copied in:
     operator may already have them set for their own reasons — a decision, not
     an inconsistency.
 
-- `/var/lib/cronicled` — the database
+- `/var/lib/cronicled` — the database. The container sets
+  `$CRONICLED_DB=/var/lib/cronicled/cronicled.sqlite3`, so `--db`'s own
+  default (a relative path, which would otherwise land in the image's
+  writable layer and vanish with the container) resolves inside this volume
+  instead.
 
 A read-only mount for the library itself will be documented here once the
 metadata-enrichment path that needs it exists.
@@ -107,11 +145,13 @@ declared in `pyproject.toml`, and fails the build if the two disagree rather
 than labelling an image with a version it was not built from.
 
 **There is no `latest` tag, and its absence is deliberate — please do not add
-one.** `latest` is read as "the one you want", and nobody reaches for it
-expecting a program that prints a line and exits. A commit SHA or a released
-version makes no such promise. The reasoning is repeated in a comment in
-`.github/workflows/ci.yml` and pinned by a test, because an omission is
-otherwise indistinguishable from an oversight.
+one.** `latest` is read as "the one you want", and this default command now
+serves an unauthenticated page whose buttons write to a library — not
+something to run without knowing which build it is. A commit SHA or a
+released version makes no such promise of currency; `latest` would. The
+reasoning is repeated in a comment in `.github/workflows/ci.yml` and pinned
+by a test, because an omission is otherwise indistinguishable from an
+oversight.
 
 ```sh
 docker pull ghcr.io/cabinetworks/cronicled:<commit-sha>
