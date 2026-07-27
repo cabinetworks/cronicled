@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import shutil
 import tempfile
@@ -7,6 +8,7 @@ from contextlib import redirect_stdout
 from unittest.mock import patch
 
 from cronicled.__main__ import main
+from cronicled.config import CONFIG_DIR_ENV_VAR
 from cronicled.jobs import JobRunner
 from cronicled.stash import Stash
 from cronicled.store import Store
@@ -129,6 +131,145 @@ class MainWiring(_Base):
         self.assertEqual(rows[0].filename, "reel.mp4")
 
 
+class HostAndPortEnvironmentDefaults(_Base):
+    # Mirrors the coverage --db already has for $CRONICLED_DB: a container
+    # can only pass these through ENV (see the Dockerfile), so the flag
+    # having no working environment default at all is exactly the kind of
+    # gap that shows up nowhere in a log -- the service starts, binds
+    # whatever the argparse default happens to be, and looks fine right up
+    # until nothing can reach it.
+
+    def test_host_defaults_from_its_environment_variable(self):
+        self._seed()
+        captured = _CapturedServe()
+        with patch.dict(os.environ, {"CRONICLED_HOST": "0.0.0.0"}):
+            with patch("cronicled.__main__.serve", captured):
+                main(["--db", self.db_path])
+        self.assertEqual(captured.kwargs["host"], "0.0.0.0")
+
+    def test_port_defaults_from_its_environment_variable(self):
+        self._seed()
+        captured = _CapturedServe()
+        with patch.dict(os.environ, {"CRONICLED_PORT": "9001"}):
+            with patch("cronicled.__main__.serve", captured):
+                main(["--db", self.db_path])
+        self.assertEqual(captured.kwargs["port"], 9001)
+
+    def test_explicit_host_flag_overrides_the_environment_variable(self):
+        self._seed()
+        captured = _CapturedServe()
+        with patch.dict(os.environ, {"CRONICLED_HOST": "0.0.0.0"}):
+            with patch("cronicled.__main__.serve", captured):
+                main(["--db", self.db_path, "--host", "127.0.0.3"])
+        self.assertEqual(captured.kwargs["host"], "127.0.0.3")
+
+    def test_host_still_defaults_to_loopback_outside_a_container(self):
+        # DEFAULT_HOST must not change for anyone running this directly --
+        # only the image's own ENV is allowed to move the effective default.
+        self._seed()
+        captured = _CapturedServe()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CRONICLED_HOST", None)
+            with patch("cronicled.__main__.serve", captured):
+                main(["--db", self.db_path])
+        self.assertEqual(captured.kwargs["host"], "127.0.0.1")
+
+
+class ConfigDirThreading(_Base):
+    # `--config-dir` has to reach `cronicled.config.config_dir` (and, when a
+    # future caller needs them, `load_server`/`load_adapters`) through their
+    # injectable `env` parameter rather than by mutating the real
+    # environment -- see cronicled/config.py's module docstring for why.
+    # `main()` proves the value actually reached that function by printing
+    # what it resolved to; these tests read that line rather than reaching
+    # into `main()`'s internals.
+
+    def _run(self, argv, environ_overrides=None):
+        captured = _CapturedServe()
+        out = io.StringIO()
+        with patch.dict(os.environ, environ_overrides or {}):
+            with patch("cronicled.__main__.serve", captured):
+                with redirect_stdout(out):
+                    main(argv)
+        return out.getvalue()
+
+    def test_config_dir_flag_is_threaded_to_config_dir(self):
+        output = self._run(["--db", self.db_path, "--config-dir", "/explicit/config"])
+        self.assertIn("config directory: /explicit/config", output)
+
+    def test_config_dir_also_reaches_the_adapters(self):
+        # The seam this project has been bitten at repeatedly: two features
+        # each correct on their own, joined by a call that quietly drops the
+        # thing connecting them. `main()` prints the directory it resolved
+        # AND loads adapters -- if the loader is called on the ambient
+        # environment instead of the same `env`, the printed line is right,
+        # the flag looks honoured, and the adapters come from somewhere else
+        # entirely. Nothing raises.
+        #
+        # Asserted by loading a real adapters.json out of the directory the
+        # flag names, so the only way to pass is for the value to have
+        # travelled the whole distance.
+        conf = os.path.join(self._dir, "conf")
+        os.makedirs(conf)
+        with open(os.path.join(conf, "adapters.json"), "w") as fh:
+            json.dump({"default": "invented",
+                       "adapters": [{"name": "invented",
+                                     "display": "An Invented Store",
+                                     "scraper_id": "InventedStore",
+                                     "owner_source": "url_segment",
+                                     "owner_segment": 3}]}, fh)
+        captured = _CapturedServe()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(CONFIG_DIR_ENV_VAR, None)
+            with patch("cronicled.__main__.serve", captured):
+                main(["--db", self.db_path, "--config-dir", conf])
+        adapter = captured.kwargs["actions"]._adapter
+        self.assertIsNotNone(
+            adapter, "the adapter directory the flag named was not read")
+        self.assertEqual(adapter.name, "invented")
+        self.assertEqual(adapter.scraper_id, "InventedStore")
+
+    def test_config_dir_flag_does_not_mutate_os_environ(self):
+        # Deliberately NOT run through `self._run`'s `patch.dict`: that
+        # context manager restores `os.environ` to its pre-call snapshot on
+        # exit regardless of what happened inside, which would silently
+        # erase the very mutation this test exists to catch. This talks to
+        # the real `os.environ` directly, with its own cleanup, so a write
+        # main() makes is still visible after the call returns.
+        self._seed()
+        original = os.environ.get(CONFIG_DIR_ENV_VAR)
+
+        def _restore():
+            if original is None:
+                os.environ.pop(CONFIG_DIR_ENV_VAR, None)
+            else:
+                os.environ[CONFIG_DIR_ENV_VAR] = original
+        self.addCleanup(_restore)
+
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            with redirect_stdout(io.StringIO()):
+                main(["--db", self.db_path, "--config-dir", "/explicit/config"])
+        self.assertEqual(os.environ.get(CONFIG_DIR_ENV_VAR), original)
+
+    def test_config_dir_flag_wins_over_the_ambient_environment_variable(self):
+        output = self._run(
+            ["--db", self.db_path, "--config-dir", "/explicit/config"],
+            environ_overrides={CONFIG_DIR_ENV_VAR: "/ambient/config"})
+        self.assertIn("config directory: /explicit/config", output)
+        self.assertNotIn("/ambient/config", output)
+
+    def test_config_dir_defaults_from_its_environment_variable(self):
+        output = self._run(
+            ["--db", self.db_path],
+            environ_overrides={CONFIG_DIR_ENV_VAR: "/from/environment"})
+        self.assertIn("config directory: /from/environment", output)
+
+    def test_config_dir_falls_back_to_the_default_directory(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(CONFIG_DIR_ENV_VAR, None)
+            output = self._run(["--db", self.db_path])
+        self.assertIn("config directory: config", output)
 class ScanWiring(_Base):
     # The runner a request's `/scan` starts a job on has to outlive that
     # request -- so it must be something `main()` builds once and hands to

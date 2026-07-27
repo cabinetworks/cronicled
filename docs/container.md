@@ -71,6 +71,28 @@ person can browse, dismiss and mute what a scan already produced, but Approve
 and Undo refuse until a media server is configured (see
 `cronicled/__main__.py`).
 
+Everything above is also settable as a trailing flag instead of an `-e`
+environment variable — useful for a companion tool that already builds an
+argument list and would rather not also assemble one of environment pairs.
+The flag and the environment variable of the same value are equivalent; the
+flag wins if both are given:
+
+```sh
+docker run --rm \
+  -p 127.0.0.1:8571:8571 \
+  -v /path/to/config:/config \
+  -v /path/to/state:/var/lib/cronicled \
+  cronicled \
+  --server http://your-stash-host:9999 --api-key "$STASH_API_KEY" \
+  --config-dir /config --db /var/lib/cronicled/cronicled.sqlite3
+```
+
+`--config-dir` and `--db` are shown here pointed at the same paths the image's
+own `ENV` defaults already resolve to (see "What is mounted, and what is not"
+below) — passing them explicitly only matters when they need to differ from
+those defaults, such as a second instance sharing one `/config` mount but
+keeping its own database.
+
 The inbox has no authentication of its own, so the `-p` form above is the
 only thing standing between its buttons and anyone who can reach this host.
 Inside the container it binds `0.0.0.0`, not the host-side default of
@@ -91,12 +113,17 @@ starting the container is not yet a way to get new proposals, only to review
 ones that already exist.
 
 The self-check that used to be this image's only default command is still
-reachable by naming it explicitly — it imports every module in the package
-and exercises a handful of pure functions end to end, proving the pinned
-interpreter actually runs this project's code:
+reachable — it imports every module in the package and exercises a handful of
+pure functions end to end, proving the pinned interpreter actually runs this
+project's code. Naming it as a trailing argument no longer works now that the
+image has an `ENTRYPOINT` (`python -m cronicled`): trailing arguments APPEND
+to that entry point instead of replacing it, so `docker run cronicled python
+-m cronicled.selfcheck` would try to run `python -m cronicled` with those four
+words as nonsense arguments, not the self-check. `--entrypoint` overrides the
+entry point itself, which is what still reaches it:
 
 ```sh
-docker run --rm cronicled python -m cronicled.selfcheck
+docker run --rm --entrypoint python cronicled -m cronicled.selfcheck
 ```
 
 ```

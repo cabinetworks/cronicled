@@ -31,6 +31,7 @@ import argparse
 import os
 
 from .adapters.registry import get_adapter
+from .config import CONFIG_DIR_ENV_VAR, config_dir
 from .jobs import JobRunner
 from .runscan import configured_adapters
 from .store import Store
@@ -46,9 +47,28 @@ def main(argv=None):
         "CRONICLED_DB", "cronicled.sqlite3"))
     parser.add_argument("--server", default=os.environ.get("CRONICLED_SERVER"))
     parser.add_argument("--api-key", default=os.environ.get("CRONICLED_API_KEY"))
-    parser.add_argument("--host", default=DEFAULT_HOST)
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    # $CRONICLED_HOST/$CRONICLED_PORT give these two the same environment
+    # default `--db` already has. DEFAULT_HOST stays 127.0.0.1 here -- the
+    # container image is what overrides it, via ENV, not this default.
+    parser.add_argument("--host", default=os.environ.get(
+        "CRONICLED_HOST", DEFAULT_HOST))
+    parser.add_argument("--port", type=int, default=int(
+        os.environ.get("CRONICLED_PORT", DEFAULT_PORT)))
+    parser.add_argument("--config-dir", default=os.environ.get(CONFIG_DIR_ENV_VAR))
     args = parser.parse_args(argv)
+
+    # cronicled.config's loaders (config_dir/load_server/load_adapters) all
+    # take an injectable `env` rather than reading os.environ directly, so a
+    # CLI override can take effect without mutating the real environment --
+    # mutating it here would leak into anything else running in this same
+    # process, and outlive this one call. A copy is built, overridden only
+    # when --config-dir/$CRONICLED_CONFIG_DIR resolved to something, and
+    # passed explicitly wherever this project's own config directory is
+    # resolved; os.environ itself is never written to.
+    env = dict(os.environ)
+    if args.config_dir is not None:
+        env[CONFIG_DIR_ENV_VAR] = args.config_dir
+    print("config directory: %s" % config_dir(env=env))
 
     store = Store(args.db)
     if args.server:
@@ -65,7 +85,12 @@ def main(argv=None):
         # docstring -- so this stays silent the same way `load_adapters`
         # itself does. `Actions.scan` gives the loud, specific refusal, and
         # only once someone actually presses Scan.
-        adapter = get_adapter(None, configured_adapters())
+        # `env=env` and not the ambient environment: this is the seam where
+        # --config-dir either reaches the adapters or silently does not.
+        # Omitting it leaves the flag half-working -- the directory printed
+        # above would be the one asked for, while the adapters came from
+        # somewhere else -- and nothing would raise to say so.
+        adapter = get_adapter(None, configured_adapters(env=env))
     except (ValueError, RuntimeError, KeyError):
         adapter = None
     runner = JobRunner(store)

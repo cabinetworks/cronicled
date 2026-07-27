@@ -72,7 +72,11 @@ jobs:
       - name: Build the image
         run: docker build --build-arg PYTHON_VERSION="$(cat .python-version)" -t cronicled:ci .
       - name: The package runs inside the image
-        run: docker run --rm cronicled:ci python -m cronicled.selfcheck
+        # ENTRYPOINT is `python -m cronicled`, so naming the self-check on the
+        # command line would now APPEND to that instead of replacing it.
+        # `--entrypoint` overrides the entry point itself, which is the
+        # invocation that still runs it -- see the Dockerfile's own comment.
+        run: docker run --rm --entrypoint python cronicled:ci -m cronicled.selfcheck
 
   # Build the documentation site on EVERY push and pull request, whether or not
   # it will be published, so a broken page or a dead internal link fails here
