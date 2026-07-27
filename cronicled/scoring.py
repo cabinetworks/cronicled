@@ -20,12 +20,12 @@ from cronicled.text import clean_folder, normalize, strip_ext, tokens
 # in the stripped view.
 _SERIES_SEP_RE = re.compile(r"\s+-{1,2}\s+")
 
-# `strip_ext` removes only the containers listed in VIDEO_EXTS -- shared
-# vocabulary that also decides which files get scanned at all, so widening it
-# would change unrelated behaviour. Any other container therefore survives into
-# the token set and counts as evidence, inflating meaningful_count past the
-# `< 2` trigger and switching the single-generic-word rule off: `Addict.mp4` is
-# refused, `Addict.mpeg` applies. So drop a trailing extension-SHAPED suffix
+# `strip_ext` removes the containers listed in CONTAINER_EXTS, which is broad
+# but can never be complete -- new containers appear, and a library holds
+# whatever it holds. Any container NOT on that list survives into the token set
+# and counts as evidence, inflating meaningful_count past the `< 2` trigger and
+# switching the single-generic-word rule off: `Addict.mp4` is refused,
+# `Addict.<unlisted>` applies. So drop a trailing extension-SHAPED suffix
 # whatever the container: 2-5 alphanumerics after a dot with something in front
 # of it, containing at least one letter. The letter requirement keeps a numeric
 # part number intact ("Volume 2.10"), and the five-character ceiling keeps a
@@ -197,7 +197,7 @@ def score(name, folder, title, artist=None):
               for view in views if title_norm and normalize(view)]
     best = max(scored, default=0.0)
 
-    # A container listed in VIDEO_EXTS is confidently not content, so
+    # A container listed in CONTAINER_EXTS is confidently not content, so
     # `strip_ext` removes it outright and neither set below ever sees it. An
     # extension-SHAPED suffix we do not recognise, and the text before a
     # ` - `, might each be a real part of the title, so the two sets disagree

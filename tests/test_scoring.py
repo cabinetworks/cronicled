@@ -4,6 +4,7 @@ import unittest
 
 from cronicled.scoring import (
     DEFAULT_THRESHOLD, Decision, Match, decide, meaningful_tokens, score)
+from cronicled.vocab import CONTAINER_EXTS
 
 
 class MeaningfulTokens(unittest.TestCase):
@@ -18,11 +19,23 @@ class MeaningfulTokens(unittest.TestCase):
                                 artist="Velvet Crane")
         self.assertEqual(got, {"morning", "ritual"})
 
-    def test_an_unknown_container_extension_is_not_evidence(self):
-        # only the containers we scan get stripped by name; renaming a file to
-        # any other container must not smuggle a second "meaningful" token in
+    def test_a_container_off_the_list_is_not_evidence(self):
+        # These are recognised containers now, so the name loses them outright
+        # rather than through the shaped-suffix rule below.
         for name in ("Addict.mpeg", "Addict.divx", "Addict.rm", "Addict.m2ts",
                      "Addict.ogm", "Addict.MPEG", "Addict.3gp"):
+            self.assertEqual(meaningful_tokens(name, ""), {"addict"}, name)
+
+    def test_a_suffix_on_no_list_at_all_is_still_not_evidence(self):
+        # The other half, and the one that has to keep working however long
+        # CONTAINER_EXTS grows: a suffix nothing recognises must not smuggle a
+        # second "meaningful" token in either. Pinned against spellings the
+        # list does not claim, and the assertion that it does not claim them is
+        # part of the test — adding one of them to the list later would
+        # otherwise quietly move this case to the branch above.
+        for name in ("Addict.zqx", "Addict.vidx", "Addict.mp5"):
+            self.assertNotIn(name[name.rindex("."):].lower(), CONTAINER_EXTS,
+                             name)
             self.assertEqual(meaningful_tokens(name, ""), {"addict"}, name)
 
     def test_a_trailing_numeric_fragment_is_not_an_extension(self):
@@ -159,11 +172,48 @@ class Scoring(unittest.TestCase):
         # strip that stops a rename posing as evidence must never be able to
         # hand a wrong title containment instead. "Dawn" is exactly what
         # separates this file from "Dusk", and it is the token being dropped.
+        #
+        # That the suffix is UNRECOGNISED is what this rests on, and
+        # CONTAINER_EXTS is now a list that grows -- so the assumption is
+        # asserted rather than assumed. Add ".dawn" to it and this test would
+        # otherwise start passing for a different reason than it was written
+        # for, while the guard it names went uncovered.
+        self.assertNotIn(".dawn", CONTAINER_EXTS)
         for name in ("Morning Ritual.Dawn", "Morning.Ritual.Dawn"):
             m = score(name, "", "Morning Ritual Dusk")
             self.assertFalse(m.contained, name)
             self.assertLess(m.value, 0.9, name)
             self.assertIsNone(decide([m], threshold=0.95).match, name)
+
+    def test_a_recognised_container_scores_the_same_whichever_one_it_is(self):
+        # The false negative the split exists to remove. The same file, the
+        # same title, muxed differently: 0.933 and contained as `.mp4`, 0.686
+        # and not contained as `.mpeg`, which is correct metadata held behind
+        # a review queue over nothing at all. Every container the broad list
+        # claims now answers exactly as `.mp4` does.
+        # Named one by one rather than looped over CONTAINER_EXTS: a loop over
+        # the constant stops visiting whatever the constant stops holding, so
+        # dropping an entry would leave this passing. Confirmed by mutation.
+        baseline = score("Morning Ritual.mp4", "", "Morning Ritual At Dawn")
+        self.assertTrue(baseline.contained)
+        for ext in (".mpeg", ".mpg", ".mpe", ".m1v", ".m2v", ".mpv", ".mp2",
+                    ".m2ts", ".mts", ".vob", ".ogv", ".ogm", ".asf",
+                    ".divx", ".xvid", ".rm", ".rmvb", ".3gp", ".3g2", ".f4v",
+                    ".qt", ".dv", ".mxf", ".wtv", ".amv",
+                    ".mkv", ".wmv", ".avi", ".mov", ".m4v", ".flv", ".ts",
+                    ".webm", ".MPEG", ".Divx"):
+            m = score("Morning Ritual" + ext, "", "Morning Ritual At Dawn")
+            self.assertEqual(m, baseline, ext)
+
+    def test_a_container_the_list_does_not_claim_still_withholds_containment(self):
+        # And the asymmetry survives the widening, which is the thing most
+        # easily lost while doing it. An unrecognised suffix still counts for
+        # nothing in the evidence count AND still grants no containment -- the
+        # confident half of the rule got bigger, the uncertain half did not
+        # change what it is allowed to do.
+        m = score("Morning Ritual.zqx", "", "Morning Ritual At Dawn")
+        self.assertEqual(m.meaningful_count, 2)
+        self.assertFalse(m.contained)
 
     def test_the_prefix_stripped_view_is_scored_at_all(self):
         # The whole reason that view exists: a filename repeating its series
@@ -215,9 +265,10 @@ class Scoring(unittest.TestCase):
 
     def test_renaming_the_container_cannot_defeat_the_generic_word_rule(self):
         # "Addict" alone is one generic word wherever it appears; the rule
-        # that refuses it must not switch off because the file was renamed
+        # that refuses it must not switch off because the file was renamed --
+        # to a container the list claims, or to one it has never heard of.
         for name in ("Addict.mp4", "Addict.mpeg", "Addict.divx",
-                     "Addict.rm", "Addict.m2ts"):
+                     "Addict.rm", "Addict.m2ts", "Addict.zqx", "Addict.vidx"):
             m = score(name, "", "Addict To The Sound")
             self.assertEqual(m.meaningful_count, 1, name)
             self.assertIsNone(decide([m]).match, name)
