@@ -446,3 +446,82 @@ class Stash:
         merging or deleting anything."""
         q = "mutation($in: TagUpdateInput!){ tagUpdate(input:$in){ id aliases } }"
         self.gql(q, {"in": {"id": str(tag_id), "aliases": list(aliases)}})
+
+    # -- scraping ---------------------------------------------------------- #
+
+    def scrape_scenes_by_query(self, scraper_id, query):
+        """Ask one configured scraper for scenes matching a free-text
+        `query`, via `scrapeSingleScene`. Returns a list of scene dicts —
+        `[]` when the scraper found nothing, which is a normal answer, not
+        an error, so nothing downstream needs a None check before iterating.
+
+        `scraper_id` sources the call (the other half of
+        `ScraperSourceInput`, a stash-box endpoint, is never used here — this
+        client only knows how to ask a media-server-configured scraper). The
+        text goes in as the input's free-text `query`, the one
+        `ScrapeSingleSceneInput` field this method uses.
+
+        The selection set covers every field `apply_scene` can write onto a
+        scene: `title`, `details`, `date`, `urls`, `code`, `director`,
+        `studio`, `performers`, `tags` and the cover `image`. `studio`,
+        `performers` and `tags` each carry `stored_id` alongside `name` —
+        the server's own way of saying "this scraped entity is already one
+        you have" — which is exactly the shape `apply_scene`'s
+        `find_or_create` resolution takes for each of them.
+
+        `url` (singular) is also selected, alongside `urls`, even though the
+        schema marks it deprecated in favour of the plural field. That is
+        deliberate rather than an oversight: `cronicled.adapters.declarative
+        .DeclarativeAdapter.owner_of` — the one existing consumer of a
+        scraped-result URL in this codebase, and the shape
+        `config/adapters.example.json`'s own example adapter is configured
+        with — reads a creator's name out of `result.get("url")`, singular,
+        for every adapter configured with `owner_source: "url_segment"`.
+        Selecting only `urls` would leave that field absent from every
+        result this method returns, which does not raise anywhere: it reads
+        back as an unresolved creator and the scan mutes the file, silently,
+        for every scene this scraper ever answers. `apply_scene` itself
+        needs no help here — its own `urls`/`url` fallback already prefers
+        the plural field — so `url` is selected for the adapter's sake, not
+        the apply path's. Reconciling the adapter side to prefer `urls[0]`
+        instead is a real option, but it belongs to whichever task wires a
+        scraper's results through the adapter layer, not to this one.
+
+        `image`, when present, is a base64 data URL. Applying it sets the
+        scene's cover, and that half of an apply cannot be undone:
+        `apply_scene`'s snapshot has no way to represent a scene's CURRENT
+        cover (the server only exposes it as a URL, not as the payload an
+        update accepts), so there is nothing to restore it from. See
+        `apply_scene`'s docstring. That is a decision already taken, not a
+        gap in this method — selecting `image` is deliberate, and nothing
+        here undoes it.
+        """
+        q = """
+        query($source: ScraperSourceInput!, $input: ScrapeSingleSceneInput!){
+          scrapeSingleScene(source:$source, input:$input){
+            title code details director urls url date image
+            studio{ stored_id name }
+            tags{ stored_id name }
+            performers{ stored_id name }
+          }
+        }"""
+        data = self.gql(q, {"source": {"scraper_id": scraper_id},
+                            "input": {"query": query}})
+        return data["scrapeSingleScene"] or []
+
+    def scene_scrapers(self):
+        """The configured scrapers that can scrape a scene, as a list of
+        `{"id", "name"}` dicts — enough for a caller to tell an operator
+        what is actually available, rather than failing on a scraper id
+        nobody can check against anything.
+
+        `listScrapers` takes `types: [ScrapeContentType!]!`; passing `SCENE`
+        is what scopes this to scrapers offering scene scraping specifically,
+        rather than every scraper the server has configured for any purpose.
+        """
+        q = """
+        query($types: [ScrapeContentType!]!){
+          listScrapers(types:$types){ id name }
+        }"""
+        data = self.gql(q, {"types": ["SCENE"]})
+        return data["listScrapers"] or []
