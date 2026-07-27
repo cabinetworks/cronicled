@@ -83,8 +83,14 @@ A few things the shape of that graph is saying:
   with `name`, `cost` and a `produce(ctx)` generator.
 - **Nothing imports `stash`.** The client is a leaf: matching logic never
   reaches for the media server on its own.
-- **`censorship` has no in-package caller.** Each adapter carries its own
-  substitution map, and expanding a query with it is the caller's step.
+- **`censorship` is called from two places, for two different reasons.**
+  `cronicled.search.catalog_search` expands the QUERY with `search_variants`
+  before any lookup happens, using the adapter's own substitution map, so a
+  censored spelling never has to reach `scan.examine` for that half.
+  `scan.examine` calls `decensor` on each candidate's TITLE, but only to
+  decide which one SCORES best — the candidate a proposal carries is always
+  the one `search` returned, untouched, so a decensored title can win but
+  can never itself become the applied title. See `scan.examine`'s docstring.
 - **No module is compiled against a particular store.** `adapters.registry`
   reads adapters out of the operator's config; see
   [Site adapters](adapters.md).

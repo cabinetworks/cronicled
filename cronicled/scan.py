@@ -32,6 +32,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from cronicled.artist import Aliases, creator_folder, resolve
+from cronicled.censorship import decensor
 from cronicled.scoring import DEFAULT_THRESHOLD, decide, score
 
 # Selection deals in one kind of subject. It is named rather than inlined so
@@ -257,7 +258,8 @@ def _primary_path(scene):
     return files[0]["path"]
 
 
-def examine(scene, *, search, folder, threshold=DEFAULT_THRESHOLD, aliases=None):
+def examine(scene, *, search, folder, threshold=DEFAULT_THRESHOLD, aliases=None,
+           censorship=None):
     """Work out what `scene` is, and return what that concluded.
 
     `search` is the injected lookup: called with the resolved creator's name
@@ -272,6 +274,20 @@ def examine(scene, *, search, folder, threshold=DEFAULT_THRESHOLD, aliases=None)
     proposal returned is complete and can be yielded to the job runner
     unchanged. (The creator's own directory is read off the path, and is a
     different thing entirely — see `creator_folder`.)
+
+    `censorship` is a store's word-substitution map (`{canonical:
+    [substituted_form, ...]}`, the shape `SiteAdapter.censorship` carries),
+    used HERE for exactly one purpose: `cronicled.censorship.decensor` rewrites
+    each candidate's title back to its canonical spelling before it is
+    SCORED, so a censored store title still string-matches an uncensored
+    local filename. It is never applied to the candidate that reaches the
+    proposal — `winner` below is the object `search` returned, untouched — so
+    a decensored title can influence which candidate wins but can never
+    itself become the applied title. The store called a title what it
+    called it; rewriting that and writing the rewrite back would invent a
+    title the store never used. `None` (the default, and what every caller
+    that has no censorship map to offer should pass) behaves as `{}`, which
+    `decensor` defines as a no-op.
 
     ORDER: the creator is resolved BEFORE anything is scored, and that is
     load-bearing rather than stylistic. `scoring.score(..., artist=)`
@@ -320,7 +336,11 @@ def examine(scene, *, search, folder, threshold=DEFAULT_THRESHOLD, aliases=None)
         return Outcome(mute_reason=MUTE_NO_CANDIDATES,
                        reason=MUTE_NO_CANDIDATES)
 
-    matches = [score(name, directory, c["title"], artist=resolution.name)
+    # `c["title"]` decensored for THIS computation only: `winner` below is
+    # sliced from `candidates`, the untouched list, so the proposal always
+    # carries whatever `search` returned rather than this rewritten form.
+    matches = [score(name, directory, decensor(c["title"], censorship or {}),
+                     artist=resolution.name)
                for c in candidates]
     decision = decide(matches, threshold)
     if decision.match is None:
@@ -508,6 +528,12 @@ class ScanProducer:
     things up; it does not set `organized`, does not touch tags or
     performers, and does not write anything back. That is what makes it safe
     to run repeatedly.
+
+    `censorship` is passed straight through to `examine` on every file — see
+    its docstring. It only ever changes which candidate scores highest; it
+    can never change what a proposal's `candidate` field carries, since
+    `examine` scores off a decensored copy and proposes the candidate
+    `search` returned, unaltered.
     """
 
     name = "library-scan"
@@ -516,7 +542,8 @@ class ScanProducer:
     cost = "scraping"
 
     def __init__(self, stash, search, *, store, folder="library", limit=None,
-                 name_filter=None, threshold=DEFAULT_THRESHOLD, aliases=None, workers=4):
+                 name_filter=None, threshold=DEFAULT_THRESHOLD, aliases=None,
+                 workers=4, censorship=None):
         if workers < 1:
             # A pool of nothing would do nothing at all, forever. Refuse it
             # where the mistake was made rather than on a background thread
@@ -529,6 +556,7 @@ class ScanProducer:
         self._limit = limit
         self._name_filter = name_filter
         self._threshold = threshold
+        self._censorship = censorship or {}
         # Indexed and checked HERE, for the same reason `workers` is checked
         # here: a duplicated or empty alias line is a wiring mistake that is
         # wrong for every file, and this is the last point at which the caller
@@ -654,7 +682,8 @@ class ScanProducer:
         """
         try:
             return examine(scene, search=search, folder=self._folder,
-                           threshold=self._threshold, aliases=self._aliases)
+                           threshold=self._threshold, aliases=self._aliases,
+                           censorship=self._censorship)
         except Exception as exc:
             # Name the type as well as the message, for the same reason
             # `examine` does: `str(exc)` alone is '' for a bare raise.
