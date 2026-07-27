@@ -25,6 +25,19 @@ class Row:
     undoable: bool
 
 
+def _runner_up_view(entry):
+    """One losing candidate, normalised to what the screen shows.
+
+    `scan._runners_up` builds each entry as `{"candidate": <the whole search
+    result>, "score": value}` -- the title lives inside `candidate`, not at
+    the top level. Deciding what the "also considered" column needs is this
+    module's job, not the template's: reading `title` from the wrong place
+    here would surface as a silently blank column there, since Jinja renders
+    an undefined attribute as empty text rather than raising.
+    """
+    return {"title": entry["candidate"]["title"], "score": entry["score"]}
+
+
 def _disagreement(creator):
     """One line naming what the resolver passed over, or None.
 
@@ -63,7 +76,8 @@ def to_row(item):
         score=score,
         # Three places, matching the precision the decision was made at.
         score_text="%.3f" % score,
-        runners_up=tuple(payload.get("runners_up") or ()),
+        runners_up=tuple(_runner_up_view(r)
+                         for r in (payload.get("runners_up") or ())),
         # An applied row with no snapshot cannot be reverted — revert_scene
         # raises on an empty one. Offering the button anyway would promise an
         # undo the code cannot perform.
