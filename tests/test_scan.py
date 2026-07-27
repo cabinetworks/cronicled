@@ -987,6 +987,77 @@ class ExamineCensorshipTest(unittest.TestCase):
                          self.run_examine(censorship={}))
 
 
+class ExamineOwnerOfTest(unittest.TestCase):
+    """`examine(..., owner_of=...)` -- the fix for issue #66, exercised as
+    `examine` actually wires it: a real `search` callable answering per
+    query, and a plain reader of one field on a result. "Amberlight" stands
+    in for the measured store, "Wren Ashcombe" for the measured creator;
+    both invented, matching no real store or performer.
+
+    `ScriptedSearch` (defined below, for `ScanProducerTest`) answers each
+    query separately, which this needs and `FakeSearch` (answers every query
+    identically) cannot: a search-backed resolve issues one query to check
+    the losing candidate and another for the winner's own catalogue, and the
+    two must not be confused.
+    """
+
+    PATH = "/library/Amberlight/Wren Ashcombe - Morning Ritual.mp4"
+
+    @staticmethod
+    def owner_of(result):
+        return (result or {}).get("owner", "")
+
+    def test_a_candidate_the_catalogue_confirms_reaches_the_proposal(self):
+        # HARM this fixes: without a search, the folder ("Amberlight", the
+        # store) would win by the old default -- exactly the wrong
+        # attribution the live scan produced.
+        owned = dict(candidate("Morning Ritual", "morning-ritual"),
+                     owner="Wren Ashcombe")
+        search = ScriptedSearch({"Amberlight": [], "Wren Ashcombe": [owned]})
+
+        outcome = examine(scene(1, self.PATH), search=search, folder=FOLDER,
+                          threshold=0.5, owner_of=self.owner_of)
+
+        self.assertEqual(outcome.proposal["payload"]["creator"], {
+            "name": "Wren Ashcombe", "source": "filename",
+            "competing": "Amberlight", "rejected_folder": None})
+        # both the losing candidate's check and the winner's own catalogue
+        # search happened -- "Wren Ashcombe" asked twice is the SAME query,
+        # once to verify and once to score; raw `examine` has no
+        # single-flight cache of its own (`ScanProducer` adds one).
+        self.assertEqual(search.queries,
+                         ["Amberlight", "Wren Ashcombe", "Wren Ashcombe"])
+
+    def test_a_candidate_the_catalogue_does_not_support_is_not_proposed(self):
+        # The store's own name has nothing behind it; only the creator's
+        # does. Swap which query answers and the winner swaps with it --
+        # proving this is the search deciding, not a fixed preference.
+        owned = dict(candidate("Morning Ritual", "morning-ritual"),
+                     owner="Amberlight")
+        search = ScriptedSearch({"Amberlight": [owned], "Wren Ashcombe": []})
+
+        outcome = examine(scene(1, self.PATH), search=search, folder=FOLDER,
+                          threshold=0.5, owner_of=self.owner_of)
+
+        self.assertEqual(outcome.proposal["payload"]["creator"]["name"],
+                         "Amberlight")
+        self.assertEqual(outcome.proposal["payload"]["creator"]["source"],
+                         "folder")
+
+    def test_owner_of_omitted_keeps_the_old_folder_wins_default(self):
+        # No `owner_of` at all: `examine` must not spend a single extra
+        # lookup checking a candidate it was never asked to check.
+        search = FakeSearch([candidate("Morning Ritual", "morning-ritual")])
+
+        outcome = examine(scene(1, self.PATH), search=search, folder=FOLDER,
+                          threshold=0.5)
+
+        self.assertEqual(outcome.proposal["payload"]["creator"], {
+            "name": "Amberlight", "source": "folder",
+            "competing": "Wren Ashcombe", "rejected_folder": None})
+        self.assertEqual(search.queries, ["Amberlight"])
+
+
 # -- running a whole batch ------------------------------------------------- #
 
 class FakeStash:

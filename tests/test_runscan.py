@@ -29,10 +29,19 @@ WAIT = 10
 
 
 class _Adapter:
-    def __init__(self, scraper_id="scraper-alpha", censorship=None, name="store"):
+    def __init__(self, scraper_id="scraper-alpha", censorship=None, name="store",
+                 catalog_resolvable=True):
         self.name = name
         self.scraper_id = scraper_id
         self.censorship = censorship or {}
+        self.catalog_resolvable = catalog_resolvable
+
+    def owner_of(self, result):
+        # None of this file's scenes are ambiguous enough to trigger a
+        # candidate check, so this is never actually called; it exists only
+        # so `build_producer` can read `adapter.owner_of` off this fake the
+        # same way it reads it off a real `SiteAdapter`.
+        return (result or {}).get("owner", "")
 
 
 def scene(scene_id, path):
@@ -190,6 +199,30 @@ class BuildProducerWiring(unittest.TestCase):
         self.assertEqual(finished.state, "done")
         for call in stash.calls:
             self.assertIn(call[0], ("unorganized_scenes", "scrape_scenes_by_query"))
+
+
+class BuildProducerOwnerOfWiring(unittest.TestCase):
+    """`adapter.owner_of` reaches the `ScanProducer` it builds, but only when
+    `adapter.catalog_resolvable` says a name search can identify a creator on
+    this store at all -- see `build_producer`'s docstring for the regression
+    this guards: an adapter with no owner signal (`owner_source: "none"`)
+    would otherwise find zero support for every candidate on every ambiguous
+    file, unresolving what the old folder-wins default used to handle.
+    """
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+
+    def test_a_catalog_resolvable_adapter_passes_its_owner_of_through(self):
+        adapter = _Adapter(catalog_resolvable=True)
+        producer = build_producer(_FakeStash([]), adapter, self.store, limit=10)
+        self.assertEqual(producer._owner_of, adapter.owner_of)
+
+    def test_a_non_catalog_resolvable_adapter_passes_none(self):
+        adapter = _Adapter(catalog_resolvable=False)
+        producer = build_producer(_FakeStash([]), adapter, self.store, limit=10)
+        self.assertIsNone(producer._owner_of)
 
 
 class ConfiguredAdapters(unittest.TestCase):

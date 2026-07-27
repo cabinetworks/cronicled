@@ -53,6 +53,18 @@ def build_producer(stash, adapter, store, *, limit, folder="library",
     `scan.examine` can decensor each candidate's TITLE for scoring — see
     `scan.examine`'s docstring for why those are two distinct uses and why
     conflating them would let a decensored title reach a proposal.
+
+    `adapter.owner_of` is threaded through the same way, so `scan.examine`'s
+    call into `cronicled.artist.resolve` can check a candidate name against
+    the catalogue instead of assuming the first one — but ONLY when
+    `adapter.catalog_resolvable` says a name search can identify this
+    store's creators at all. An adapter configured `owner_source: "none"`
+    returns "" from `owner_of` for every result, no matter the candidate;
+    passed through unconditionally, every ambiguous file against such a
+    store would find zero support for anything and come back unresolved —
+    a regression from today's folder-wins default, not the fix this wiring
+    exists for. `catalog_resolvable` already existed to answer exactly this
+    question; nothing read it before this.
     """
     if limit is None:
         raise ValueError(
@@ -62,10 +74,11 @@ def build_producer(stash, adapter, store, *, limit, folder="library",
             "scraper. Pass an explicit limit (0 runs the selection "
             "accounting with no lookups spent, if that is what is wanted).")
     search = catalog_search(stash, adapter)
+    owner_of = adapter.owner_of if adapter.catalog_resolvable else None
     return ScanProducer(
         stash, search, store=store, folder=folder, limit=limit,
         name_filter=name_filter, threshold=threshold, aliases=aliases,
-        workers=workers, censorship=adapter.censorship)
+        workers=workers, censorship=adapter.censorship, owner_of=owner_of)
 
 
 def configured_adapters(env=None):

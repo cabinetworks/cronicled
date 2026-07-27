@@ -38,6 +38,18 @@ nothing downstream ever questions it. When in doubt, this module declines.
 
 Nothing here touches the filesystem. `creator_folder` splits a path as a
 string; `resolve` is given the folder name, not a path.
+
+`resolve`'s folder-wins default is itself a guess, and a measured one: a file
+named "<store> - <creator> - <title>", filed straight under a folder named
+for the store, used to resolve to the store, because the store's own name
+passed every guard `_is_name` enforces just as cleanly as the creator's did.
+An optional `owners_of` collaborator lets `resolve` check a candidate instead
+of assuming it: when the folder and the filename (or the filename's own
+several segments) name more than one plausible person, each is asked of the
+catalogue, and only a candidate the catalogue actually attributes results to
+wins -- see `_resolve_by_evidence`. Nothing calls a search when there is only
+one plausible candidate, so the common, unambiguous file costs exactly what
+it always did.
 """
 import posixpath
 import re
@@ -169,11 +181,19 @@ class Resolution:
     `source` names where `name` came from -- "folder", "filename", "alias" --
     or is None when nothing resolved. `competing` carries the name that lost:
     when the folder and the filename each yield a plausible but different
-    person, the folder wins and the filename's answer is recorded here.
+    person, the folder wins and the filename's answer is recorded here --
+    UNLESS `resolve` was given a search to check candidates against, in which
+    case the candidate the catalogue actually supports wins and whichever
+    plausible name lost -- folder or filename, either can now lose -- is
+    recorded here instead. Either way, a name that competed and lost is
+    reported, never silently dropped.
 
     `rejected_folder` carries a folder whose text a guard threw out -- it was
     not a name at all, so it never competed. Set whenever a non-empty folder
-    name neither won nor matched an alias, whatever `name` ended up being.
+    name neither won nor matched an alias, whatever `name` ended up being. A
+    folder that WAS a plausible name but lost an evidence-backed competition
+    is not this -- it competed, so it belongs in `competing`, the same as a
+    losing filename ever has.
 
     The two are kept apart on purpose. `competing` is a *name*: something a
     consumer may legitimately search a catalogue for, or offer as the other
@@ -323,6 +343,162 @@ def _filename_candidate(name):
     return _featured_name(text)
 
 
+def _filename_candidates(name):
+    """Every plausible creator name the filename offers, most specific
+    (leftmost) first -- the plural counterpart to `_filename_candidate`,
+    used only when `resolve` has a search to check candidates against (see
+    `_resolve_by_evidence`). Where `_filename_candidate` commits to the
+    FIRST dash segment alone, this offers every segment before the last one,
+    because a filename can name more than one thing before its title:
+    "<store> - <creator> - <title>" splits into three segments, and the
+    creator is the SECOND, not the first -- a real, measured case where
+    `_filename_candidate`'s single answer was the store, not the person who
+    made the clip.
+
+    The last segment is never a candidate -- it is read as the title, the
+    same convention `_filename_candidate` and every dash-delimited test in
+    this module already assume. Each of the segments before it is checked
+    against `_is_name` independently, so one that fails (a date, a
+    container word) does not stop a later one from still being offered --
+    unlike `_filename_candidate`, which gives up the instant its one segment
+    fails the guard.
+
+    No dash at all falls back to the single `feat`-guarded name
+    `_featured_name` finds, exactly as `_filename_candidate` does, since
+    there is only ever one such candidate to offer.
+    """
+    text = strip_ext(name or "").strip()
+    if not text:
+        return []
+    segments = _DASH_SPLIT_RE.split(text)
+    if len(segments) >= 2:
+        candidates = []
+        for segment in segments[:-1]:
+            cleaned = clean_folder(segment.strip())
+            if _is_name(cleaned):
+                candidates.append(cleaned)
+        return candidates
+    featured = _featured_name(text)
+    return [featured] if featured is not None else []
+
+
+# How many of a candidate's search results the catalogue must attribute to
+# that SAME name before the candidate is trusted -- see `_owner_support` and
+# `_resolve_by_evidence`. The two thresholds are unequal on purpose:
+#
+# * an EXACT match -- the owner's name, once spacing/case/punctuation are
+#   stripped, equals the candidate outright -- is trusted from a single
+#   supporting result. Nothing about an exact match is a guess.
+# * a PREFIX match -- the owner's name only EXTENDS the candidate ("Ivy"
+#   inside a store's own "Ivy Kingsley Waters") -- needs more than one
+#   supporting result, so a single mis-tagged or cross-store clip cannot
+#   manufacture an extended name that was never really filed under it.
+#
+# Measured on live data: querying the correct creator's name returned 19
+# results the adapter attributed to that same name (exact); querying the
+# wrong candidate (a store's own name, repeated in every filename) returned
+# 0. Neither number is close to a boundary, so these thresholds are a
+# reasonable floor rather than a value tuned to that one measurement.
+MIN_EXACT_SUPPORT = 1
+MIN_PREFIX_SUPPORT = 2
+
+
+def _owner_support(candidate, owner_names):
+    """How many of `owner_names` -- the owner `owners_of(candidate)` read off
+    each of the candidate's search results -- support `candidate`, split into
+    an EXACT count and a PREFIX count. See `MIN_EXACT_SUPPORT` for what each
+    means and why they differ.
+
+    Compared the same way `_same_name` compares two names -- spacing, case
+    and punctuation stripped -- so "Ivy Kingsley" from a filename and
+    "IvyKingsley" from a store's own field are the same owner. A blank owner
+    name (a result the adapter could not attribute to anyone) counts toward
+    neither: it is evidence about nobody, not evidence that the candidate is
+    wrong.
+    """
+    slug = spaceless(candidate)
+    exact = prefix = 0
+    for owner in owner_names:
+        owner_slug = spaceless(owner)
+        if not owner_slug:
+            continue
+        if owner_slug == slug:
+            exact += 1
+        elif owner_slug.startswith(slug):
+            prefix += 1
+    return exact, prefix
+
+
+def _is_supported(exact, prefix):
+    """True when a candidate's `_owner_support` clears the bar `resolve`
+    requires before trusting it -- see `MIN_EXACT_SUPPORT`."""
+    return exact >= MIN_EXACT_SUPPORT or prefix >= MIN_PREFIX_SUPPORT
+
+
+def _resolve_by_evidence(folder_text, name, owners_of):
+    """Resolve `folder_text`/`name` by checking each plausible candidate
+    against the catalogue, when more than one is on offer.
+
+    Builds the full candidate set -- `folder_text` itself, if it is a name,
+    then every segment `_filename_candidates` offers that is not already the
+    same name (by `_same_name`) as one already in the set -- folder first,
+    matching the priority `resolve` has always given it. With at most one
+    distinct candidate, there is nothing to check: it is the answer, exactly
+    as the search-free rule would give, and `owners_of` is never called --
+    the common, unambiguous file costs nothing extra. This is also why a
+    single-creator store (the store's own folder name IS the creator) still
+    resolves: there is only ever one candidate on offer, so it wins without
+    ever being questioned.
+
+    With two or more, each is asked of `owners_of(candidate)` -- a real
+    catalogue search -- and `_owner_support` counts how many of the results
+    the catalogue attributes to that same name. A candidate is SUPPORTED
+    when that count clears `_is_supported`'s bar.
+
+    Exactly one supported candidate wins; the runner-up -- the first other
+    candidate on offer, whichever source it came from -- is reported as
+    `competing`, never dropped (see `Resolution`'s docstring: a losing
+    candidate here is evidence the filing convention was not what was
+    assumed, not a tie to break by discarding one side).
+
+    Zero supported candidates and more than one both come back unresolved
+    (`None, None, None`) -- deliberately the SAME outcome, for two different
+    reasons. Zero: nothing in the catalogue backs any reading, which is the
+    existing "creator unresolved" mute path and correct. More than one: two
+    candidates are BOTH catalogue-confirmed, and picking between them by
+    whichever was checked first is exactly the ordering mistake this project
+    has already removed from candidate scoring, alias-key collisions and
+    (until now) this module's own folder-vs-filename default. Reporting
+    nothing is the cheap, visible failure `resolve`'s own docstring commits
+    to; this case is not distinguished further because it has not been
+    observed, only reasoned about -- see this task's report for that
+    caveat. Neither path ever falls back to a candidate's position in the
+    list.
+    """
+    candidates = []
+    if _is_name(folder_text):
+        candidates.append((folder_text, "folder"))
+    for segment in _filename_candidates(name):
+        if not any(_same_name(segment, existing) for existing, _ in candidates):
+            candidates.append((segment, "filename"))
+
+    if not candidates:
+        return None, None, None
+    if len(candidates) == 1:
+        resolved, source = candidates[0]
+        return resolved, source, None
+
+    supported = [(candidate_name, source) for candidate_name, source in candidates
+                 if _is_supported(*_owner_support(candidate_name, owners_of(candidate_name)))]
+    if len(supported) != 1:
+        return None, None, None
+
+    resolved, source = supported[0]
+    competing = next((candidate_name for candidate_name, _ in candidates
+                      if not _same_name(candidate_name, resolved)), None)
+    return resolved, source, competing
+
+
 def _alias_index(aliases):
     """`aliases` re-keyed by the normalised spaceless form of each key, with
     the wiring mistakes refused rather than resolved by luck.
@@ -457,7 +633,7 @@ def _alias_name(folder, aliases):
     return aliases.full_name(folder)
 
 
-def resolve(name, folder, aliases=None):
+def resolve(name, folder, aliases=None, *, owners_of=None):
     """Attribute the file `name` sitting in `folder` to a creator.
 
     `folder` is a folder *name* -- normally whatever `creator_folder`
@@ -473,45 +649,71 @@ def resolve(name, folder, aliases=None):
     rather than on an arbitrary file mid-run. The mapping is accepted because
     a single call has nothing to amortise and should not have to say so.
 
-    Tried in order: an alias on the folder, the folder itself, then the
-    filename. The folder beats the filename because someone chose to file
-    the video there; that is a more deliberate signal than a name typed into
-    a filename, which is as often the title, the site or the guest. Each
+    `owners_of`, when given, is a one-argument callable: `owners_of(name)`
+    runs a real catalogue search for `name` and returns the owner attributed
+    to each of its results (see `cronicled.scan.examine`, the caller that
+    builds one from the same `search` it already has). It is the ONLY thing
+    that can make this function issue a lookup, and it is asked at most once
+    per plausible candidate a file's folder and filename actually disagree
+    about -- see `_resolve_by_evidence`. Omitted (the default), `resolve`
+    stays exactly the pure function it always was: no lookup is possible, so
+    ambiguity falls back to the folder-wins default described below.
+
+    Tried in order: an alias on the folder, then -- with `owners_of` given --
+    whichever candidate the catalogue actually supports (see
+    `_resolve_by_evidence`), then the folder itself, then the filename. The
+    folder beats the filename by default because someone chose to file the
+    video there; that is a more deliberate signal than a name typed into a
+    filename, which is as often the title, the site or the guest. That
+    default is exactly what `owners_of` exists to override when it disagrees
+    with the catalogue: a folder that names a store rather than the person
+    who made the clip passes `_is_name` just as cleanly as the creator's own
+    name does, and nothing about the text alone tells the two apart. Each
     candidate has to survive `_is_name` (and, for a `feat` marker,
     `_featured_name`) or it is not a name at all.
 
     When the folder and the filename both name someone, and they are not the
     same person by `_same_name` (so "Velvet Crane" and "velvetcrane" agree,
-    while "Ivy" and "Ivy Kingsley Waters" do not), the folder wins and the
-    filename's name is returned in `competing`. When the folder yields text
-    that no guard will accept as a name, it is returned in `rejected_folder`.
+    while "Ivy" and "Ivy Kingsley Waters" do not), the winner's rival is
+    returned in `competing` -- the folder's rival when `owners_of` is absent
+    or only one candidate is on offer, or whichever plausible name actually
+    lost the evidence check otherwise. When the folder yields text that no
+    guard will accept as a name, it is returned in `rejected_folder` instead.
     Neither is ever silently dropped -- see `Resolution`.
 
     Returns a `Resolution`; all of its fields are None when nothing resolved
     and there was no folder to reject, which is a real answer and not an
-    error.
+    error -- and also the answer when `owners_of` found either no candidate
+    or more than one supported, on purpose; see `_resolve_by_evidence`.
     """
     folder_text = clean_folder(folder or "")
     from_filename = _filename_candidate(name)
+    folder_is_name = _is_name(folder_text)
 
     aliased = _alias_name(folder_text, aliases)
     if aliased is not None:
         resolved, source = aliased, "alias"
-    elif _is_name(folder_text):
+        competing = (from_filename if from_filename is not None
+                     and not _same_name(resolved, from_filename) else None)
+    elif owners_of is not None:
+        resolved, source, competing = _resolve_by_evidence(
+            folder_text, name, owners_of)
+    elif folder_is_name:
         resolved, source = folder_text, "folder"
+        competing = (from_filename if from_filename is not None
+                     and not _same_name(resolved, from_filename) else None)
     elif from_filename is not None:
-        resolved, source = from_filename, "filename"
+        resolved, source, competing = from_filename, "filename", None
     else:
-        resolved, source = None, None
+        resolved, source, competing = None, None, None
 
     # The folder had something to say and it was not used: say so, or the
-    # filename's answer looks unopposed when it is not.
+    # filename's answer looks unopposed when it is not. Not when the folder
+    # itself passed `_is_name`, though -- it competed and lost (either to the
+    # OLD unconditional folder-wins rule never applying, or, with
+    # `owners_of`, to a candidate the catalogue actually supported) rather
+    # than failing a guard, so it belongs in `competing`, not here.
     rejected_folder = folder_text or None
-    if source in ("folder", "alias"):
+    if source in ("folder", "alias") or folder_is_name:
         rejected_folder = None
-
-    competing = None
-    if (source != "filename" and from_filename is not None
-            and not _same_name(resolved, from_filename)):
-        competing = from_filename
     return Resolution(resolved, source, competing, rejected_folder)
