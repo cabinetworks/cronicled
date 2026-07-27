@@ -7,6 +7,7 @@ from contextlib import redirect_stdout
 from unittest.mock import patch
 
 from cronicled.__main__ import main
+from cronicled.jobs import JobRunner
 from cronicled.stash import Stash
 from cronicled.store import Store
 
@@ -125,6 +126,44 @@ class MainWiring(_Base):
         rows = captured.kwargs["rows"]()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].filename, "reel.mp4")
+
+
+class ScanWiring(_Base):
+    # The runner a request's `/scan` starts a job on has to outlive that
+    # request -- so it must be something `main()` builds once and hands to
+    # `actions`, not something a handler could construct per-request and
+    # lose the moment the connection closes.
+
+    def test_a_job_runner_reaches_actions(self):
+        self._seed()
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path])
+        self.assertIsInstance(captured.kwargs["actions"]._runner, JobRunner)
+
+    def test_the_same_runner_backs_the_actions_scan_status_callable(self):
+        self._seed()
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path])
+        actions = captured.kwargs["actions"]
+        # Bound-method equality: same underlying object and function, not
+        # merely the same behaviour by coincidence -- a `scan_status` that
+        # `main()` built fresh from a DIFFERENT runner would still equal
+        # this by return value alone, on an empty runner, without this
+        # checking they are the same object.
+        self.assertEqual(captured.kwargs["scan_status"], actions.scan_status)
+
+    def test_with_no_adapters_configured_the_adapter_is_none_not_a_crash(self):
+        # A fresh install (no config/adapters.json committed -- this repo's
+        # own working tree has none) is a legitimate state: the app must
+        # still start, with `Actions.scan` left to give its own clear
+        # refusal only once someone actually presses Scan.
+        self._seed()
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path])
+        self.assertIsNone(captured.kwargs["actions"]._adapter)
 
 
 if __name__ == "__main__":

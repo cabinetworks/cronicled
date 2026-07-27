@@ -1,10 +1,20 @@
 import re
 import unittest
 
+from cronicled.jobs import Job
 from cronicled.web.render import environment, render
 from cronicled.web.rows import to_row
 
 _HOSTILE = '<script>alert("x")</script>'
+
+
+def _job(**over):
+    job = dict(id="job-1", producer="library-scan-x", cost="scraping",
+               state="running", started_at="2026-07-27T00:00:00+00:00",
+               finished_at=None, message="working", recorded=0, skipped=0,
+               error=None, traceback=None)
+    job.update(over)
+    return Job(**job)
 
 
 def _row(runners_up=None, **over):
@@ -166,6 +176,58 @@ class ButtonWiring(unittest.TestCase):
         row = _row(state="applied", prior_state=None)
         self.assertFalse(row.undoable)
         self.assertEqual(self._controls(row), [])
+
+
+class ScanStatusEscaping(unittest.TestCase):
+    # A job's `message` carries file names -- attacker-influenceable text,
+    # the same reason a row's fields are escaped. This is the same backstop
+    # `Autoescaping` runs for row fields, aimed at the one new field this
+    # ticket adds to the page.
+
+    def test_the_scan_messages_hostile_content_is_escaped(self):
+        html = render("inbox.html", rows=[], counts={},
+                      scan=_job(message=_HOSTILE))
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+    def test_a_failed_scans_error_is_escaped_too(self):
+        html = render("inbox.html", rows=[], counts={},
+                      scan=_job(state="failed", error=_HOSTILE))
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+
+class ScanControlWiring(unittest.TestCase):
+    """The Scan control, pinned as a whole rather than by substring: the
+    form's method, action, the visible number input's name, and the button
+    -- the same reason `ButtonWiring` pins a row's controls as a whole set
+    rather than sampling one field, so a control silently losing its
+    `limit` field (falling back to whatever the code path does with none)
+    is caught here rather than by a containment check on unrelated text."""
+
+    _FORM_RE = re.compile(
+        r'<form method="post" action="/scan">'
+        r'<label>[^<]*<input type="number" name="limit" '
+        r'value="(?P<value>[^"]*)" min="0"></label> <button>(?P<label>[^<]+)'
+        r'</button></form>')
+
+    def test_the_scan_control_offers_exactly_one_limited_start_button(self):
+        html = render("inbox.html", rows=[], counts={}, scan=None,
+                      scan_default_limit=25)
+        matches = self._FORM_RE.findall(html)
+        self.assertEqual(len(matches), 1)
+        value, label = matches[0]
+        self.assertEqual(value, "25")
+        self.assertEqual(label, "Scan")
+
+    def test_the_control_still_appears_while_a_scan_is_running(self):
+        # A busy runner is refused when the form is POSTed (see
+        # `tests/test_web_app.py`'s `ScanControl`) -- it is not hidden here,
+        # so pressing it while one runs is a visible refusal, not a control
+        # that silently vanished.
+        html = render("inbox.html", rows=[], counts={},
+                      scan=_job(state="running"), scan_default_limit=25)
+        self.assertEqual(len(self._FORM_RE.findall(html)), 1)
 
 
 if __name__ == "__main__":

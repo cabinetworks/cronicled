@@ -1,5 +1,8 @@
 {# cronicled/web/templates/inbox.html #}
 <h1>Inbox</h1>
+{% if scan and scan.state == 'running' %}
+<meta http-equiv="refresh" content="3">
+{% endif %}
 {% if not rows %}
 <p>Nothing waiting. Proposals appear here after a scan.</p>
 {% endif %}
@@ -31,3 +34,10 @@
   {% endif %}
   {% endfor %}
 </table>
+
+<h2>Scan</h2>
+{% if scan %}
+<p>Scan {{ scan.id }}: {{ scan.state }} -- {{ scan.message }}</p>
+<p>recorded {{ scan.recorded }}, skipped {{ scan.skipped }}{% if scan.state == 'failed' %} -- FAILED: {{ scan.error }}{% endif %}</p>
+{% endif %}
+<form method="post" action="/scan"><label>Files to look at (each spends one lookup against the configured scraper, and files already proposed or muted don't count against this): <input type="number" name="limit" value="{{ scan_default_limit }}" min="0"></label> <button>Scan</button></form>
