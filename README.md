@@ -148,13 +148,13 @@ Every push to the default branch publishes a multi-architecture image to
 docker pull ghcr.io/cabinetworks/cronicled:<commit-sha>
 ```
 
-**There is no `latest` tag, and its absence is deliberate.** The image's
-default command now serves an unauthenticated page whose buttons write to a
-library — `latest` is read as "the one you want", and nobody who reaches for
-it expects the version running to have changed since they last checked, with
-no version number in the reference to say so. A commit SHA or a released
-version makes no such promise. [The container page](docs/container.md) has
-the tagging scheme and the mounts.
+**`latest` follows the default branch and is published.** It names the newest
+build of that branch, not a reviewed release, and it moves under anyone who
+pulls it — while what it starts is an unauthenticated page whose buttons write
+to a library. A commit SHA or a released version makes no such promise, and
+both are still published; a release tag deliberately does not move `latest`.
+[The container page](docs/container.md) has the tagging scheme and the
+mounts.
 
 ## License
 

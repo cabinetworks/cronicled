@@ -93,10 +93,16 @@ class TagScript(unittest.TestCase):
             line.split("=", 1) for line in written.splitlines() if "=" in line)
         return proc, outputs
 
-    def test_a_push_to_the_default_branch_tags_only_the_commit(self):
+    def test_a_push_to_the_default_branch_tags_the_commit_and_latest(self):
+        # Asserted as the WHOLE tag list rather than by checking `latest` is
+        # somewhere in it: this output is the exact argument the push step
+        # takes, so a tag gained or lost is the defect worth catching, and a
+        # containment check cannot see either.
         proc, outputs = self._run("refs/heads/main", sha="a" * 40)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(outputs["tags"], "%s:%s" % (REGISTRY_IMAGE, "a" * 40))
+        self.assertEqual(
+            outputs["tags"],
+            "%s:%s,%s:latest" % (REGISTRY_IMAGE, "a" * 40, REGISTRY_IMAGE))
 
     def test_a_release_tag_adds_the_declared_version(self):
         proc, outputs = self._run("refs/tags/v" + self.declared_version,
@@ -107,17 +113,25 @@ class TagScript(unittest.TestCase):
             "%s:%s,%s:%s" % (REGISTRY_IMAGE, "b" * 40,
                              REGISTRY_IMAGE, self.declared_version))
 
-    def test_no_latest_tag_is_ever_produced(self):
-        # The whole point of the ticket. Someone who finds this image on the
-        # registry has none of the README's context; `latest` would tell them
-        # it is the build they want, and it is a program that exits at once.
-        for ref in ("refs/heads/main", "refs/tags/v" + self.declared_version):
-            with self.subTest(ref=ref):
-                _, outputs = self._run(ref)
-                produced = outputs["tags"].split(",")
-                self.assertTrue(produced)
-                for tag in produced:
-                    self.assertNotEqual(tag.rsplit(":", 1)[1], "latest")
+    def test_a_release_tag_does_not_move_latest(self):
+        # The one way this tag can mislead beyond its ordinary imprecision.
+        # Releases are not necessarily cut in order: tagging an older but
+        # still-supported version would drag `latest` backwards onto it, so
+        # someone pulling `latest` would silently DOWNGRADE. `latest` follows
+        # the default branch and nothing else.
+        _, outputs = self._run("refs/tags/v" + self.declared_version)
+        produced = outputs["tags"].split(",")
+        self.assertTrue(produced)
+        for tag in produced:
+            self.assertNotEqual(tag.rsplit(":", 1)[1], "latest")
+
+    def test_a_push_to_a_non_default_branch_does_not_move_latest(self):
+        # The publish job's `if:` gate should already stop this job running at
+        # all off the default branch; this pins the tag script's own half of
+        # that, so `latest` cannot follow a branch even if the gate widens.
+        _, outputs = self._run("refs/heads/some-feature-branch")
+        for tag in outputs["tags"].split(","):
+            self.assertNotEqual(tag.rsplit(":", 1)[1], "latest")
 
     def test_a_tag_that_disagrees_with_the_declared_version_publishes_nothing(self):
         # Not a tie to break by preferring one of the two: an image labelled
@@ -431,9 +445,21 @@ class PublishedImageDocumented(unittest.TestCase):
     def test_the_readme_names_the_published_image(self):
         self.assertIn(REGISTRY_IMAGE, self.readme)
 
-    def test_the_readme_records_that_there_is_no_latest_tag(self):
-        # Otherwise the omission looks like an oversight and gets "fixed".
-        self.assertRegex(self.readme, r"no\s+`?latest`?\s+tag")
+    def test_the_readme_says_what_latest_actually_means(self):
+        # `latest` is published now, so the claim this guarded is gone. What
+        # replaces it is narrower and worth pinning for the same reason the
+        # absence was: a moving tag on an image whose default command serves
+        # an unauthenticated page that writes to a library is a fact someone
+        # deserves before they pull it, and prose that quietly loses it reads
+        # exactly like prose that never had it.
+        self.assertRegex(self.readme, r"`latest`.{0,80}default branch",
+                         re.S)
+        self.assertRegex(self.readme, r"moves under anyone who\s+pulls it",
+                         re.S)
+        # And still points at the pinnable alternatives, so the moving tag is
+        # never the only option a reader is shown.
+        self.assertRegex(self.readme, r"commit SHA or a released\s+version",
+                         re.S)
 
 
 if __name__ == "__main__":
