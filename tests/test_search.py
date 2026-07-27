@@ -147,6 +147,27 @@ class CatalogSearchDeduplication(unittest.TestCase):
 
         self.assertEqual(results, [same_scene])
 
+    def test_a_row_differing_only_in_image_is_still_a_duplicate(self):
+        # HARM: two candidates with the same title, urls and code but a
+        # byte-different cover image score identically, and the scorer's
+        # ambiguity rule refuses when the top two sit within a small margin.
+        # A duplicated winner manufactures a tie out of a file that had
+        # exactly one good answer -- a refusal produced by which cover
+        # encoding a re-scrape happened to return, not by real doubt.
+        adapter = _Adapter("scraper-alpha", CENSORSHIP)
+        first = row("Nightfall Errand", "https://example.invalid/clip/x")
+        first["image"] = "data:image/jpeg;base64,AAAA"
+        second = dict(first)
+        second["image"] = "data:image/jpeg;base64,ZZZZ"
+        stash = _SpyStash({
+            ("scraper-alpha", CREATOR): [first],
+            ("scraper-alpha", "k3strel hollow"): [second],
+        })
+
+        results = catalog_search(stash, adapter)(CREATOR)
+
+        self.assertEqual(results, [first])
+
     def test_genuinely_different_rows_are_both_kept(self):
         adapter = _Adapter("scraper-alpha", CENSORSHIP)
         a = row("Nightfall Errand", "https://example.invalid/clip/a")

@@ -50,20 +50,23 @@ def catalog_search(stash, adapter):
     genuine winner into an "ambiguous: X vs X" refusal, an artefact of how
     the query happened to be phrased rather than evidence about the file.
 
-    Deduplication is by exact equality of the whole row: a real duplicate
-    comes back byte-identical, because it is the same scraped page read
-    twice. A row that merely resembles another is kept as a distinct
-    candidate rather than folded into it — collapsing two rows that are not
-    provably the same scene would be a guess this project does not make
-    elsewhere (see `_query_key` in `cronicled.scan`, which folds only case
-    and whitespace for the same reason). The accepted cost of the stricter
-    rule: a scraper that reorders a nested list (`tags`, `performers`)
-    between two otherwise-identical answers is not deduplicated, and a
-    genuine duplicate survives into the candidate list once per spelling
-    that found it. That costs the ambiguity margin `scoring.decide` enforces,
-    which is the same failure this function exists to avoid — but never
-    wrongly merges two different scenes, which is the worse of the two ways
-    to be wrong.
+    Deduplication is by the fields that IDENTIFY a scene — `urls`, the
+    source's own remote id, and `title` — not by equality of the whole row;
+    see `_dedup_key` for why, and for the measurement that shows a
+    byte-different `image` (two encodings of the same cover) is the real
+    shape this has to survive. A row that merely resembles another on those
+    fields is kept as a distinct candidate rather than folded into it —
+    collapsing two rows that are not provably the same scene would be a
+    guess this project does not make elsewhere (see `_query_key` in
+    `cronicled.scan`, which folds only case and whitespace for the same
+    reason). The accepted cost of the narrower identity: a scraper that
+    reorders a nested list (`tags`, `performers`) between two answers whose
+    `urls`/`code`/`title` agree IS now deduplicated (an improvement over
+    comparing the whole row), but two rows that share those identity fields
+    while genuinely describing different content — a re-cut sharing a
+    studio's scene code, say — would be wrongly folded into one. That is a
+    real, accepted trade against the previous rule's opposite failure, not a
+    case this module has evidence for either way.
 
     Returns a fresh list on every call. `examine` indexes into what `search`
     returns to build its runners-up list, and a list this function kept a
@@ -95,16 +98,38 @@ def catalog_search(stash, adapter):
 
 
 def _dedup_key(row):
-    """A hashable fingerprint of one candidate row's whole content.
+    """A hashable fingerprint of what IDENTIFIES a candidate scene, not of
+    the row's whole content.
+
+    Three fields, deliberately: `urls` and `code` (the source's own remote
+    id for the scene — see `Stash.scene_existing`'s docstring, which reads
+    the same field for the same reason) each independently pin the row to
+    one real scene, and `title` is included alongside them for a row from a
+    source that supplies neither. Everything else — `image` chief among it —
+    is excluded on purpose.
+
+    This was measured, not assumed: a live search returned 36 candidates
+    carrying only 24 distinct titles, identical in every field except
+    `image`, which held two different base64 encodings of the SAME cover.
+    Comparing the whole row (the previous rule) treated those as different
+    candidates, so the same scene reached `scoring.decide` twice under one
+    title — manufacturing a tie out of a file that had exactly one good
+    answer, an "ambiguous: X vs X" refusal produced by a duplicate rather
+    than by real doubt about the file (see `catalog_search`'s docstring).
+    `image` is exactly the kind of field a re-scrape re-encodes byte-for-byte
+    differently without the scene itself having changed, so keying on it is
+    how a duplicate escapes deduplication in the first place.
 
     `json.dumps(..., sort_keys=True)` rather than `repr`: `sort_keys` is a
     documented guarantee that the same mapping produces the same string
     regardless of insertion order, which is exactly "the same content", not
     "the same object" — `repr` of a dict carries no such guarantee across
-    Python versions or construction paths. No `default=`: a row this
+    Python versions or construction paths. No `default=`: a value here this
     method cannot serialise is a shape `scrapeSingleScene` was not expected
     to return, and that is a wiring or schema mistake worth raising on, not
     one to paper over with a stringified fallback that might just as easily
     hide two rows silently colliding on the same fallback text.
     """
-    return json.dumps(row, sort_keys=True)
+    identity = {"urls": row.get("urls"), "code": row.get("code"),
+                "title": row.get("title")}
+    return json.dumps(identity, sort_keys=True)
