@@ -3,16 +3,19 @@
 This page describes what the package is made of and how the pieces fit
 together. It is deliberately explicit about a distinction the diagrams below
 would otherwise blur: **everything in the first three diagrams exists in the
-repository today; everything in the fourth does not.**
+repository today; the fourth mixes what exists with the one thing that
+still does not.**
 
-There is no inbox of proposed changes, nothing that applies one, and no entry
-point that runs any of this continuously. What exists is library code, called
-directly — including by the tests, which are currently its only caller.
+There is now an inbox of proposed changes, an entry point that serves it, and
+an approval gate: `python -m cronicled` serves what the store holds, and
+nothing writes to the media server except through an explicit approve or
+undo. What does not exist is anything that runs unattended.
 
-A scheduler is part of that library code: it resolves each producer's cadence,
+A scheduler is part of the library code: it resolves each producer's cadence,
 decides what is due, runs it and records the run. What does not exist is a
-process that constructs one. A scheduler nobody starts is a component, not a
-service, and the fourth diagram is drawn around that distinction.
+process that constructs one and calls it on a timer. A scheduler nobody starts
+is a component, not a service, and the fourth diagram is drawn around that one
+remaining gap.
 
 ## The module map
 
@@ -225,46 +228,50 @@ kill wherever it has got to.
 
 ## The service that does not exist yet
 
-Everything below is **planned**. None of it is in the repository. It is drawn
-separately, rather than as part of the diagrams above, precisely because a
-single picture of the whole intended system would read as a description of what
-is built.
+Only one node below is **planned**. Everything else in this diagram now has
+code behind it — it is drawn separately from the three above only because it
+carries the one node that does not exist, and mixing a planned node into a
+diagram of what is built is how a picture starts claiming more than the prose
+does.
 
 ```mermaid
 flowchart TD
-    entry["PLANNED: a long-running entry point<br/>nothing constructs a scheduler today"]
+    entry["BUILT: `python -m cronicled`<br/>serves the inbox; constructs no scheduler"]
     sched["BUILT: Scheduler decides what is due,<br/>runs it, and records the run"]
+    unattended{"PLANNED: something calls the scheduler on its own"}
     built["BUILT: JobRunner drives the producer,<br/>Store records each proposal as it is yielded"]
-    inbox["PLANNED: an inbox — somewhere a person sees what was proposed"]
-    gate{"PLANNED: approval<br/>no write happens without one"}
-    apply["PLANNED: the caller that applies an approved proposal<br/>Stash.apply_scene and revert_scene themselves are built"]
+    inbox["BUILT: the inbox — a person sees what was proposed"]
+    gate{"BUILT: approval<br/>no write happens without one"}
+    apply["BUILT: Actions.approve calls Stash.apply_scene;<br/>Actions.undo calls Stash.revert_scene"]
 
-    entry --> sched
-    sched -- "starts a job when a producer is due" --> built
-    built -- "PLANNED: something reads the store back" --> inbox
+    unattended -. "would start a job when a producer is due" .-> sched
+    sched --> built
+    built -- "the store now holds a proposal" --> inbox
+    entry --> inbox
     inbox --> gate
     gate -- "approved" --> apply
     gate -- "dismissed" --> inbox
 
     classDef planned stroke-dasharray:6 4
     classDef built stroke-width:3px
-    class entry,inbox,gate,apply planned
-    class sched,built built
+    class unattended planned
+    class entry,sched,built,inbox,gate,apply built
 ```
 
-Two nodes in that diagram are solid, and they are the only ones that exist: the
-scheduler, and the runner with the store behind it. Everything reaching the
-scheduler, and everything leading away from the runner, is a label starting with
-`PLANNED:` and has no code behind it.
+One node in that diagram is dashed, and it is the only one that does not exist:
+whatever would call the scheduler without a person asking. Everything else —
+the entry point, the inbox, the approval gate, and the caller that applies or
+reverts a scene — is built and tested.
 
-The scheduler being solid is worth reading carefully. It decides what is due and
-starts it, and it is tested doing so — but the arrow *into* it is planned, which
-is the whole point: nothing constructs a scheduler, so nothing ever calls the
-code that would run producers unattended. The built nodes show where the planned
-parts would attach, not that the surrounding machinery is half-finished.
+The scheduler being solid is worth reading carefully, because it predates this
+diagram's rewrite. It decides what is due and starts it, and it is tested doing
+so — but the arrow *into* it is still planned, which is the whole point:
+nothing constructs a scheduler, so nothing ever calls the code that would run
+producers unattended. `python -m cronicled` does not close that gap; it serves
+the inbox and answers a person's clicks, and starts no timer of its own.
 
-The store already keeps the *record* an inbox would read — proposals, their
-states, dismissals and mutes — and the media-server client already knows how to
-apply a scene and how to revert one. What is missing is everything that decides
-*when* to run, everything that shows a person the result, and the approval that
-must sit between the two.
+The store already keeps the record an inbox reads — proposals, their states,
+dismissals and mutes — and the inbox now reads it: a person sees each
+proposal, approves, dismisses, mutes or undoes it, and nothing is written to
+the media server except through that approval. What is missing is only the
+part that would decide *when* to run a scan without someone asking first.

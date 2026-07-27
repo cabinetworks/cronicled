@@ -78,8 +78,8 @@ jobs:
   # it will be published, so a broken page or a dead internal link fails here
   # rather than on a deploy nobody is watching. mkdocs-material comes from the
   # `docs` dependency group and from nowhere else: the project's runtime
-  # dependencies stay empty, and neither the `test` job above nor the image
-  # installs any of this.
+  # dependencies stay exactly Jinja2, and neither the `test` job above nor the
+  # image installs any of this.
   docs:
     needs: guard
     runs-on: ubuntu-latest
