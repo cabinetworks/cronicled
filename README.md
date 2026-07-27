@@ -15,7 +15,11 @@ this.** The scheduler knows what is due and can run it; nothing constructs a
 scheduler. The pieces above are library code, called directly (including by
 tests); nothing here watches a library or writes to it on its own.
 
-Zero runtime dependencies: Python standard library only.
+One runtime dependency: Jinja2, for autoescaped HTML. Everything else is the
+Python standard library. The inbox renders text the project did not write —
+filenames from disk, titles from a scraper — and autoescaping makes escaping a
+property of the renderer rather than something a person must remember at every
+interpolation.
 
 ## Status
 
@@ -33,13 +37,19 @@ describing what is built, on the
 
 ## Quickstart
 
-The runtime version is pinned in [`.python-version`](.python-version). There
-are no runtime dependencies, so a checkout runs its own tests with nothing
-installed beyond a matching Python:
+The runtime version is pinned in [`.python-version`](.python-version). The
+project takes one runtime dependency (Jinja2 — see above), so a checkout
+installs it before running the suite:
 
 ```sh
+pip install -e .
 python3 -m unittest discover -s tests -t . -v
 ```
+
+No test in this tree imports Jinja2 directly yet — the inbox that renders
+with it is a later task — but installing the project pulls in whatever
+`pyproject.toml` declares, so this is the honest instruction regardless of
+which tests happen to exercise it today.
 
 There is no entry point to run yet. The container's default command is a
 self-check that proves the pinned interpreter can import and run the package;

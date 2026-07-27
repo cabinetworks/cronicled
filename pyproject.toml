@@ -5,12 +5,14 @@ description = "An always-on companion for a self-hosted media library."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "jinja2>=3.1",
+]
 
 # Documentation tooling ONLY. This is a dependency GROUP, not a dependency:
-# `dependencies` above stays empty, nothing here is installed by `uv run` or by
-# the container build, and the test suite still runs on a bare interpreter with
-# none of it present. Build the site with `uv run --group docs mkdocs build`.
+# `dependencies` above stays exactly Jinja2, nothing here is installed by
+# `uv run` or by the container build, and the test suite still runs with none
+# of it present. Build the site with `uv run --group docs mkdocs build`.
 [dependency-groups]
 docs = [
     "mkdocs-material>=9.5",

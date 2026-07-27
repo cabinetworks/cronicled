@@ -7,26 +7,30 @@ and CI both read. That file is the only place it is declared.
 
 ## Running the tests
 
-The project has zero runtime dependencies — standard library only — so a local
-checkout runs with nothing installed beyond a matching Python:
+The project takes one runtime dependency, Jinja2, for autoescaped rendering.
+Everything else is the standard library, and a local checkout installs that
+one dependency before running the suite:
 
 ```sh
+pip install -e .
 python3 -m unittest discover -s tests -t . -v
 ```
 
 Development and CI drive the suite through [uv](https://docs.astral.sh/uv/)
-instead, which reads the pinned version out of `.python-version` automatically
-and supplies that exact interpreter regardless of what else is on `PATH`:
+instead, which reads the pinned version out of `.python-version` automatically,
+supplies that exact interpreter regardless of what else is on `PATH`, and
+installs the one declared dependency itself:
 
 ```sh
 uv run python -m unittest discover -s tests -t . -v
 ```
 
 uv is a development and CI convenience only — it is not a project dependency.
-`pyproject.toml` declares no runtime dependencies, and the container image
-ships without uv installed in it: the command above still works for anyone
-without uv, on any interpreter meeting the `requires-python` constraint,
-because the project must never require a tool to run its own tests.
+`pyproject.toml` declares exactly one runtime dependency, Jinja2, and the
+container image installs that dependency itself rather than shipping uv: the
+commands above still work for anyone without uv, on any interpreter meeting
+the `requires-python` constraint, because the project must never require a
+tool other than its one declared dependency to run its own tests.
 
 The same holds for the documentation site. `mkdocs-material` lives in a
 `docs` dependency group, which nothing else installs:

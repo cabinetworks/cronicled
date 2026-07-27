@@ -119,6 +119,9 @@ wheels = [
 name = "cronicled"
 version = "0.1.0"
 source = { editable = "." }
+dependencies = [
+    { name = "jinja2" },
+]
 
 [package.dev-dependencies]
 docs = [
@@ -126,6 +129,7 @@ docs = [
 ]
 
 [package.metadata]
+requires-dist = [{ name = "jinja2", specifier = ">=3.1" }]
 
 [package.metadata.requires-dev]
 docs = [{ name = "mkdocs-material", specifier = ">=9.5" }]

@@ -14,8 +14,11 @@ LABEL org.opencontainers.image.title="cronicled" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.description="A pinned, reproducible runtime for a library that has no entry point yet. There is no service in this image: its default command imports the package, exercises a handful of pure functions, prints one line and exits. It is a way to run this project's code on the interpreter the project declares, not a way to run the tool."
 
-# No runtime dependencies by design: the standard library only. There is
-# deliberately no pip install step here.
+# One runtime dependency, pinned exactly so the image stays a function of its
+# inputs rather than of the day it was built. An unpinned install here would
+# quietly end this image's reproducibility.
+RUN pip install --no-cache-dir "jinja2==3.1.4"
+
 WORKDIR /app
 COPY cronicled/ ./cronicled/
 

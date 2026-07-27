@@ -224,8 +224,9 @@ class TheDocsBuildRunsOnEveryCommit(unittest.TestCase):
         self.assertRegex(
             self.ci, r"uv run --frozen --group docs mkdocs build --strict",
             "the site must build from the `docs` dependency group (so the "
-            "project's runtime dependencies stay empty) and with --strict "
-            "(so a dead internal link fails here rather than shipping)")
+            "project's runtime dependencies stay exactly Jinja2, nothing "
+            "more) and with --strict (so a dead internal link fails here "
+            "rather than shipping)")
 
     def test_both_site_jobs_run_only_after_the_guard(self):
         # Nothing reaches the open internet without ./scripts/check_leaks

@@ -52,6 +52,13 @@ class RuntimePin(unittest.TestCase):
         self.assertNotRegex(body, r"\bPython\s+3\.\d+\b")
 
 
+# Exactly one runtime dependency is permitted, and it is here for one reason:
+# the inbox renders scraped text, and Jinja2's autoescaping makes escaping
+# structural instead of remembered. Anything else is an architectural change
+# that should be argued for, not slipped in.
+_ALLOWED_DEPENDENCIES = ("jinja2",)
+
+
 class ProjectMetadata(unittest.TestCase):
     """pyproject.toml necessarily restates the Python version, so it joins the set
     of copies that must be kept honest by a test rather than by memory."""
@@ -65,14 +72,26 @@ class ProjectMetadata(unittest.TestCase):
         self.assertIsNotNone(m, "pyproject.toml must declare requires-python")
         self.assertEqual(m.group(1), _declared())
 
-    def test_declares_no_runtime_dependencies(self):
-        # the whole point of the project: it runs with an interpreter and nothing
-        # else. A runtime dependency here would be a real architectural change.
+    def test_declares_only_the_permitted_runtime_dependencies(self):
         m = re.search(r"^dependencies\s*=\s*\[(.*?)\]", self._pyproject(),
                       re.S | re.M)
         self.assertIsNotNone(m, "pyproject.toml must declare dependencies")
-        self.assertEqual(m.group(1).strip(), "",
-                         "runtime dependencies are not permitted")
+        declared = re.findall(r'"([^"]+)"', m.group(1))
+        names = [re.split(r"[<>=!~\[ ]", d)[0].strip().lower() for d in declared]
+        # Asserted as a whole list, not with assertIn: sampling the names would
+        # let an added dependency through, which is precisely what this guards.
+        self.assertEqual(names, list(_ALLOWED_DEPENDENCIES),
+                         "only %s may be a runtime dependency"
+                         % ", ".join(_ALLOWED_DEPENDENCIES))
+
+    def test_the_permitted_dependency_is_pinned_to_a_floor(self):
+        # An unbounded requirement makes the image a function of the day it was
+        # built rather than of its inputs.
+        m = re.search(r"^dependencies\s*=\s*\[(.*?)\]", self._pyproject(),
+                      re.S | re.M)
+        for dep in re.findall(r'"([^"]+)"', m.group(1)):
+            self.assertRegex(dep, r"[><=~]=?\s*\d",
+                             "%r must carry a version constraint" % dep)
 
     def test_the_image_does_not_install_uv(self):
         # uv is a development tool; putting it in the runtime image would add a
