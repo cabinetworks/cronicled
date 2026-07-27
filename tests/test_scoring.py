@@ -2,7 +2,8 @@
 the tests here state the wrong match each rule prevents."""
 import unittest
 
-from cronicled.scoring import DEFAULT_THRESHOLD, Match, decide, meaningful_tokens, score
+from cronicled.scoring import (
+    DEFAULT_THRESHOLD, Decision, Match, decide, meaningful_tokens, score)
 
 
 class MeaningfulTokens(unittest.TestCase):
@@ -372,6 +373,103 @@ class Deciding(unittest.TestCase):
         # generic-word rule, so a malformed candidate failed OPEN
         with self.assertRaises((TypeError, ValueError)):
             decide([Match(value=0.9, contained=False)])
+
+    def test_a_decision_says_how_many_candidates_competed(self):
+        # Refusals arrive as match=None and mean opposite things. "Nothing
+        # cleared the bar" is consistent with the source listing no entry for
+        # the file at all; "two cleared it and I cannot say which" is the
+        # opposite -- entries that look like this file are RIGHT THERE. A
+        # consumer that treats a refusal as evidence of absence
+        # (stashbox.listing_verdict) has to tell them apart, and the only
+        # thing that currently distinguishes them is the wording of `reason`.
+        # scan.py already refuses to read a fact off that prose, for the
+        # reason stated there: the wording is free to change and nothing would
+        # notice. So the count is carried as a number.
+        self.assertEqual(decide([]).contenders, 0)
+        self.assertEqual(decide([self._m(0.4)]).contenders, 0)
+        self.assertEqual(decide([self._m(0.9, meaningful_count=0)]).contenders, 0)
+        self.assertEqual(decide([self._m(0.7, meaningful_count=1)]).contenders, 0)
+        # refused as ambiguous -- both cleared the bar
+        self.assertEqual(decide([self._m(0.80), self._m(0.78)]).contenders, 2)
+        # a winner, and the loser it beat by more than the margin. The count
+        # is of candidates that COMPETED, not of the one that won, so a
+        # decision that names a winner still reports both.
+        self.assertEqual(decide([self._m(0.9), self._m(0.2)]).contenders, 1)
+        self.assertEqual(
+            decide([self._m(0.9), self._m(0.75), self._m(0.2)]).contenders, 2)
+
+    def test_a_decision_says_whether_the_candidates_were_interrogated(self):
+        # `contenders == 0` is returned for four different refusals and only
+        # one of them is evidence about the source's listing. Two of the
+        # others never weighed a single candidate title: the caller offered
+        # nothing, or the filename carried no word that is not the artist's
+        # or generic --
+        # which `_is_eligible` bars at ANY score, so no title was ever
+        # compared. A consumer reading only `contenders` cannot tell those
+        # from "500 entries were checked and none is close", and would report
+        # a fabricated absence over a listing it never questioned.
+        self.assertFalse(decide([]).interrogated, "the caller asked nothing")
+        self.assertFalse(
+            decide([self._m(0.9, meaningful_count=0)]).interrogated,
+            "there was nothing to ask with")
+        # No score and no containment CLAIM buys a look either, and the order
+        # matters for the same reason it does in `_is_eligible`: the zero is
+        # checked before anything that could excuse it. A containment flag on
+        # a candidate with no meaningful token is barred there at any score,
+        # so it was never weighed here -- and letting it vouch for a look
+        # would be a guard skipped by a value that reads as extra confidence.
+        self.assertFalse(
+            decide([self._m(1.0, contained=True,
+                            meaningful_count=0)]).interrogated)
+
+        # BOTH sides of the boundary. meaningful_count=1 is a real
+        # interrogation -- the token was compared against every title and fell
+        # short of a bar a higher score would have cleared -- and a guard
+        # drifting to `> 1` would silently stop licensing an absence for every
+        # one-word filename. That direction is as wrong as the loose one and
+        # much quieter.
+        self.assertTrue(
+            decide([self._m(0.7, meaningful_count=1)]).interrogated)
+        self.assertTrue(decide([self._m(0.4)]).interrogated)
+        self.assertTrue(decide([self._m(0.80), self._m(0.78)]).interrogated)
+        self.assertTrue(decide([self._m(0.9)]).interrogated)
+
+    def test_one_candidate_without_evidence_withholds_the_whole_claim(self):
+        # `meaningful_count` comes from the name, the folder and the artist,
+        # never from the candidate title, so every entry of a list built for
+        # one file carries the same one. A list where they DIFFER is a caller
+        # pooling candidates scored for different files, and no reading of it
+        # supports an absence -- so `all`, not `any`. Uncertainty may withhold
+        # evidence, never supply it.
+        #
+        # Asserted on every branch that builds a Decision, because the field
+        # is only consulted on one of them: an inconsistent value on the
+        # others is invisible downstream and would be free to drift.
+        mixed = [self._m(0.9), self._m(0.5, meaningful_count=0)]
+        self.assertFalse(decide(mixed).interrogated)
+        self.assertIsNotNone(decide(mixed).match, "a winner was still picked")
+        self.assertFalse(
+            decide([self._m(0.80), self._m(0.78),
+                    self._m(0.5, meaningful_count=0)]).interrogated)
+        self.assertFalse(
+            decide([self._m(0.4), self._m(0.5, meaningful_count=0)]).interrogated)
+
+    def test_a_missing_contender_count_raises(self):
+        # Same shape as the meaningful_count guard above, and the same reason:
+        # 0 is not a neutral default here, it is precisely the value that
+        # licenses a downstream absence claim. A Decision assembled without
+        # one must fail loudly rather than assert "nothing competed".
+        with self.assertRaises(TypeError):
+            Decision(match=None, index=None, reason="nothing above the threshold",
+                     interrogated=True)
+
+    def test_a_missing_interrogation_flag_raises(self):
+        # The other half of the same licence, and the same asymmetry: True is
+        # the value that lets an absence be claimed, so a Decision assembled
+        # without one must fail rather than assert that a look happened.
+        with self.assertRaises(TypeError):
+            Decision(match=None, index=None, reason="nothing above the threshold",
+                     contenders=0)
 
 
 class TheDefaultThresholdIsTheMeasuredOne(unittest.TestCase):
