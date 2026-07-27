@@ -92,6 +92,22 @@ class RowContent(unittest.TestCase):
             [(r["title"], r["score"]) for r in row.runners_up],
             [("The Lantern", 0.61), ("Winter Echoes", 0.55)])
 
+    def test_a_malformed_runner_up_raises_rather_than_rendering_blank(self):
+        # The pressure here is to "harden" this with .get(..., "") the next
+        # time something malformed turns up. That would not be safer: a
+        # runner-up with a blank title renders as an empty entry in the "also
+        # considered" column, and a column that looks empty reads as "nothing
+        # else was close" — the reassuring reading, and the one that gets a row
+        # approved. The same silent-blank failure this normalisation exists to
+        # prevent, arrived at from the other direction. A malformed entry is a
+        # wiring error and must propagate, which is `scan.py`'s stated policy
+        # for a malformed candidate too.
+        with self.assertRaises(KeyError):
+            to_row(_item(payload={"runners_up": [{"score": 0.61}]}))
+        with self.assertRaises(KeyError):
+            to_row(_item(payload={
+                "runners_up": [{"candidate": {"title": "The Lantern"}}]}))
+
     def test_no_rivals_is_a_normal_empty_list_not_an_error(self):
         # A proposal with nothing else in contention is the common case,
         # not a malformed one.
