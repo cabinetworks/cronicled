@@ -1,6 +1,6 @@
 import unittest
 
-from cronicled.web.actions import Actions, UnknownProposal
+from cronicled.web.actions import Actions, ApplyFailed, UnknownProposal
 
 
 class _FakeStash:
@@ -75,7 +75,8 @@ class Approve(unittest.TestCase):
         # happened, and revert_scene would then restore a snapshot that does
         # not describe anything.
         store, stash = _FakeStore(_item()), _FakeStash(fail=True)
-        Actions(store, stash).approve("fp-1")
+        with self.assertRaises(ApplyFailed):
+            Actions(store, stash).approve("fp-1")
         self.assertEqual([c[0] for c in store.calls], ["failed"])
 
     def test_an_unknown_fingerprint_raises_rather_than_silently_doing_nothing(self):

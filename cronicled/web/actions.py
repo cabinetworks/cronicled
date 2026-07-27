@@ -12,6 +12,14 @@ class UnknownProposal(KeyError):
     watching a page that will redraw either way."""
 
 
+class ApplyFailed(RuntimeError):
+    """The write to the media server failed. Raised rather than returned:
+    a caller that discards a return value discards it silently, and a
+    failed apply must not look, to the person watching the page, like a
+    successful one. The proposal is already recorded as failed in the
+    store before this is raised."""
+
+
 class Actions:
     def __init__(self, store, stash):
         self._store = store
@@ -43,7 +51,10 @@ class Actions:
             # undo, and an undo of a write that never happened would restore
             # a snapshot describing nothing.
             self._store.mark_failed(fp, "%s: %s" % (type(exc).__name__, exc))
-            return "could not apply: %s" % exc
+            # Raised, not returned: a caller that discards a return value
+            # (as the HTTP handler did before this was a raise) must not be
+            # able to answer as though the write succeeded.
+            raise ApplyFailed("could not apply: %s" % exc) from exc
         self._store.mark_applied(fp, prior_state=result.get("prior"))
         return "applied"
 
