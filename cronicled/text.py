@@ -4,7 +4,7 @@ import os
 import re
 import unicodedata
 
-from cronicled.vocab import JUNK_TOKENS, STOPWORDS, VIDEO_EXTS
+from cronicled.vocab import CONTAINER_EXTS, JUNK_TOKENS, STOPWORDS
 
 
 _BACKSLASH_ESCAPE_RE = re.compile(r"\\(['\"/\\])")
@@ -44,8 +44,16 @@ def strip_html(text):
 
 
 def strip_ext(name):
+    """Drop a trailing container extension, leaving anything else alone.
+
+    Consults CONTAINER_EXTS, the broad list, and never SCAN_EXTS: the question
+    here is "is this trailing token part of the title", not "is this a file
+    worth walking". Answering it from the walker's list left a file muxed as
+    `.mpeg` carrying a token its `.mp4` twin did not, and scored the two
+    differently for it.
+    """
     root, ext = os.path.splitext(name)
-    return root if ext.lower() in VIDEO_EXTS else name
+    return root if ext.lower() in CONTAINER_EXTS else name
 
 
 _QUALIFIER_RE = re.compile(r"[\(\[\{][^\)\]\}]*[\)\]\}]")

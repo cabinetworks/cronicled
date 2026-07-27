@@ -1,9 +1,11 @@
 """Which creator a file belongs to scopes every later decision, so these tests
 state the wrong attribution each rule prevents."""
 import unittest
+from unittest import mock
 
-from cronicled.artist import (CONTAINER_NAMES, MAX_NAME_WORDS, MIN_NAME_CHARS,
-                              creator_folder, resolve)
+import cronicled.artist
+from cronicled.artist import (Aliases, CONTAINER_NAMES, MAX_NAME_WORDS,
+                              MIN_NAME_CHARS, creator_folder, resolve)
 
 
 class CreatorFolder(unittest.TestCase):
@@ -435,7 +437,7 @@ class GuardIsolation(unittest.TestCase):
         self.assertIsNone(r.name)
 
 
-class Aliases(unittest.TestCase):
+class AliasMatching(unittest.TestCase):
     def test_an_alias_resolves_to_the_full_name(self):
         r = resolve("clip01.mp4", "vcrane", aliases={"vcrane": "Velvet Crane"})
         self.assertEqual(r.name, "Velvet Crane")
@@ -509,3 +511,110 @@ class AliasWiring(unittest.TestCase):
         # in its own right -- a half-written line quietly becoming a name
         with self.assertRaises(ValueError):
             resolve("clip01.mp4", "vcrane", aliases={"vcrane": None})
+
+
+class TheAliasIndexAsAValue(unittest.TestCase):
+    """The index a lookup needs is derived from a map that does not change
+    during a run, and `resolve` was rebuilding it on every call — for a scan,
+    once per file. `Aliases` is that index as a value the caller builds once.
+
+    Two things had to be decided rather than assumed, and both are pinned
+    here: that a prebuilt index answers exactly as the mapping it came from
+    (or it is an optimisation that changes attributions), and that it is a
+    SNAPSHOT rather than a live view of the mapping — which is the whole
+    argument against hiding the same saving inside `resolve` as a cache. A
+    cache keyed on a mutable mapping's identity would answer from a stale
+    index after the caller edited it, silently, and this states plainly which
+    of the two readings applies to which argument.
+    """
+
+    MAP = {"vcrane": "Velvet Crane", "V-Wren": "Copper Wren"}
+
+    def test_a_prebuilt_index_answers_exactly_as_its_mapping_does(self):
+        # Every shape the matching rules distinguish, asked both ways: an
+        # unnormalised key, an unnormalised folder, a miss, and an empty
+        # folder. A saving that changed any of these answers would be
+        # attributing files differently to buy time.
+        built = Aliases(self.MAP)
+        for name, folder in (("clip01.mp4", "vcrane"),
+                             ("clip01.mp4", "V-Crane"),
+                             ("clip01.mp4", "vwren"),
+                             ("clip01.mp4", "nobody"),
+                             ("clip01.mp4", ""),
+                             ("Ivy Kingsley - Morning Ritual.mp4", "vcrane"),
+                             ("Ivy Kingsley - Morning Ritual.mp4", "nobody")):
+            self.assertEqual(resolve(name, folder, built),
+                             resolve(name, folder, self.MAP),
+                             (name, folder))
+
+    def test_it_is_a_snapshot_and_the_mapping_is_not(self):
+        source = {"vcrane": "Velvet Crane"}
+        built = Aliases(source)
+        source["vcrane"] = "Somebody Else"
+
+        self.assertEqual(resolve("clip01.mp4", "vcrane", built).name,
+                         "Velvet Crane", "the index was taken at build time")
+        self.assertEqual(resolve("clip01.mp4", "vcrane", source).name,
+                         "Somebody Else", "a mapping is read on every call")
+
+    def test_a_prebuilt_index_is_not_rebuilt_on_a_lookup(self):
+        # The saving itself, counted rather than timed. A timing assertion
+        # would be flaky and would not say what regressed; this fails naming
+        # the number of rebuilds a lookup caused.
+        built = Aliases(self.MAP)
+        rebuilds = []
+        real = cronicled.artist._alias_index
+
+        def counting(mapping):
+            rebuilds.append(mapping)
+            return real(mapping)
+
+        with mock.patch("cronicled.artist._alias_index", counting):
+            for _ in range(5):
+                resolve("clip01.mp4", "vcrane", built)
+            self.assertEqual(rebuilds, [], "a lookup rebuilt the index")
+            resolve("clip01.mp4", "vcrane", self.MAP)
+            self.assertEqual(len(rebuilds), 1,
+                             "a plain mapping is still indexed per call")
+
+    def test_a_malformed_map_is_refused_when_the_index_is_built(self):
+        # The gap this closes. Building the index is something a caller does
+        # at load, with the map in front of it; resolving is something it does
+        # per file, in a run. Every refusal `_alias_index` makes now lands at
+        # the first of those.
+        for bad in ({"vcrane": "Velvet Crane", "v crane": "Copper Wren"},
+                    {"--": "Velvet Crane"},
+                    {"vcrane": ""},
+                    {"vcrane": 42},
+                    {"vcrane": None}):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                Aliases(bad)
+
+    def test_no_map_at_all_is_a_valid_empty_index(self):
+        # An operator who has registered no alias has an empty index, not a
+        # broken one. `resolve` is given None by every caller that has no map.
+        for empty in (None, {}):
+            built = Aliases(empty)
+            self.assertEqual(len(built), 0)
+            # "vc" is too short to be a name in its own right, so nothing but
+            # an alias could have resolved it -- which is what makes this a
+            # test of the empty index rather than of the folder guard.
+            self.assertIsNone(resolve("clip01.mp4", "vc", built).name)
+            # and a folder that IS a name still resolves as a folder, not as
+            # an alias, so an empty index withholds rather than blocks
+            self.assertEqual(resolve("clip01.mp4", "Velvet Crane", built).source,
+                             "folder")
+
+    def test_two_indexes_built_from_the_same_map_are_equal(self):
+        self.assertEqual(Aliases(self.MAP), Aliases(dict(self.MAP)))
+        self.assertNotEqual(Aliases(self.MAP), Aliases({"vc": "Velvet Crane"}))
+        self.assertNotEqual(Aliases(self.MAP), self.MAP)
+
+    def test_it_does_not_print_the_operators_map(self):
+        # The keys are an operator's own folder names and the values are
+        # people's names. A repr reaches log lines and tracebacks, so it
+        # carries the size and nothing else.
+        text = repr(Aliases(self.MAP))
+        self.assertIn("2", text)
+        for secret in ("vcrane", "Velvet Crane", "V-Wren", "Copper Wren"):
+            self.assertNotIn(secret, text)

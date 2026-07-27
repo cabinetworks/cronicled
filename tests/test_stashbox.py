@@ -35,6 +35,31 @@ def _blocks(blocks):
     return {"data": {"findScenesBySceneFingerprints": [list(b) for b in blocks]}}
 
 
+# The fields both queries ask for on a scene, stated HERE rather than read off
+# the query — reading it off the query is the defect these pins exist to close.
+# Neither query's selection set is reachable any other way: the request bodies
+# below are asserted against the query constants themselves, so a field dropped
+# from a constant moves both sides of that comparison at once, and a fake
+# transport answers whatever the test scripted rather than whatever the query
+# actually requested. Confirmed by mutation: dropping any one of these from
+# either constant leaves the whole suite green.
+#
+# What a query does not select, the source never sends, and the scene dicts
+# this client hands back simply lack the key. `id` is how an entry is pointed
+# at afterwards and `title` is the only field a title match can be scored on,
+# so those two are the sharp ones. `date` and `urls` are what a person is shown
+# beside a candidate to check it; dropped, every entry from this source arrives
+# dateless and linkless, and nothing anywhere says why.
+SCENE_FIELDS = ("id", "title", "date", "urls", "url")
+
+
+def _names_in(query):
+    """Every bare name appearing in `query`. Coarse on purpose: nothing here
+    can check a query against a real schema, so what is pinned is that the
+    names a caller depends on are still being asked for at all."""
+    return set(re.findall(r"[A-Za-z_]+", query))
+
+
 class PerformerListing(unittest.TestCase):
     def test_a_listing_that_fits_on_one_page_is_complete(self):
         # The ordinary case: the count matches what the first page handed
@@ -231,6 +256,14 @@ class FingerprintLookup(unittest.TestCase):
         self.assertIn("findScenesBySceneFingerprints(fingerprints: $fingerprints)",
                       SCENES_BY_FINGERPRINT)
         self.assertIn("[[FingerprintQueryInput!]!]!", SCENES_BY_FINGERPRINT)
+        # Its selection set, for the same reason and by the same means: see
+        # SCENE_FIELDS. Nothing else in this file touched it at all, so until
+        # now this query could have come back asking for nothing but an id.
+        requested = _names_in(SCENES_BY_FINGERPRINT)
+        for field in SCENE_FIELDS:
+            self.assertIn(field, requested,
+                          "a hit carries the scene this query selects, and %s "
+                          "is not being asked for" % (field,))
         self.assertEqual([body for body, _ in t.calls], [{
             "query": SCENES_BY_FINGERPRINT,
             "variables": {"fingerprints": [
@@ -443,10 +476,15 @@ class RequestShape(unittest.TestCase):
         # name is a GraphQL error.
         self.assertIn("queryScenes(input: $input)", PERFORMER_SCENES)
         self.assertIn("SceneQueryInput!", PERFORMER_SCENES)
-        requested = set(re.findall(r"[A-Za-z_]+", PERFORMER_SCENES))
-        for field in ("count", "id", "title"):
+        requested = _names_in(PERFORMER_SCENES)
+        self.assertIn("count", requested, "the read depends on count")
+        # The rest of the selection set, which the three fields named above
+        # left uncovered: `date` and `urls` could both be dropped with the
+        # suite still green. See SCENE_FIELDS.
+        for field in SCENE_FIELDS:
             self.assertIn(field, requested,
-                          "the read depends on %s" % (field,))
+                          "an entry from this listing carries what the query "
+                          "selects, and %s is not being asked for" % (field,))
         self.assertEqual([body for body, _ in t.calls], [
             {"query": PERFORMER_SCENES, "variables": {"input": {
                 "performers": {"value": ["p1"], "modifier": "INCLUDES"},

@@ -32,7 +32,10 @@ instead of hanging.
 import inspect
 import threading
 import unittest
+from unittest import mock
 
+import cronicled.artist
+from cronicled.artist import Aliases
 from cronicled.jobs import COST_CLASS_LIMITS, JobRunner
 from cronicled.scan import (
     Counts, MAX_RUNNERS_UP, MUTE_NO_CANDIDATES, MUTE_UNRESOLVED_CREATOR,
@@ -160,6 +163,38 @@ class SelectTest(unittest.TestCase):
         self.assertEqual([s["id"] for s in selected], ["2"])
         self.assertEqual(counts, Counts(
             total=2, already_proposed=0, muted=1, filtered_out=0, selected=1,
+            deferred=0))
+
+    def test_the_subject_kind_matches_what_earlier_runs_already_wrote(self):
+        """The mute and the proposal here are written with the LITERAL string,
+        the way a database filled by an earlier run holds them.
+
+        Every other assertion in this file spells the kind `SUBJECT_TYPE` on
+        both sides — the value handed to the store and the value it is checked
+        against — so changing the constant moves both and nothing objects.
+        Confirmed by mutation: renaming it survives the whole suite.
+
+        It is not an internal label. `select` reads muted subjects and
+        existing proposals back OUT of a store that outlives the run that
+        wrote them, keyed on this string. Change it and every mute a reviewer
+        has ever set stops suppressing its file, every proposal already in the
+        inbox stops counting as already proposed, and the next scan re-offers
+        work that was decided months ago — spending the lookup budget this
+        whole module exists to ration, with nothing anywhere reporting it.
+        """
+        self.assertEqual(SUBJECT_TYPE, "scene")
+        self.store.record(folder=FOLDER, subject_type="scene", subject_id="1",
+                          summary="a proposal", payload={"title": "something"},
+                          producer="an-earlier-run")
+        self.store.mute("scene", "2")
+
+        _, counts = select([scene(1, "/library/one.mp4"),
+                            scene(2, "/library/two.mp4"),
+                            scene(3, "/library/three.mp4")],
+                           store=self.store, folder=FOLDER)
+
+        self.assertEqual(counts, Counts(
+            total=3, already_proposed=1, muted=1, filtered_out=0, selected=1,
             deferred=0))
 
     def test_a_muted_subject_is_not_also_counted_as_already_proposed(self):
@@ -680,6 +715,38 @@ class ExamineTest(unittest.TestCase):
         names nobody — and only one of them is fixed by an alias. A single
         catch-all reason would satisfy both tests above and lose that."""
         self.assertNotEqual(MUTE_NO_CANDIDATES, MUTE_UNRESOLVED_CREATOR)
+
+    def test_each_mute_reason_says_which_of_the_two_it_is(self):
+        """Which constant carries which sentence, pinned as a property of the
+        sentence rather than as the constant compared to itself.
+
+        The tests above spell the expected reason `MUTE_NO_CANDIDATES` and
+        `MUTE_UNRESOLVED_CREATOR`, which is the same name the code returns:
+        exchange the two strings at their definitions and both sides move
+        together, both tests still pass, and `assertNotEqual` above still
+        holds because they are still two different strings. Confirmed by
+        mutation — the swap survives the whole suite.
+
+        What the swap costs is the one thing these two reasons exist to
+        separate. The stored reason is what a reviewer reads months later,
+        and only ONE of the two is fixed by adding an alias. Swapped, every
+        file the catalogue had nothing for tells them to go write an alias
+        that will never fire, and every file whose layout named nobody tells
+        them the catalogue is empty for a creator that was never identified.
+
+        Each sentence is pinned by what it names AND by what it does not: a
+        single catch-all mentioning the catalogue, the folder and the
+        filename at once would satisfy the positive halves alone.
+        """
+        self.assertIn("candidates", MUTE_NO_CANDIDATES)
+        self.assertIn("catalogue", MUTE_NO_CANDIDATES)
+        self.assertNotIn("folder", MUTE_NO_CANDIDATES)
+        self.assertNotIn("filename", MUTE_NO_CANDIDATES)
+
+        self.assertIn("folder", MUTE_UNRESOLVED_CREATOR)
+        self.assertIn("filename", MUTE_UNRESOLVED_CREATOR)
+        self.assertNotIn("candidates", MUTE_UNRESOLVED_CREATOR)
+        self.assertNotIn("catalogue", MUTE_UNRESOLVED_CREATOR)
 
     # -- the second kind: a human should look ----------------------------- #
 
@@ -1615,21 +1682,53 @@ class ScanProducerTest(unittest.TestCase):
         self.assertTrue(any("ValueError" in m for m in self.ctx.messages),
                         self.ctx.messages)
 
-    def test_a_malformed_alias_map_ends_the_run_before_anything_is_read(self):
+    def test_a_malformed_alias_map_is_refused_before_a_producer_exists(self):
         """A duplicated alias line is a wiring mistake, wrong for every file.
         Reported once per file it looks like N transient failures; raised once
-        it names the mistake where it was made — and costs no lookups."""
+        it names the mistake where it was made — and costs no lookups.
+
+        Raised at CONSTRUCTION, which is stricter than raising on the first
+        line of the run and is the point of building the index there. The
+        caller who wrote the map is still on the stack, no job has been
+        started, and nothing has to read a traceback off a background thread
+        to find out that a configuration line needs an edit.
+        """
         search = ScriptedSearch(self.SCRIPT)
-        producer = self.build([scene(1, "/library/VC/Morning Ritual.mp4")],
-                              search,
-                              aliases={"VC": "Velvet Crane",
-                                       "v c": "Ivy Kingsley"})
 
         with self.assertRaises(ValueError):
-            next(producer.produce(self.ctx))
+            self.build([scene(1, "/library/VC/Morning Ritual.mp4")], search,
+                       aliases={"VC": "Velvet Crane", "v c": "Ivy Kingsley"})
 
         self.assertEqual(search.queries, [])
         self.assertEqual(self.stash.calls, [])
+
+    def test_the_alias_index_is_built_once_for_the_whole_batch(self):
+        """Not per file, which is what `resolve` does when it is handed a
+        plain mapping.
+
+        The map cannot change during a run, so re-normalising its keys for
+        every file is work with no possible result: 642 us per file against a
+        500-entry map on this machine, and 12.7 seconds across a 50,000-file
+        scan against a 200-entry one. A timing assertion would be flaky and
+        would not say what went wrong, so what is counted is the number of
+        times the index is built — exactly once, for a batch of four files
+        that all reach the resolver.
+        """
+        built = []
+        real = cronicled.artist._alias_index
+
+        def counting(mapping):
+            built.append(mapping)
+            return real(mapping)
+
+        with mock.patch("cronicled.artist._alias_index", counting):
+            proposals = self.scan(
+                [scene(i, "/library/VC/Morning Ritual.mp4") for i in range(4)],
+                ScriptedSearch(self.SCRIPT), aliases={"VC": "Velvet Crane"})
+
+        self.assertEqual(len(proposals), 4, "every file reached the resolver")
+        self.assertEqual(len(built), 1, "the index was built %d times for 4 "
+                                        "files" % (len(built),))
 
     # -- what the caller's knobs reach ------------------------------------- #
 
