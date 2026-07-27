@@ -68,15 +68,29 @@ class Autoescaping(unittest.TestCase):
 
     def test_no_template_disables_escaping(self):
         # A single |safe or {% autoescape false %} reopens the hole the
-        # dependency was taken to close, and would pass every test above if it
-        # sat on a field the fixtures do not populate.
+        # dependency was taken to close. This scan is the backstop for the
+        # rendering tests above, which can only see fields the fixtures
+        # populate -- one sitting on any other field would pass all of them.
+        #
+        # Matched by pattern rather than by substring, because the substrings
+        # miss the spellings people actually write. Verified: `| safe` with
+        # spaces -- the idiomatic form, and more likely than `|safe` -- was not
+        # caught, and neither was `{% autoescape  false %}` with two spaces.
+        # A backstop that only catches the unidiomatic spelling is not one.
         import pathlib
+        import re
+        unsafe = re.compile(r"\|\s*safe\b|autoescape\s+false\b")
         root = pathlib.Path("cronicled/web/templates")
+        seen = 0
         for path in root.rglob("*.html"):
-            body = path.read_text()
-            self.assertNotIn("|safe", body, "%s disables escaping" % path)
-            self.assertNotIn("autoescape false", body,
-                             "%s disables escaping" % path)
+            seen += 1
+            found = unsafe.search(path.read_text())
+            self.assertIsNone(
+                found, "%s disables escaping: %r"
+                % (path, found.group(0) if found else None))
+        # Without this the scan passes by finding no templates at all, which
+        # is how it would read as green after a move or a rename.
+        self.assertGreater(seen, 0, "found no templates to scan")
 
     def test_a_runner_up_title_actually_reaches_the_page(self):
         # Built through the real helper, not hand-written: a fixture carrying
