@@ -27,7 +27,12 @@ interpolation.
 The inbox is real: `python -m cronicled` serves proposals from the store,
 takes approve/dismiss/mute/undo over POST, and applies or reverts a scene
 through the media-server client — no write happens without a person clicking
-one of those. What is still missing is the part that would make any of this
+one of those. Undo is not always complete: a proposal that carries a cover
+image writes one the media server never exposes in a form its own undo
+snapshot can restore, so that one field stays as the approve left it. The
+inbox warns before an approve that would do this, and undo reports the same
+residual afterward, rather than either one reading as a clean, full
+reversal. What is still missing is the part that would make any of this
 unattended: nothing constructs a scheduler, so no proposal is ever produced
 without a person starting a scan themselves.
 
@@ -156,13 +161,13 @@ Every push to the default branch publishes a multi-architecture image to
 docker pull ghcr.io/cabinetworks/cronicled:<commit-sha>
 ```
 
-**There is no `latest` tag, and its absence is deliberate.** The image's
-default command now serves an unauthenticated page whose buttons write to a
-library — `latest` is read as "the one you want", and nobody who reaches for
-it expects the version running to have changed since they last checked, with
-no version number in the reference to say so. A commit SHA or a released
-version makes no such promise. [The container page](docs/container.md) has
-the tagging scheme and the mounts.
+**`latest` follows the default branch and is published.** It names the newest
+build of that branch, not a reviewed release, and it moves under anyone who
+pulls it — while what it starts is an unauthenticated page whose buttons write
+to a library. A commit SHA or a released version makes no such promise, and
+both are still published; a release tag deliberately does not move `latest`.
+[The container page](docs/container.md) has the tagging scheme and the
+mounts.
 
 ## License
 

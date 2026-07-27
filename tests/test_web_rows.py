@@ -30,7 +30,7 @@ def _item(**over):
         "path": "/library/Nine Winters/nine-winters-the-lantern-room.mp4",
         "creator": {"name": "Nine Winters", "source": "folder",
                     "competing": None, "rejected_folder": None},
-        "candidate": {"id": "c-1", "title": "The Lantern Room"},
+        "candidate": {"id": "c-1", "title": "The Lantern Room", "image": None},
         "score": 0.8123,
         "runners_up": _real_runners_up([("The Lantern", 0.61)]),
     }
@@ -124,6 +124,29 @@ class RowContent(unittest.TestCase):
         self.assertFalse(to_row(_item(state="new")).undoable)
 
 
+class CoverImage(unittest.TestCase):
+    # `carries_cover` is the field a person reads before clicking Approve
+    # (and the same one `Actions.undo` reads to report what it could not
+    # restore) -- see `rows.carries_cover`'s docstring for why it is
+    # indexed, not `.get`.
+
+    def test_a_candidate_carrying_an_image_reports_a_cover(self):
+        row = to_row(_item(payload={"candidate": {
+            "id": "c-1", "title": "The Lantern Room",
+            "image": "data:image/jpeg;base64,notarealcover"}}))
+        self.assertTrue(row.carries_cover)
+
+    def test_a_candidate_with_no_image_reports_no_cover(self):
+        row = to_row(_item(payload={"candidate": {
+            "id": "c-1", "title": "The Lantern Room", "image": None}}))
+        self.assertFalse(row.carries_cover)
+
+    def test_a_candidate_with_an_empty_image_reports_no_cover(self):
+        row = to_row(_item(payload={"candidate": {
+            "id": "c-1", "title": "The Lantern Room", "image": ""}}))
+        self.assertFalse(row.carries_cover)
+
+
 class RowRequirements(unittest.TestCase):
     def test_a_payload_missing_its_creator_raises(self):
         # No default. An absent creator rendered as blank reads as "nobody
@@ -138,6 +161,21 @@ class RowRequirements(unittest.TestCase):
         with self.assertRaises(KeyError) as cm:
             to_row(broken)
         self.assertEqual(cm.exception.args[0], "creator")
+
+    def test_a_candidate_missing_the_image_key_raises(self):
+        # `Stash.scrape_scenes_by_query`'s own query selects `image` on
+        # every candidate it returns, so a real candidate always answers
+        # this key -- `None` is "no cover", not "unknown". A candidate
+        # missing the key entirely is a payload from somewhere that never
+        # asked the question, and defaulting that to "no cover" is exactly
+        # the silent, safe-looking guess this project has been bitten by
+        # before: it would skip the warning on a proposal the code simply
+        # never checked.
+        broken = _item(payload={"candidate": {
+            "id": "c-1", "title": "The Lantern Room"}})
+        with self.assertRaises(KeyError) as cm:
+            to_row(broken)
+        self.assertEqual(cm.exception.args[0], "image")
 
     def test_the_score_is_shown_at_the_precision_it_was_decided_at(self):
         # Rounding to 2 places would print 0.81 for a value that missed a 0.82

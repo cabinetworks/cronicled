@@ -180,13 +180,29 @@ jobs:
           set -eu
           image=ghcr.io/cabinetworks/cronicled
 
-          # There is deliberately NO `latest` tag, and this is not an
-          # oversight to be helpfully corrected. `latest` is read as "the one
-          # you want", and nobody pulls it expecting a program that imports a
-          # package, prints a line and exits - which is all this image does
-          # until there is a service to put in it. A commit SHA and a release
-          # version make no such promise, so those are the only tags pushed.
+          # `latest` tracks the default branch, and it is published
+          # deliberately rather than by habit. The reason it was withheld no
+          # longer holds: this image used to import a package, print a line
+          # and exit, and nobody pulls `latest` expecting that. It now serves
+          # the inbox, so `latest` names a runnable thing.
+          #
+          # What it means, written down because `latest` is read as a promise
+          # it cannot keep: the newest build of the default branch, not a
+          # reviewed release. It moves under anyone who pulls it, and its
+          # default command serves a page with NO authentication whose buttons
+          # write to a media library. Pin a commit SHA or a released version
+          # for anything that should not change without being asked. Both are
+          # still published; nothing was taken away to add this.
           tags="${image}:${GITHUB_SHA}"
+
+          # Only from the default branch. A release tag publishes its version
+          # and its SHA and must NOT also move `latest`: tagging an older
+          # still-supported release would otherwise drag `latest` backwards
+          # onto it, which is the one way this tag can mislead beyond its
+          # usual imprecision.
+          case "${GITHUB_REF}" in
+            refs/heads/main) tags="${tags},${image}:latest" ;;
+          esac
 
           case "${GITHUB_REF}" in
             refs/tags/v*)

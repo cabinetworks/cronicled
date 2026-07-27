@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import shutil
 import tempfile
@@ -8,6 +9,7 @@ from unittest.mock import patch
 
 from cronicled.__main__ import main
 from cronicled.config import CONFIG_DIR_ENV_VAR
+from cronicled.jobs import JobRunner
 from cronicled.stash import Stash
 from cronicled.store import Store
 
@@ -40,7 +42,8 @@ class _Base(unittest.TestCase):
             payload={"path": "/library/reel.mp4",
                      "creator": {"name": "Someone", "source": "folder",
                                  "competing": None, "rejected_folder": None},
-                     "candidate": {"id": "c-1", "title": "A Title"},
+                     "candidate": {"id": "c-1", "title": "A Title",
+                                   "image": None},
                      "score": 0.9, "runners_up": []},
             producer="test-producer", confidence=0.9)
         store.close()
@@ -194,6 +197,38 @@ class ConfigDirThreading(_Base):
         output = self._run(["--db", self.db_path, "--config-dir", "/explicit/config"])
         self.assertIn("config directory: /explicit/config", output)
 
+    def test_config_dir_also_reaches_the_adapters(self):
+        # The seam this project has been bitten at repeatedly: two features
+        # each correct on their own, joined by a call that quietly drops the
+        # thing connecting them. `main()` prints the directory it resolved
+        # AND loads adapters -- if the loader is called on the ambient
+        # environment instead of the same `env`, the printed line is right,
+        # the flag looks honoured, and the adapters come from somewhere else
+        # entirely. Nothing raises.
+        #
+        # Asserted by loading a real adapters.json out of the directory the
+        # flag names, so the only way to pass is for the value to have
+        # travelled the whole distance.
+        conf = os.path.join(self._dir, "conf")
+        os.makedirs(conf)
+        with open(os.path.join(conf, "adapters.json"), "w") as fh:
+            json.dump({"default": "invented",
+                       "adapters": [{"name": "invented",
+                                     "display": "An Invented Store",
+                                     "scraper_id": "InventedStore",
+                                     "owner_source": "url_segment",
+                                     "owner_segment": 3}]}, fh)
+        captured = _CapturedServe()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(CONFIG_DIR_ENV_VAR, None)
+            with patch("cronicled.__main__.serve", captured):
+                main(["--db", self.db_path, "--config-dir", conf])
+        adapter = captured.kwargs["actions"]._adapter
+        self.assertIsNotNone(
+            adapter, "the adapter directory the flag named was not read")
+        self.assertEqual(adapter.name, "invented")
+        self.assertEqual(adapter.scraper_id, "InventedStore")
+
     def test_config_dir_flag_does_not_mutate_os_environ(self):
         # Deliberately NOT run through `self._run`'s `patch.dict`: that
         # context manager restores `os.environ` to its pre-call snapshot on
@@ -235,6 +270,42 @@ class ConfigDirThreading(_Base):
             os.environ.pop(CONFIG_DIR_ENV_VAR, None)
             output = self._run(["--db", self.db_path])
         self.assertIn("config directory: config", output)
+class ScanWiring(_Base):
+    # The runner a request's `/scan` starts a job on has to outlive that
+    # request -- so it must be something `main()` builds once and hands to
+    # `actions`, not something a handler could construct per-request and
+    # lose the moment the connection closes.
+
+    def test_a_job_runner_reaches_actions(self):
+        self._seed()
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path])
+        self.assertIsInstance(captured.kwargs["actions"]._runner, JobRunner)
+
+    def test_the_same_runner_backs_the_actions_scan_status_callable(self):
+        self._seed()
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path])
+        actions = captured.kwargs["actions"]
+        # Bound-method equality: same underlying object and function, not
+        # merely the same behaviour by coincidence -- a `scan_status` that
+        # `main()` built fresh from a DIFFERENT runner would still equal
+        # this by return value alone, on an empty runner, without this
+        # checking they are the same object.
+        self.assertEqual(captured.kwargs["scan_status"], actions.scan_status)
+
+    def test_with_no_adapters_configured_the_adapter_is_none_not_a_crash(self):
+        # A fresh install (no config/adapters.json committed -- this repo's
+        # own working tree has none) is a legitimate state: the app must
+        # still start, with `Actions.scan` left to give its own clear
+        # refusal only once someone actually presses Scan.
+        self._seed()
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path])
+        self.assertIsNone(captured.kwargs["actions"]._adapter)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,12 @@ from .render import render
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8571
 
-_ACTIONS = ("approve", "dismiss", "mute", "undo")
+_ACTIONS = ("approve", "dismiss", "mute", "undo", "scan")
+
+# Pre-filled into the number input so a person is not left guessing a value
+# from nothing -- never read on the code path itself. A request that omits
+# `limit` is refused there (see `do_POST`), not silently given this number.
+DEFAULT_SCAN_LIMIT = 25
 
 # Every write here posts exactly one hidden field: a fingerprint. Nothing
 # genuine comes anywhere near this many bytes -- it exists to bound
@@ -49,7 +54,14 @@ def _origin_matches_host(origin, host_header):
     return origin[idx + len(marker):] == host_header
 
 
-def build_handler(rows, actions):
+def build_handler(rows, actions, scan_status=None):
+    # A separate callable rather than always reaching through `actions`:
+    # every existing action-path test builds its own recording double for
+    # `actions` and none of them implement `scan_status`, so defaulting it
+    # here keeps GET / renderable for a double that only knows the four
+    # original writes.
+    _scan_status = scan_status or (lambda: None)
+
     class Handler(BaseHTTPRequestHandler):
         def _send(self, status, body=b"", headers=()):
             self.send_response(status)
@@ -70,7 +82,9 @@ def build_handler(rows, actions):
             if path != "/":
                 self._send(404, b"not found")
                 return
-            body = render("inbox.html", rows=rows(), counts={}).encode()
+            body = render("inbox.html", rows=rows(), counts={},
+                         scan=_scan_status(),
+                         scan_default_limit=DEFAULT_SCAN_LIMIT).encode()
             self._send(200, body,
                        [("Content-Type", "text/html; charset=utf-8")])
 
@@ -135,16 +149,41 @@ def build_handler(rows, actions):
                 return
             form = urllib.parse.parse_qs(
                 self.rfile.read(length).decode("utf-8"))
-            fp = (form.get("fp") or [""])[0]
-            if not fp:
-                self._send(400, b"missing fingerprint")
-                return
-            try:
-                getattr(actions, name)(fp)
-            except Exception as exc:
-                self._send(400, str(exc).encode("utf-8"),
-                           [("Content-Type", "text/plain; charset=utf-8")])
-                return
+            if name == "scan":
+                # `limit` is required here on the same terms
+                # `cronicled.runscan.build_producer` requires it of the CLI:
+                # no permissive default, so a request that omits it (or
+                # sends something that is not a number) is refused before
+                # anything is registered or started -- never silently
+                # treated as "no limit", which `scan.select` reads as
+                # "scan everything".
+                raw_limit = (form.get("limit") or [""])[0]
+                if raw_limit == "":
+                    self._send(400, b"missing limit")
+                    return
+                try:
+                    limit = int(raw_limit)
+                except ValueError:
+                    self._send(400, b"malformed limit",
+                               [("Content-Type", "text/plain; charset=utf-8")])
+                    return
+                try:
+                    actions.scan(limit)
+                except Exception as exc:
+                    self._send(400, str(exc).encode("utf-8"),
+                               [("Content-Type", "text/plain; charset=utf-8")])
+                    return
+            else:
+                fp = (form.get("fp") or [""])[0]
+                if not fp:
+                    self._send(400, b"missing fingerprint")
+                    return
+                try:
+                    getattr(actions, name)(fp)
+                except Exception as exc:
+                    self._send(400, str(exc).encode("utf-8"),
+                               [("Content-Type", "text/plain; charset=utf-8")])
+                    return
             # 303 so a refresh redraws the page rather than repeating the write.
             self._send(303, b"", [("Location", "/")])
 
@@ -154,7 +193,7 @@ def build_handler(rows, actions):
     return Handler
 
 
-def serve(rows, actions, host=DEFAULT_HOST, port=DEFAULT_PORT):
+def serve(rows, actions, scan_status=None, host=DEFAULT_HOST, port=DEFAULT_PORT):
     # `HTTPServer` is single-threaded: one connection wedged on a slow read
     # or a slow downstream call (a media server taking its whole configured
     # timeout to answer an Approve, say) stalls every other request -- an
@@ -197,6 +236,6 @@ def serve(rows, actions, host=DEFAULT_HOST, port=DEFAULT_PORT):
               "only from this machine; `-p %d:%d` (or -P) publishes this "
               "same unauthenticated page to every network this host is on."
               % (host, DEFAULT_HOST, port, port, port, port))
-    httpd = HTTPServer((host, port), build_handler(rows, actions))
+    httpd = HTTPServer((host, port), build_handler(rows, actions, scan_status))
     print("inbox on http://%s:%d/" % (host, port))
     httpd.serve_forever()

@@ -42,6 +42,7 @@ from cronicled.scan import (
     Outcome, ScanProducer, SUBJECT_TYPE, _SingleFlight, examine, select,
 )
 from cronicled.store import Store
+from tests.fixtures.cast import CENSORSHIP
 
 FOLDER = "library"
 
@@ -922,6 +923,141 @@ class ExamineTest(unittest.TestCase):
                              results=[{"url": "https://example.invalid/x"}])
 
 
+class ExamineCensorshipTest(unittest.TestCase):
+    """`censorship` decensors a candidate's title for SCORING only.
+
+    The filename below spells its subject the canonical way ("Kestrel"); the
+    candidate is the store's own record of it, spelled the way the fixture
+    store censors that word ("K3strel"). Read raw, that one substituted
+    letter costs enough recall/similarity to fall well under the default
+    threshold. Decensored for scoring, the two agree exactly and the file is
+    contained, which is why this fixture (not an arbitrary one) is what
+    exercises the wiring: the difference between "refused" and "chosen with
+    score 1.000" IS the censorship map actually being consulted.
+    """
+
+    CENSORED = candidate("K3strel Nightfall", "kestrel-nightfall")
+    PATH = "/library/Velvet Crane/Kestrel Nightfall.mp4"
+
+    def run_examine(self, censorship=None):
+        search = FakeSearch([self.CENSORED])
+        return examine(scene(1, self.PATH), search=search, folder=FOLDER,
+                       threshold=0.7, censorship=censorship)
+
+    def test_without_the_map_the_censored_spelling_is_refused(self):
+        # HARM: this is the baseline the two tests below exist to contrast
+        # with. If this one stops refusing, the fixture no longer proves
+        # anything about the map, and the "with censorship" test could pass
+        # for a reason that has nothing to do with decensoring.
+        outcome = self.run_examine(censorship=None)
+        self.assertIsNone(outcome.proposal)
+        self.assertIn("nothing above the threshold", outcome.reason)
+
+    def test_with_the_map_the_decensored_title_is_what_gets_scored(self):
+        # HARM: dropping the decensor call from the scoring path (or from
+        # the query path in `cronicled.search`, which this does not exercise)
+        # leaves a real store's censorship map inert, exactly as it was
+        # before this was wired in — a store configured with censored-word
+        # substitutions never benefits from any of them.
+        outcome = self.run_examine(censorship=CENSORSHIP)
+        self.assertIsNotNone(outcome.proposal)
+        self.assertEqual(outcome.proposal["payload"]["score"], 1.0)
+
+    def test_the_proposal_carries_the_original_spelling_never_the_decensored_one(self):
+        # HARM: if a decensored string ever replaced the candidate that
+        # reaches the payload, an apply would write a title the store never
+        # used — the store called this "K3strel Nightfall", and proposing
+        # "Kestrel Nightfall" instead invents a title on the strength of a
+        # scoring aid, not of anything the store actually said.
+        outcome = self.run_examine(censorship=CENSORSHIP)
+        self.assertEqual(outcome.proposal["payload"]["candidate"], self.CENSORED)
+        self.assertEqual(
+            outcome.proposal["payload"]["candidate"]["title"], "K3strel Nightfall")
+        self.assertEqual(
+            outcome.proposal["summary"],
+            'Kestrel Nightfall.mp4 -> "K3strel Nightfall" by Velvet Crane '
+            '(score 1.000)')
+
+    def test_an_absent_map_behaves_exactly_like_an_empty_one(self):
+        """`censorship=None` (every existing caller of `examine`) must not be
+        a different code path from `censorship={}` — both are "nothing to
+        decensor", and a caller that never heard of this feature must see
+        unchanged behaviour."""
+        self.assertEqual(self.run_examine(censorship=None),
+                         self.run_examine(censorship={}))
+
+
+class ExamineOwnerOfTest(unittest.TestCase):
+    """`examine(..., owner_of=...)` -- the fix for issue #66, exercised as
+    `examine` actually wires it: a real `search` callable answering per
+    query, and a plain reader of one field on a result. "Amberlight" stands
+    in for the measured store, "Wren Ashcombe" for the measured creator;
+    both invented, matching no real store or performer.
+
+    `ScriptedSearch` (defined below, for `ScanProducerTest`) answers each
+    query separately, which this needs and `FakeSearch` (answers every query
+    identically) cannot: a search-backed resolve issues one query to check
+    the losing candidate and another for the winner's own catalogue, and the
+    two must not be confused.
+    """
+
+    PATH = "/library/Amberlight/Wren Ashcombe - Morning Ritual.mp4"
+
+    @staticmethod
+    def owner_of(result):
+        return (result or {}).get("owner", "")
+
+    def test_a_candidate_the_catalogue_confirms_reaches_the_proposal(self):
+        # HARM this fixes: without a search, the folder ("Amberlight", the
+        # store) would win by the old default -- exactly the wrong
+        # attribution the live scan produced.
+        owned = dict(candidate("Morning Ritual", "morning-ritual"),
+                     owner="Wren Ashcombe")
+        search = ScriptedSearch({"Amberlight": [], "Wren Ashcombe": [owned]})
+
+        outcome = examine(scene(1, self.PATH), search=search, folder=FOLDER,
+                          threshold=0.5, owner_of=self.owner_of)
+
+        self.assertEqual(outcome.proposal["payload"]["creator"], {
+            "name": "Wren Ashcombe", "source": "filename",
+            "competing": "Amberlight", "rejected_folder": None})
+        # both the losing candidate's check and the winner's own catalogue
+        # search happened -- "Wren Ashcombe" asked twice is the SAME query,
+        # once to verify and once to score; raw `examine` has no
+        # single-flight cache of its own (`ScanProducer` adds one).
+        self.assertEqual(search.queries,
+                         ["Amberlight", "Wren Ashcombe", "Wren Ashcombe"])
+
+    def test_a_candidate_the_catalogue_does_not_support_is_not_proposed(self):
+        # The store's own name has nothing behind it; only the creator's
+        # does. Swap which query answers and the winner swaps with it --
+        # proving this is the search deciding, not a fixed preference.
+        owned = dict(candidate("Morning Ritual", "morning-ritual"),
+                     owner="Amberlight")
+        search = ScriptedSearch({"Amberlight": [owned], "Wren Ashcombe": []})
+
+        outcome = examine(scene(1, self.PATH), search=search, folder=FOLDER,
+                          threshold=0.5, owner_of=self.owner_of)
+
+        self.assertEqual(outcome.proposal["payload"]["creator"]["name"],
+                         "Amberlight")
+        self.assertEqual(outcome.proposal["payload"]["creator"]["source"],
+                         "folder")
+
+    def test_owner_of_omitted_keeps_the_old_folder_wins_default(self):
+        # No `owner_of` at all: `examine` must not spend a single extra
+        # lookup checking a candidate it was never asked to check.
+        search = FakeSearch([candidate("Morning Ritual", "morning-ritual")])
+
+        outcome = examine(scene(1, self.PATH), search=search, folder=FOLDER,
+                          threshold=0.5)
+
+        self.assertEqual(outcome.proposal["payload"]["creator"], {
+            "name": "Amberlight", "source": "folder",
+            "competing": "Wren Ashcombe", "rejected_folder": None})
+        self.assertEqual(search.queries, ["Amberlight"])
+
+
 # -- running a whole batch ------------------------------------------------- #
 
 class FakeStash:
@@ -1753,6 +1889,27 @@ class ScanProducerTest(unittest.TestCase):
         self.assertEqual(search.queries, ["Velvet Crane"])
         self.assertEqual([p["payload"]["creator"]["source"] for p in proposals],
                          ["alias"])
+
+    def test_the_censorship_map_reaches_every_files_scoring(self):
+        """The constructor argument, not a per-`produce()` one — pinned at
+        the batch level so a mutation that wires it into `__init__` but
+        never forwards it to `_examine`/`examine` (or forwards it to only the
+        first file) shows up here rather than only in `ExamineCensorshipTest`,
+        which calls `examine` directly and cannot see `ScanProducer`'s own
+        plumbing."""
+        censored = candidate("K3strel Nightfall", "kestrel-nightfall")
+        path = "/library/Velvet Crane/Kestrel Nightfall.mp4"
+        search = ScriptedSearch({"Velvet Crane": [censored]})
+
+        without = self.scan([scene(1, path)], search)
+        with_map = self.scan([scene(1, path)], ScriptedSearch({"Velvet Crane": [censored]}),
+                             censorship=CENSORSHIP)
+
+        self.assertEqual(without, [])
+        self.assertEqual(len(with_map), 1)
+        self.assertEqual(with_map[0]["payload"]["score"], 1.0)
+        # never the applied title, even threaded through the whole producer
+        self.assertEqual(with_map[0]["payload"]["candidate"], censored)
 
     def test_one_worker_is_accepted(self):
         """The permissive side of the guard, pinned: a scan narrowed to a

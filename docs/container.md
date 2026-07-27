@@ -127,7 +127,7 @@ docker run --rm --entrypoint python cronicled -m cronicled.selfcheck
 ```
 
 ```
-cronicled selfcheck ready (25 modules imported)
+cronicled selfcheck ready (27 modules imported)
 ```
 
 That count is the number of modules `pkgutil` finds under the package, so it
@@ -171,18 +171,30 @@ with the commit SHA. A release tag `vX.Y.Z` additionally publishes the version
 declared in `pyproject.toml`, and fails the build if the two disagree rather
 than labelling an image with a version it was not built from.
 
-**There is no `latest` tag, and its absence is deliberate — please do not add
-one.** `latest` is read as "the one you want", and this default command now
-serves an unauthenticated page whose buttons write to a library — not
-something to run without knowing which build it is. A commit SHA or a
-released version makes no such promise of currency; `latest` would. The
-reasoning is repeated in a comment in `.github/workflows/ci.yml` and pinned
-by a test, because an omission is otherwise indistinguishable from an
-oversight.
+**`latest` follows the default branch.** It was withheld while this image only
+imported a package, printed a line and exited, because nobody pulls `latest`
+expecting that. The image serves the inbox now, so `latest` names a runnable
+thing and is published.
+
+Read it for what it is rather than what the name suggests: **the newest build
+of the default branch, not a reviewed release.** It moves under anyone who
+pulls it, and what it starts is a page with no authentication whose buttons
+write to a media library. Pin instead for anything that should not change
+without being asked — both of these are still published, and nothing was
+removed to add `latest`:
 
 ```sh
-docker pull ghcr.io/cabinetworks/cronicled:<commit-sha>
+docker pull ghcr.io/cabinetworks/cronicled:latest        # moves
+docker pull ghcr.io/cabinetworks/cronicled:<commit-sha>  # does not
+docker pull ghcr.io/cabinetworks/cronicled:<version>     # does not
 ```
+
+A release tag publishes its version and its commit SHA and deliberately does
+**not** move `latest`. Releases are not necessarily cut in order, and tagging
+an older still-supported version would otherwise drag `latest` backwards onto
+it, silently downgrading anyone who pulls it. That, rather than the tag's
+ordinary imprecision, is the one way it could genuinely mislead, and a test
+pins it.
 
 Publishing runs only after the leak guard has passed, and never from a pull
 request. Everything that reaches the image is tracked source the guard has

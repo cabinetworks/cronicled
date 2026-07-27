@@ -1,5 +1,8 @@
 {# cronicled/web/templates/inbox.html #}
 <h1>Inbox</h1>
+{% if scan and scan.state == 'running' %}
+<meta http-equiv="refresh" content="3">
+{% endif %}
 {% if not rows %}
 <p>Nothing waiting. Proposals appear here after a scan.</p>
 {% endif %}
@@ -24,6 +27,11 @@
   {% if row.contested %}
   <tr class="warning"><td colspan="5">Attribution is contested: {{ row.disagreement }}</td></tr>
   {% endif %}
+  {% if row.carries_cover and row.state == 'new' %}
+  <tr class="warning"><td colspan="5">Approving this proposal writes a cover image. Undo cannot restore a scene's previous cover, so this write cannot be fully undone.</td></tr>
+  {% elif row.carries_cover and row.state == 'applied' %}
+  <tr class="warning"><td colspan="5">This proposal's cover image cannot be restored by Undo, even after reverting.</td></tr>
+  {% endif %}
   {% if row.runners_up %}
   <tr class="runners"><td colspan="5">Also considered:
     {% for r in row.runners_up %}{{ r.title }} ({{ "%.3f"|format(r.score) }}){% if not loop.last %}, {% endif %}{% endfor %}
@@ -31,3 +39,10 @@
   {% endif %}
   {% endfor %}
 </table>
+
+<h2>Scan</h2>
+{% if scan %}
+<p>Scan {{ scan.id }}: {{ scan.state }} -- {{ scan.message }}</p>
+<p>recorded {{ scan.recorded }}, skipped {{ scan.skipped }}{% if scan.state == 'failed' %} -- FAILED: {{ scan.error }}{% endif %}</p>
+{% endif %}
+<form method="post" action="/scan"><label>Files to look at (each spends one lookup against the configured scraper, and files already proposed or muted don't count against this): <input type="number" name="limit" value="{{ scan_default_limit }}" min="0"></label> <button>Scan</button></form>

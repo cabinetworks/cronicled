@@ -1,22 +1,39 @@
 """Start the inbox.
 
 The one entry point this package has. It constructs no scheduler and starts
-no timer: nothing here scans, and no proposal is produced without a person
-asking for one elsewhere. This serves what the store already holds.
+no timer: no scan runs on its own here, and no proposal is produced without a
+person asking for one. A person CAN ask for one, from the page itself — the
+`Scan` control posts to `/scan`, which starts a `JobRunner` job through
+`web.actions.Actions.scan`, built from the same `cronicled.runscan.build_producer`
+the CLI uses. That is the one place a scan starts; nothing decides on its own
+that one is due.
 
 `--server` names a media server; it has no default because there is no safe
 guess for it. Without one, the inbox still starts: a person can browse what a
 scan already produced, and dismiss or mute proposals, with nothing here that
 needs to reach a media server. Approve and Undo are the two actions that
-write to one, so those two refuse with a clear message instead (see
-`web.actions.Actions`) rather than the whole tool being unusable to someone
-who only wants to look at what a scan produced before wiring up a server.
+write to one. Scan never writes to a media server -- it only reads the
+library and looks candidates up -- but it does need both a media server
+and a configured site adapter to search against, so it refuses with its own
+clear message when either is missing (see `web.actions.Actions`) rather
+than the whole tool being unusable to someone who only wants to look at
+what a scan already produced before wiring either one up.
+
+The `JobRunner` built below outlives any one request: it is constructed once,
+here, alongside `Store` and `Stash`, and lives for as long as this process
+does — a scan a request started keeps running after that request's own
+connection has closed. Like `Store` and `Stash`, it is not explicitly closed
+on shutdown; that is unchanged from how this entry point already treated the
+other two.
 """
 
 import argparse
 import os
 
+from .adapters.registry import get_adapter
 from .config import CONFIG_DIR_ENV_VAR, config_dir
+from .jobs import JobRunner
+from .runscan import configured_adapters
 from .store import Store
 from .stash import Stash
 from .web.actions import Actions
@@ -62,8 +79,24 @@ def main(argv=None):
               "muting still work; Approve and Undo will refuse until a "
               "media server is set (--server / --api-key, or "
               "$CRONICLED_SERVER / $CRONICLED_API_KEY).")
+    try:
+        # A fresh install with no adapters.json configured is a legitimate
+        # state, not an error -- see cronicled.adapters.registry's module
+        # docstring -- so this stays silent the same way `load_adapters`
+        # itself does. `Actions.scan` gives the loud, specific refusal, and
+        # only once someone actually presses Scan.
+        # `env=env` and not the ambient environment: this is the seam where
+        # --config-dir either reaches the adapters or silently does not.
+        # Omitting it leaves the flag half-working -- the directory printed
+        # above would be the one asked for, while the adapters came from
+        # somewhere else -- and nothing would raise to say so.
+        adapter = get_adapter(None, configured_adapters(env=env))
+    except (ValueError, RuntimeError, KeyError):
+        adapter = None
+    runner = JobRunner(store)
+    actions = Actions(store, stash, runner=runner, adapter=adapter)
     serve(rows=lambda: to_rows(store.items()),
-          actions=Actions(store, stash),
+          actions=actions, scan_status=actions.scan_status,
           host=args.host, port=args.port)
 
 

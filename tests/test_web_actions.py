@@ -1,6 +1,11 @@
+import threading
 import unittest
 
+from cronicled.jobs import JobRejected, JobRunner
+from cronicled.store import Store
 from cronicled.web.actions import Actions, ApplyFailed, UnknownProposal
+
+WAIT = 10
 
 
 class _FakeStash:
@@ -50,14 +55,20 @@ class _FakeStore:
         self.calls.append(("muted", subject_type, subject_id, reason))
 
 
-def _item(**over):
+def _item(candidate=None, **over):
+    # `candidate` is its own parameter, not folded into `**over`: it lives
+    # under `payload`, and `item.update(over)` only ever touches the top
+    # level. Defaults to a candidate with no cover, matching every existing
+    # caller here that never mentions one.
     item = {"fingerprint": "fp-1", "state": "new", "subject_type": "scene",
             "subject_id": "42", "prior_state": None,
             "payload": {"path": "/l/a.mp4",
                         "creator": {"name": "N", "source": "folder",
                                     "competing": None,
                                     "rejected_folder": None},
-                        "candidate": {"id": "c-1", "title": "T"},
+                        "candidate": (candidate if candidate is not None
+                                     else {"id": "c-1", "title": "T",
+                                          "image": None}),
                         "score": 0.81, "runners_up": []}}
     item.update(over)
     return item
@@ -100,6 +111,35 @@ class Undo(unittest.TestCase):
         with self.assertRaises(ValueError):
             Actions(store, stash).undo("fp-1")
         self.assertEqual(stash.calls, [])
+
+    def test_a_plain_revert_reports_a_clean_reversal(self):
+        # No cover was ever written by this proposal's apply, so there is
+        # nothing revert_scene's snapshot-based restore leaves behind --
+        # "reverted" is the whole truth here.
+        item = _item(state="applied", prior_state={"title": "was"},
+                     candidate={"id": "c-1", "title": "T", "image": None})
+        store, stash = _FakeStore(item), _FakeStash()
+        self.assertEqual(Actions(store, stash).undo("fp-1"), "reverted")
+
+    def test_reverting_a_proposal_that_wrote_a_cover_names_the_residual(self):
+        # HARM: `revert_scene` restores everything ITS OWN snapshot
+        # describes and, on its own terms, reports a plain success -- but
+        # that snapshot never held the scene's prior cover in the first
+        # place (see `Stash.apply_scene`'s docstring), so a bare "reverted"
+        # here would tell whoever reads it that this call undid the whole
+        # apply. It did not: the cover this proposal's apply wrote is
+        # exactly as unrestored as it was before this call.
+        item = _item(state="applied", prior_state={"title": "was"},
+                     candidate={"id": "c-1", "title": "T",
+                               "image": "data:image/jpeg;base64,cover"})
+        store, stash = _FakeStore(item), _FakeStash()
+        result = Actions(store, stash).undo("fp-1")
+        self.assertNotEqual(result, "reverted")
+        self.assertIn("cannot be restored", result)
+        # The revert itself still has to run -- reporting the residual
+        # must not come at the cost of skipping the actual restore.
+        self.assertEqual(stash.calls,
+                         [("revert", "42", {"title": "was"})])
 
 
 class NoStashConfigured(unittest.TestCase):
@@ -160,6 +200,183 @@ class Reject(unittest.TestCase):
         self.assertNotEqual(dismissed.calls[0][-1], muted.calls[0][-1])
         self.assertIn("dismiss", dismissed.calls[0][-1])
         self.assertIn("mute", muted.calls[0][-1])
+
+
+class _Adapter:
+    """The minimum `build_producer` needs off a site adapter: a scraper id
+    to search under, no censorship map, and `catalog_resolvable=False` --
+    so `examine` never asks `owner_of` anything (it would raise if it did),
+    and resolves each file's creator from its own name and folder alone.
+    None of these fixture scenes name anything a real adapter would
+    recognise, so every one of them ends up muted, never proposed."""
+    name = "test-adapter"
+    scraper_id = "scraper-test"
+    censorship = {}
+    catalog_resolvable = False
+
+    def owner_of(self, result):
+        raise AssertionError(
+            "catalog_resolvable is False; owner_of must not be called")
+
+
+class _ScanStash:
+    """Everything a scan wired through `Actions.scan` may touch: one read to
+    enumerate the library, and one read per query to the configured
+    scraper. `apply_scene`/`revert_scene` -- the two ways a media server is
+    actually WRITTEN to -- raise rather than quietly succeeding: a scan
+    reaching either is exactly the regression this class exists to catch."""
+
+    def __init__(self, scenes=()):
+        self._scenes = list(scenes)
+        self.calls = []
+
+    def unorganized_scenes(self, limit):
+        self.calls.append(("unorganized_scenes", limit))
+        scenes = self._scenes if limit is None else self._scenes[:limit]
+        return len(self._scenes), list(scenes)
+
+    def scrape_scenes_by_query(self, scraper_id, query):
+        self.calls.append(("scrape_scenes_by_query", scraper_id, query))
+        return []
+
+    def apply_scene(self, *args, **kwargs):
+        raise AssertionError("a scan must never write to the media server")
+
+    def revert_scene(self, *args, **kwargs):
+        raise AssertionError("a scan must never write to the media server")
+
+
+class _BlockingScanStash(_ScanStash):
+    """Blocks `unorganized_scenes` on a gate the test controls, so a scan
+    job can be held genuinely `running` for as long as a test needs --
+    deterministically, rather than by racing a real scan to finish before
+    the test's next line runs."""
+
+    def __init__(self, gate):
+        super().__init__(scenes=())
+        self._gate = gate
+
+    def unorganized_scenes(self, limit):
+        self._gate.wait(WAIT)
+        return super().unorganized_scenes(limit)
+
+
+def _library_scene(sid):
+    # A path naming no real creator or store this fixture set defines --
+    # every scene here is expected to end up muted (no candidates, or an
+    # unresolved creator), never proposed.
+    return {"id": str(sid),
+            "files": [{"path": "/library/Unresolved Corner/clip-%s.mp4" % sid}]}
+
+
+class ScanNotConfigured(unittest.TestCase):
+    # `approve`/`undo` already refuse this clearly for a missing `stash`;
+    # `scan` needs a runner AND an adapter as well, and must refuse just as
+    # clearly rather than an AttributeError on `None`.
+
+    def test_refuses_clearly_with_no_runner_or_adapter_configured(self):
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        with self.assertRaises(RuntimeError) as ctx:
+            Actions(store, None).scan(5)
+        self.assertIn("adapter", str(ctx.exception))
+
+    def test_refuses_clearly_with_no_stash_configured(self):
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        runner = JobRunner(store)
+        self.addCleanup(runner.close)
+        actions = Actions(store, None, runner=runner, adapter=_Adapter())
+        with self.assertRaises(RuntimeError) as ctx:
+            actions.scan(5)
+        self.assertIn("no media server is configured", str(ctx.exception))
+
+
+class Scan(unittest.TestCase):
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+        self.runner = JobRunner(self.store)
+        self.addCleanup(self.runner.close)
+
+    def test_the_limit_reaches_the_job(self):
+        # HARM: a `limit` that stops at the HTTP layer and never reaches the
+        # producer would scan the whole library regardless of what was
+        # asked for -- this is the one place that can actually be checked,
+        # since `scan.select` logs how many of how many it took.
+        stash = _ScanStash([_library_scene(1), _library_scene(2),
+                            _library_scene(3)])
+        actions = Actions(self.store, stash, runner=self.runner,
+                          adapter=_Adapter())
+        job = actions.scan(1)
+        self.assertTrue(self.runner.wait(job.id, WAIT))
+        finished = self.runner.job(job.id)
+        self.assertIn("selected 1 of 3", finished.message)
+
+    def test_never_writes_to_the_media_server(self):
+        stash = _ScanStash([_library_scene(1)])
+        actions = Actions(self.store, stash, runner=self.runner,
+                          adapter=_Adapter())
+        job = actions.scan(10)
+        self.assertTrue(self.runner.wait(job.id, WAIT))
+        self.assertGreater(len(stash.calls), 0)
+        for call in stash.calls:
+            self.assertIn(call[0],
+                         ("unorganized_scenes", "scrape_scenes_by_query"))
+
+    def test_two_scans_in_turn_both_start(self):
+        # HARM: `ScanProducer.name` is a fixed class attribute
+        # ("library-scan"); reusing it across calls to `JobRunner.register`
+        # would make every scan after the first one ever run against this
+        # runner refuse with "already registered", not "busy".
+        stash = _ScanStash([_library_scene(1)])
+        actions = Actions(self.store, stash, runner=self.runner,
+                          adapter=_Adapter())
+        first = actions.scan(1)
+        self.assertTrue(self.runner.wait(first.id, WAIT))
+        second = actions.scan(1)  # must not raise
+        self.assertTrue(self.runner.wait(second.id, WAIT))
+        self.assertNotEqual(first.id, second.id)
+
+    def test_a_second_scan_while_one_runs_is_refused_not_swallowed(self):
+        gate = threading.Event()
+        actions = Actions(self.store, _BlockingScanStash(gate),
+                          runner=self.runner, adapter=_Adapter())
+        first = actions.scan(1)
+        try:
+            with self.assertRaises(JobRejected):
+                actions.scan(1)
+        finally:
+            gate.set()
+            self.runner.wait(first.id, WAIT)
+
+
+class ScanStatus(unittest.TestCase):
+    def test_none_when_scanning_is_not_configured(self):
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        self.assertIsNone(Actions(store, None).scan_status())
+
+    def test_none_before_any_scan_has_run(self):
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        runner = JobRunner(store)
+        self.addCleanup(runner.close)
+        actions = Actions(store, _ScanStash([]), runner=runner,
+                          adapter=_Adapter())
+        self.assertIsNone(actions.scan_status())
+
+    def test_reports_the_most_recently_started_scan(self):
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        runner = JobRunner(store)
+        self.addCleanup(runner.close)
+        actions = Actions(store, _ScanStash([_library_scene(1)]),
+                          runner=runner, adapter=_Adapter())
+        job = actions.scan(1)
+        self.assertTrue(runner.wait(job.id, WAIT))
+        status = actions.scan_status()
+        self.assertEqual(status.id, job.id)
 
 
 if __name__ == "__main__":

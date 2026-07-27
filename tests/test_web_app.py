@@ -6,6 +6,7 @@ from contextlib import redirect_stdout
 from http.server import HTTPServer
 from unittest.mock import patch
 
+from cronicled.jobs import JobRejected
 from cronicled.web.actions import ApplyFailed, UnknownProposal
 from cronicled.web.app import build_handler, serve, DEFAULT_HOST
 
@@ -40,6 +41,9 @@ class _RecordingActions:
 
     def undo(self, fp):
         return self._do("undo", fp, "reverted")
+
+    def scan(self, limit):
+        return self._do("scan", limit, "started")
 
 
 class _Server:
@@ -82,6 +86,15 @@ class GetNeverWrites(unittest.TestCase):
             self.assertEqual(r.status, 200)
             self.assertEqual(s.actions.calls, [])
 
+    def test_a_get_to_scan_does_not_start_one(self):
+        # `/scan` starts a job that spends a rate-limited third party's
+        # budget -- exactly the control a prefetching browser, or a link
+        # followed by something that is not a person, must never trigger.
+        with _Server() as s:
+            r = s.request("GET", "/scan")
+            self.assertEqual(r.status, 405)
+            self.assertEqual(s.actions.calls, [])
+
 
 class Posts(unittest.TestCase):
     def test_each_action_path_reaches_its_action(self):
@@ -97,6 +110,52 @@ class Posts(unittest.TestCase):
         with _Server() as s:
             r = s.request("POST", "/approve", "")
             self.assertEqual(r.status, 400)
+            self.assertEqual(s.actions.calls, [])
+
+
+class ScanControl(unittest.TestCase):
+    # `/scan` is shaped differently from the other four actions: it carries
+    # a `limit`, not a fingerprint, and a "busy" refusal from the runner
+    # must reach the person as clearly as an unknown fingerprint does for
+    # the other four (see `ExceptionBranch`).
+
+    def test_a_scan_with_a_limit_starts_a_job_and_redirects(self):
+        with _Server() as s:
+            r = s.request("POST", "/scan", "limit=25")
+            # An int, not the string the form actually posts: a mutation
+            # that forwarded the raw form string straight through instead
+            # of parsing it would still satisfy an assertion written
+            # against "25", so this is asserted as the type the rest of
+            # the wiring (`build_producer`, then `scan.select`) requires.
+            self.assertEqual(s.actions.calls, [("scan", 25)])
+            self.assertEqual(r.status, 303)
+
+    def test_a_scan_with_no_limit_is_refused_not_defaulted_to_unlimited(self):
+        # HARM: `scan.select` reads a missing limit as "take every
+        # survivor" -- the harm this whole control exists to bound.
+        with _Server() as s:
+            r = s.request("POST", "/scan", "")
+            self.assertEqual(r.status, 400)
+            self.assertEqual(s.actions.calls, [])
+
+    def test_a_malformed_limit_is_refused_not_a_crash(self):
+        with _Server() as s:
+            r = s.request("POST", "/scan", "limit=not-a-number")
+            self.assertEqual(r.status, 400)
+            self.assertEqual(s.actions.calls, [])
+
+    def test_a_busy_runner_refusal_is_reported_not_redirected(self):
+        # The runner already raises `JobRejected` for a second concurrent
+        # scan of the same cost class; the handler must let that reach the
+        # person as an error, not swallow it and redirect as though this
+        # scan, too, had started -- indistinguishable, to someone watching
+        # the page, from a control that silently does nothing.
+        with _Server(fail={"scan": JobRejected(
+                "cost class 'scraping' is already running library-scan-x")
+                }) as s:
+            r = s.request("POST", "/scan", "limit=25")
+            self.assertEqual(r.status, 400)
+            self.assertIn(b"already running", r.read())
             self.assertEqual(s.actions.calls, [])
 
 
