@@ -218,10 +218,24 @@ def serve(rows, actions, scan_status=None, host=DEFAULT_HOST, port=DEFAULT_PORT)
     # documented limitation rather than a silently traded one.
     if host != DEFAULT_HOST:
         # Loud, because there is no authentication: the binding is the only
-        # thing standing between this page and anyone who can reach the host.
+        # thing standing between this page and anyone who can reach the
+        # host -- and inside a container this fires on EVERY start, not just
+        # a mistake, because 127.0.0.1 in there answers nothing `docker run
+        # -p` forwards to it. Repeating a true warning every time is the
+        # accepted cost: what it says stays correct no matter how often it
+        # prints, and silencing it on the container path would hide the one
+        # thing an operator most needs to get right -- which this message
+        # names directly, rather than just naming the bind host that no
+        # longer decides it.
         print("WARNING: binding to %s, not %s. This page has NO "
-              "authentication and its buttons write to your library."
-              % (host, DEFAULT_HOST))
+              "authentication and its buttons write to your library. If "
+              "this is a container, the bind host above is not what "
+              "protects you -- 0.0.0.0 is required in there just to be "
+              "reachable at all. What protects you is how `docker run` "
+              "published the port: `-p 127.0.0.1:%d:%d` keeps it reachable "
+              "only from this machine; `-p %d:%d` (or -P) publishes this "
+              "same unauthenticated page to every network this host is on."
+              % (host, DEFAULT_HOST, port, port, port, port))
     httpd = HTTPServer((host, port), build_handler(rows, actions, scan_status))
     print("inbox on http://%s:%d/" % (host, port))
     httpd.serve_forever()
