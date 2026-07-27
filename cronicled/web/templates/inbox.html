@@ -17,13 +17,16 @@
     <td>
       {% if row.undoable %}
       <form method="post" action="/undo"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Undo</button></form>
-      {% elif row.state == 'new' %}
-      <form method="post" action="/approve"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Approve</button></form>
+      {% elif row.actionable %}
+      <form method="post" action="/approve"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>{% if row.error %}Try again{% else %}Approve{% endif %}</button></form>
       <form method="post" action="/dismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Dismiss</button></form>
       <form method="post" action="/mute"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Mute</button></form>
       {% endif %}
     </td>
   </tr>
+  {% if row.error %}
+  <tr class="warning"><td colspan="5">The last attempt to apply this failed, and nothing was written: {{ row.error }}</td></tr>
+  {% endif %}
   {% if row.contested %}
   <tr class="warning"><td colspan="5">Attribution is contested: {{ row.disagreement }}</td></tr>
   {% endif %}

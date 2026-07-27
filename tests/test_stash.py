@@ -3312,3 +3312,67 @@ class IrreversibleTagWriteTypes(unittest.TestCase):
         self.assertEqual(t.only()["values"],
                          {"id": CANONICAL_TAG_ID, "aliases": MERGED_ALIASES})
         json.dumps(t.only())
+
+
+class CompositeFieldsAreSelectedWithSubfields(unittest.TestCase):
+    """A field whose type is an object needs a selection set. Written bare it
+    is not a narrower read -- the server rejects the WHOLE query, so every
+    call using it fails.
+
+    This shipped. `stash_ids` (type `[StashID!]!`) was selected bare in the
+    read that builds an apply's undo snapshot, so every apply against a real
+    server failed with a validation error while the entire suite stayed
+    green. Nothing here parses a query: the transport under test is a double
+    that returns canned dictionaries for any string at all, so a query can be
+    well-formed Python, invalid GraphQL, and fully "covered".
+
+    Narrow by design -- it knows only the composite fields this client
+    actually selects. The general fix is validating every query against the
+    server's published schema offline, which is filed separately.
+    """
+
+    # Read off the upstream schema rather than guessed. `StashID` is
+    # {endpoint, stash_id, updated_at}; only the first two are accepted by
+    # `StashIDInput` on the way back, which is why the snapshot takes those.
+    _COMPOSITE = ("stash_ids", "studio", "performers", "tags", "files",
+                  "scene", "findScene")
+
+    @staticmethod
+    def _graphql_literals():
+        """Every GraphQL document in the client, taken from the AST rather
+        than by scanning the source -- a regex over Python text also finds
+        dict keys and prose, which is how the first attempt at this test
+        produced false failures."""
+        import ast
+        import inspect
+        from cronicled import stash as stash_module
+        tree = ast.parse(inspect.getsource(stash_module))
+        out = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                text = node.value.strip()
+                if text.startswith(("query", "mutation")):
+                    out.append(node.value)
+        return out
+
+    def test_there_are_queries_to_check(self):
+        # Without this the scan passes by finding nothing, which is how it
+        # would read as green after a refactor moved the queries elsewhere.
+        self.assertGreater(len(self._graphql_literals()), 3)
+
+    def test_every_composite_field_selected_has_a_selection_set(self):
+        import re
+        for doc in self._graphql_literals():
+            for field in self._COMPOSITE:
+                for m in re.finditer(
+                        r"(?<![A-Za-z_$])%s(?![A-Za-z_])" % re.escape(field),
+                        doc):
+                    tail = doc[m.end():].lstrip()
+                    if tail[:1] in ("{", "("):
+                        continue          # has a selection, or is a call
+                    self.fail(
+                        "%r is a composite field selected without a "
+                        "selection set. The server rejects the whole query, "
+                        "so every call using it fails -- and no fake "
+                        "transport will ever notice.\n  in: %s"
+                        % (field, " ".join(doc.split())[:160]))

@@ -190,3 +190,38 @@ class ToRowsTest(unittest.TestCase):
         items = [_item(fingerprint="fp-1"), _item(fingerprint="fp-2")]
         rows = to_rows(items)
         self.assertEqual([r.fingerprint for r in rows], ["fp-1", "fp-2"])
+
+
+class FailedApplyIsNotADeadEnd(unittest.TestCase):
+    """A failed apply wrote NOTHING, so the proposal is exactly as live as it
+    was before the attempt. The page used to offer controls only for `new`,
+    so a row that failed lost every button and gave no reason -- it could not
+    be retried, dismissed or muted, and nothing said why. Observed on a real
+    library: an invalid query made every apply fail, and the rows it touched
+    became unreachable.
+    """
+
+    def _failed(self, error="HTTP 422 from the media server"):
+        return _item(state="failed", error=error)
+
+    def test_a_failed_row_still_offers_its_decisions(self):
+        row = to_row(self._failed())
+        self.assertTrue(row.actionable)
+        # Not undoable: nothing was written, so there is nothing to revert.
+        self.assertFalse(row.undoable)
+
+    def test_a_failed_row_carries_the_reason_it_failed(self):
+        row = to_row(self._failed("HTTP 422: field needs a selection"))
+        self.assertEqual(row.error, "HTTP 422: field needs a selection")
+
+    def test_an_applied_row_is_the_only_closed_one(self):
+        # Stated as "not applied" rather than a list of open states, so a
+        # state added later inherits its controls instead of silently losing
+        # them the way `failed` did.
+        self.assertFalse(to_row(_item(state="applied",
+                                      prior_state={"t": 1})).actionable)
+        for state in ("new", "seen", "failed"):
+            self.assertTrue(to_row(_item(state=state)).actionable, state)
+
+    def test_a_row_that_never_failed_carries_no_error(self):
+        self.assertIsNone(to_row(_item()).error)
