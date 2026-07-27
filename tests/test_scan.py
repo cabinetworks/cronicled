@@ -162,6 +162,38 @@ class SelectTest(unittest.TestCase):
             total=2, already_proposed=0, muted=1, filtered_out=0, selected=1,
             deferred=0))
 
+    def test_the_subject_kind_matches_what_earlier_runs_already_wrote(self):
+        """The mute and the proposal here are written with the LITERAL string,
+        the way a database filled by an earlier run holds them.
+
+        Every other assertion in this file spells the kind `SUBJECT_TYPE` on
+        both sides — the value handed to the store and the value it is checked
+        against — so changing the constant moves both and nothing objects.
+        Confirmed by mutation: renaming it survives the whole suite.
+
+        It is not an internal label. `select` reads muted subjects and
+        existing proposals back OUT of a store that outlives the run that
+        wrote them, keyed on this string. Change it and every mute a reviewer
+        has ever set stops suppressing its file, every proposal already in the
+        inbox stops counting as already proposed, and the next scan re-offers
+        work that was decided months ago — spending the lookup budget this
+        whole module exists to ration, with nothing anywhere reporting it.
+        """
+        self.assertEqual(SUBJECT_TYPE, "scene")
+        self.store.record(folder=FOLDER, subject_type="scene", subject_id="1",
+                          summary="a proposal", payload={"title": "something"},
+                          producer="an-earlier-run")
+        self.store.mute("scene", "2")
+
+        _, counts = select([scene(1, "/library/one.mp4"),
+                            scene(2, "/library/two.mp4"),
+                            scene(3, "/library/three.mp4")],
+                           store=self.store, folder=FOLDER)
+
+        self.assertEqual(counts, Counts(
+            total=3, already_proposed=1, muted=1, filtered_out=0, selected=1,
+            deferred=0))
+
     def test_a_muted_subject_is_not_also_counted_as_already_proposed(self):
         """Muting a proposed subject moves its row out of the visible view, so
         the same file must not be counted under two reasons at once."""
@@ -680,6 +712,38 @@ class ExamineTest(unittest.TestCase):
         names nobody — and only one of them is fixed by an alias. A single
         catch-all reason would satisfy both tests above and lose that."""
         self.assertNotEqual(MUTE_NO_CANDIDATES, MUTE_UNRESOLVED_CREATOR)
+
+    def test_each_mute_reason_says_which_of_the_two_it_is(self):
+        """Which constant carries which sentence, pinned as a property of the
+        sentence rather than as the constant compared to itself.
+
+        The tests above spell the expected reason `MUTE_NO_CANDIDATES` and
+        `MUTE_UNRESOLVED_CREATOR`, which is the same name the code returns:
+        exchange the two strings at their definitions and both sides move
+        together, both tests still pass, and `assertNotEqual` above still
+        holds because they are still two different strings. Confirmed by
+        mutation — the swap survives the whole suite.
+
+        What the swap costs is the one thing these two reasons exist to
+        separate. The stored reason is what a reviewer reads months later,
+        and only ONE of the two is fixed by adding an alias. Swapped, every
+        file the catalogue had nothing for tells them to go write an alias
+        that will never fire, and every file whose layout named nobody tells
+        them the catalogue is empty for a creator that was never identified.
+
+        Each sentence is pinned by what it names AND by what it does not: a
+        single catch-all mentioning the catalogue, the folder and the
+        filename at once would satisfy the positive halves alone.
+        """
+        self.assertIn("candidates", MUTE_NO_CANDIDATES)
+        self.assertIn("catalogue", MUTE_NO_CANDIDATES)
+        self.assertNotIn("folder", MUTE_NO_CANDIDATES)
+        self.assertNotIn("filename", MUTE_NO_CANDIDATES)
+
+        self.assertIn("folder", MUTE_UNRESOLVED_CREATOR)
+        self.assertIn("filename", MUTE_UNRESOLVED_CREATOR)
+        self.assertNotIn("candidates", MUTE_UNRESOLVED_CREATOR)
+        self.assertNotIn("catalogue", MUTE_UNRESOLVED_CREATOR)
 
     # -- the second kind: a human should look ----------------------------- #
 
