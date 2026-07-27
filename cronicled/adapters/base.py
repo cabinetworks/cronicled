@@ -29,5 +29,13 @@ class SiteAdapter(object):
 
     def search_query(self, seed, title_query):
         """The targeted per-title query: the creator handle plus the title, which
-        narrows a catalog search to that creator's own clips."""
+        narrows a catalog search to that creator's own clips.
+
+        Not wired to anything: `cronicled.search.catalog_search` — the
+        production `search` callable `scan.examine` actually calls — queries
+        once per CREATOR, not once per title, so it never builds this query
+        at all. Reading this method as live because it exists would be a
+        mistake; it describes the other shape a search could have taken, not
+        the one that was chosen. See `cronicled.search`'s module docstring.
+        """
         return seed + " " + title_query

@@ -27,7 +27,12 @@ interpolation.
 The inbox is real: `python -m cronicled` serves proposals from the store,
 takes approve/dismiss/mute/undo over POST, and applies or reverts a scene
 through the media-server client — no write happens without a person clicking
-one of those. What is still missing is the part that would make any of this
+one of those. Undo is not always complete: a proposal that carries a cover
+image writes one the media server never exposes in a form its own undo
+snapshot can restore, so that one field stays as the approve left it. The
+inbox warns before an approve that would do this, and undo reports the same
+residual afterward, rather than either one reading as a clean, full
+reversal. What is still missing is the part that would make any of this
 unattended: nothing constructs a scheduler, so no proposal is ever produced
 without a person starting a scan themselves.
 

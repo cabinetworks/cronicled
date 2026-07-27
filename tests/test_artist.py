@@ -618,3 +618,159 @@ class TheAliasIndexAsAValue(unittest.TestCase):
         self.assertIn("2", text)
         for secret in ("vcrane", "Velvet Crane", "V-Wren", "Copper Wren"):
             self.assertNotIn(secret, text)
+
+
+def _owners_of(script):
+    """A fake `owners_of` collaborator, for a test to pass to `resolve`: no
+    search runs, no socket opens. `script` maps a candidate name to the list
+    of owner names its (fake) search would return; a name with no entry
+    answers `[]`, matching a real search that genuinely found nothing.
+
+    Calls are recorded on `.calls` so a test can assert exactly which
+    candidates were checked -- in particular, that the SINGLE-candidate case
+    never calls this at all (see `EvidenceBackedResolution.
+    test_a_single_candidate_never_spends_a_lookup`), which is the cost bound
+    `_resolve_by_evidence` promises.
+    """
+    calls = []
+
+    def owners_of(name):
+        calls.append(name)
+        return list(script.get(name, []))
+
+    owners_of.calls = calls
+    return owners_of
+
+
+class EvidenceBackedResolution(unittest.TestCase):
+    """`resolve(..., owners_of=...)` -- the fix for issue #66: a file named
+    "<store> - <creator> - <title>", filed under a folder named for the
+    store, used to resolve to the store, because the store's own name is
+    just as plausible a *shape* as the creator's. `owners_of` lets `resolve`
+    check a candidate against the catalogue instead of assuming the first
+    one -- see `_resolve_by_evidence`.
+
+    "Amberlight" stands in for the measured store, "Wren Ashcombe" for the
+    measured creator; both invented, matching no real store or performer.
+    """
+
+    FILENAME = "Amberlight - Wren Ashcombe - Morning Session.mp4"
+
+    def test_a_supported_deeper_candidate_beats_an_unsupported_folder(self):
+        # HARM this fixes: without a search, the folder ("Amberlight", the
+        # store) would win by the old default, exactly the wrong attribution
+        # the live scan produced.
+        owners_of = _owners_of({
+            "Amberlight": [],
+            "Wren Ashcombe": ["Wren Ashcombe"] * 19,
+        })
+
+        r = resolve(self.FILENAME, "Amberlight", owners_of=owners_of)
+
+        self.assertEqual(r.name, "Wren Ashcombe")
+        self.assertEqual(r.source, "filename")
+
+    def test_the_losing_candidate_is_reported_not_dropped(self):
+        owners_of = _owners_of({
+            "Amberlight": [],
+            "Wren Ashcombe": ["Wren Ashcombe"] * 19,
+        })
+
+        r = resolve(self.FILENAME, "Amberlight", owners_of=owners_of)
+
+        self.assertEqual(r.competing, "Amberlight")
+        # It competed and lost on evidence, not on a guard -- so it is NOT
+        # also reported as a rejected folder (see `Resolution`'s docstring).
+        self.assertIsNone(r.rejected_folder)
+
+    def test_the_folder_can_still_win_when_the_catalogue_backs_it(self):
+        owners_of = _owners_of({
+            "Amberlight": ["Amberlight", "Amberlight"],
+            "Wren Ashcombe": [],
+        })
+
+        r = resolve(self.FILENAME, "Amberlight", owners_of=owners_of)
+
+        self.assertEqual(r.name, "Amberlight")
+        self.assertEqual(r.source, "folder")
+        self.assertEqual(r.competing, "Wren Ashcombe")
+
+    def test_zero_supported_candidates_is_unresolved_not_a_guess(self):
+        # HARM this guards: falling back to "take the first segment anyway"
+        # here would silently reproduce the exact bug this task fixes,
+        # just relabelled as "nothing was supported".
+        owners_of = _owners_of({"Amberlight": [], "Wren Ashcombe": []})
+
+        r = resolve(self.FILENAME, "Amberlight", owners_of=owners_of)
+
+        self.assertIsNone(r.name)
+        self.assertIsNone(r.source)
+        # both candidates were actually checked -- neither was skipped nor
+        # was a decision made without asking
+        self.assertEqual(set(owners_of.calls), {"Amberlight", "Wren Ashcombe"})
+
+    def test_two_supported_candidates_is_unresolved_not_picked_by_order(self):
+        # Ambiguity is reported, never resolved by iteration order: two
+        # DIFFERENT names the catalogue each separately confirm is a
+        # genuine conflict, not a tie to break by which was folder and
+        # which was filename.
+        filename = "Amberlight - Rowantide - Morning Session.mp4"
+        owners_of = _owners_of({
+            "Amberlight": ["Amberlight"],
+            "Rowantide": ["Rowantide"],
+        })
+
+        r = resolve(filename, "Amberlight", owners_of=owners_of)
+
+        self.assertIsNone(r.name)
+        self.assertIsNone(r.source)
+
+    def test_a_single_candidate_never_spends_a_lookup(self):
+        # The common, unambiguous file: folder and filename agree, so there
+        # is nothing to check. This is the cost bound -- a search-backed
+        # resolve() must not cost every file a lookup just because it CAN.
+        owners_of = _owners_of({})
+
+        r = resolve("Wren Ashcombe - Morning Session.mp4", "Wren Ashcombe",
+                     owners_of=owners_of)
+
+        self.assertEqual(r.name, "Wren Ashcombe")
+        self.assertEqual(owners_of.calls, [])
+
+    def test_an_extended_name_resolves_with_real_support(self):
+        # "Wren" is a short form of "Wren Ashcombe"; a PREFIX match, trusted
+        # only with more than one supporting result (see MIN_PREFIX_SUPPORT).
+        filename = "Amberlight - Wren - Morning Session.mp4"
+        owners_of = _owners_of({
+            "Amberlight": [],
+            "Wren": ["Wren Ashcombe", "Wren Ashcombe"],
+        })
+
+        r = resolve(filename, "Amberlight", owners_of=owners_of)
+
+        self.assertEqual(r.name, "Wren")
+        self.assertEqual(r.source, "filename")
+
+    def test_a_single_prefix_hit_is_a_fluke_not_support(self):
+        filename = "Amberlight - Wren - Morning Session.mp4"
+        owners_of = _owners_of({
+            "Amberlight": [],
+            "Wren": ["Wren Ashcombe"],
+        })
+
+        r = resolve(filename, "Amberlight", owners_of=owners_of)
+
+        self.assertIsNone(r.name)
+
+    def test_owners_of_absent_keeps_the_old_folder_wins_default(self):
+        # No search collaborator at all: resolve() stays the pure function
+        # it always was. Without one, only the FIRST dash segment is ever
+        # read from the filename ("Amberlight" -- see `_filename_candidate`),
+        # which here agrees with the folder, so there is no competitor to
+        # report either; this is the exact pre-existing behaviour this task
+        # leaves untouched for every caller that has no search to give.
+        r = resolve(self.FILENAME, "Amberlight")
+
+        self.assertEqual(r.name, "Amberlight")
+        self.assertEqual(r.source, "folder")
+        self.assertIsNone(r.competing)

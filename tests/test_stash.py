@@ -905,6 +905,244 @@ class UpdateTagAliases(unittest.TestCase):
         self.assertIn("tagUpdate", t.calls[0][0])
 
 
+# -- scraping --------------------------------------------------------------- #
+#
+# scrape_scenes_by_query is the only thing in this project that can execute a
+# search: scan.examine's `search` callable has had no production
+# implementation, so this is the seam a later task wires the scan to, and
+# nothing here has ever run against a real server. That raises the stakes on
+# the one failure mode this project has already hit twice: a selection set
+# whose test only compares the request against the very query constant the
+# client built, so a field silently dropped from both sides at once leaves
+# the suite green. Two queries elsewhere in this codebase were once reducible
+# to a bare `id` that way. So every test below that touches the selection set
+# or the argument shape reads the ACTUAL request scrape_scenes_by_query sent
+# — through _QueryRecorder, parsed by the same structural helpers the rest of
+# this file's binding tests use (_bound_arguments, _declared_type_of,
+# _selection_of) — and asserts field names and argument bindings, never a
+# second copy of the query text.
+
+SCRAPER_ID = "scraper-velvet-index"
+SCRAPE_QUERY_TEXT = "Velvet Crane - Copper Kettle"
+
+
+def _scraped_scene(**fields):
+    """One ScrapedScene-shaped row, as scrapeSingleScene would answer it."""
+    row = {"title": "Copper Kettle", "code": None, "details": None,
+           "director": None, "urls": [], "date": None, "image": None,
+           "studio": None, "tags": [], "performers": []}
+    row.update(fields)
+    return row
+
+
+class ScrapeScenesByQuery(unittest.TestCase):
+    def test_it_returns_the_scenes_the_scraper_found(self):
+        scene = _scraped_scene(title="Copper Kettle")
+        t = _transport([{"data": {"scrapeSingleScene": [scene]}}])
+        got = _read_stash(t).scrape_scenes_by_query(SCRAPER_ID, SCRAPE_QUERY_TEXT)
+        self.assertEqual(got, [scene])
+
+    def test_no_match_is_an_empty_list_not_an_error(self):
+        # HARM: scan.examine treats an empty catalogue as the ordinary
+        # "nothing to identify this file with" case (MUTE_NO_CANDIDATES), not
+        # a failure. Raising here, or handing back something a caller must
+        # special-case, would turn every plain miss — the common case for an
+        # obscure creator — into an error scan._examine has to catch instead
+        # of a result it can act on directly.
+        t = _transport([{"data": {"scrapeSingleScene": []}}])
+        got = _read_stash(t).scrape_scenes_by_query(SCRAPER_ID, SCRAPE_QUERY_TEXT)
+        self.assertEqual(got, [])
+
+    def test_a_null_result_is_normalised_to_an_empty_list(self):
+        # HARM: the schema this method is built against was read off the
+        # upstream project's published files because the live instance
+        # refused introspection — it is good but UNVERIFIED, and declares
+        # scrapeSingleScene non-null. `examine` calls `list(search(...))`
+        # unconditionally, so a server that answers `null` for "nothing
+        # matched" (a schema mismatch, a version difference) must not reach
+        # it as None: that is a TypeError on every miss instead of the empty
+        # catalogue examine already knows how to handle.
+        t = _transport([{"data": {"scrapeSingleScene": None}}])
+        got = _read_stash(t).scrape_scenes_by_query(SCRAPER_ID, SCRAPE_QUERY_TEXT)
+        self.assertEqual(got, [])
+        self.assertIsInstance(got, list)
+
+
+def _scrape_request(query=SCRAPE_QUERY_TEXT, scraper_id=SCRAPER_ID):
+    t = _QueryRecorder({"data": {"scrapeSingleScene": []}})
+    _binding_stash(t).scrape_scenes_by_query(scraper_id, query)
+    return t.only()
+
+
+class ScrapeScenesByQueryBindings(unittest.TestCase):
+    def test_the_scraper_id_binds_to_source_and_the_text_binds_to_input(self):
+        # HARM: `source` and `input` take opposite roles — WHICH scraper
+        # answers versus WHAT it is asked — and swapping them is invisible to
+        # a check that only inspects the variables dict, which holds the same
+        # two values either way. Bound the wrong way round the server refuses
+        # every call, so scrape_scenes_by_query — the one thing that can
+        # execute a search this whole project has been waiting on — never
+        # works at all.
+        query, variables = _scrape_request()
+        self.assertEqual(
+            _bound_arguments(query, variables, "scrapeSingleScene"),
+            {"source": {"scraper_id": SCRAPER_ID},
+             "input": {"query": SCRAPE_QUERY_TEXT}})
+
+    def test_each_argument_declares_the_type_the_schema_gives_it(self):
+        # HARM: the bindings above pass even if the operation header declares
+        # the wrong type for whichever variable they are bound to — a swap of
+        # the two DECLARATIONS is a different mutation than a swap of the two
+        # ARGUMENTS, and the server rejects it at parse time just the same.
+        query, _ = _scrape_request()
+        self.assertEqual(
+            _declared_type_of(query, "scrapeSingleScene", "source"),
+            "ScraperSourceInput!")
+        self.assertEqual(
+            _declared_type_of(query, "scrapeSingleScene", "input"),
+            "ScrapeSingleSceneInput!")
+
+    def test_the_selection_set_names_every_field_apply_scene_can_write(self):
+        # HARM: what a query does not select, the server never sends, and a
+        # dropped field is silent — nothing raises, the key is simply absent
+        # forever. `title` is the one scan.examine cannot run without
+        # (candidates are scored on it); the rest is exactly what
+        # Stash.apply_scene can write onto a scene, read off its own body.
+        # `image` is here too, and deliberately: see the docstring test below
+        # for why dropping it is worse than dropping an ordinary field.
+        selection = _selection_of(_scrape_request()[0], "scrapeSingleScene")
+        for field in ("title", "code", "details", "director", "urls",
+                     "date", "image", "studio", "tags", "performers"):
+            with self.subTest(field=field):
+                self.assertIn(field, selection,
+                              "%s is writable by apply_scene and is not "
+                              "being asked for" % (field,))
+
+    def test_studio_performers_and_tags_carry_the_ids_apply_scene_resolves_by(self):
+        # HARM: apply_scene's find_or_create takes a `stored_id` alongside
+        # `name` for each of these three — the server's own "you already have
+        # this one" signal, which is exactly the shape ScrapedStudio /
+        # ScrapedPerformer / ScrapedTag take on the wire. Selecting `name`
+        # alone would still let a scene apply, but every single one of these
+        # would be re-resolved by name search on every scrape, even for an
+        # entity the server itself already matched.
+        selection = _selection_of(_scrape_request()[0], "scrapeSingleScene")
+        for block in ("studio", "tags", "performers"):
+            with self.subTest(block=block):
+                self.assertEqual(set(selection[block]), {"stored_id", "name"})
+
+
+class DeprecatedSingularUrlIsStillSelected(unittest.TestCase):
+    """`ScrapedScene.url` (singular) is schema-deprecated in favour of `urls`
+    — but `cronicled.adapters.declarative.DeclarativeAdapter.owner_of` is the
+    one existing consumer of a scraped result's URL in this codebase, and it
+    reads `result.get("url")`, singular, for every adapter configured with
+    `owner_source: "url_segment"` (the shape `config/adapters.example.json`'s
+    own example adapter uses). apply_scene needs no help here — its own
+    `urls`/`url` fallback already prefers the plural field — so dropping
+    `url` would not touch the apply path at all; it would silently leave
+    every url_segment adapter's `owner_of` reading nothing, which resolves to
+    an unresolved creator and mutes the file. Nothing raises anywhere in that
+    chain, which is exactly the shape of failure this project's briefs keep
+    finding: a field silently missing rather than an error."""
+
+    def test_the_deprecated_singular_url_is_selected_alongside_urls(self):
+        selection = _selection_of(_scrape_request()[0], "scrapeSingleScene")
+        self.assertIn("url", selection)
+        self.assertIn("urls", selection)
+
+
+class CoverImageIsIrreversible(unittest.TestCase):
+    """The one field here that is not like the others: `apply_scene` can
+    write it, but its undo snapshot cannot represent a scene's CURRENT
+    cover — only a URL is exposed for that, never the base64 payload an
+    update accepts — so a cover applied from what this method returns can
+    never be reverted. Selecting it anyway is a decision already taken with
+    the project owner, not something this task may undo; what this task owns
+    is making sure that is documented where a reader of this method will
+    meet it."""
+
+    def test_the_docstring_states_the_cover_cannot_be_undone(self):
+        # HARM: the whole point of writing this down is that a person reads
+        # it before wiring an auto-apply path to a result carrying `image`.
+        # A docstring that selects the field without saying so is the silent
+        # version of the exact harm the brief for this task exists to close.
+        doc = Stash.scrape_scenes_by_query.__doc__
+        self.assertIn("cannot be undone", doc)
+        self.assertIn("image", doc)
+
+    def test_nothing_here_claims_the_undo_is_complete(self):
+        # HARM: the inverse overclaim — a comment or docstring that describes
+        # apply_scene's undo as whole would be read as "safe to auto-apply
+        # blindly", which is false for exactly the cover field this method
+        # selects. Checked across both new methods' docs, not just the one
+        # that mentions the cover, since the false claim would be just as
+        # wrong sitting beside the other.
+        for doc in (Stash.scrape_scenes_by_query.__doc__,
+                   Stash.scene_scrapers.__doc__):
+            for overclaim in ("fully reversible", "can always be undone",
+                             "undo is complete", "safe to undo"):
+                self.assertNotIn(overclaim, doc.lower())
+
+
+def _scrapers_request(**kwargs):
+    t = _QueryRecorder({"data": {"listScrapers": []}})
+    _binding_stash(t).scene_scrapers(**kwargs)
+    return t.only()
+
+
+class SceneScrapers(unittest.TestCase):
+    def test_it_returns_what_the_server_configured(self):
+        # HARM: a caller uses this to tell an operator which scraper ids are
+        # actually usable, rather than failing later on a bare id nobody can
+        # check. Losing a row here is the tool silently under-reporting what
+        # is available.
+        rows = [{"id": SCRAPER_ID, "name": "Velvet Index"},
+               {"id": "scraper-other", "name": "Harbour Registry"}]
+        t = _transport([{"data": {"listScrapers": rows}}])
+        self.assertEqual(_read_stash(t).scene_scrapers(), rows)
+
+    def test_nothing_configured_is_an_empty_list_not_an_error(self):
+        t = _transport([{"data": {"listScrapers": []}}])
+        self.assertEqual(_read_stash(t).scene_scrapers(), [])
+
+    def test_a_null_result_is_normalised_to_an_empty_list(self):
+        # HARM: same schema-drift residual as the scrape read above — a
+        # server answering `null` where the published schema promises a
+        # non-null list must not reach a caller doing `for s in
+        # scene_scrapers()` as a crash.
+        t = _transport([{"data": {"listScrapers": None}}])
+        got = _read_stash(t).scene_scrapers()
+        self.assertEqual(got, [])
+        self.assertIsInstance(got, list)
+
+
+class SceneScrapersBindings(unittest.TestCase):
+    def test_the_types_argument_asks_for_scene_scrapers_specifically(self):
+        # HARM: `listScrapers` takes `types: [ScrapeContentType!]!` — read
+        # off the schema rather than guessed. Sending the wrong content type,
+        # or none at all in a way the server accepts as "everything", answers
+        # a different question than "what can scrape a SCENE": a gallery- or
+        # movie-only scraper would be reported as available for a scene
+        # search and fail the moment it is actually used.
+        query, variables = _scrapers_request()
+        self.assertEqual(
+            _bound_arguments(query, variables, "listScrapers"),
+            {"types": ["SCENE"]})
+        self.assertEqual(
+            _declared_type_of(query, "listScrapers", "types"),
+            "[ScrapeContentType!]!")
+
+    def test_the_selection_carries_a_name_a_caller_can_show_an_operator(self):
+        # HARM: the whole reason this method exists rather than a caller
+        # guessing a bare scraper id is so an operator can be told what is
+        # available in words they can check. Selecting `id` alone defeats
+        # that: a caller would still have nothing but an id to fail with.
+        selection = _selection_of(_scrapers_request()[0], "listScrapers")
+        self.assertIn("id", selection)
+        self.assertIn("name", selection)
+
+
 # -- which scenes a bulk run writes to ------------------------------------- #
 
 class _ReadTransport:

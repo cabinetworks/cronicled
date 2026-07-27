@@ -1,24 +1,36 @@
 import re
 import unittest
 
+from cronicled.jobs import Job
 from cronicled.web.render import environment, render
 from cronicled.web.rows import to_row
 
 _HOSTILE = '<script>alert("x")</script>'
 
 
-def _row(runners_up=None, **over):
-    # `runners_up` is its own parameter, not folded into `**over`: it lives
-    # under `payload` in the real item shape, and `item.update(over)` only
-    # ever touches the top level. Routing it through `over` would silently
-    # keep the default fixture's runners_up on every call that tried to
-    # override it -- exactly the kind of blank-column bug this task exists to
-    # catch, just moved into the test instead of the template.
+def _job(**over):
+    job = dict(id="job-1", producer="library-scan-x", cost="scraping",
+               state="running", started_at="2026-07-27T00:00:00+00:00",
+               finished_at=None, message="working", recorded=0, skipped=0,
+               error=None, traceback=None)
+    job.update(over)
+    return Job(**job)
+
+
+def _row(runners_up=None, image=None, **over):
+    # `runners_up` and `image` are their own parameters, not folded into
+    # `**over`: both live under `payload` in the real item shape, and
+    # `item.update(over)` only ever touches the top level. Routing either
+    # through `over` would silently keep the default fixture's value on
+    # every call that tried to override it -- exactly the kind of
+    # blank-column bug this task exists to catch, just moved into the test
+    # instead of the template. `image` defaults to `None` -- "no cover",
+    # matching every existing caller here that never mentions a cover.
     payload = {
         "path": "/library/x/%s.mp4" % _HOSTILE,
         "creator": {"name": _HOSTILE, "source": "folder",
                     "competing": _HOSTILE, "rejected_folder": _HOSTILE},
-        "candidate": {"id": "c-1", "title": _HOSTILE},
+        "candidate": {"id": "c-1", "title": _HOSTILE, "image": image},
         "score": 0.812,
         # Nested under `candidate`, matching what `scan._runners_up` actually
         # emits and what `rows.to_row` requires -- see test_web_rows.py's
@@ -166,6 +178,113 @@ class ButtonWiring(unittest.TestCase):
         row = _row(state="applied", prior_state=None)
         self.assertFalse(row.undoable)
         self.assertEqual(self._controls(row), [])
+
+
+class CoverWarning(unittest.TestCase):
+    """The warning a person needs before Approve writes something Undo
+    cannot take back -- and the same fact, past tense, once the row is
+    applied. Checked as text actually reaching the rendered page, not by
+    inspecting `row.carries_cover` alone: a template that stopped
+    rendering the warning while the field stayed `True` would still pass a
+    test that only checked the dataclass.
+
+    Two mutations matter enough to name explicitly:
+      - dropping the warning for a row whose candidate DOES carry a cover
+        -- silence exactly where the person needs it most;
+      - showing it for every row regardless of `carries_cover` -- a
+        warning true of nothing trains a person to stop reading it,
+        including the genuinely-true one beside it (`contested`).
+    """
+
+    _NOT_YET_APPLIED = "cannot be fully undone"
+    _ALREADY_APPLIED = "cannot be restored by Undo, even after reverting"
+
+    def test_a_new_row_with_a_cover_warns_before_the_click(self):
+        row = _row(state="new", image="data:image/jpeg;base64,realcover")
+        html = render("inbox.html", rows=[row], counts={})
+        self.assertIn(self._NOT_YET_APPLIED, html)
+
+    def test_a_new_row_without_a_cover_never_warns(self):
+        row = _row(state="new", image=None)
+        html = render("inbox.html", rows=[row], counts={})
+        self.assertNotIn(self._NOT_YET_APPLIED, html)
+        self.assertNotIn(self._ALREADY_APPLIED, html)
+
+    def test_an_applied_row_with_a_cover_reports_the_residual_not_a_clean_reversal(self):
+        row = _row(state="applied", prior_state={"title": "old"},
+                   image="data:image/jpeg;base64,realcover")
+        html = render("inbox.html", rows=[row], counts={})
+        self.assertIn(self._ALREADY_APPLIED, html)
+
+    def test_an_applied_row_without_a_cover_never_warns(self):
+        row = _row(state="applied", prior_state={"title": "old"}, image=None)
+        html = render("inbox.html", rows=[row], counts={})
+        self.assertNotIn(self._NOT_YET_APPLIED, html)
+        self.assertNotIn(self._ALREADY_APPLIED, html)
+
+    def test_the_base64_image_itself_never_reaches_the_page(self):
+        # The row carries a boolean, not the image: rendering the actual
+        # payload would put a base64 blob nobody asked for in the page, on
+        # top of being the exact escaping-route mistake this ticket's
+        # brief warns against -- a second rendering path around the
+        # boolean this module is supposed to be the only route through.
+        cover = "data:image/jpeg;base64," + ("Q" * 200)
+        row = _row(state="new", image=cover)
+        html = render("inbox.html", rows=[row], counts={})
+        self.assertNotIn(cover, html)
+        self.assertNotIn("base64", html)
+
+
+class ScanStatusEscaping(unittest.TestCase):
+    # A job's `message` carries file names -- attacker-influenceable text,
+    # the same reason a row's fields are escaped. This is the same backstop
+    # `Autoescaping` runs for row fields, aimed at the one new field this
+    # ticket adds to the page.
+
+    def test_the_scan_messages_hostile_content_is_escaped(self):
+        html = render("inbox.html", rows=[], counts={},
+                      scan=_job(message=_HOSTILE))
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+    def test_a_failed_scans_error_is_escaped_too(self):
+        html = render("inbox.html", rows=[], counts={},
+                      scan=_job(state="failed", error=_HOSTILE))
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+
+class ScanControlWiring(unittest.TestCase):
+    """The Scan control, pinned as a whole rather than by substring: the
+    form's method, action, the visible number input's name, and the button
+    -- the same reason `ButtonWiring` pins a row's controls as a whole set
+    rather than sampling one field, so a control silently losing its
+    `limit` field (falling back to whatever the code path does with none)
+    is caught here rather than by a containment check on unrelated text."""
+
+    _FORM_RE = re.compile(
+        r'<form method="post" action="/scan">'
+        r'<label>[^<]*<input type="number" name="limit" '
+        r'value="(?P<value>[^"]*)" min="0"></label> <button>(?P<label>[^<]+)'
+        r'</button></form>')
+
+    def test_the_scan_control_offers_exactly_one_limited_start_button(self):
+        html = render("inbox.html", rows=[], counts={}, scan=None,
+                      scan_default_limit=25)
+        matches = self._FORM_RE.findall(html)
+        self.assertEqual(len(matches), 1)
+        value, label = matches[0]
+        self.assertEqual(value, "25")
+        self.assertEqual(label, "Scan")
+
+    def test_the_control_still_appears_while_a_scan_is_running(self):
+        # A busy runner is refused when the form is POSTed (see
+        # `tests/test_web_app.py`'s `ScanControl`) -- it is not hidden here,
+        # so pressing it while one runs is a visible refusal, not a control
+        # that silently vanished.
+        html = render("inbox.html", rows=[], counts={},
+                      scan=_job(state="running"), scan_default_limit=25)
+        self.assertEqual(len(self._FORM_RE.findall(html)), 1)
 
 
 if __name__ == "__main__":

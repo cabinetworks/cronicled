@@ -32,6 +32,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from cronicled.artist import Aliases, creator_folder, resolve
+from cronicled.censorship import decensor
 from cronicled.scoring import DEFAULT_THRESHOLD, decide, score
 
 # Selection deals in one kind of subject. It is named rather than inlined so
@@ -257,7 +258,38 @@ def _primary_path(scene):
     return files[0]["path"]
 
 
-def examine(scene, *, search, folder, threshold=DEFAULT_THRESHOLD, aliases=None):
+def _owners_of(search, owner_of):
+    """The `owners_of` collaborator `resolve` uses to confirm a candidate
+    name against the catalogue (see `cronicled.artist._resolve_by_evidence`),
+    or None when this run has no way to read an owner off a result at all.
+
+    Built from the SAME `search` `examine` already calls for the winning
+    candidate's own catalogue — not a second, unwrapped lookup — so a
+    candidate `resolve` checks and then goes on to win costs exactly one
+    network round trip, not two: the verifying call here and the later
+    `search(resolution.name)` below are the identical query, and
+    `_SingleFlight` (see `ScanProducer.produce`) answers the second from the
+    first's cached result. Only a LOSING candidate's check is genuinely
+    extra — bounded by how many plausible names one file's folder and
+    filename disagree about, which is the filename's own dash count, not
+    the library.
+
+    `owner_of` is a single-result reader — `SiteAdapter.owner_of`, or None
+    when the adapter cannot attribute a result to anyone at all
+    (`catalog_resolvable=False`; see `docs/adapters.md`) — passed straight
+    through rather than a whole adapter, the same reason `censorship` below
+    is a plain dict and not one either.
+    """
+    if owner_of is None:
+        return None
+
+    def owners_of(candidate):
+        return [owner_of(r) for r in search(candidate)]
+    return owners_of
+
+
+def examine(scene, *, search, folder, threshold=DEFAULT_THRESHOLD, aliases=None,
+           censorship=None, owner_of=None):
     """Work out what `scene` is, and return what that concluded.
 
     `search` is the injected lookup: called with the resolved creator's name
@@ -268,10 +300,33 @@ def examine(scene, *, search, folder, threshold=DEFAULT_THRESHOLD, aliases=None)
     collapse identical queries; that is the seam, and this function stays
     single-file and single-lookup.
 
+    `owner_of`, when given, is a one-argument callable reading the owner name
+    off a single search result (`SiteAdapter.owner_of`, unbound from the rest
+    of the adapter — see `_owners_of`). It is what lets `resolve` check a
+    candidate name against the catalogue instead of assuming the first one
+    when the folder and filename disagree — see
+    `cronicled.artist._resolve_by_evidence`. Omitted (the default), the
+    creator is resolved exactly as it always was: no search happens before
+    scoring, and the folder-wins default applies without checking it.
+
     `folder` is the store's proposal namespace, not a directory on disk: the
     proposal returned is complete and can be yielded to the job runner
     unchanged. (The creator's own directory is read off the path, and is a
     different thing entirely — see `creator_folder`.)
+
+    `censorship` is a store's word-substitution map (`{canonical:
+    [substituted_form, ...]}`, the shape `SiteAdapter.censorship` carries),
+    used HERE for exactly one purpose: `cronicled.censorship.decensor` rewrites
+    each candidate's title back to its canonical spelling before it is
+    SCORED, so a censored store title still string-matches an uncensored
+    local filename. It is never applied to the candidate that reaches the
+    proposal — `winner` below is the object `search` returned, untouched — so
+    a decensored title can influence which candidate wins but can never
+    itself become the applied title. The store called a title what it
+    called it; rewriting that and writing the rewrite back would invent a
+    title the store never used. `None` (the default, and what every caller
+    that has no censorship map to offer should pass) behaves as `{}`, which
+    `decensor` defines as a no-op.
 
     ORDER: the creator is resolved BEFORE anything is scored, and that is
     load-bearing rather than stylistic. `scoring.score(..., artist=)`
@@ -283,11 +338,22 @@ def examine(scene, *, search, folder, threshold=DEFAULT_THRESHOLD, aliases=None)
     zero-evidence rule in `scoring` exists to catch, and it can only see it
     if the artist reaches it.
 
-    Only `search` is wrapped: a raising lookup is the transient failure this
-    is built to survive. A malformed alias map, a scene with no file, a
-    candidate with no title are all wiring or data mistakes that are wrong
-    for every file, and they propagate rather than being reported as this
-    one file's bad luck.
+    Only the FINAL `search` call below is wrapped: a raising lookup there is
+    the transient failure this is built to survive. A malformed alias map, a
+    scene with no file, a candidate with no title are all wiring or data
+    mistakes that are wrong for every file, and they propagate rather than
+    being reported as this one file's bad luck — and so, for the same
+    reason, does a raising `owners_of` call inside `resolve` itself: this
+    function does not distinguish that from any other exception `resolve`
+    can raise. In production that distinction does not matter — `resolve`
+    only ever raises here on a genuine transient failure (the alias map is
+    validated once, at `ScanProducer` construction, long before any file
+    reaches this function), and `ScanProducer._examine` isolates whichever
+    scene hit it into its own `Outcome(error=...)` exactly as it does for
+    this function's own uncaught exceptions today. A caller of `examine`
+    directly, outside `ScanProducer`, sees the exception, not an `Outcome` —
+    which is already true of a malformed alias map, and this is simply the
+    same contract extended to a new way `resolve` can raise.
     """
     path = _primary_path(scene)
     name = posixpath.basename(path)
@@ -297,7 +363,8 @@ def examine(scene, *, search, folder, threshold=DEFAULT_THRESHOLD, aliases=None)
     # attribution and the evidence describe different files.
     directory = creator_folder(path)
 
-    resolution = resolve(name, directory, aliases)
+    resolution = resolve(name, directory, aliases,
+                         owners_of=_owners_of(search, owner_of))
     if resolution.name is None:
         return Outcome(mute_reason=MUTE_UNRESOLVED_CREATOR,
                        reason=MUTE_UNRESOLVED_CREATOR)
@@ -320,7 +387,11 @@ def examine(scene, *, search, folder, threshold=DEFAULT_THRESHOLD, aliases=None)
         return Outcome(mute_reason=MUTE_NO_CANDIDATES,
                        reason=MUTE_NO_CANDIDATES)
 
-    matches = [score(name, directory, c["title"], artist=resolution.name)
+    # `c["title"]` decensored for THIS computation only: `winner` below is
+    # sliced from `candidates`, the untouched list, so the proposal always
+    # carries whatever `search` returned rather than this rewritten form.
+    matches = [score(name, directory, decensor(c["title"], censorship or {}),
+                     artist=resolution.name)
                for c in candidates]
     decision = decide(matches, threshold)
     if decision.match is None:
@@ -508,6 +579,18 @@ class ScanProducer:
     things up; it does not set `organized`, does not touch tags or
     performers, and does not write anything back. That is what makes it safe
     to run repeatedly.
+
+    `censorship` is passed straight through to `examine` on every file — see
+    its docstring. It only ever changes which candidate scores highest; it
+    can never change what a proposal's `candidate` field carries, since
+    `examine` scores off a decensored copy and proposes the candidate
+    `search` returned, unaltered.
+
+    `owner_of` is also passed straight through, to let `examine`'s call into
+    `cronicled.artist.resolve` check a candidate name against the catalogue
+    instead of assuming the first one — see `examine`'s and `_owners_of`'s
+    docstrings. `None` (the default) keeps the creator resolved exactly as it
+    always was, with no search issued before scoring.
     """
 
     name = "library-scan"
@@ -516,7 +599,8 @@ class ScanProducer:
     cost = "scraping"
 
     def __init__(self, stash, search, *, store, folder="library", limit=None,
-                 name_filter=None, threshold=DEFAULT_THRESHOLD, aliases=None, workers=4):
+                 name_filter=None, threshold=DEFAULT_THRESHOLD, aliases=None,
+                 workers=4, censorship=None, owner_of=None):
         if workers < 1:
             # A pool of nothing would do nothing at all, forever. Refuse it
             # where the mistake was made rather than on a background thread
@@ -529,6 +613,8 @@ class ScanProducer:
         self._limit = limit
         self._name_filter = name_filter
         self._threshold = threshold
+        self._censorship = censorship or {}
+        self._owner_of = owner_of
         # Indexed and checked HERE, for the same reason `workers` is checked
         # here: a duplicated or empty alias line is a wiring mistake that is
         # wrong for every file, and this is the last point at which the caller
@@ -654,7 +740,8 @@ class ScanProducer:
         """
         try:
             return examine(scene, search=search, folder=self._folder,
-                           threshold=self._threshold, aliases=self._aliases)
+                           threshold=self._threshold, aliases=self._aliases,
+                           censorship=self._censorship, owner_of=self._owner_of)
         except Exception as exc:
             # Name the type as well as the message, for the same reason
             # `examine` does: `str(exc)` alone is '' for a bare raise.

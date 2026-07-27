@@ -19,6 +19,7 @@ class Row:
     creator_source: str
     contested: bool
     disagreement: str | None
+    carries_cover: bool
     score: float
     score_text: str
     runners_up: tuple
@@ -36,6 +37,29 @@ def _runner_up_view(entry):
     an undefined attribute as empty text rather than raising.
     """
     return {"title": entry["candidate"]["title"], "score": entry["score"]}
+
+
+def carries_cover(candidate):
+    """Would applying `candidate` write a cover image `Stash.revert_scene`
+    cannot restore?
+
+    Indexed as `candidate["image"]`, not `.get("image")`. `image` is a
+    field `Stash.scrape_scenes_by_query`'s own query selects on every
+    candidate it returns (see its docstring), so a real candidate always
+    answers this key -- `None` or `""` meaning "the scraper found no
+    cover", a plain, ordinary no. A candidate with the key absent entirely
+    is not that: it is a payload from somewhere that never asked the
+    question, and `.get("image")` would read it back exactly like "no
+    cover" -- the one value that skips the warning this function exists to
+    raise. That is a malformed payload, and it must raise, not answer
+    `False` as though nothing were being hidden.
+
+    Shared between `to_row` (the pre-approve warning) and
+    `cronicled.web.actions.Actions.undo` (the post-revert one) so the two
+    only ever disagree if the payload itself changes between an approve
+    and its undo, never because one of them reimplemented the check.
+    """
+    return bool(candidate["image"])
 
 
 def _disagreement(creator):
@@ -63,16 +87,18 @@ def to_row(item):
     # gets a wrong row approved.
     creator = payload["creator"]
     disagreement = _disagreement(creator)
+    candidate = payload["candidate"]
     score = payload["score"]
     return Row(
         fingerprint=item["fingerprint"],
         state=item["state"],
         filename=os.path.basename(payload["path"]),
-        proposed_title=payload["candidate"]["title"],
+        proposed_title=candidate["title"],
         creator=creator["name"],
         creator_source=creator["source"],
         contested=disagreement is not None,
         disagreement=disagreement,
+        carries_cover=carries_cover(candidate),
         score=score,
         # Three places, matching the precision the decision was made at.
         score_text="%.3f" % score,
