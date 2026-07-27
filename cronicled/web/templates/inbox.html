@@ -1,0 +1,33 @@
+{# cronicled/web/templates/inbox.html #}
+<h1>Inbox</h1>
+{% if not rows %}
+<p>Nothing waiting. Proposals appear here after a scan.</p>
+{% endif %}
+<table>
+  <tr><th>File</th><th>Proposed</th><th>Creator</th><th>Score</th><th></th></tr>
+  {% for row in rows %}
+  <tr{% if row.contested %} class="contested"{% endif %}>
+    <td>{{ row.filename }}</td>
+    <td>{{ row.proposed_title }}</td>
+    <td>{{ row.creator }} <small>(from the {{ row.creator_source }})</small></td>
+    <td>{{ row.score_text }}</td>
+    <td>
+      {% if row.undoable %}
+      <form method="post" action="/undo"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Undo</button></form>
+      {% elif row.state == 'new' %}
+      <form method="post" action="/approve"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Approve</button></form>
+      <form method="post" action="/dismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Dismiss</button></form>
+      <form method="post" action="/mute"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Mute</button></form>
+      {% endif %}
+    </td>
+  </tr>
+  {% if row.contested %}
+  <tr class="warning"><td colspan="5">Attribution is contested: {{ row.disagreement }}</td></tr>
+  {% endif %}
+  {% if row.runners_up %}
+  <tr class="runners"><td colspan="5">Also considered:
+    {% for r in row.runners_up %}{{ r.title }} ({{ "%.3f"|format(r.score) }}){% if not loop.last %}, {% endif %}{% endfor %}
+  </td></tr>
+  {% endif %}
+  {% endfor %}
+</table>
