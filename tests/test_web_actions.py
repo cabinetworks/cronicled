@@ -55,14 +55,20 @@ class _FakeStore:
         self.calls.append(("muted", subject_type, subject_id, reason))
 
 
-def _item(**over):
+def _item(candidate=None, **over):
+    # `candidate` is its own parameter, not folded into `**over`: it lives
+    # under `payload`, and `item.update(over)` only ever touches the top
+    # level. Defaults to a candidate with no cover, matching every existing
+    # caller here that never mentions one.
     item = {"fingerprint": "fp-1", "state": "new", "subject_type": "scene",
             "subject_id": "42", "prior_state": None,
             "payload": {"path": "/l/a.mp4",
                         "creator": {"name": "N", "source": "folder",
                                     "competing": None,
                                     "rejected_folder": None},
-                        "candidate": {"id": "c-1", "title": "T"},
+                        "candidate": (candidate if candidate is not None
+                                     else {"id": "c-1", "title": "T",
+                                          "image": None}),
                         "score": 0.81, "runners_up": []}}
     item.update(over)
     return item
@@ -105,6 +111,35 @@ class Undo(unittest.TestCase):
         with self.assertRaises(ValueError):
             Actions(store, stash).undo("fp-1")
         self.assertEqual(stash.calls, [])
+
+    def test_a_plain_revert_reports_a_clean_reversal(self):
+        # No cover was ever written by this proposal's apply, so there is
+        # nothing revert_scene's snapshot-based restore leaves behind --
+        # "reverted" is the whole truth here.
+        item = _item(state="applied", prior_state={"title": "was"},
+                     candidate={"id": "c-1", "title": "T", "image": None})
+        store, stash = _FakeStore(item), _FakeStash()
+        self.assertEqual(Actions(store, stash).undo("fp-1"), "reverted")
+
+    def test_reverting_a_proposal_that_wrote_a_cover_names_the_residual(self):
+        # HARM: `revert_scene` restores everything ITS OWN snapshot
+        # describes and, on its own terms, reports a plain success -- but
+        # that snapshot never held the scene's prior cover in the first
+        # place (see `Stash.apply_scene`'s docstring), so a bare "reverted"
+        # here would tell whoever reads it that this call undid the whole
+        # apply. It did not: the cover this proposal's apply wrote is
+        # exactly as unrestored as it was before this call.
+        item = _item(state="applied", prior_state={"title": "was"},
+                     candidate={"id": "c-1", "title": "T",
+                               "image": "data:image/jpeg;base64,cover"})
+        store, stash = _FakeStore(item), _FakeStash()
+        result = Actions(store, stash).undo("fp-1")
+        self.assertNotEqual(result, "reverted")
+        self.assertIn("cannot be restored", result)
+        # The revert itself still has to run -- reporting the residual
+        # must not come at the cost of skipping the actual restore.
+        self.assertEqual(stash.calls,
+                         [("revert", "42", {"title": "was"})])
 
 
 class NoStashConfigured(unittest.TestCase):

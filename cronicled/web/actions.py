@@ -8,6 +8,7 @@ job runner directly and grow another kind of write nobody reviewed.
 import uuid
 
 from cronicled.runscan import build_producer
+from cronicled.web.rows import carries_cover
 
 
 class UnknownProposal(KeyError):
@@ -27,6 +28,16 @@ class ApplyFailed(RuntimeError):
 _NO_STASH = ("no media server is configured -- start cronicled with "
              "--server (and --api-key, if the server requires one) to "
              "enable Approve and Undo")
+
+# What `undo` reports when the proposal it just reverted had carried a cover
+# image. Not "reverted" alone: `Stash.revert_scene` restores exactly what
+# `prior` describes, and `prior` cannot describe a scene's cover (see
+# `Stash.apply_scene`'s docstring) -- so a plain "reverted" here would tell
+# whoever reads it that this call undid everything the approve wrote, which
+# is false for exactly this field, every time.
+_COVER_NOT_RESTORED = ("reverted -- except the cover image, which cannot be "
+                       "restored (Stash.apply_scene's undo snapshot has no "
+                       "way to represent a scene's prior cover)")
 
 
 class Actions:
@@ -86,6 +97,20 @@ class Actions:
         return "applied"
 
     def undo(self, fp):
+        """Revert one applied proposal to the state its stored snapshot
+        describes, and report the outcome.
+
+        `Stash.revert_scene` restores every field `prior` holds -- but
+        `prior` cannot hold a scene's cover, because `apply_scene`'s
+        snapshot has no representation for it (see that method's
+        docstring). So when THIS proposal's own candidate carried a cover
+        image, whatever `apply_scene` wrote as a cover is not, and cannot
+        be, touched by this call: the return value says so explicitly
+        rather than answering the bare "reverted" a caller would read as a
+        complete reversal. The check is against the proposal's candidate,
+        not the snapshot -- the snapshot has nothing to say about the
+        cover either way, which is exactly the gap being reported.
+        """
         item = self._find(fp)
         if self._stash is None:
             raise RuntimeError("cannot undo %s: %s" % (fp, _NO_STASH))
@@ -96,6 +121,8 @@ class Actions:
             raise ValueError(
                 "cannot undo %s: no snapshot was stored for it" % fp)
         self._stash.revert_scene(item["subject_id"], prior)
+        if carries_cover(item["payload"]["candidate"]):
+            return _COVER_NOT_RESTORED
         return "reverted"
 
     def dismiss(self, fp):

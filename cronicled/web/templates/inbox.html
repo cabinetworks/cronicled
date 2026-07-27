@@ -27,6 +27,11 @@
   {% if row.contested %}
   <tr class="warning"><td colspan="5">Attribution is contested: {{ row.disagreement }}</td></tr>
   {% endif %}
+  {% if row.carries_cover and row.state == 'new' %}
+  <tr class="warning"><td colspan="5">Approving this proposal writes a cover image. Undo cannot restore a scene's previous cover, so this write cannot be fully undone.</td></tr>
+  {% elif row.carries_cover and row.state == 'applied' %}
+  <tr class="warning"><td colspan="5">This proposal's cover image cannot be restored by Undo, even after reverting.</td></tr>
+  {% endif %}
   {% if row.runners_up %}
   <tr class="runners"><td colspan="5">Also considered:
     {% for r in row.runners_up %}{{ r.title }} ({{ "%.3f"|format(r.score) }}){% if not loop.last %}, {% endif %}{% endfor %}

@@ -17,18 +17,20 @@ def _job(**over):
     return Job(**job)
 
 
-def _row(runners_up=None, **over):
-    # `runners_up` is its own parameter, not folded into `**over`: it lives
-    # under `payload` in the real item shape, and `item.update(over)` only
-    # ever touches the top level. Routing it through `over` would silently
-    # keep the default fixture's runners_up on every call that tried to
-    # override it -- exactly the kind of blank-column bug this task exists to
-    # catch, just moved into the test instead of the template.
+def _row(runners_up=None, image=None, **over):
+    # `runners_up` and `image` are their own parameters, not folded into
+    # `**over`: both live under `payload` in the real item shape, and
+    # `item.update(over)` only ever touches the top level. Routing either
+    # through `over` would silently keep the default fixture's value on
+    # every call that tried to override it -- exactly the kind of
+    # blank-column bug this task exists to catch, just moved into the test
+    # instead of the template. `image` defaults to `None` -- "no cover",
+    # matching every existing caller here that never mentions a cover.
     payload = {
         "path": "/library/x/%s.mp4" % _HOSTILE,
         "creator": {"name": _HOSTILE, "source": "folder",
                     "competing": _HOSTILE, "rejected_folder": _HOSTILE},
-        "candidate": {"id": "c-1", "title": _HOSTILE},
+        "candidate": {"id": "c-1", "title": _HOSTILE, "image": image},
         "score": 0.812,
         # Nested under `candidate`, matching what `scan._runners_up` actually
         # emits and what `rows.to_row` requires -- see test_web_rows.py's
@@ -176,6 +178,61 @@ class ButtonWiring(unittest.TestCase):
         row = _row(state="applied", prior_state=None)
         self.assertFalse(row.undoable)
         self.assertEqual(self._controls(row), [])
+
+
+class CoverWarning(unittest.TestCase):
+    """The warning a person needs before Approve writes something Undo
+    cannot take back -- and the same fact, past tense, once the row is
+    applied. Checked as text actually reaching the rendered page, not by
+    inspecting `row.carries_cover` alone: a template that stopped
+    rendering the warning while the field stayed `True` would still pass a
+    test that only checked the dataclass.
+
+    Two mutations matter enough to name explicitly:
+      - dropping the warning for a row whose candidate DOES carry a cover
+        -- silence exactly where the person needs it most;
+      - showing it for every row regardless of `carries_cover` -- a
+        warning true of nothing trains a person to stop reading it,
+        including the genuinely-true one beside it (`contested`).
+    """
+
+    _NOT_YET_APPLIED = "cannot be fully undone"
+    _ALREADY_APPLIED = "cannot be restored by Undo, even after reverting"
+
+    def test_a_new_row_with_a_cover_warns_before_the_click(self):
+        row = _row(state="new", image="data:image/jpeg;base64,realcover")
+        html = render("inbox.html", rows=[row], counts={})
+        self.assertIn(self._NOT_YET_APPLIED, html)
+
+    def test_a_new_row_without_a_cover_never_warns(self):
+        row = _row(state="new", image=None)
+        html = render("inbox.html", rows=[row], counts={})
+        self.assertNotIn(self._NOT_YET_APPLIED, html)
+        self.assertNotIn(self._ALREADY_APPLIED, html)
+
+    def test_an_applied_row_with_a_cover_reports_the_residual_not_a_clean_reversal(self):
+        row = _row(state="applied", prior_state={"title": "old"},
+                   image="data:image/jpeg;base64,realcover")
+        html = render("inbox.html", rows=[row], counts={})
+        self.assertIn(self._ALREADY_APPLIED, html)
+
+    def test_an_applied_row_without_a_cover_never_warns(self):
+        row = _row(state="applied", prior_state={"title": "old"}, image=None)
+        html = render("inbox.html", rows=[row], counts={})
+        self.assertNotIn(self._NOT_YET_APPLIED, html)
+        self.assertNotIn(self._ALREADY_APPLIED, html)
+
+    def test_the_base64_image_itself_never_reaches_the_page(self):
+        # The row carries a boolean, not the image: rendering the actual
+        # payload would put a base64 blob nobody asked for in the page, on
+        # top of being the exact escaping-route mistake this ticket's
+        # brief warns against -- a second rendering path around the
+        # boolean this module is supposed to be the only route through.
+        cover = "data:image/jpeg;base64," + ("Q" * 200)
+        row = _row(state="new", image=cover)
+        html = render("inbox.html", rows=[row], counts={})
+        self.assertNotIn(cover, html)
+        self.assertNotIn("base64", html)
 
 
 class ScanStatusEscaping(unittest.TestCase):
