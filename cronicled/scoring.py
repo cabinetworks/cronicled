@@ -111,12 +111,21 @@ def _strip_unknown_ext(name):
 
 
 def _evidence(name, folder, artist=None):
-    """Both readings of the evidence: `kept` holds a trailing extension-shaped
-    suffix, `stripped` drops it. Callers pick per use -- see `score`."""
+    """Both readings of the evidence, widest and narrowest.
+
+    `kept` is the whole filename plus the folder: a trailing extension-shaped
+    suffix and a leading series prefix both survive into it. `stripped` drops
+    both. Callers pick per use, and which one they may pick is not a
+    preference -- see `score`.
+    """
     from_folder = set(tokens(clean_folder(folder)))
     base = strip_ext(name)
+    narrowed = _strip_unknown_ext(base)
+    without_prefix = _without_series_prefix(narrowed)
+    if without_prefix is not None:
+        narrowed = without_prefix
     kept = set(tokens(base)) | from_folder
-    stripped = set(tokens(_strip_unknown_ext(base))) | from_folder
+    stripped = set(tokens(narrowed)) | from_folder
     if artist:
         from_artist = set(tokens(artist))
         kept -= from_artist
@@ -125,8 +134,26 @@ def _evidence(name, folder, artist=None):
 
 
 def meaningful_tokens(name, folder, artist=None):
-    """Tokens left after dropping stopwords, junk, and the artist's own name --
-    the evidence that can actually distinguish one title from another."""
+    """The evidence that can actually distinguish one title from another:
+    tokens left after dropping stopwords, junk, the artist's own name, a
+    trailing extension-shaped suffix, and a leading `Series - ` prefix.
+
+    The NARROWEST of the views `score` weighs, and deliberately so. A series
+    or studio prefix is identical on every file filed under it, so it can
+    separate none of them from each other -- but it is two or three tokens
+    long, and counting it lifts a filename whose only distinguishing word sits
+    after the dash over the `< 2` trigger, switching the single-generic-word
+    rule off exactly where that rule is the one thing standing between a
+    common word and an automatic write. That is the same harm the trailing
+    suffix causes and the same answer, so the two strips belong in the same
+    set.
+
+    A wrong guess about where the prefix ends can only ever remove tokens
+    here, which can only ever make this gate stricter. That is the direction a
+    guess is allowed to move it. The other direction -- a smaller set being
+    more of a subset, and subset-ness bypassing the threshold -- is why
+    `score` judges containment on `kept` and never on this.
+    """
     return _evidence(name, folder, artist=artist)[1]
 
 
@@ -172,12 +199,18 @@ def score(name, folder, title, artist=None):
 
     # A container listed in VIDEO_EXTS is confidently not content, so
     # `strip_ext` removes it outright and neither set below ever sees it. An
-    # extension-SHAPED suffix we do not recognise might be a real word, so the
-    # two sets disagree about it and each is asked only what it can safely
-    # answer: uncertainty may withhold evidence, never supply it.
+    # extension-SHAPED suffix we do not recognise, and the text before a
+    # ` - `, might each be a real part of the title, so the two sets disagree
+    # about them and each is asked only what it can safely answer:
+    # uncertainty may withhold evidence, never supply it.
     #
-    # `meaningful_count` reads the stripped set, so a renamed container cannot
-    # inflate the count past the single-generic-word rule.
+    # `meaningful_count` reads the stripped set, so neither a renamed
+    # container nor a series prefix can inflate the count past the
+    # single-generic-word rule. The prefix is the more common of the two:
+    # every file in a series carries the same one, and it is usually two or
+    # three tokens, so without this a filename whose only distinguishing word
+    # is a common one clears the `< 2` gate on the strength of text that
+    # separates it from nothing.
     #
     # `contained` reads the UN-stripped set, because containment is a subset
     # test and dropping a token can only make a set more of a subset. Judged on
@@ -188,6 +221,15 @@ def score(name, folder, title, artist=None):
     # dot-separated naming makes it common. The count gate stays on the
     # stripped set, the strictly smaller of the two, so the strip can only ever
     # cost containment, never grant it.
+    #
+    # The prefix strip is held to the same rule, and it costs nothing to hold
+    # it there: a view whose tokens are a subset of the title scores recall
+    # 1.0, hence at least 0.7 before similarity is added, so a prefix-stripped
+    # view that would have been contained is already over the threshold on its
+    # own arithmetic. Granting it containment as well buys eligibility only
+    # above 0.7 -- measured at zero cases in 440 at every threshold from 0.50
+    # to 0.80 -- while handing the ` - ` guess the power to bypass the
+    # threshold. That trade is the wrong way round.
     kept, meaningful = _evidence(name, folder, artist=artist)
     contained = len(meaningful) >= 2 and kept.issubset(set(title_tokens))
     if contained:
@@ -266,6 +308,20 @@ def _shortfall(match, threshold):
 # is not in the catalogue at all. The scorer has no way to say "none of these",
 # so it takes the best available — confidently, not narrowly, which is why the
 # ambiguity rule never sees these. Tracked separately.
+#
+# THE TABLE ABOVE PREDATES THE SERIES-PREFIX STRIP in `meaningful_tokens` and
+# has not been re-measured against the library since. The strip only ever
+# lowers the evidence count, so every file it moves moves the same way — from
+# the threshold branch to the 0.9 the single-generic-word rule wants, i.e.
+# from applied to refused. Both columns therefore fall, and the right-hand one
+# by more than the left, because the affected files are those whose only
+# distinguishing word is a common one. On a synthetic grid of 440 pairs
+# carrying a `Series - ` prefix it moved 30 of them, identically at 0.50,
+# 0.60, 0.70 and 0.80 and none at 0.90. That grid says the effect exists and
+# is one-directional; it says nothing about how many real filenames carry such
+# a prefix, which is what decides the size of the change and can only be
+# answered against the library. Whoever re-measures it: 0.70 was chosen as the
+# knee of the curve, and a curve that has shifted may have moved its knee.
 DEFAULT_THRESHOLD = 0.7
 
 

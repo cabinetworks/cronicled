@@ -54,6 +54,48 @@ class MeaningfulTokens(unittest.TestCase):
         self.assertIn("garden", got)
         self.assertIn("sessions", got)
 
+    def test_a_series_prefix_is_not_evidence(self):
+        # This is the answer to "which view defines the file's meaningful
+        # tokens": the narrowest one. A series or studio prefix is identical
+        # on every file filed under it, so it separates none of them from
+        # each other -- the same reason the artist's own name is subtracted
+        # two tests up. The artist is not the only name that repeats.
+        self.assertEqual(
+            meaningful_tokens("Backyard Sessions - Morning Ritual.mp4", ""),
+            {"morning", "ritual"})
+
+    def test_both_dash_conventions_lose_the_prefix(self):
+        # The scorer's prefix view reads a single OR a doubled dash as the
+        # boundary, and the evidence set has to read it the same way or the
+        # two halves of the same file disagree about what the title is.
+        for name in ("Backyard Sessions - Morning Ritual.mp4",
+                     "Backyard Sessions -- Morning Ritual.mp4"):
+            self.assertEqual(meaningful_tokens(name, ""),
+                             {"morning", "ritual"}, name)
+
+    def test_a_prefix_and_a_renamed_container_both_go_at_once(self):
+        # One filename can carry both, and each strip has to survive the
+        # other: leaving either in is a token counted as evidence that
+        # distinguishes nothing.
+        self.assertEqual(
+            meaningful_tokens("Backyard Sessions - Morning Ritual.mpeg", ""),
+            {"morning", "ritual"})
+
+    def test_a_dash_that_is_not_a_prefix_boundary_keeps_the_whole_name(self):
+        # The other side of the guard, and the one that decides how much of a
+        # name can vanish. A dash with no whitespace around it is a hyphenated
+        # word, not a separator, and a name with no dash at all has no prefix
+        # to lose -- both must keep every token, or the count gate starts
+        # firing on files that carry plenty of evidence.
+        for name, expected in (
+            ("Morning Ritual.mp4", {"morning", "ritual"}),
+            ("Wren-Copper Marchcroft.mp4", {"wren", "copper", "marchcroft"}),
+            # nothing after the separator: a prefix that is the whole name is
+            # not a prefix, and stripping it would leave no evidence at all
+            ("Morning Ritual - .mp4", {"morning", "ritual"}),
+        ):
+            self.assertEqual(meaningful_tokens(name, ""), expected, name)
+
 
 class Scoring(unittest.TestCase):
     def test_an_exact_match_scores_one(self):
@@ -122,6 +164,47 @@ class Scoring(unittest.TestCase):
             self.assertFalse(m.contained, name)
             self.assertLess(m.value, 0.9, name)
             self.assertIsNone(decide([m], threshold=0.95).match, name)
+
+    def test_the_prefix_stripped_view_is_scored_at_all(self):
+        # The whole reason that view exists: a filename repeating its series
+        # before the title is compared against a bare catalogue title, and the
+        # repetition drags both halves of the score down. Deleting the view
+        # entirely used to leave the suite green -- this file is an EXACT
+        # match once the prefix is gone, and 0.537 with it still attached.
+        m = score("Backyard Sessions - Morning Ritual.mp4", "",
+                  "Morning Ritual")
+        self.assertEqual(m.value, 1.0)
+        self.assertLess(score("Backyard Sessions Morning Ritual.mp4", "",
+                              "Morning Ritual").value, 0.6,
+                        "without a separator there is no prefix to strip")
+
+    def test_a_series_prefix_cannot_pad_the_evidence_count(self):
+        # The count gate asks whether this filename carries enough evidence to
+        # tell one title from another. A series prefix is not that evidence --
+        # every file under it carries the same one -- but it is two tokens
+        # long, and counting it clears the `< 2` gate on the strength of text
+        # that separates this file from nothing. What is actually being
+        # matched on here is the single word "Ritual", and the rule that
+        # refuses a single common word has to see that.
+        m = score("Backyard Sessions - Ritual.mp4", "Velvet Crane",
+                  "Morning Ritual", artist="Velvet Crane")
+        self.assertEqual(m.meaningful_count, 1)
+        self.assertEqual(m.value, 0.88)          # short of the 0.9 that rule wants
+        self.assertIsNone(decide([m]).match)
+
+    def test_a_series_prefix_cannot_manufacture_containment(self):
+        # The counterpart, and the asymmetry the extension strip already
+        # holds: dropping the prefix shrinks the evidence set, and a smaller
+        # set is MORE of a subset -- which is the path that bypasses the
+        # threshold outright. Here the file is "Evening Tea" in the series
+        # "Morning Coffee", and the candidate is a DIFFERENT title that
+        # happens to contain both of the surviving words. The strip that makes
+        # the count honest must not be able to hand that candidate a bypass.
+        m = score("Morning Coffee - Evening Tea.mp4", "",
+                  "Evening Tea Ceremony")
+        self.assertEqual(m.meaningful_count, 2)
+        self.assertFalse(m.contained)
+        self.assertIsNone(decide([m], threshold=0.95).match)
 
     def test_a_known_container_is_gone_before_containment_is_judged(self):
         # the counterpart: a container we recognise is confidently not
