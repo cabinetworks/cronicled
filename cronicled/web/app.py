@@ -15,6 +15,21 @@ DEFAULT_PORT = 8571
 
 _ACTIONS = ("approve", "dismiss", "mute", "undo")
 
+# Every write here posts exactly one hidden field: a fingerprint. Nothing
+# genuine comes anywhere near this many bytes -- it exists to bound
+# `rfile.read(length)` below, not to accommodate a real form.
+#
+# `int(Content-Length)` alone only catches a non-numeric header (a
+# `ValueError`); a numeric-but-dishonest one still parses. `rfile.read(n)`
+# blocks until `n` bytes arrive or the connection closes, so a NEGATIVE
+# length (`read(-1)` means read-until-EOF, and this client has no reason to
+# close) or an absurdly large one (far more than this client will ever send)
+# both wedge the handler waiting on bytes that are never coming. Both are
+# refused here, before `rfile.read` is ever called -- this server is
+# single-threaded (see `serve()`), so a wedge on any one connection stalls
+# every other request until it clears.
+_MAX_BODY_BYTES = 4096
+
 # Sec-Fetch-Site values a legitimate write can carry. `same-origin` is a
 # request from a page this server served; `none` is the address bar, a
 # bookmark, or curl deliberately setting the header. Everything else
@@ -114,6 +129,10 @@ def build_handler(rows, actions):
                 self._send(400, b"malformed content-length",
                            [("Content-Type", "text/plain; charset=utf-8")])
                 return
+            if not (0 <= length <= _MAX_BODY_BYTES):
+                self._send(400, b"malformed content-length",
+                           [("Content-Type", "text/plain; charset=utf-8")])
+                return
             form = urllib.parse.parse_qs(
                 self.rfile.read(length).decode("utf-8"))
             fp = (form.get("fp") or [""])[0]
@@ -136,6 +155,28 @@ def build_handler(rows, actions):
 
 
 def serve(rows, actions, host=DEFAULT_HOST, port=DEFAULT_PORT):
+    # `HTTPServer` is single-threaded: one connection wedged on a slow read
+    # or a slow downstream call (a media server taking its whole configured
+    # timeout to answer an Approve, say) stalls every other request -- an
+    # unrelated GET for the page itself included -- until it clears.
+    #
+    # `ThreadingHTTPServer` (stdlib, same module) would remove that freeze
+    # for free and was evaluated as a straight swap here. Rejected: it would
+    # let two Approve/Undo requests run concurrently against the SAME
+    # `Actions`/`Stash`, and while `Store`'s own lock serializes its SQL
+    # (safe on its own), `Stash.apply_scene` is a multi-step check-then-act
+    # sequence against the REMOTE server -- find-or-create for each studio/
+    # performer/tag, then one write -- with no lock of its own. Two
+    # concurrent approvals (a double-submitted click, or two proposals that
+    # happen to name the same new performer) could each find nothing, each
+    # create, and leave the library with two entities for one name. That is
+    # a silent, hard-to-notice corruption of the thing this tool exists to
+    # curate, traded for a freeze that is at least visible and bounded (the
+    # client's own configured timeout, and `Stash`'s HARD_DEADLINE_SLACK on
+    # top of it). Making concurrent Approves safe would need its own guard
+    # (serializing writes per subject, at least) and is out of scope here --
+    # this single-threaded server, and the freeze it implies, stays as a
+    # documented limitation rather than a silently traded one.
     if host != DEFAULT_HOST:
         # Loud, because there is no authentication: the binding is the only
         # thing standing between this page and anyone who can reach the host.

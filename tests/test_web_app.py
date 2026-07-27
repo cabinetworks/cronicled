@@ -196,6 +196,28 @@ class MalformedContentLength(unittest.TestCase):
             self.assertEqual(r.status, 400)
             self.assertEqual(s.actions.calls, [])
 
+    def test_a_negative_content_length_is_refused_not_read(self):
+        # `rfile.read(-1)` means "read until the connection closes" -- a
+        # client that lies with a negative Content-Length and never closes
+        # would otherwise wedge this single-threaded handler indefinitely.
+        # If this assertion regresses to a hang, that IS the bug it pins.
+        with _Server() as s:
+            r = s.request("POST", "/approve", "fp=fp-1",
+                          headers={"Content-Length": "-1"})
+            self.assertEqual(r.status, 400)
+            self.assertEqual(s.actions.calls, [])
+
+    def test_an_absurdly_large_content_length_is_refused_not_read(self):
+        # A numeric Content-Length far beyond anything this form ever sends
+        # still parses with plain `int()` -- it takes an explicit bound to
+        # catch it before `rfile.read` blocks waiting for bytes the client
+        # never sends.
+        with _Server() as s:
+            r = s.request("POST", "/approve", "fp=fp-1",
+                          headers={"Content-Length": "999999999"})
+            self.assertEqual(r.status, 400)
+            self.assertEqual(s.actions.calls, [])
+
 
 class Binding(unittest.TestCase):
     def test_the_default_host_is_loopback(self):

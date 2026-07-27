@@ -20,9 +20,19 @@ class ApplyFailed(RuntimeError):
     store before this is raised."""
 
 
+_NO_STASH = ("no media server is configured -- start cronicled with "
+             "--server (and --api-key, if the server requires one) to "
+             "enable Approve and Undo")
+
+
 class Actions:
     def __init__(self, store, stash):
         self._store = store
+        # `stash` is None when the entry point was started without a
+        # configured media server -- see cronicled/__main__.py. Every method
+        # here that would otherwise write to it checks that explicitly and
+        # raises a message naming what is missing, rather than falling
+        # through to an AttributeError on `None`.
         self._stash = stash
 
     def _find(self, fp):
@@ -39,6 +49,12 @@ class Actions:
     def approve(self, fp):
         item = self._find(fp)
         subject_id = item["subject_id"]
+        if self._stash is None:
+            # Recorded as failed for the same reason a real apply failure is:
+            # an applied row offers an undo, and this proposal was never
+            # applied at all.
+            self._store.mark_failed(fp, _NO_STASH)
+            raise ApplyFailed("could not apply: %s" % _NO_STASH)
         try:
             # The snapshot is produced INSIDE apply_scene, which reads the
             # scene immediately before the single write and returns nothing
@@ -60,6 +76,8 @@ class Actions:
 
     def undo(self, fp):
         item = self._find(fp)
+        if self._stash is None:
+            raise RuntimeError("cannot undo %s: %s" % (fp, _NO_STASH))
         prior = item.get("prior_state")
         if not prior:
             # Checked here so the refusal names the proposal. Left to

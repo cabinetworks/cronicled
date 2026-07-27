@@ -1,3 +1,4 @@
+import re
 import unittest
 
 from cronicled.web.render import environment, render
@@ -107,6 +108,64 @@ class Autoescaping(unittest.TestCase):
         row = _row(runners_up=payload_runners)
         html = render("inbox.html", rows=[row], counts={})
         self.assertIn("The Lantern", html)
+
+
+class ButtonWiring(unittest.TestCase):
+    """Every control a row's action cell offers, pinned as a whole set --
+    action path, label, and the fingerprint each form carries -- rather than
+    sampled one at a time, so a control silently gaining, losing, or being
+    repointed to the wrong path is caught.
+
+    Two mutations matter enough to name explicitly:
+      - the Undo button's `action` swapped from "/undo" to "/approve": the
+        one control whose entire job is reversing a write would instead
+        repeat it.
+      - `{% if row.undoable %}` inverted to `{% if not row.undoable %}`:
+        Undo would then be offered on exactly the rows where
+        `Stash.revert_scene` raises (no snapshot), and withheld on exactly
+        the rows where it would work.
+
+    The previous fixture here hardcoded `state="new"`/`prior_state=None`, so
+    the Undo branch was never reached by any render -- these build both an
+    undoable row and a non-undoable "applied" row through the same `_row`
+    helper, via the same override path `test_web_rows.py` already relies on
+    for `state`/`prior_state` (both live at the item's top level, unlike
+    `runners_up`, so `**over` reaches them directly).
+    """
+
+    _FORM_RE = re.compile(
+        r'<form method="post" action="(?P<action>[^"]+)">'
+        r'<input type="hidden" name="fp" value="(?P<fp>[^"]*)">'
+        r'<button>(?P<label>[^<]+)</button></form>')
+
+    def _controls(self, row):
+        html = render("inbox.html", rows=[row], counts={})
+        return [(m.group("action"), m.group("label"), m.group("fp"))
+                for m in self._FORM_RE.finditer(html)]
+
+    def test_a_new_undecided_row_offers_exactly_approve_dismiss_mute(self):
+        row = _row(state="new", prior_state=None)
+        self.assertFalse(row.undoable)
+        self.assertEqual(
+            self._controls(row),
+            [("/approve", "Approve", row.fingerprint),
+             ("/dismiss", "Dismiss", row.fingerprint),
+             ("/mute", "Mute", row.fingerprint)])
+
+    def test_an_applied_row_with_a_snapshot_offers_exactly_undo(self):
+        row = _row(state="applied", prior_state={"title": "old"})
+        self.assertTrue(row.undoable)
+        self.assertEqual(self._controls(row),
+                         [("/undo", "Undo", row.fingerprint)])
+
+    def test_an_applied_row_without_a_snapshot_offers_no_control_at_all(self):
+        # undoable is False (nothing to revert to) and state is not "new",
+        # so neither template branch fires. Exactly what revert_scene's own
+        # refusal on an empty snapshot demands: no button may promise an
+        # undo the code cannot perform.
+        row = _row(state="applied", prior_state=None)
+        self.assertFalse(row.undoable)
+        self.assertEqual(self._controls(row), [])
 
 
 if __name__ == "__main__":

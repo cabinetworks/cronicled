@@ -102,6 +102,32 @@ class Undo(unittest.TestCase):
         self.assertEqual(stash.calls, [])
 
 
+class NoStashConfigured(unittest.TestCase):
+    # cronicled/__main__.py starts the inbox with `stash=None` when no
+    # `--server` was given (see its module docstring). Approve and Undo are
+    # the two actions that write to a media server, so those two must refuse
+    # with a clear, specific message rather than an AttributeError on `None`.
+
+    def test_approve_refuses_clearly_and_records_the_row_as_failed(self):
+        store = _FakeStore(_item())
+        with self.assertRaises(ApplyFailed) as ctx:
+            Actions(store, None).approve("fp-1")
+        self.assertIn("no media server is configured", str(ctx.exception))
+        # Same invariant as a real apply failure: never left as "new" with
+        # no record of what happened, and never marked "applied".
+        self.assertEqual([c[0] for c in store.calls], ["failed"])
+
+    def test_undo_refuses_clearly_rather_than_an_attribute_error(self):
+        item = _item(state="applied", prior_state={"title": "was"})
+        store = _FakeStore(item)
+        with self.assertRaises(RuntimeError) as ctx:
+            Actions(store, None).undo("fp-1")
+        self.assertIn("no media server is configured", str(ctx.exception))
+        # No store mutation on this path -- undo only ever writes through
+        # the stash, and there is none configured to have written through.
+        self.assertEqual(store.calls, [])
+
+
 class Reject(unittest.TestCase):
     # Both of these assert the call WHOLE, reason string included. Sampling
     # the first element, or slicing the tuple short, leaves the reason free to
