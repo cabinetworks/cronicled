@@ -94,8 +94,10 @@ class ProjectMetadata(unittest.TestCase):
                              "%r must carry a version constraint" % dep)
 
     def test_the_image_does_not_install_uv(self):
-        # uv is a development tool; putting it in the runtime image would add a
-        # dependency to a deliberately dependency-free container
+        # uv is a development and CI convenience, not something the service
+        # needs to run. The image installs exactly one thing (see the pip line
+        # above `COPY cronicled/`), and this keeps that list from growing a
+        # second entry by way of the build tooling rather than a decision.
         with open("Dockerfile") as fh:
             body = fh.read()
         self.assertNotIn("uv", body.lower())
