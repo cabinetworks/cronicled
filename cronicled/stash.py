@@ -167,11 +167,22 @@ class Stash:
         scan time) also catches metadata a human set between scan and apply.
 
         Selects every field the apply path can write, so this same read also
-        supplies apply_scene's undo snapshot (see `apply_scene`'s docstring)."""
+        supplies apply_scene's undo snapshot (see `apply_scene`'s docstring).
+
+        `stash_ids` is `[StashID!]!`, an OBJECT list, so it needs a selection
+        set. Written bare it is not a narrower read -- the server rejects the
+        whole query with a validation error, `scene_existing` raises, and every
+        apply fails. It shipped that way and no test noticed, because the
+        transport under test is a double that returns canned dictionaries and
+        never parses the query it is handed. Only `endpoint` and `stash_id` are
+        taken: `updated_at` is the server's own bookkeeping and is not part of
+        `StashIDInput`, so carrying it into a snapshot would put a field into
+        the restore payload that the mutation cannot accept."""
         q = """
         query($id: ID!){
           findScene(id:$id){ id title details date urls organized rating100
-            code director stash_ids
+            code director
+            stash_ids{ endpoint stash_id }
             studio{ id name } performers{ id name } tags{ id name } }
         }"""
         return self.gql(q, {"id": scene_id}).get("findScene") or {}

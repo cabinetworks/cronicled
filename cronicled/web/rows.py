@@ -24,6 +24,19 @@ class Row:
     score_text: str
     runners_up: tuple
     undoable: bool
+    # Why an apply failed, for a row in the `failed` state. Without it the page
+    # shows a row that quietly stopped offering any control and says nothing
+    # about why -- a person cannot tell a transient server error from a
+    # proposal that will never apply, and cannot act on either.
+    error: str | None
+    # Whether this row still has a decision left in it. A failed apply wrote
+    # NOTHING, so the proposal is as live as it was before the attempt: it can
+    # be tried again, dismissed, or muted. Only an applied row is closed, and
+    # that one has Undo instead. Derived here rather than spelled as a list of
+    # states in the template, because the template is where a new state would
+    # silently fall through every branch and take the controls away again --
+    # which is exactly how a failed row became a dead end.
+    actionable: bool
 
 
 def _runner_up_view(entry):
@@ -109,6 +122,13 @@ def to_row(item):
         # undo the code cannot perform.
         undoable=(item["state"] == "applied"
                   and bool(item.get("prior_state"))),
+        error=item.get("error"),
+        # Everything that is not applied still has a decision left in it.
+        # Stated as "not closed" rather than as a list of open states, so a
+        # state added later inherits its controls instead of silently losing
+        # them -- `failed` lost them exactly that way, and the row became
+        # unreachable: no retry, no dismissal, no mute, and no reason given.
+        actionable=item["state"] != "applied",
     )
 
 
