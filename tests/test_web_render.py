@@ -37,9 +37,21 @@ class Autoescaping(unittest.TestCase):
     """The single reason this project has a runtime dependency at all."""
 
     def test_the_environment_autoescapes(self):
-        self.assertTrue(environment().autoescape,
-                        "autoescaping is why Jinja2 is a dependency here; "
-                        "the bare default escapes nothing")
+        # Asserted as the environment's DECISION for the template actually
+        # rendered, not as the truthiness of the `autoescape` attribute.
+        # `select_autoescape` returns a callable, so `assertTrue` on the
+        # attribute holds for every configuration there is -- including one
+        # that escapes nothing. Verified rather than reasoned: with
+        # `enabled_extensions=()` and both defaults False, the attribute is
+        # still a function, still truthy, this assertion still passed, and the
+        # page rendered a live script tag. The rendering tests below caught it;
+        # the test named for the property could not.
+        env = environment()
+        decided = (env.autoescape("inbox.html") if callable(env.autoescape)
+                   else env.autoescape)
+        self.assertIs(decided, True,
+                      "autoescaping is why Jinja2 is a dependency here; "
+                      "the bare default escapes nothing")
 
     def test_every_field_of_a_row_comes_back_inert(self):
         # Asserted over the whole page rather than field by field: a template
