@@ -6,14 +6,15 @@ string and filename normalization, date extraction, a client for the media
 server's own API, a pluggable site-adapter interface for matching against a
 clip store, candidate scoring, creator attribution, a durable store for
 proposed changes, a background job runner, a library scan that turns unmatched
-files into proposals, a scheduler that decides when each producer is due, and a
-leak guard for the repo itself.
+files into proposals, a scheduler that decides when each producer is due, an
+inbox that shows a proposal and takes approve/dismiss/mute/undo, an entry point
+that serves it, and a leak guard for the repo itself.
 
-**Not yet built:** there is no inbox of proposed changes, nothing that applies
-one, and — the part that matters most — **no entry point that starts any of
-this.** The scheduler knows what is due and can run it; nothing constructs a
-scheduler. The pieces above are library code, called directly (including by
-tests); nothing here watches a library or writes to it on its own.
+**Not yet built:** nothing runs this unattended. `python -m cronicled` serves
+the inbox and answers a person's clicks; it constructs no scheduler and starts
+no timer. The scheduler knows what is due and can run it, but nothing calls it
+on its own — a scan still has to be started by something outside this package.
+Until that exists, "always-on" describes the design, not what is running.
 
 One runtime dependency: Jinja2, for autoescaped HTML. Everything else is the
 Python standard library. The inbox renders text the project did not write —
@@ -23,16 +24,17 @@ interpolation.
 
 ## Status
 
-Early. The foundation layer described above is what exists, and it now reaches
-as far as deciding when work is due — but the always-on *service* does not
-exist: nothing runs continuously, no inbox shows what was proposed, and no
-write happens without a person calling the client directly.
+The inbox is real: `python -m cronicled` serves proposals from the store,
+takes approve/dismiss/mute/undo over POST, and applies or reverts a scene
+through the media-server client — no write happens without a person clicking
+one of those. What is still missing is the part that would make any of this
+unattended: nothing constructs a scheduler, so no proposal is ever produced
+without a person starting a scan themselves.
 
 The distinction worth keeping in mind: a scheduler that is never started is a
 component, not a service. What is missing is the process that would construct
-one, the interface that would show its output, and the approval gate between a
-proposal and a write. Those have their own diagram, kept separate from the ones
-describing what is built, on the
+one and start it on a schedule. That gap has its own diagram, kept separate
+from the ones describing what is built, on the
 [architecture](docs/index.md#the-service-that-does-not-exist-yet) page.
 
 ## Quickstart
@@ -46,14 +48,21 @@ pip install -e .
 python3 -m unittest discover -s tests -t . -v
 ```
 
-No test in this tree imports Jinja2 directly yet — the inbox that renders
-with it is a later task — but installing the project pulls in whatever
-`pyproject.toml` declares, so this is the honest instruction regardless of
-which tests happen to exercise it today.
+`tests/test_web_render.py` imports Jinja2 through `cronicled/web/render.py`,
+the module autoescaping was taken as a dependency to configure.
 
-There is no entry point to run yet. The container's default command is a
-self-check that proves the pinned interpreter can import and run the package;
-see [Running it, and the container](docs/container.md).
+Serve the inbox against a store:
+
+```sh
+python -m cronicled --db /path/to/cronicled.sqlite3 \
+    --server http://your-stash-host:9999 --api-key "$STASH_API_KEY"
+```
+
+It binds to loopback only (`127.0.0.1:8571` by default) — there is no
+authentication, so the binding is the only thing standing between the page's
+buttons and anyone who can reach the host. The container's default command is
+still a self-check, not this entry point; see
+[Running it, and the container](docs/container.md).
 
 ## The module map
 
@@ -136,10 +145,11 @@ Every push to the default branch publishes a multi-architecture image to
 docker pull ghcr.io/cabinetworks/cronicled:<commit-sha>
 ```
 
-**There is no `latest` tag, and its absence is deliberate.** The image is a
-pinned runtime for a library with no entry point yet — its default command
-prints one line and exits — and `latest` is read as "the one you want".
-[The container page](docs/container.md) has the tagging scheme and the mounts.
+**There is no `latest` tag, and its absence is deliberate.** The image's
+default command still prints one line and exits — the package's entry point
+exists now, but the image does not run it by default — and `latest` is read as
+"the one you want". [The container page](docs/container.md) has the tagging
+scheme and the mounts.
 
 ## License
 
