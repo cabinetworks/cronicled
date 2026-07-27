@@ -58,6 +58,14 @@ python -m cronicled --db /path/to/cronicled.sqlite3 \
     --server http://your-stash-host:9999 --api-key "$STASH_API_KEY"
 ```
 
+Every flag above (plus `--config-dir`, `--host` and `--port`) also reads an
+environment variable of the matching name (`$CRONICLED_DB`,
+`$CRONICLED_SERVER`, `$CRONICLED_API_KEY`, `$CRONICLED_CONFIG_DIR`,
+`$CRONICLED_HOST`, `$CRONICLED_PORT`) when the flag itself is not given — the
+form the container image relies on, since a `docker run` argument list and an
+`-e` list are both just ways of setting the same thing. The flag wins if both
+are set.
+
 It binds to loopback only (`127.0.0.1:8571` by default) — there is no
 authentication, so the binding is the only thing standing between the page's
 buttons and anyone who can reach the host. The container's default command

@@ -13,7 +13,7 @@ FROM python:${PYTHON_VERSION}-slim
 LABEL org.opencontainers.image.title="cronicled" \
       org.opencontainers.image.source="https://github.com/cabinetworks/cronicled" \
       org.opencontainers.image.licenses="MIT" \
-      org.opencontainers.image.description="A pinned, reproducible runtime for a media-library companion tool. The default command now starts its inbox: an HTTP page for reviewing and applying proposed library changes. It binds 0.0.0.0 inside the container (127.0.0.1 would answer nothing docker run -p forwards to it) and has NO authentication of its own -- publish the port to loopback only (-p 127.0.0.1:8571:8571), never to every interface, or this unauthenticated page becomes reachable from anywhere that can reach the host. Nothing here scans a library or writes a proposal yet; the inbox only shows what a scan run elsewhere already put in the store. The self-check that used to be this image's only default (import the package, exercise a handful of pure functions, print one line, exit) is still reachable explicitly: python -m cronicled.selfcheck."
+      org.opencontainers.image.description="A pinned, reproducible runtime for a media-library companion tool. The default command now starts its inbox: an HTTP page for reviewing and applying proposed library changes. It binds 0.0.0.0 inside the container (127.0.0.1 would answer nothing docker run -p forwards to it) and has NO authentication of its own -- publish the port to loopback only (-p 127.0.0.1:8571:8571), never to every interface, or this unauthenticated page becomes reachable from anywhere that can reach the host. Nothing here scans a library or writes a proposal yet; the inbox only shows what a scan run elsewhere already put in the store. --db, --config-dir, --host and --port can all be passed as trailing arguments to `docker run`, alongside the same-named environment variables the image already sets. The self-check that used to be this image's only default (import the package, exercise a handful of pure functions, print one line, exit) is still reachable by overriding the entry point: docker run --rm --entrypoint python <image> -m cronicled.selfcheck."
 
 # One runtime dependency, pinned exactly so the image stays a function of its
 # inputs rather than of the day it was built. An unpinned install here would
@@ -39,6 +39,18 @@ ENV CRONICLED_CONFIG_DIR=/config
 # declared volume is what makes "docker run" without --db keep its data.
 ENV CRONICLED_DB=/var/lib/cronicled/cronicled.sqlite3
 
+# The bind host used to live in CMD, as a `--host 0.0.0.0` argument. It moved
+# here because ENTRYPOINT (below) makes CMD/trailing arguments overridable --
+# and an override REPLACES arguments, it does not merge with them. Anyone
+# passing `--db` on the command line would otherwise silently drop `--host
+# 0.0.0.0` along with it, the service would bind the host-side default
+# (127.0.0.1) instead, and a container's own loopback answers nothing that
+# `docker run -p` forwards to it: it would start, log normally, and be
+# unreachable, with no error anywhere. An ENV default cannot be dropped by an
+# argument the way a CMD argument can, so the host has to live here before
+# the command line becomes overridable at all.
+ENV CRONICLED_HOST=0.0.0.0
+
 # Without this the startup warnings are INVISIBLE in `docker logs`. Python
 # block-buffers stdout when it is not a terminal, and a container's stdout is
 # a pipe, so the binding warning -- the one telling an operator that what
@@ -56,16 +68,25 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 8571
 
 # The service entry point now exists (cronicled/__main__.py) and this is how
-# the container runs it. Bound to 0.0.0.0, not the host-side default of
-# 127.0.0.1: a container's own loopback answers nothing that arrives through
-# `docker run -p`, which forwards to the container's other interface, so a
-# service bound to 127.0.0.1 in here would build, start, and be unreachable
-# from outside it. That moves the actual protection from the bind host to
-# the operator's -p flag -- see the warning `serve()` prints, and
-# docs/container.md, for what that flag has to do. DEFAULT_HOST (127.0.0.1)
-# is untouched for anyone running this outside a container.
+# the container runs it. ENTRYPOINT, not CMD: trailing arguments to `docker
+# run` APPEND to an ENTRYPOINT instead of replacing it, which is what lets an
+# operator pass `--db`, `--config-dir`, or any other flag straight through
+# -- `docker run cronicled --db /var/lib/cronicled/other.sqlite3` now reaches
+# this exact command, host and all, instead of replacing it wholesale. The
+# bind host above (0.0.0.0, not the host-side default of 127.0.0.1) is what
+# makes that safe to allow: a container's own loopback answers nothing that
+# arrives through `docker run -p`, which forwards to the container's other
+# interface, so a service bound to 127.0.0.1 in here would build, start, and
+# be unreachable from outside it. That moves the actual protection from the
+# bind host to the operator's -p flag -- see the warning `serve()` prints,
+# and docs/container.md, for what that flag has to do. DEFAULT_HOST
+# (127.0.0.1) is untouched for anyone running this outside a container.
 #
 # The self-check that used to be this image's only default (see
-# cronicled/selfcheck.py) is still reachable by naming it explicitly:
-#   docker run --rm cronicled python -m cronicled.selfcheck
-CMD ["python", "-m", "cronicled", "--host", "0.0.0.0"]
+# cronicled/selfcheck.py) is still reachable, but ENTRYPOINT means naming it
+# on the command line no longer replaces the whole thing -- it would now
+# APPEND "python -m cronicled.selfcheck" as arguments to the entry point
+# above, which is not what runs the self-check. Overriding the entry point
+# itself is the invocation that works:
+#   docker run --rm --entrypoint python cronicled -m cronicled.selfcheck
+ENTRYPOINT ["python", "-m", "cronicled"]

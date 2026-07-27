@@ -54,9 +54,19 @@ class Wiring(unittest.TestCase):
         # Now the only place the self-check runs automatically. It used to have
         # the image's default command as a second, independent trigger; that
         # backstop is gone, so this assertion carries it alone.
+        #
+        # ENTRYPOINT is `python -m cronicled` (see the Dockerfile), so naming
+        # the self-check as trailing arguments would now APPEND to that entry
+        # point instead of replacing it -- `docker run img python -m
+        # cronicled.selfcheck` no longer runs the self-check, it runs `python
+        # -m cronicled` with four nonsense arguments. `--entrypoint` overrides
+        # the entry point itself, which is what still reaches it, so that is
+        # the invocation pinned here rather than the string the ENTRYPOINT
+        # change made stop working.
         with open(".github/workflows/ci.yml") as fh:
             body = fh.read()
-        self.assertRegex(body, r"python -m cronicled\.selfcheck")
+        self.assertRegex(body, r"--entrypoint python\b")
+        self.assertRegex(body, r"-m cronicled\.selfcheck")
 
 
 if __name__ == "__main__":
