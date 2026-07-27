@@ -66,7 +66,7 @@ docker run --rm \
 ```
 
 ```
-cronicled selfcheck ready (22 modules imported)
+cronicled selfcheck ready (23 modules imported)
 ```
 
 That count is the number of modules `pkgutil` finds under the package, so it
