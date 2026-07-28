@@ -171,6 +171,35 @@ class Stash:
         return self._find_scenes({"tags": {"value": [tag_id], "modifier": "INCLUDES"}},
                                  limit)
 
+    def performers_with_stash_ids(self):
+        """Every performer this server holds, with just enough to link a
+        NAME to a stash-box id: `id`, `name`, and `stash_ids` (`endpoint`,
+        `stash_id`) -- the same object shape `scene_existing` already reads
+        for a scene, read here for a performer instead. Most rows will carry
+        an empty `stash_ids` list; that is a normal answer, not a gap to
+        raise on -- a performer nobody has ever scraped or applied from a
+        stash-box source simply has none yet.
+
+        Paged the same way `all_tags` pages: a whole-library, no-filter read
+        is the point (see `cronicled.performer_ids.derive_performer_ids`,
+        this method's one caller), and a real library holds performers in
+        the hundreds to low thousands, not a count worth trimming."""
+        q = """
+        query($f: FindFilterType){
+          findPerformers(filter:$f){
+            count performers{ id name stash_ids{ endpoint stash_id } }
+          }
+        }"""
+        out, page = [], 1
+        while True:
+            data = self.gql(q, {"f": {"per_page": 500, "page": page,
+                                      "sort": "name", "direction": "ASC"}})
+            rows = data["findPerformers"]["performers"]
+            out.extend(rows)
+            if len(rows) < 500 or len(out) >= data["findPerformers"]["count"]:
+                return out
+            page += 1
+
     def tag_id_by_name(self, name):
         """A tag's id on THIS server, looked up by exact name — ids are
         installation-specific. None when the server has no such tag."""

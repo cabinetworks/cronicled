@@ -19,7 +19,35 @@ from unittest import mock
 from cronicled.jobs import JobRunner
 from cronicled.runstashbox import (
     build_producer, default_performer_ids_path, load_performer_ids, main)
+from cronicled.stash import StashError
+from cronicled.stashbox import SourceListing
 from cronicled.store import Store
+
+
+def _patched_except_producer():
+    return mock.patch.multiple(
+        "cronicled.runstashbox",
+        load_server=mock.DEFAULT,
+        load_stashbox=mock.DEFAULT,
+        load_performer_ids=mock.DEFAULT,
+        Stash=mock.DEFAULT,
+        StashBox=mock.DEFAULT,
+        Store=mock.DEFAULT,
+    )
+
+
+def _patched_all():
+    return mock.patch.multiple(
+        "cronicled.runstashbox",
+        load_server=mock.DEFAULT,
+        load_stashbox=mock.DEFAULT,
+        load_performer_ids=mock.DEFAULT,
+        Stash=mock.DEFAULT,
+        StashBox=mock.DEFAULT,
+        Store=mock.DEFAULT,
+        JobRunner=mock.DEFAULT,
+        build_producer=mock.DEFAULT,
+    )
 
 
 class BuildProducerRequiresALimit(unittest.TestCase):
@@ -203,7 +231,10 @@ class EndToEndWithRealProducer(unittest.TestCase):
             def unorganized_scenes(self, limit):
                 return 0, []
 
-        with self._patched_except_producer() as mocks:
+            def performers_with_stash_ids(self):
+                return []
+
+        with _patched_except_producer() as mocks:
             mocks["load_server"].return_value = {
                 "url": "http://server.example.test", "api_key": "K"}
             mocks["load_stashbox"].return_value = {
@@ -217,16 +248,217 @@ class EndToEndWithRealProducer(unittest.TestCase):
 
         self.assertEqual(rc, 0)
 
-    def _patched_except_producer(self):
-        return mock.patch.multiple(
-            "cronicled.runstashbox",
-            load_server=mock.DEFAULT,
-            load_stashbox=mock.DEFAULT,
-            load_performer_ids=mock.DEFAULT,
-            Stash=mock.DEFAULT,
-            StashBox=mock.DEFAULT,
-            Store=mock.DEFAULT,
-        )
+
+BOX_ENDPOINT = "http://box.example.test/graphql"
+
+
+class DerivedPerformerIdsReachTheCheck(unittest.TestCase):
+    """The whole point of ticket #81: a performer id nothing but an
+    operator-typed JSON file used to supply now comes from the media
+    server's own performer records (`cronicled.performer_ids
+    .derive_performer_ids`). This runs `main` for real -- no mock in place
+    of `build_producer` or `JobRunner` -- against a fake media server that
+    exposes exactly one performer, linked to the configured stash-box
+    endpoint, and NO manual `performer_ids.json` mapping at all.
+    """
+
+    class _FakeStash:
+        def __init__(self, scenes, performers):
+            self._scenes = list(scenes)
+            self._performers = list(performers)
+
+        def unorganized_scenes(self, limit):
+            return len(self._scenes), list(self._scenes)
+
+        def performers_with_stash_ids(self):
+            return list(self._performers)
+
+    def _run(self, path):
+        scene = {"id": "1", "files": [{"path": path}]}
+        performer = {"id": "pf-1", "name": "Velvet Crane",
+                    "stash_ids": [{"endpoint": BOX_ENDPOINT, "stash_id": "pf-1"}]}
+        with _patched_except_producer() as mocks:
+            mocks["load_server"].return_value = {
+                "url": "http://server.example.test", "api_key": "K"}
+            mocks["load_stashbox"].return_value = {
+                "url": "http://box.example.test", "api_key": "BK"}
+            mocks["load_performer_ids"].return_value = {}
+            mocks["Stash"].return_value = self._FakeStash([scene], [performer])
+            box = mock.Mock()
+            box.url = BOX_ENDPOINT
+            box.performer_listing.return_value = SourceListing(
+                "pf-1", [], complete=True)
+            mocks["StashBox"].return_value = box
+            mocks["Store"].return_value = Store(":memory:")
+
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = main(["--limit", "5"])
+            box_seen = box
+        return rc, out.getvalue(), box_seen
+
+    def test_an_uncontested_file_is_checked_using_the_derived_id(self):
+        rc, output, box = self._run("/library/Velvet Crane/Morning Ritual.mp4")
+
+        self.assertEqual(rc, 0)
+        box.performer_listing.assert_called_once()
+        self.assertEqual(box.performer_listing.call_args[0][0], "pf-1")
+        self.assertIn("checked 1", output)
+
+    def test_a_contested_attribution_is_not_settled_by_a_derived_id_either(self):
+        # HARM (acceptance criterion): a performer id that WAS successfully
+        # derived from the media server's own records must not make a
+        # contested folder/filename disagreement read as though it were
+        # settled. Mutating away the attribution_certain guard anywhere on
+        # this path would turn this file's verdict from "inconclusive" into
+        # a confident "unlisted"/"present" -- a wrong answer sent to a
+        # reviewer with nothing in it to say the attribution was ever in
+        # doubt.
+        rc, output, box = self._run(
+            "/library/Velvet Crane/Ivy Thorn - Morning Ritual.mp4")
+
+        self.assertEqual(rc, 0)
+        # the id WAS available and WAS used to read a listing...
+        box.performer_listing.assert_called_once_with(
+            "pf-1", per_page=mock.ANY, max_pages=mock.ANY, timeout=mock.ANY)
+        # ...but the folder/filename disagreement still downgrades the verdict
+        self.assertIn("checked 1, 0 unlisted, 0 present, 1 inconclusive, 0 skipped",
+                      output)
+
+
+class _FakeStashOfPerformers:
+    def __init__(self, performers):
+        self._performers = list(performers)
+
+    def unorganized_scenes(self, limit):
+        return 0, []
+
+    def performers_with_stash_ids(self):
+        return list(self._performers)
+
+
+def _done(message="finished: checked 0"):
+    return mock.Mock(id="job-1", state="done", message=message, error=None)
+
+
+class ManualAndDerivedPerformerIdsMerge(unittest.TestCase):
+    """`main` merges an operator's `performer_ids.json` with whatever
+    `cronicled.performer_ids.derive_performer_ids` reads off the media
+    server -- see that module's own docstring for why an operator's entry
+    always wins for a name it names at all, and why a name the server's own
+    performer records disagree about is reported rather than guessed.
+    `build_producer` and `JobRunner` are replaced here (mirroring
+    `MainOrchestration`): what these tests pin is the MAPPING `main`
+    assembles, not the check's own mechanics.
+    """
+
+    def _run(self, stash, manual, argv=("--limit", "5")):
+        with _patched_all() as mocks:
+            mocks["load_server"].return_value = {
+                "url": "http://server.example.test", "api_key": "K"}
+            mocks["load_stashbox"].return_value = {
+                "url": "http://box.example.test", "api_key": "BK"}
+            mocks["load_performer_ids"].return_value = manual
+            mocks["Stash"].return_value = stash
+            box = mock.Mock()
+            box.url = BOX_ENDPOINT
+            mocks["StashBox"].return_value = box
+            producer = mock.Mock()
+            producer.name = "stashbox-check"
+            mocks["build_producer"].return_value = producer
+            runner = mocks["JobRunner"].return_value
+            runner.start.return_value = mock.Mock(id="job-1")
+            runner.job.return_value = _done()
+
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = main(list(argv))
+
+            args, _ = mocks["build_producer"].call_args
+        return rc, args[2], err.getvalue()
+
+    def test_a_derived_only_name_reaches_the_producer_alongside_a_manual_one(self):
+        stash = _FakeStashOfPerformers([
+            {"id": "pf-1", "name": "Velvet Crane",
+             "stash_ids": [{"endpoint": BOX_ENDPOINT, "stash_id": "pf-derived"}]},
+        ])
+
+        rc, performer_ids, _ = self._run(stash, {"Ivy Thorn": "pf-manual"})
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(performer_ids, {"Ivy Thorn": "pf-manual",
+                                         "Velvet Crane": "pf-derived"})
+
+    def test_a_manual_entry_overrides_a_conflicting_derived_one(self):
+        stash = _FakeStashOfPerformers([
+            {"id": "pf-1", "name": "Velvet Crane",
+             "stash_ids": [{"endpoint": BOX_ENDPOINT, "stash_id": "pf-derived"}]},
+        ])
+
+        rc, performer_ids, _ = self._run(stash, {"Velvet Crane": "pf-manual"})
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(performer_ids, {"Velvet Crane": "pf-manual"})
+
+    def test_an_ambiguous_derived_name_is_reported_and_excluded_not_guessed(self):
+        # HARM (acceptance criterion): two performers this library holds
+        # share a name and disagree about the id at this endpoint. Taking
+        # whichever one the server happened to list first would file a
+        # listing read under a performer nobody confirmed is this file's
+        # creator -- exactly the wrong-person read `cronicled.stashbox`'s
+        # own docstring calls the sharp edge of this feature.
+        stash = _FakeStashOfPerformers([
+            {"id": "pf-1", "name": "Ivy Thorn",
+             "stash_ids": [{"endpoint": BOX_ENDPOINT, "stash_id": "pf-1"}]},
+            {"id": "pf-2", "name": "Ivy Thorn",
+             "stash_ids": [{"endpoint": BOX_ENDPOINT, "stash_id": "pf-2"}]},
+        ])
+
+        rc, performer_ids, stderr = self._run(stash, {})
+
+        self.assertEqual(rc, 0)
+        self.assertNotIn("Ivy Thorn", performer_ids)
+        self.assertIn("Ivy Thorn", stderr)
+        self.assertIn("pf-1", stderr)
+        self.assertIn("pf-2", stderr)
+
+    def test_a_manual_entry_settles_an_ambiguous_derived_name(self):
+        stash = _FakeStashOfPerformers([
+            {"id": "pf-1", "name": "Ivy Thorn",
+             "stash_ids": [{"endpoint": BOX_ENDPOINT, "stash_id": "pf-1"}]},
+            {"id": "pf-2", "name": "Ivy Thorn",
+             "stash_ids": [{"endpoint": BOX_ENDPOINT, "stash_id": "pf-2"}]},
+        ])
+
+        rc, performer_ids, stderr = self._run(stash, {"Ivy Thorn": "pf-2"})
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(performer_ids.get("Ivy Thorn"), "pf-2")
+        self.assertNotIn("Ivy Thorn", stderr)
+
+
+class DerivationFailureAbortsBeforeAnythingRuns(unittest.TestCase):
+    def test_a_media_server_failure_while_deriving_ids_is_reported(self):
+        class _FailingStash:
+            def performers_with_stash_ids(self):
+                raise StashError("cannot reach the media server")
+
+        with _patched_all() as mocks:
+            mocks["load_server"].return_value = {
+                "url": "http://server.example.test", "api_key": "K"}
+            mocks["load_stashbox"].return_value = {
+                "url": "http://box.example.test", "api_key": "BK"}
+            mocks["load_performer_ids"].return_value = {}
+            mocks["Stash"].return_value = _FailingStash()
+            box = mock.Mock()
+            box.url = BOX_ENDPOINT
+            mocks["StashBox"].return_value = box
+
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = main(["--limit", "5"])
+
+            self.assertEqual(rc, 1)
+            self.assertIn("could not read performer ids", err.getvalue())
+            mocks["build_producer"].assert_not_called()
+            mocks["Store"].assert_not_called()
 
 
 if __name__ == "__main__":
