@@ -8,6 +8,8 @@ proposal without opening anything else. That is worth testing on its own.
 import os
 from dataclasses import dataclass
 
+from cronicled.text import slug_match, spaceless
+
 
 @dataclass(frozen=True)
 class Row:
@@ -115,20 +117,44 @@ def _studio_name(candidate):
     return studio["name"] if studio else None
 
 
-def _disagreement(creator):
-    """One line naming what the resolver passed over, or None.
+def _disagreement(creator, filename_stem):
+    """One line naming what the resolver passed over, or None when nothing it
+    passed over actually disagrees.
 
     The two kinds are kept apart deliberately upstream and are phrased apart
     here: `competing` is a name a reviewer could go and search for;
-    `rejected_folder` is folder text that failed the guards and treating it as
-    a name is the mistake the resolver exists to prevent.
+    `rejected_folder` is folder text that failed the guards, and treating it
+    as a name is the mistake the resolver exists to prevent.
+
+    The resolver goes on recording both, unchanged -- deciding what is worth
+    interrupting a person about belongs here, not there. Two of the things it
+    records are not disagreements at all, and measured against a real library
+    they produced six warnings of which one meant anything. A warning that
+    fires on almost every row stops being read, and then the one that matters
+    goes past unread with the rest of them.
+
+    **A folder that is the filename repeated.** One file per folder is an
+    ordinary layout, and such a folder was never going to name anyone: it
+    failed the guards for being a title, not because the filing convention is
+    wrong. It carries no evidence independent of the filename beside it.
+
+    Suppressed on exact equality of the normalised forms, NOT on containment,
+    and that asymmetry is deliberate. Silencing a warning is the expensive
+    direction here -- a folder genuinely naming a different creator is the
+    mis-filing this field exists to catch, and a looser rule would hide it.
+    Equality demands the strongest evidence that the folder is a copy.
+
+    **A competing name that is the same attribution spelled longer.** A loser
+    containing the winner, or contained by it, is one person written two ways
+    rather than two candidates. `slug_match` is this project's existing answer
+    to "are these the same name", so this asks it rather than deciding again.
     """
     competing = creator.get("competing")
     rejected = creator.get("rejected_folder")
     parts = []
-    if competing:
+    if competing and not slug_match(competing, creator["name"]):
         parts.append("the filename names %s instead" % competing)
-    if rejected:
+    if rejected and spaceless(rejected) != spaceless(filename_stem):
         parts.append("the folder text %r was not usable as a name" % rejected)
     return "; ".join(parts) if parts else None
 
@@ -139,13 +165,14 @@ def to_row(item):
     # blank creator column reads as "nothing disagreed" — the reading that
     # gets a wrong row approved.
     creator = payload["creator"]
-    disagreement = _disagreement(creator)
+    filename = os.path.basename(payload["path"])
+    disagreement = _disagreement(creator, os.path.splitext(filename)[0])
     candidate = payload["candidate"]
     score = payload["score"]
     return Row(
         fingerprint=item["fingerprint"],
         state=item["state"],
-        filename=os.path.basename(payload["path"]),
+        filename=filename,
         proposed_title=candidate["title"],
         creator=creator["name"],
         creator_source=creator["source"],
