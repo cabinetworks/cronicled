@@ -12,17 +12,22 @@ inside a `"scraping"`-classed scan (see `cronicled.stashbox_scan`'s own
 docstring for why the two must never share a job).
 
 The `performer_ids` mapping -- a resolved creator NAME to the stash-box id
-whose listing should be read for them -- is the one piece of this feature
-nothing in the project resolves automatically. A stash-box performer is a
-different identity from a name resolved out of a folder or a filename, and
-this ticket did not find a source that links the two (see this ticket's own
-report). What this module offers instead is the plainest possible stopgap: a
-flat JSON object, `{"resolved name": "stash-box performer id", ...}`, read
-from `--performer-ids` (default: `performer_ids.json` inside the configured
-`config_dir()`). An absent file is a legitimate state, not an error -- the
-same shape `cronicled.adapters.registry.load_adapters` already uses for a
-fresh install -- and means every file is skipped with a stated reason rather
-than the run refusing to start.
+whose listing should be read for them -- has two sources, combined by
+`cronicled.performer_ids.merge_performer_ids` before a check ever runs.
+Most of it now comes from the media server's OWN performer records: a
+performer this library already links to the configured stash-box instance
+(by an earlier scrape, apply, or an operator's own edit) supplies its name
+and id for free -- see `cronicled.performer_ids.derive_performer_ids`. What
+that CANNOT supply is a performer this library has never linked to that
+stash-box at all, or a name two different local performers share; for those,
+`--performer-ids` still reads a flat JSON object,
+`{"resolved name": "stash-box performer id", ...}`, from a file (default:
+`performer_ids.json` inside the configured `config_dir()`), and an entry
+there always wins over a derived one for the same name. An absent file is a
+legitimate state, not an error -- the same shape
+`cronicled.adapters.registry.load_adapters` already uses for a fresh
+install -- and, same as a name neither source supplies, means that file is
+skipped with a stated reason rather than the run refusing to start.
 """
 import argparse
 import json
@@ -31,8 +36,9 @@ import sys
 
 from cronicled.config import config_dir, load_server, load_stashbox
 from cronicled.jobs import JobRunner
+from cronicled.performer_ids import derive_performer_ids, merge_performer_ids
 from cronicled.scoring import DEFAULT_THRESHOLD
-from cronicled.stash import Stash
+from cronicled.stash import Stash, StashError
 from cronicled.stashbox import StashBox
 from cronicled.stashbox_scan import StashBoxCheckProducer
 from cronicled.store import Store
@@ -48,9 +54,10 @@ def load_performer_ids(path=None, env=None):
 
     Absence is a legitimate state, not an error, on the same terms
     `cronicled.config.load_stashbox` already treats a missing endpoint: a
-    check that finds no mapping simply skips every file with a stated
-    reason (see `cronicled.stashbox_scan.StashBoxCheckProducer`) rather than
-    refusing to run.
+    check that finds no mapping here, and none derived either (see
+    `cronicled.performer_ids.derive_performer_ids`), simply skips a file
+    with a stated reason (see `cronicled.stashbox_scan.StashBoxCheckProducer`)
+    rather than refusing to run.
     """
     if path is None:
         path = default_performer_ids_path(env)
@@ -104,8 +111,10 @@ def main(argv=None):
                              "stash-box; required, with no default")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
     parser.add_argument("--performer-ids", default=None,
-                        help="path to the {name: stash-box performer id} "
-                             "JSON mapping (default: performer_ids.json "
+                        help="path to a {name: stash-box performer id} JSON "
+                             "mapping that OVERRIDES what is derived from "
+                             "the media server's own performer records for "
+                             "any name it lists (default: performer_ids.json "
                              "inside the configured config directory)")
     args = parser.parse_args(argv)
 
@@ -123,10 +132,25 @@ def main(argv=None):
              "config/stashbox.example.json for the shape)", file=sys.stderr)
         return 1
 
-    performer_ids = load_performer_ids(args.performer_ids)
+    manual_performer_ids = load_performer_ids(args.performer_ids)
 
     stash = Stash(server["url"], server["api_key"])
     box = StashBox(stashbox_config["url"], stashbox_config["api_key"])
+    try:
+        derived = derive_performer_ids(stash, box.url)
+    except StashError as exc:
+        print("cannot run a stash-box check: could not read performer ids "
+             "from the media server: %s" % exc, file=sys.stderr)
+        return 1
+    performer_ids, unresolved = merge_performer_ids(manual_performer_ids, derived)
+    for name, ids in sorted(unresolved.items()):
+        print("stash-box check: %r names more than one performer on the "
+             "media server (%s) and is not being guessed at -- add it to "
+             "%s to settle it" % (
+                 name, ", ".join(ids),
+                 args.performer_ids or default_performer_ids_path()),
+             file=sys.stderr)
+
     store = Store(args.db)
     try:
         runner = JobRunner(store)

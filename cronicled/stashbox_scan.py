@@ -20,13 +20,16 @@ run; the per-file lines are for whoever is watching it live, exactly as
 `cronicled.scan.ScanProducer` already accepts for its own per-file lines.
 
 `performer_ids` maps a resolved creator NAME to that performer's stash-box
-id. Nothing else in this project resolves that mapping -- a stash-box
-performer is a different identity from a name resolved out of a folder or a
-filename, and linking the two automatically is its own piece of work this
-module does not attempt (see this ticket's report). An empty or absent
-mapping means every file is skipped with a stated reason, not an error: the
-same shape `cronicled.config.load_stashbox` already uses for configuration
-whose absence is a legitimate state.
+id. This producer never builds that mapping itself -- a stash-box performer
+is a different identity from a name resolved out of a folder or a filename,
+and conflating the two is the sharp edge `cronicled.stashbox`'s own
+docstring warns about. `cronicled.runstashbox.main` is what assembles it
+before this producer ever runs, mostly from the media server's own
+performer records (`cronicled.performer_ids.derive_performer_ids`), filled
+out by an operator's own entries for whatever that cannot supply. An empty
+or absent mapping means every file is skipped with a stated reason, not an
+error: the same shape `cronicled.config.load_stashbox` already uses for
+configuration whose absence is a legitimate state.
 
 The creator for each file is resolved WITHOUT `owners_of` -- no site search
 runs here, on purpose. `owners_of` is what lets `cronicled.artist.resolve`

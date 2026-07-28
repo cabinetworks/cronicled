@@ -1583,6 +1583,110 @@ class AllTags(unittest.TestCase):
         self.assertEqual(len(t.calls), 1)
 
 
+PERFORMER_PAGE_SIZE = 500
+
+
+def _performer_rows(n, prefix, endpoint="https://box.example.test/graphql"):
+    return [{"id": "%s-%d" % (prefix, i), "name": "%s %d" % (prefix, i),
+             "stash_ids": [{"endpoint": endpoint, "stash_id": "%s-%d" % (prefix, i)}]}
+            for i in range(n)]
+
+
+class _PerformerReadTransport:
+    """Fake transport for `performers_with_stash_ids`, in the style of
+    `_ReadTransport`'s tag paging: `pages` is served by requested page
+    number, `count` (default: the true total across `pages`) can be forced
+    to disagree with what the pages actually hold, so the short-page and
+    count-reached stop conditions can be driven apart the same way
+    `AllTags` drives `all_tags`'s two arms apart."""
+
+    def __init__(self, pages=None, count=None, max_pages=6):
+        self.calls = []
+        self.pages = [[]] if pages is None else pages
+        self.count = count
+        self.max_pages = max_pages
+        self.requests = 0
+
+    def __call__(self, body, timeout):
+        q, variables = body["query"], body["variables"]
+        self.calls.append((q, variables))
+        if "findPerformers(" not in q:
+            raise AssertionError("test transport does not recognize query: %s" % q)
+        self.requests += 1
+        if self.requests > self.max_pages:
+            raise AssertionError(
+                "the client is still asking for performer pages after %d "
+                "requests — it never stopped" % self.max_pages)
+        page = (variables.get("f") or {}).get("page", 1)
+        rows = self.pages[page - 1] if page <= len(self.pages) else []
+        total = sum(len(p) for p in self.pages)
+        return {"data": {"findPerformers": {
+            "count": total if self.count is None else self.count,
+            "performers": rows}}}
+
+
+class PerformersWithStashIds(unittest.TestCase):
+    def test_it_pages_past_the_first_page(self):
+        # HARM: `cronicled.performer_ids.derive_performer_ids` builds its
+        # name -> stash-box id mapping from this whole list. Stopping at the
+        # first page means a performer whose name sorts past it is simply
+        # never offered a stash-box id, and every file resolved to them is
+        # silently skipped as though this library had no link for them at all.
+        pages = [_performer_rows(PERFORMER_PAGE_SIZE, "alpha"),
+                 _performer_rows(3, "omega")]
+        t = _PerformerReadTransport(pages=pages)
+        got = _read_stash(t).performers_with_stash_ids()
+        self.assertEqual(len(got), PERFORMER_PAGE_SIZE + 3)
+        self.assertEqual(got, pages[0] + pages[1])
+        self.assertEqual([v["f"]["page"] for _, v in t.calls], [1, 2])
+
+    def test_every_page_is_requested_with_the_same_size_and_ordering(self):
+        pages = [_performer_rows(PERFORMER_PAGE_SIZE, "alpha"),
+                 _performer_rows(1, "omega")]
+        t = _PerformerReadTransport(pages=pages)
+        _read_stash(t).performers_with_stash_ids()
+        self.assertEqual([v["f"] for _, v in t.calls],
+                         [{"per_page": PERFORMER_PAGE_SIZE, "page": 1,
+                           "sort": "name", "direction": "ASC"},
+                          {"per_page": PERFORMER_PAGE_SIZE, "page": 2,
+                           "sort": "name", "direction": "ASC"}])
+
+    def test_a_short_page_ends_the_read_even_when_the_count_over_reports(self):
+        # HARM: pins the short-page arm alone, by making the count arm unable
+        # to fire. Without it a server whose count over-reports (a performer
+        # deleted between pages) is asked for page after empty page forever.
+        for short in (4, PERFORMER_PAGE_SIZE - 1):
+            with self.subTest(rows=short):
+                t = _PerformerReadTransport(
+                    pages=[_performer_rows(short, "alpha")],
+                    count=PERFORMER_PAGE_SIZE * 3)
+                got = _read_stash(t).performers_with_stash_ids()
+                self.assertEqual(len(got), short)
+                self.assertEqual(len(t.calls), 1)
+
+    def test_a_full_page_that_completes_the_count_ends_the_read(self):
+        # HARM: pins the count arm alone, by making the short-page arm unable
+        # to fire — exactly PERFORMER_PAGE_SIZE rows, indistinguishable from
+        # "there is more" by length alone.
+        t = _PerformerReadTransport(pages=[_performer_rows(PERFORMER_PAGE_SIZE, "alpha")])
+        got = _read_stash(t).performers_with_stash_ids()
+        self.assertEqual(len(got), PERFORMER_PAGE_SIZE)
+        self.assertEqual(len(t.calls), 1)
+
+    def test_the_selection_set_carries_the_stash_id_object_fields(self):
+        # HARM: `stash_ids` is `[StashID!]!`, an OBJECT list — written bare
+        # in the query it is either rejected outright or (against a fake
+        # transport that never parses the query it is handed, as every test
+        # transport here does not) silently comes back without `endpoint`,
+        # and `cronicled.performer_ids.derive_performer_ids` can then never
+        # tell which stash-box a performer's id belongs to.
+        t = _PerformerReadTransport(pages=[_performer_rows(1, "alpha")])
+        _read_stash(t).performers_with_stash_ids()
+        query = t.calls[0][0]
+        self.assertIn("stash_ids{ endpoint stash_id }", query)
+        self.assertIn("findPerformers(filter:$f)", query)
+
+
 # -- the request path: what would actually go on the wire ----------------- #
 
 # Invented server. `.invalid` is a reserved TLD that can never resolve, so if
