@@ -133,6 +133,33 @@ def _evidence(name, folder, artist=None):
     return kept, stripped
 
 
+def title_view(name):
+    """The filename read as a TITLE: the container extension dropped, and a
+    leading `Series - ` prefix with it when there is one.
+
+    ONE derivation with two consumers, and that is the reason it is a
+    function rather than three lines inside `score`. `score` weighs this view
+    against every candidate title, and `scan.examine_sources` builds the
+    per-title fallback QUERY out of it. Asking a store for one string and
+    judging its answers against a differently-cleaned one is a recall loss
+    with no symptom: the store answers what it was asked, the scorer refuses
+    what it was handed, and nothing anywhere compares the two.
+
+    Deliberately NOT `_strip_unknown_ext`. That strip exists to stop an
+    unrecognised suffix inflating `meaningful_count`, and `score` keeps it
+    out of the views it scores for the same reason it keeps it out of the
+    containment set: an unknown suffix might be part of the real title. A
+    query is the one place withholding it costs outright — the store is
+    asked for less than the file says.
+
+    Returns the extension-stripped name unchanged when there is no prefix to
+    strip, so a caller never has to know which of the two it got.
+    """
+    stripped = strip_ext(name)
+    without_prefix = _without_series_prefix(stripped)
+    return stripped if without_prefix is None else without_prefix
+
+
 def meaningful_tokens(name, folder, artist=None):
     """The evidence that can actually distinguish one title from another:
     tokens left after dropping stopwords, junk, the artist's own name, a
@@ -212,9 +239,11 @@ def score(name, folder, title, artist=None):
     views = [stripped_name]
     if _folder_adds_evidence(folder, artist):
         views.append(cleaned_folder)
-    prefix_stripped = _without_series_prefix(stripped_name)
-    if prefix_stripped is not None:
-        views.append(prefix_stripped)
+    # The same `title_view` the per-title fallback query is built from — see
+    # its docstring for why the two must not each derive their own.
+    as_title = title_view(name)
+    if as_title != stripped_name:
+        views.append(as_title)
 
     # An empty string on either side is not a resemblance to be measured:
     # difflib rates two of them a perfect 1.0, which gave a blank candidate

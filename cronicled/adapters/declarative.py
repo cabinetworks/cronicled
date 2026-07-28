@@ -157,8 +157,9 @@ class DeclarativeAdapter(SiteAdapter):
         by the creator seed costs recall and buys nothing, so the query is
         the title alone.
 
-        Dead code in production today: see `SiteAdapter.search_query`'s
-        docstring for why nothing calls this."""
+        Reached only by the per-title fallback, and only for a file the
+        per-creator pass could not resolve — see `SiteAdapter.search_query`
+        for the whole ordering."""
         if self._search_omits_seed:
             return title_query
         return super(DeclarativeAdapter, self).search_query(seed, title_query)

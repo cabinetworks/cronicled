@@ -33,7 +33,8 @@ from dataclasses import dataclass, field
 
 from cronicled.artist import Aliases, creator_folder, resolve
 from cronicled.censorship import decensor
-from cronicled.scoring import AMBIGUITY_MARGIN, DEFAULT_THRESHOLD, decide, score
+from cronicled.scoring import (AMBIGUITY_MARGIN, DEFAULT_THRESHOLD, decide,
+                               meaningful_tokens, score, title_view)
 
 # Selection deals in one kind of subject. It is named rather than inlined so
 # a test and the store agree on the same string, and so a future second kind
@@ -266,11 +267,20 @@ class Outcome:
     are set, and is the ONLY record in the refusal case — where nothing is
     proposed, nothing is muted, and without it the caller has nothing to tell
     a reviewer and no way to distinguish a tie from a near miss.
+
+    `fallback_queries` counts the per-title searches THIS file spent — one
+    per (file, store), and zero for a file the per-creator pass resolved (see
+    `examine_sources`). It is carried on the outcome rather than tallied by a
+    shared counter because every file is examined on its own worker thread;
+    the producer sums what comes back and logs the total, so the cost of the
+    fallback is a number a reader can see rather than one they infer from the
+    file limit.
     """
     proposal: dict = None
     mute_reason: str = None
     error: str = None
     reason: str = ""
+    fallback_queries: int = 0
 
 
 def _primary_path(scene):
@@ -627,12 +637,28 @@ class Source:
     STORE rather than assumed to be one map for the whole run: two stores
     can censor the same word two different ways, or censor two different
     words, and neither's substitutions belong on the other's titles.
+
+    `title_query` phrases THIS store's per-title fallback query — ordinarily
+    `SiteAdapter.search_query`, taking the resolved creator's name and the
+    filename read as a title and returning the string to search for. It
+    travels with the source rather than being one rule for the run because
+    the phrasing is the store's own: an adapter configured
+    `search_omits_seed` narrows by title alone, and that is a fact about one
+    store's search, not about the scan.
+
+    `None` — the default — means this store contributes no fallback: it is
+    asked once, by creator, and a file its page did not answer is refused as
+    it is today. That default withholds an expensive query rather than a
+    guard, and it fails in the recoverable direction (a refusal a person can
+    see, never an automatic write); the cost of leaving it unset is recall,
+    and `runscan.build_producer` sets it for every configured adapter.
     """
     name: str
     search: object
     owner_of: object = None
     catalog_resolvable: bool = True
     censorship: dict = None
+    title_query: object = None
 
 
 class _StoreDecision:
@@ -649,6 +675,25 @@ class _StoreDecision:
         self.candidates = candidates
         self.matches = matches
         self.decision = decision
+
+
+def _judge(source, candidates, *, name, directory, artist, threshold):
+    """One store's verdict on one file's candidates: score every candidate
+    against the filename and let `scoring.decide` pick or refuse.
+
+    Shared by both passes — the per-creator search and the per-title fallback
+    — so a candidate is weighed identically however it was found. A second
+    copy of these three lines would be free to disagree about the artist
+    subtraction, the store's own censorship map, or the threshold, and a
+    fallback candidate judged by different arithmetic than the pass it is
+    meant to rescue is exactly the drift this ticket exists to avoid.
+    """
+    matches = [score(name, directory,
+                     decensor(c["title"], source.censorship or {}),
+                     artist=artist)
+               for c in candidates]
+    return _StoreDecision(source, candidates, matches,
+                          decide(matches, threshold))
 
 
 def _combined_owners_of(sources):
@@ -818,6 +863,44 @@ def examine_sources(scene, *, sources, folder, threshold=DEFAULT_THRESHOLD,
     different stores is two different lookups, and collapsing them would
     silently answer one store's file from another's catalogue).
 
+    A PER-TITLE QUERY IS THE FALLBACK, AND ONLY EVER THE FALLBACK. A store's
+    search answers with a PAGE, not a catalogue, so a creator with more clips
+    than fit one page can have the wanted clip missing from everything that
+    came back — and no scoring recovers a candidate that was never returned.
+    So when the pass above leaves not one store with a winner, and only then,
+    each store is asked once more for the file itself: `source.title_query`
+    (the store's own `SiteAdapter.search_query`) phrases the resolved
+    creator's name and `scoring.title_view(name)` — the SAME view the scorer
+    weighs, never a second derivation — into one query, and the answers are
+    judged by the same `_judge` the first pass used. A store that raised
+    above is not asked again, and a store that raises here loses only its own
+    fallback: the others still answer and the file still refuses if none of
+    them can rescue it.
+
+    THE COST, STATED, because the per-creator shape was chosen for it: the
+    fallback adds at most ONE query per (file, store) — times whatever
+    `censorship.search_variants` expands it to, bounded at 6 — and adds it
+    only to files that were going to be refused or muted. A run's file limit
+    therefore still means files (see `ScanProducer`), and the worst case for
+    a batch is `files x stores` fallback queries, reached only when every
+    file in it fails. `Outcome.fallback_queries` carries the real number back
+    so the producer can log what a run actually spent.
+
+    Muting is held to the same bar. A file every store answered nothing for
+    is still asked by title before `MUTE_NO_CANDIDATES` is recorded, because
+    a mute is the claim that the file is unidentifiable and stops it ever
+    being looked at again — the strongest verdict here makes, and not one to
+    reach on the cheaper question alone. The single exception is a file with
+    no meaningful token of its own: `scoring._is_eligible` bars it at every
+    score against every candidate, so no answer could change its outcome and
+    the query is withheld as provably useless, not as a guess about it.
+
+    The threshold is untouched by any of this. `scoring.DEFAULT_THRESHOLD`
+    was measured against a per-CREATOR candidate population, and a per-title
+    query returns a different one — fewer rows, closer to the filename.
+    Whether 0.70 still holds for it is a measurement nobody has taken, so
+    nothing here claims it does.
+
     Returns an `Outcome`, on the same three-way contract `examine`
     documents (`mute_reason` / refused-but-not-muted / `error`), with two
     additions when a proposal is returned: the payload's `"store"` names
@@ -851,41 +934,107 @@ def examine_sources(scene, *, sources, folder, threshold=DEFAULT_THRESHOLD,
         return Outcome(mute_reason=MUTE_UNRESOLVED_CREATOR,
                        reason=MUTE_UNRESOLVED_CREATOR)
 
-    per_store = []
+    # Keyed by the source's POSITION, not its name: two sources sharing a
+    # name is a caller's wiring mistake `Source` names but cannot catch, and
+    # keying by name would let one store's fallback quietly replace another's
+    # verdict. Position pairs a store with its own two passes and does
+    # nothing else: `_choose_winner` and `_closest_refusal` still rank by
+    # content, so re-ordering a config file still changes nothing.
+    decisions = {}
     store_errors = []
-    for source in sources:
+    raised = set()
+    for index, source in enumerate(sources):
         try:
             candidates = list(source.search(resolution.name))
         except Exception as exc:
             store_errors.append(
                 "%s: %s: %s" % (source.name, type(exc).__name__, exc))
+            raised.add(index)
             continue
         if not candidates:
             continue
-        matches = [score(name, directory,
-                         decensor(c["title"], source.censorship or {}),
-                         artist=resolution.name)
-                  for c in candidates]
-        decision = decide(matches, threshold)
-        per_store.append(_StoreDecision(source, candidates, matches, decision))
+        decisions[index] = _judge(source, candidates, name=name,
+                                  directory=directory, artist=resolution.name,
+                                  threshold=threshold)
 
     def with_store_errors(reason):
         if not store_errors:
             return reason
         return "%s (store errors: %s)" % (reason, "; ".join(store_errors))
 
-    winners = [sd for sd in per_store if sd.decision.match is not None]
+    def winners_of(decided):
+        return [sd for sd in decided if sd.decision.match is not None]
+
+    per_store = [decisions[i] for i in sorted(decisions)]
+    winners = winners_of(per_store)
+
+    # --- the per-title fallback -----------------------------------------
+    #
+    # Reached only here: every store has been asked once, by creator, and not
+    # one of them produced a candidate this file could be proposed from. A
+    # file that DID resolve never gets this far, and that ordering is the
+    # whole cost argument — see this function's docstring.
+    fallback_queries = 0
+    if not winners:
+        # ...with one exception, and it is a proof rather than a heuristic:
+        # a file carrying no meaningful token is barred by
+        # `scoring._is_eligible` at ANY score, for EVERY candidate, because
+        # the count is derived from the filename, the folder and the artist
+        # and never from a candidate title. No answer a store could give
+        # would change this file's outcome, so the query cannot buy
+        # anything. That is the one case where withholding a query costs no
+        # recall at all — every other file gets its turn.
+        if meaningful_tokens(name, directory, artist=resolution.name):
+            as_title = title_view(name)
+            for index, source in enumerate(sources):
+                # A store that just raised is not asked a second question.
+                # Its failure is already recorded against this file, and a
+                # second query is another round trip to a store known to be
+                # failing right now — the same reasoning `_SingleFlight`
+                # applies to a cached failure, which cannot help here because
+                # a different query is a different cache entry.
+                if index in raised or source.title_query is None:
+                    continue
+                query = source.title_query(resolution.name, as_title)
+                fallback_queries += 1
+                try:
+                    candidates = list(source.search(query))
+                except Exception as exc:
+                    store_errors.append(
+                        "%s: %s: %s" % (source.name, type(exc).__name__, exc))
+                    continue
+                if not candidates:
+                    continue
+                # REPLACES that store's per-creator verdict rather than
+                # pooling with it. The two passes are two answers to two
+                # different questions, and nothing deduplicates ACROSS them
+                # — `search._dedup_key` folds duplicates within one call
+                # only — so a clip present in both answers would reach
+                # `decide` twice and refuse as "ambiguous: X vs X", the
+                # artefact that dedup exists to prevent. The per-creator
+                # candidates cannot win anyway (nothing here was eligible);
+                # what is given up is their reason text, and the targeted
+                # pass's reason describes the better-aimed question.
+                decisions[index] = _judge(source, candidates, name=name,
+                                          directory=directory,
+                                          artist=resolution.name,
+                                          threshold=threshold)
+            per_store = [decisions[i] for i in sorted(decisions)]
+            winners = winners_of(per_store)
 
     if not winners:
         if not per_store:
             if store_errors:
                 combined = "; ".join(store_errors)
-                return Outcome(error=combined, reason=combined)
+                return Outcome(error=combined, reason=combined,
+                               fallback_queries=fallback_queries)
             return Outcome(mute_reason=MUTE_NO_CANDIDATES,
-                           reason=MUTE_NO_CANDIDATES)
+                           reason=MUTE_NO_CANDIDATES,
+                           fallback_queries=fallback_queries)
         best = _closest_refusal(per_store)
         reason = "%s: %s" % (best.source.name, best.decision.reason)
-        return Outcome(reason=with_store_errors(reason))
+        return Outcome(reason=with_store_errors(reason),
+                       fallback_queries=fallback_queries)
 
     chosen, competing = _choose_winner(winners)
     if chosen is None:
@@ -893,7 +1042,8 @@ def examine_sources(scene, *, sources, folder, threshold=DEFAULT_THRESHOLD,
         reason = ("ambiguous across stores: %s each matched a candidate "
                   "above the threshold, too close to call between them"
                   % names)
-        return Outcome(reason=with_store_errors(reason))
+        return Outcome(reason=with_store_errors(reason),
+                       fallback_queries=fallback_queries)
 
     winner = chosen.candidates[chosen.decision.index]
     if enrich is not None:
@@ -944,6 +1094,7 @@ def examine_sources(scene, *, sources, folder, threshold=DEFAULT_THRESHOLD,
             "payload": payload,
         },
         reason=with_store_errors(chosen.decision.reason),
+        fallback_queries=fallback_queries,
     )
 
 
@@ -1379,7 +1530,9 @@ class ScanProducer:
     # Every selected file drives at least one lookup per configured store
     # against a scraper, which is the resource `COST_CLASS_LIMITS` rations to
     # one job at a time — see `examine_sources` for why the multiplier is
-    # bounded per CREATOR rather than per file.
+    # bounded per CREATOR rather than per file, and for the one query per
+    # (file, store) the per-title fallback adds on top for a file that pass
+    # could not resolve.
     cost = "scraping"
 
     def __init__(self, stash, sources, *, store, folder="library", limit=None,
@@ -1508,11 +1661,18 @@ class ScanProducer:
         sources = [
             Source(name=source.name, search=flight, owner_of=source.owner_of,
                   catalog_resolvable=source.catalog_resolvable,
-                  censorship=source.censorship)
+                  censorship=source.censorship,
+                  title_query=source.title_query)
             for source, flight in zip(self._sources, flights)
         ]
         tally = {"proposed": 0, "muted": 0, "refused": 0, "errors": 0}
         done = 0
+        # Summed from what each file's own examination reports, never counted
+        # here: the fallback is decided per (file, store) on a worker thread,
+        # and a counter kept at this level could only ever count files. The
+        # fingerprint loop below adds nothing to it — a file a box identified
+        # is never searched for at all, by creator or by title.
+        fallbacks = 0
         # Files a box identified are recorded first, in selection order —
         # they are already decided, so there is nothing to wait for and no
         # reason to hold them behind the pool's first completion.
@@ -1535,6 +1695,7 @@ class ScanProducer:
                 scene = futures[future]
                 outcome = future.result()
                 tally[self._record(scene, outcome)] += 1
+                fallbacks += outcome.fallback_queries
                 done += 1
                 ctx.log("%d/%d scene %s: %s" % (
                     done, len(selected), str(scene["id"]), outcome.reason))
@@ -1579,10 +1740,16 @@ class ScanProducer:
             note = "; %d identified by fingerprint" % len(by_fingerprint)
             if box_errors:
                 note += " (box errors: %s)" % "; ".join(box_errors)
+        # Reported beside `lookups` rather than folded into it: these are the
+        # queries the per-title FALLBACK issued, one per (file, store) for
+        # files the cheap pass could not resolve, and a person weighing the
+        # file limit needs to see that second, conditional multiplier rather
+        # than infer it from a single total. Counted as queries issued — a
+        # file that spent one against each of two stores counts two.
         ctx.log("finished: %d proposed, %d muted, %d refused, %d errors, "
-                "%d lookups; %s%s"
+                "%d lookups, %d per-title fallback queries; %s%s"
                 % (tally["proposed"], tally["muted"], tally["refused"],
-                   tally["errors"], lookups, selection, note))
+                   tally["errors"], lookups, fallbacks, selection, note))
 
     def _identify_batch(self, selected):
         """Ask the configured boxes about the whole batch, and never let that
