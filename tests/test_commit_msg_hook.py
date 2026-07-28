@@ -7,16 +7,16 @@ allowed the commit. These tests exercise the hook as a black box, the same
 way tests/test_guard.py exercises the guard."""
 import os
 import subprocess
-import tempfile
 import unittest
 
+from tests.fixtures.tempdirs import TempDirCleanup, mkdtemp
 from tests.test_guard import GUARD, _repo
 
 HOOK = os.path.abspath("scripts/hooks/commit-msg")
 
 
 def _msg_file(body):
-    d = tempfile.mkdtemp()
+    d = mkdtemp()
     path = os.path.join(d, "COMMIT_EDITMSG")
     with open(path, "w") as fh:
         fh.write(body)
@@ -32,7 +32,7 @@ def _run(msg_file, env=None):
     return p.returncode, p.stdout.decode("utf-8", "replace")
 
 
-class BasicBehaviour(unittest.TestCase):
+class BasicBehaviour(TempDirCleanup, unittest.TestCase):
     def test_blocks_a_message_matching_a_forbidden_pattern(self):
         f = _msg_file("contains zzsecretzz\n")
         code, out = _run(f, env={"LEAK_PATTERNS": "zzsecretzz"})
@@ -51,7 +51,7 @@ class BasicBehaviour(unittest.TestCase):
         self.assertIn("no patterns", out.lower())
 
 
-class UnreadableMessageFailsClosed(unittest.TestCase):
+class UnreadableMessageFailsClosed(TempDirCleanup, unittest.TestCase):
     """The exact defect the re-review found: an unreadable message file
     must not be treated the same as a clean one."""
 
@@ -70,7 +70,7 @@ class UnreadableMessageFailsClosed(unittest.TestCase):
         self.assertIn("BLOCKED", out)
 
 
-class BomFailClosed(unittest.TestCase):
+class BomFailClosed(TempDirCleanup, unittest.TestCase):
     """This hook used to carry its own ~60-line copy of the guard's
     pattern loading, and that copy never received the BOM strip: a
     byte-order mark glued to the front of the first pattern (some editors,
@@ -99,7 +99,7 @@ def _run_guard(cwd, env=None):
     return p.returncode, p.stdout.decode("utf-8", "replace")
 
 
-class HookAndGuardAgree(unittest.TestCase):
+class HookAndGuardAgree(TempDirCleanup, unittest.TestCase):
     """The hook and the guard now import the exact same
     scripts/lib/leakpatterns.py, rather than two independently-maintained
     copies of the same ~60 lines. Across any shape the pattern list can

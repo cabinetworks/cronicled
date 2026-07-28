@@ -113,6 +113,58 @@ class RunningAJob(_RunnerCase):
             self.runner.start("nosuchproducer")
 
 
+class Duration(_RunnerCase):
+    """Ticket #33: `started_at`/`finished_at` are whole-second timestamps, so
+    a job that finishes inside the second it started (the ordinary case, not
+    an edge case) has `started_at == finished_at` and no duration can be
+    read off them. `duration` is measured separately, from a monotonic
+    clock, so it survives exactly that case."""
+
+    def test_a_running_job_has_no_duration_yet(self):
+        gate = threading.Event()
+        self.runner.register(_Producer(gate=gate, count=1))
+        job = self.runner.start("test-producer")
+        self.assertIsNone(self.runner.job(job.id).duration)
+        gate.set()
+        self.runner.wait(job.id, timeout=5)
+
+    def test_a_finished_job_reports_a_sub_second_duration(self):
+        # A real run of this producer completes in well under a second, so
+        # `started_at == finished_at` for it -- the exact case `duration`
+        # exists to cover. Driven with a real clock (not mocked) so the
+        # assertion is about the actual failure mode, not a value we handed
+        # the code back to itself.
+        self.runner.register(_Producer(count=1))
+        job = self.runner.start("test-producer")
+        self.runner.wait(job.id, timeout=5)
+        done = self.runner.job(job.id)
+        self.assertEqual(done.started_at, done.finished_at,
+                         "the fixture is only interesting if this holds")
+        self.assertIsNotNone(done.duration)
+        self.assertGreaterEqual(done.duration, 0.0)
+        self.assertLess(done.duration, 1.0)
+
+    def test_duration_is_measured_from_a_monotonic_clock_not_the_timestamps(self):
+        # Pins the mechanism, not just the outcome: two monotonic readings
+        # 0.25s apart must produce a duration of 0.25, regardless of what
+        # the (whole-second) wall-clock timestamps say.
+        with mock.patch("cronicled.jobs.time.monotonic",
+                        side_effect=[100.0, 100.25]):
+            self.runner.register(_Producer(count=1))
+            job = self.runner.start("test-producer")
+            self.runner.wait(job.id, timeout=5)
+        self.assertAlmostEqual(self.runner.job(job.id).duration, 0.25, places=6)
+
+    def test_a_failed_job_still_reports_a_duration(self):
+        self.runner.register(_Producer(count=1, boom=True))
+        job = self.runner.start("test-producer")
+        self.runner.wait(job.id, timeout=5)
+        failed = self.runner.job(job.id)
+        self.assertEqual(failed.state, "failed")
+        self.assertIsNotNone(failed.duration)
+        self.assertGreaterEqual(failed.duration, 0.0)
+
+
 class Failure(_RunnerCase):
     def test_a_failing_producer_marks_the_job_failed_with_the_error(self):
         self.runner.register(_Producer(count=2, boom=True))
