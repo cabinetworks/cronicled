@@ -688,12 +688,30 @@ class Store:
 
     def mutes(self):
         """Every standing mute, as dicts with `subject_type`, `subject_id`,
-        `reason` and `at` — the same `mute` table `muted_subjects()` reads,
-        but keeping the reason and timestamp that method deliberately leaves
-        out (it exists for the batch membership test `select()` needs, not
-        for display — see its own docstring). This is for showing a person
+        `reason`, `at` and `payload` — the same `mute` table `muted_subjects()`
+        reads, but keeping the reason and timestamp that method deliberately
+        leaves out (it exists for the batch membership test `select()` needs,
+        not for display — see its own docstring). This is for showing a person
         what is currently hidden from them, and a bare `(type, id)` pair
         gives them nothing to judge.
+
+        `payload` is the most recently seen `item` row ever recorded for this
+        subject — decoded the same way `items()` decodes its own `payload`
+        column — or `None` when no proposal was ever recorded for this
+        subject at all. That second case is the one `mute`'s own docstring
+        names: a subject muted ahead of any scan ever finding it. `mute`
+        itself never deletes an existing `item` row (it only changes its
+        `state`, and only for a non-terminal one — see `mute`'s docstring),
+        so the payload recorded against whichever row was seen last is still
+        sitting in the `item` table regardless of what state that row ended
+        up in, terminal or not; a subject can also carry more than one `item`
+        row (successive proposals under different producers or payloads
+        before it was muted), so this reads the freshest by `last_seen_at`
+        rather than picking arbitrarily.
+
+        Deciding what to show a person for a subject with no recoverable
+        payload is `cronicled.web.rows.to_mute_row`'s job, not this method's
+        — this only ever answers what the store actually knows, honestly.
 
         Ordered by `at` then `subject_id`, the same tie-break `items()` uses
         for its own listing.
@@ -703,11 +721,18 @@ class Store:
                 "SELECT subject_type, subject_id, reason, at FROM mute "
                 "ORDER BY at, subject_id"
             ).fetchall()
-        return [
-            {"subject_type": subject_type, "subject_id": subject_id,
-             "reason": reason, "at": at}
-            for subject_type, subject_id, reason, at in rows
-        ]
+            result = []
+            for subject_type, subject_id, reason, at in rows:
+                item_row = self._conn.execute(
+                    "SELECT payload FROM item WHERE subject_type = ? AND "
+                    "subject_id = ? ORDER BY last_seen_at DESC LIMIT 1",
+                    (subject_type, subject_id),
+                ).fetchone()
+                payload = json.loads(item_row[0]) if item_row is not None else None
+                result.append({"subject_type": subject_type,
+                              "subject_id": subject_id, "reason": reason,
+                              "at": at, "payload": payload})
+        return result
 
     # Superseding a proposal
     # ----------------------

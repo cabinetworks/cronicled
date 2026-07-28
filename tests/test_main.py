@@ -132,6 +132,40 @@ class MainWiring(_Base):
         self.assertEqual(rows[0].filename, "reel.mp4")
 
 
+class SceneUrlWiring(_Base):
+    """Ticket 97: the configured `--server` address reaches every row
+    builder as its `base_url` -- reused from the same resolution `Stash`
+    itself was built from, never a second, separate piece of
+    configuration."""
+
+    def test_a_configured_server_reaches_a_rows_scene_url(self):
+        self._seed(subject_id="55")
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path, "--server", "http://media.example"])
+        rows = captured.kwargs["rows"]()
+        self.assertEqual(rows[0].scene_url, "http://media.example/scenes/55")
+
+    def test_no_configured_server_leaves_a_rows_scene_url_none(self):
+        self._seed(subject_id="55")
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path])
+        rows = captured.kwargs["rows"]()
+        self.assertIsNone(rows[0].scene_url)
+
+    def test_the_muted_sections_link_uses_the_same_configured_server(self):
+        store = Store(self.db_path)
+        store.mute("scene", "9", reason="never identifiable")
+        store.close()
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path, "--server", "http://media.example"])
+        muted = captured.kwargs["muted"]()
+        self.assertEqual(muted[0]["scene_url"],
+                         "http://media.example/scenes/9")
+
+
 class HostAndPortEnvironmentDefaults(_Base):
     # Mirrors the coverage --db already has for $CRONICLED_DB: a container
     # can only pass these through ENV (see the Dockerfile), so the flag

@@ -3,7 +3,8 @@ import unittest
 from cronicled.scan import _runners_up
 from cronicled.scoring import Match
 from cronicled.web.rows import (
-    Row, to_refusal_row, to_refusal_rows, to_row, to_rows,
+    Row, scene_url, to_mute_row, to_mute_rows, to_refusal_row,
+    to_refusal_rows, to_row, to_rows,
 )
 
 
@@ -40,7 +41,8 @@ def _item(**over):
     }
     payload.update(over.pop("payload", {}))
     item = {"fingerprint": "fp-1", "state": "new", "summary": "s",
-            "confidence": 0.8123, "payload": payload, "prior_state": None}
+            "confidence": 0.8123, "payload": payload, "prior_state": None,
+            "subject_id": "42"}
     item.update(over)
     return item
 
@@ -158,6 +160,131 @@ class RowContent(unittest.TestCase):
         self.assertFalse(to_row(_item(state="applied",
                                       prior_state=None)).undoable)
         self.assertFalse(to_row(_item(state="new")).undoable)
+
+
+class SceneUrlHelper(unittest.TestCase):
+    """`scene_url` — the one place this project writes the path shape for a
+    scene page, shared by every row builder that links to one."""
+
+    def test_builds_the_scene_page_from_the_base_url_and_the_subject_id(self):
+        self.assertEqual(scene_url("http://media.example", "42"),
+                         "http://media.example/scenes/42")
+
+    def test_a_trailing_slash_on_the_base_url_does_not_double_up(self):
+        self.assertEqual(scene_url("http://media.example/", "42"),
+                         "http://media.example/scenes/42")
+
+    def test_no_base_url_is_none_not_a_broken_link(self):
+        # Ticket 97: the tool now starts read-only with no server
+        # configured, and the link has to degrade rather than render
+        # broken.
+        self.assertIsNone(scene_url(None, "42"))
+
+    def test_an_empty_base_url_is_also_none(self):
+        self.assertIsNone(scene_url("", "42"))
+
+
+class RowSceneUrl(unittest.TestCase):
+    """A proposal row links to its own scene on the media server -- ticket
+    97's second half, alongside the muted subject's name."""
+
+    def test_a_row_carries_its_scene_url_when_a_server_is_configured(self):
+        row = to_row(_item(subject_id="55"), base_url="http://media.example")
+        self.assertEqual(row.scene_url, "http://media.example/scenes/55")
+
+    def test_a_row_has_no_scene_url_without_a_configured_server(self):
+        # The default, and the case every existing caller of `to_row`
+        # exercises -- must not raise or invent a link.
+        row = to_row(_item())
+        self.assertIsNone(row.scene_url)
+
+    def test_to_rows_threads_the_base_url_to_every_row(self):
+        items = [_item(fingerprint="fp-1", subject_id="1"),
+                 _item(fingerprint="fp-2", subject_id="2")]
+        rows = to_rows(items, base_url="http://media.example")
+        self.assertEqual([r.scene_url for r in rows],
+                         ["http://media.example/scenes/1",
+                          "http://media.example/scenes/2"])
+
+
+class ToRefusalRowSceneUrl(unittest.TestCase):
+    def _entry(self, **over):
+        entry = {"subject_type": "scene", "subject_id": "1",
+                 "path": "/library/Nine Winters/nine-winters-clip.mp4",
+                 "reason": "a tie between two candidates",
+                 "at": "2026-07-27T00:00:00"}
+        entry.update(over)
+        return entry
+
+    def test_a_refusal_carries_its_scene_url_when_configured(self):
+        row = to_refusal_row(self._entry(subject_id="9"),
+                             base_url="http://media.example")
+        self.assertEqual(row["scene_url"], "http://media.example/scenes/9")
+
+    def test_a_refusal_has_no_scene_url_without_a_configured_server(self):
+        row = to_refusal_row(self._entry())
+        self.assertIsNone(row["scene_url"])
+
+    def test_to_refusal_rows_threads_the_base_url(self):
+        entries = [self._entry(subject_id="1"), self._entry(subject_id="2")]
+        rows = to_refusal_rows(entries, base_url="http://media.example")
+        self.assertEqual([r["scene_url"] for r in rows],
+                         ["http://media.example/scenes/1",
+                          "http://media.example/scenes/2"])
+
+
+class ToMuteRowTest(unittest.TestCase):
+    """`Store.mutes()`'s dict shape -> what the Muted section shows --
+    ticket 97's headline case: a muted subject named by its filename, not a
+    bare id, whenever one can be recovered.
+    """
+
+    def _entry(self, **over):
+        entry = {"subject_type": "scene", "subject_id": "1",
+                 "reason": "never identifiable",
+                 "at": "2026-07-27T00:00:00", "payload": None}
+        entry.update(over)
+        return entry
+
+    def test_a_recoverable_payload_is_shown_by_filename(self):
+        row = to_mute_row(self._entry(
+            payload={"path": "/library/Nine Winters/reel.mp4"}))
+        self.assertEqual(row["filename"], "reel.mp4")
+
+    def test_no_payload_at_all_reports_no_filename(self):
+        # The genuine exception: muted ahead of any proposal ever being
+        # recorded for the subject. This must stay `None`, not silently
+        # become an empty string or the subject id -- that is the
+        # template's job to mark as the exception, not this one's to hide.
+        row = to_mute_row(self._entry(payload=None))
+        self.assertIsNone(row["filename"])
+
+    def test_carries_the_subject_reason_and_when(self):
+        row = to_mute_row(self._entry())
+        self.assertEqual(row["subject_type"], "scene")
+        self.assertEqual(row["subject_id"], "1")
+        self.assertEqual(row["reason"], "never identifiable")
+        self.assertEqual(row["at"], "2026-07-27T00:00:00")
+
+    def test_carries_its_scene_url_when_configured(self):
+        row = to_mute_row(self._entry(subject_id="9"),
+                          base_url="http://media.example")
+        self.assertEqual(row["scene_url"], "http://media.example/scenes/9")
+
+    def test_has_no_scene_url_without_a_configured_server(self):
+        row = to_mute_row(self._entry())
+        self.assertIsNone(row["scene_url"])
+
+    def test_to_mute_rows_converts_every_entry_and_keeps_their_order(self):
+        entries = [self._entry(subject_id="1"), self._entry(subject_id="2")]
+        rows = to_mute_rows(entries)
+        self.assertEqual([r["subject_id"] for r in rows], ["1", "2"])
+
+    def test_a_payload_missing_its_path_raises_rather_than_hiding_the_filename(self):
+        # Same discipline as `to_row`'s own `filename`: a payload that
+        # exists but cannot answer `path` is malformed, not "no filename".
+        with self.assertRaises(KeyError):
+            to_mute_row(self._entry(payload={"title": "no path here"}))
 
 
 class CoverImage(unittest.TestCase):

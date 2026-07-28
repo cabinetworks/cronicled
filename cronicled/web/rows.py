@@ -16,6 +16,10 @@ class Row:
     fingerprint: str
     state: str
     filename: str
+    # The media server's own page for this row's scene, or `None` when no
+    # server is configured -- see `scene_url`'s own docstring for why the
+    # address is threaded in here rather than typed a second time.
+    scene_url: str | None
     proposed_title: str
     creator: str
     creator_source: str
@@ -52,6 +56,32 @@ class Row:
     # silently fall through every branch and take the controls away again --
     # which is exactly how a failed row became a dead end.
     actionable: bool
+
+
+def scene_url(base_url, subject_id):
+    """The media server's own page for `subject_id`, or `None` when
+    `base_url` is falsy.
+
+    `base_url` is the same address `cronicled.__main__` already resolved
+    for the `Stash` client it builds (`--server` / `$CRONICLED_SERVER`) --
+    passed through from there, never re-derived from `Stash.url` (which has
+    `/graphql` appended for the API client's own purposes, see `Stash
+    .__init__`) and never read from a second, separate piece of
+    configuration. One address, read once, used for both jobs.
+
+    The one place this project writes the path shape for a scene page, so
+    nothing else -- a row builder, the template -- reconstructs it a second
+    way that could drift from this one.
+
+    Ticket 97 is explicit that this tool "now starts read-only with no
+    server configured": that is the ordinary case this returns `None` for,
+    not a malformed one, so no exception here -- a caller (`to_row`,
+    `to_refusal_row`, `to_mute_row`) folds `None` into a row exactly like
+    any other optional field, and the template degrades to plain text.
+    """
+    if not base_url:
+        return None
+    return "%s/scenes/%s" % (base_url.rstrip("/"), subject_id)
 
 
 def _runner_up_view(entry):
@@ -176,7 +206,7 @@ def _disagreement(creator, filename_stem, competing_store=None):
     return "; ".join(parts) if parts else None
 
 
-def to_row(item):
+def to_row(item, base_url=None):
     payload = item["payload"]
     # Indexed, not .get(): a proposal without a creator is malformed, and a
     # blank creator column reads as "nothing disagreed" — the reading that
@@ -191,6 +221,12 @@ def to_row(item):
         fingerprint=item["fingerprint"],
         state=item["state"],
         filename=filename,
+        # Indexed, not .get(): every real `item` row carries a subject_id --
+        # it is a NOT NULL column (see cronicled/store.py's schema) -- so an
+        # item without one is a wiring error, not "no server configured".
+        # That case is `base_url` being falsy, which `scene_url` already
+        # handles on its own terms.
+        scene_url=scene_url(base_url, item["subject_id"]),
         proposed_title=candidate["title"],
         creator=creator["name"],
         creator_source=creator["source"],
@@ -219,11 +255,11 @@ def to_row(item):
     )
 
 
-def to_rows(items):
-    return [to_row(i) for i in items]
+def to_rows(items, base_url=None):
+    return [to_row(i, base_url=base_url) for i in items]
 
 
-def to_refusal_row(entry):
+def to_refusal_row(entry, base_url=None):
     """One standing refusal (`Store.refusals()`'s dict shape) -> what the
     Refused section shows for it.
 
@@ -231,6 +267,11 @@ def to_refusal_row(entry):
     editorial choice (`to_row`'s `filename` above) — the directory is the
     reviewer's own filing, not part of judging why a candidate did not
     clear the threshold.
+
+    Refused rows are, per ticket 97, one of the two lists where a person
+    has the least to go on already -- no title, no creator, nothing but a
+    filename and a reason -- so the scene link matters here as much as it
+    does for `to_mute_row`.
     """
     return {
         "subject_type": entry["subject_type"],
@@ -238,8 +279,40 @@ def to_refusal_row(entry):
         "filename": os.path.basename(entry["path"]),
         "reason": entry["reason"],
         "at": entry["at"],
+        "scene_url": scene_url(base_url, entry["subject_id"]),
     }
 
 
-def to_refusal_rows(entries):
-    return [to_refusal_row(e) for e in entries]
+def to_refusal_rows(entries, base_url=None):
+    return [to_refusal_row(e, base_url=base_url) for e in entries]
+
+
+def to_mute_row(entry, base_url=None):
+    """One standing mute (`Store.mutes()`'s dict shape) -> what the Muted
+    section shows for it.
+
+    `entry["payload"]` is `Store.mutes()`'s own recovery of the most
+    recently seen proposal ever made for this subject, or `None` when none
+    ever was -- the genuine exception ticket 97 names: a subject muted
+    ahead of any scan finding it. `filename` follows the same "honest
+    exception, not a blended-in normal case" split the ticket asks for:
+    recovered from the payload the same way `to_row`'s own `filename` is
+    (indexed, not `.get`, for the same reason -- a payload that exists but
+    has no `path` is malformed, not "no filename"), or `None` when there is
+    no payload at all to read one from. The template is where that `None`
+    becomes visibly the exception, not this function's job.
+    """
+    payload = entry["payload"]
+    filename = os.path.basename(payload["path"]) if payload is not None else None
+    return {
+        "subject_type": entry["subject_type"],
+        "subject_id": entry["subject_id"],
+        "reason": entry["reason"],
+        "at": entry["at"],
+        "filename": filename,
+        "scene_url": scene_url(base_url, entry["subject_id"]),
+    }
+
+
+def to_mute_rows(entries, base_url=None):
+    return [to_mute_row(e, base_url=base_url) for e in entries]

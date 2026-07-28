@@ -17,7 +17,7 @@ def _job(**over):
     return Job(**job)
 
 
-def _row(runners_up=None, image=None, **over):
+def _row(runners_up=None, image=None, base_url=None, **over):
     # `runners_up` and `image` are their own parameters, not folded into
     # `**over`: both live under `payload` in the real item shape, and
     # `item.update(over)` only ever touches the top level. Routing either
@@ -42,9 +42,10 @@ def _row(runners_up=None, image=None, **over):
                         if runners_up is None else runners_up),
     }
     item = {"fingerprint": "fp-1", "state": "new", "summary": "s",
-            "confidence": 0.812, "payload": payload, "prior_state": None}
+            "confidence": 0.812, "payload": payload, "prior_state": None,
+            "subject_id": "1"}
     item.update(over)
-    return to_row(item)
+    return to_row(item, base_url=base_url)
 
 
 class Autoescaping(unittest.TestCase):
@@ -268,7 +269,8 @@ class PerformersAndStudioOnThePage(unittest.TestCase):
             "runners_up": [],
         }
         return {"fingerprint": "fp-1", "state": "new", "summary": "s",
-                "confidence": 0.812, "payload": payload, "prior_state": None}
+                "confidence": 0.812, "payload": payload, "prior_state": None,
+                "subject_id": "1"}
 
     def _candidate(self, **over):
         candidate = {"id": "c-1", "title": "The Lantern Room", "image": None,
@@ -479,6 +481,86 @@ class NewSectionsEscaping(unittest.TestCase):
                       dismissed=[row], refused=[])
         self.assertNotIn("<script>", html)
         self.assertIn("&lt;script&gt;", html)
+
+
+class SceneLinks(unittest.TestCase):
+    """Ticket 97: a row links to its scene on the media server when one is
+    configured, and degrades to plain text -- never a broken link -- when
+    it is not.
+    """
+
+    def test_a_rows_filename_links_to_its_scene_when_configured(self):
+        row = _row(subject_id="42", base_url="http://media.example")
+        html = render("inbox.html", rows=[row], counts={})
+        self.assertIn(
+            '<a href="http://media.example/scenes/42" target="_blank" '
+            'rel="noopener noreferrer">', html)
+
+    def test_the_link_opens_a_new_tab_and_never_a_get_back_here(self):
+        # "A link is a GET to another origin ... it cannot be allowed to
+        # become a way to trigger anything here" -- pinned as a whole
+        # attribute set, not sampled, so a mutation dropping target="_blank"
+        # or rel="noopener noreferrer" is caught the same way `ButtonWiring`
+        # pins a control's whole attribute set.
+        row = _row(subject_id="42", base_url="http://media.example")
+        html = render("inbox.html", rows=[row], counts={})
+        match = re.search(r'<a href="[^"]+"[^>]*>', html)
+        self.assertIsNotNone(match)
+        self.assertIn('target="_blank"', match.group(0))
+        self.assertIn('rel="noopener noreferrer"', match.group(0))
+        self.assertNotIn("<form", match.group(0))
+
+    def test_no_configured_server_degrades_to_plain_text_not_a_broken_link(self):
+        # Ticket 97: "the tool now starts read-only with no server
+        # configured ... the link has to degrade rather than render
+        # broken." No base_url at all here -- row.scene_url is None.
+        row = _row(subject_id="42")
+        html = render("inbox.html", rows=[row], counts={})
+        self.assertNotIn("<a href", html)
+        self.assertNotIn("scenes/42", html)
+
+
+class MutedSubjectFilename(unittest.TestCase):
+    """Ticket 97's headline case: the Muted section names the file, not a
+    bare scene id, whenever the store recovered one -- and marks the
+    genuine exception (no proposal ever recorded) visibly rather than
+    blending it in.
+    """
+
+    def test_a_recoverable_muted_entry_shows_the_filename_not_the_id(self):
+        html = render("inbox.html", rows=[], counts={},
+                      muted=[{"subject_type": "scene", "subject_id": "12962",
+                             "reason": "never identifiable", "at": "t",
+                             "filename": "reel.mp4", "scene_url": None}],
+                      dismissed=[], refused=[])
+        start = html.index("Muted (")
+        section = html[start:html.index("</details>", start)]
+        self.assertIn("reel.mp4", section)
+        self.assertNotIn("scene 12962", section)
+
+    def test_no_recoverable_payload_shows_the_id_marked_as_the_exception(self):
+        # The genuine exception ticket 97 names: muted ahead of any
+        # proposal ever being recorded. Showing the id is honest here, but
+        # it must be visibly the exception -- the `subject-unknown` class
+        # and the explanatory aside are what make it look unlike every
+        # other, ordinary filename row.
+        html = render("inbox.html", rows=[], counts={},
+                      muted=[{"subject_type": "scene", "subject_id": "12962",
+                             "reason": "never identifiable", "at": "t",
+                             "filename": None, "scene_url": None}],
+                      dismissed=[], refused=[])
+        start = html.index("Muted (")
+        section = html[start:html.index("</details>", start)]
+        self.assertIn("scene 12962", section)
+        self.assertIn("subject-unknown", section)
+
+    def test_a_muted_entrys_scene_url_is_a_link(self):
+        html = render("inbox.html", rows=[], counts={},
+                      muted=[{"subject_type": "scene", "subject_id": "7",
+                             "reason": "r", "at": "t", "filename": "reel.mp4",
+                             "scene_url": "http://media.example/scenes/7"}],
+                      dismissed=[], refused=[])
+        self.assertIn('<a href="http://media.example/scenes/7"', html)
 
 
 if __name__ == "__main__":

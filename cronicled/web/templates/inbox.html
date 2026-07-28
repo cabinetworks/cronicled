@@ -91,11 +91,22 @@
                  color: var(--fg); cursor: pointer; }
   .note { color: var(--muted); font-size: 0.85rem; }
 
-  /* Muted/Dismissed/Refused: collapsed by default so a person is not made
-     to scroll past sixteen rows of their own past decisions to reach the
-     inbox, but the count beside each summary is plain page text -- present
-     in the markup, and so in a page search, whether or not the section is
-     open. */
+  /* A row's own link to the media server: understated, so it reads as part
+     of the identifying text rather than as a call to action competing with
+     Approve/Dismiss/Mute. */
+  .file a, .subject a { color: inherit; text-decoration-color: var(--muted); }
+
+  /* The one case ticket 97 asks to look like the exception, not the norm: a
+     subject muted before any proposal was ever recorded for it, so only its
+     id is known. Italic and a visible aside mark it as missing information,
+     not as an ordinary filename that merely happens to be short. */
+  .subject-unknown { font-style: italic; }
+
+  /* Muted/Dismissed/Refused/Superseded: collapsed by default so a person is
+     not made to scroll past sixteen rows of their own past decisions to
+     reach the inbox, but the count beside each summary is plain page text --
+     present in the markup, and so in a page search, whether or not the
+     section is open. */
   details.section { border: 1px solid var(--line); border-radius: 6px;
                     margin: 0 0 0.9rem; background: var(--panel); }
   details.section summary { padding: 0.6rem 0.9rem; cursor: pointer;
@@ -106,6 +117,13 @@
   details.section .proposal:first-of-type { border-top: 1px solid var(--line); }
   details.section p.empty { margin: 0; padding: 0.7rem 0.9rem; }
 </style>
+
+{# The one place this template builds a link to the media server: an anchor
+   when a scene URL was computed (see `cronicled.web.rows.scene_url`), plain
+   text otherwise. Never bakes in the address itself -- `url` always arrives
+   already built from the configured server, so this only ever decides
+   whether to wrap it, not what it is. #}
+{% macro identifier(text, url) %}{% if url %}<a href="{{ url }}" target="_blank" rel="noopener noreferrer">{{ text }}</a>{% else %}{{ text }}{% endif %}{% endmacro %}
 
 <h1>Inbox</h1>
 {% if scan and scan.state == 'running' %}
@@ -119,7 +137,7 @@
 <div class="proposal">
   <div class="head">
     <div class="what">
-      <p class="file">{{ row.filename }}</p>
+      <p class="file">{{ identifier(row.filename, row.scene_url) }}</p>
       <p class="title">{{ row.proposed_title }}</p>
       <div class="meta">
         <b>{{ row.creator }}</b> (from the {{ row.creator_source }})
@@ -179,7 +197,11 @@
   <div class="proposal">
     <div class="head">
       <div class="what">
-        <p class="file">{{ m.subject_type }} {{ m.subject_id }}</p>
+        {% if m.filename %}
+        <p class="file">{{ identifier(m.filename, m.scene_url) }}</p>
+        {% else %}
+        <p class="file subject-unknown">{{ identifier("scene " ~ m.subject_id, m.scene_url) }} <span class="note">(muted before any proposal was ever recorded -- only the id is known)</span></p>
+        {% endif %}
         <div class="meta">{{ m.reason }} &middot; muted {{ m.at }}</div>
       </div>
       <div class="acts">
@@ -199,7 +221,7 @@
   <div class="proposal">
     <div class="head">
       <div class="what">
-        <p class="file">{{ row.filename }}</p>
+        <p class="file">{{ identifier(row.filename, row.scene_url) }}</p>
         <p class="title">{{ row.proposed_title }}</p>
         <div class="meta"><b>{{ row.creator }}</b> (from the {{ row.creator_source }})</div>
       </div>
@@ -221,7 +243,7 @@
   <div class="proposal">
     <div class="head">
       <div class="what">
-        <p class="file">{{ row.filename }}</p>
+        <p class="file">{{ identifier(row.filename, row.scene_url) }}</p>
         <p class="title">{{ row.proposed_title }}</p>
         <div class="meta"><b>{{ row.creator }}</b> (from the {{ row.creator_source }})</div>
       </div>
@@ -240,7 +262,7 @@
   <div class="proposal">
     <div class="head">
       <div class="what">
-        <p class="file">{{ r.filename }}</p>
+        <p class="file">{{ identifier(r.filename, r.scene_url) }}</p>
         <div class="meta">{{ r.reason }}</div>
       </div>
     </div>
