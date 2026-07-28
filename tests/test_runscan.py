@@ -7,10 +7,11 @@ No test here opens a socket or touches the real environment or filesystem
 outside a temporary directory this file creates and cleans up itself. The
 media client is a fake holding the same discipline `tests/test_scan.py`'s
 `FakeStash` and `tests/test_search.py`'s `_SpyStash` do: one read to
-enumerate the library, one read per query to the scraper, and anything else
-raises — this file is the first place a write introduced by the WIRING
-itself (as opposed to `ScanProducer` or `catalog_search` alone) would show
-up, since it is the first place all three are run together.
+enumerate the library, one read per query to the scraper, one read per
+proposal to enrich the winning candidate's URL, and anything else raises —
+this file is the first place a write introduced by the WIRING itself (as
+opposed to `ScanProducer` or `catalog_search` alone) would show up, since it
+is the first place all three are run together.
 """
 import contextlib
 import io
@@ -58,13 +59,23 @@ def row(title, url):
 
 class _FakeStash:
     """Everything a scan wired through `build_producer` may touch: one read
-    to enumerate the library (`unorganized_scenes`), and one read per query
-    to the configured scraper (`scrape_scenes_by_query`). Anything else
-    raises — the property this whole module exists to preserve."""
+    to enumerate the library (`unorganized_scenes`), one read per query to
+    the configured scraper (`scrape_scenes_by_query`), and one read per
+    proposal to enrich the winning candidate's own URL (`scrape_scene_url`).
+    Anything else raises — the property this whole module exists to
+    preserve.
 
-    def __init__(self, scenes, script=None):
+    `by_url` scripts `scrape_scene_url`, keyed by the exact URL asked for;
+    an unscripted URL answers `None` — an ordinary "nothing new for this
+    one" miss, exactly `Stash.scrape_scene_url`'s own contract for a scraper
+    that has nothing to add, so a test that never exercises enrichment does
+    not have to script it to stay green.
+    """
+
+    def __init__(self, scenes, script=None, by_url=None):
         self._scenes = list(scenes)
         self._script = dict(script or {})
+        self._by_url = dict(by_url or {})
         self.calls = []
 
     def unorganized_scenes(self, limit):
@@ -75,6 +86,10 @@ class _FakeStash:
     def scrape_scenes_by_query(self, scraper_id, query):
         self.calls.append(("scrape_scenes_by_query", scraper_id, query))
         return list(self._script.get((scraper_id, query), []))
+
+    def scrape_scene_url(self, url):
+        self.calls.append(("scrape_scene_url", url))
+        return self._by_url.get(url)
 
     def __getattr__(self, name):
         def refuse(*args, **kwargs):
@@ -198,7 +213,9 @@ class BuildProducerWiring(unittest.TestCase):
 
         self.assertEqual(finished.state, "done")
         for call in stash.calls:
-            self.assertIn(call[0], ("unorganized_scenes", "scrape_scenes_by_query"))
+            self.assertIn(call[0], ("unorganized_scenes",
+                                    "scrape_scenes_by_query",
+                                    "scrape_scene_url"))
 
 
 class BuildProducerOwnerOfWiring(unittest.TestCase):
@@ -223,6 +240,79 @@ class BuildProducerOwnerOfWiring(unittest.TestCase):
         adapter = _Adapter(catalog_resolvable=False)
         producer = build_producer(_FakeStash([]), adapter, self.store, limit=10)
         self.assertIsNone(producer._owner_of)
+
+
+class BuildProducerEnrichmentWiring(unittest.TestCase):
+    """`stash.scrape_scene_url` reaches the `ScanProducer` as `enrich`,
+    unconditionally -- unlike `owner_of`, this needs no adapter-level gate,
+    since it scrapes a URL directly rather than asking a per-adapter name
+    search to identify anything.
+    """
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+
+    def _run_to_completion(self, producer):
+        runner = JobRunner(self.store)
+        runner.register(producer)
+        job = runner.start(producer.name)
+        self.assertTrue(runner.wait(job.id, WAIT))
+        return runner.job(job.id)
+
+    def test_the_stashs_own_scrape_by_url_method_is_wired_through(self):
+        stash = _FakeStash([])
+        producer = build_producer(stash, _Adapter(), self.store, limit=10)
+        self.assertEqual(producer._enrich, stash.scrape_scene_url)
+
+    def test_a_proposal_carries_the_fuller_scrape_of_its_own_url(self):
+        # The end-to-end property `scan.ExamineEnrichmentTest` already pins
+        # against `examine` directly: run here through the whole wiring
+        # path, so a mismatch introduced by the COMPOSITION itself -- rather
+        # than by `ScanProducer` or `Stash` alone -- would be caught.
+        path = "/library/Velvet Crane/Morning Ritual.mp4"
+        url = "https://example.invalid/clip/morning-ritual"
+        thin = row("Morning Ritual", url)
+        fuller = dict(thin, date="2025-11-02",
+                     studio={"stored_id": None, "name": "Amber Vale"},
+                     performers=[{"stored_id": None, "name": "Wren Ashcombe"}])
+        stash = _FakeStash(
+            [scene(1, path)],
+            script={("scraper-alpha", "Velvet Crane"): [thin]},
+            by_url={url: fuller})
+        adapter = _Adapter(scraper_id="scraper-alpha")
+
+        finished = self._run_to_completion(
+            build_producer(stash, adapter, self.store, limit=10))
+
+        self.assertEqual(finished.recorded, 1)
+        item = self.store.items(folder="library")[0]
+        self.assertEqual(item["payload"]["candidate"], fuller)
+        self.assertIn(("scrape_scene_url", url), stash.calls)
+
+    def test_a_failed_enrichment_still_records_the_thin_proposal(self):
+        # HARM: refusing the row over a scrape failure would throw away a
+        # title and a URL that are worth writing on their own, exactly as
+        # `scan.ExamineEnrichmentTest` pins directly against `examine`.
+        path = "/library/Velvet Crane/Morning Ritual.mp4"
+        url = "https://example.invalid/clip/morning-ritual"
+        thin = row("Morning Ritual", url)
+
+        def raising_scrape(_url):
+            raise RuntimeError("connection reset")
+
+        stash = _FakeStash(
+            [scene(1, path)],
+            script={("scraper-alpha", "Velvet Crane"): [thin]})
+        stash.scrape_scene_url = raising_scrape
+        adapter = _Adapter(scraper_id="scraper-alpha")
+
+        finished = self._run_to_completion(
+            build_producer(stash, adapter, self.store, limit=10))
+
+        self.assertEqual(finished.recorded, 1)
+        item = self.store.items(folder="library")[0]
+        self.assertEqual(item["payload"]["candidate"], thin)
 
 
 class ConfiguredAdapters(unittest.TestCase):

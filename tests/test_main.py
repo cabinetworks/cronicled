@@ -43,7 +43,8 @@ class _Base(unittest.TestCase):
                      "creator": {"name": "Someone", "source": "folder",
                                  "competing": None, "rejected_folder": None},
                      "candidate": {"id": "c-1", "title": "A Title",
-                                   "image": None},
+                                   "image": None, "performers": [],
+                                   "studio": None},
                      "score": 0.9, "runners_up": []},
             producer="test-producer", confidence=0.9)
         store.close()

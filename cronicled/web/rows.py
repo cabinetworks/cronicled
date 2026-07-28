@@ -20,6 +20,19 @@ class Row:
     contested: bool
     disagreement: str | None
     carries_cover: bool
+    # What approving this proposal will actually write onto the scene —
+    # the whole reason a proposal now scrapes the winning candidate's own
+    # URL rather than carrying only a title and a link (see
+    # `cronicled.scan.examine`'s `enrich` argument). `performers` is a tuple
+    # of names, in the order the candidate carries them; `studio` is a
+    # single name or `None`. Both are empty/`None` on a candidate that was
+    # never enriched, or whose enrichment failed — see `_performer_names`
+    # and `_studio_name` below for why that is read off the candidate
+    # itself rather than tracked as a separate "did enrichment happen" flag:
+    # a thin candidate's own fields already say "nothing here", and a
+    # second, parallel signal saying the same thing could drift from it.
+    performers: tuple
+    studio: str | None
     score: float
     score_text: str
     runners_up: tuple
@@ -75,6 +88,33 @@ def carries_cover(candidate):
     return bool(candidate["image"])
 
 
+def _performer_names(candidate):
+    """The performer names a proposal's `candidate` carries, in the order
+    the scraper returned them.
+
+    Indexed as `candidate["performers"]`, not `.get`, for the same reason
+    `carries_cover` indexes `candidate["image"]`: `Stash
+    .scrape_scenes_by_query` and `Stash.scrape_scene_url` both select
+    `performers` on every candidate either can return (see their shared
+    `_SCRAPED_SCENE_SELECTION`), so a real candidate always answers this
+    key — `[]` meaning "no performers found (or none carried over from
+    before enrichment)", a plain, ordinary answer. A candidate with the key
+    absent entirely is a payload from somewhere that never asked the
+    question, and `.get("performers")` would read it back exactly like "no
+    performers" — indistinguishable from the ordinary case this function
+    exists to report honestly.
+    """
+    return tuple(p["name"] for p in (candidate["performers"] or ()))
+
+
+def _studio_name(candidate):
+    """The studio name a proposal's `candidate` carries, or `None` — the
+    same indexing discipline as `_performer_names` and `carries_cover`, and
+    for the same reason."""
+    studio = candidate["studio"]
+    return studio["name"] if studio else None
+
+
 def _disagreement(creator):
     """One line naming what the resolver passed over, or None.
 
@@ -112,6 +152,8 @@ def to_row(item):
         contested=disagreement is not None,
         disagreement=disagreement,
         carries_cover=carries_cover(candidate),
+        performers=_performer_names(candidate),
+        studio=_studio_name(candidate),
         score=score,
         # Three places, matching the precision the decision was made at.
         score_text="%.3f" % score,

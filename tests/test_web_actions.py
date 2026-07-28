@@ -221,10 +221,11 @@ class _Adapter:
 
 class _ScanStash:
     """Everything a scan wired through `Actions.scan` may touch: one read to
-    enumerate the library, and one read per query to the configured
-    scraper. `apply_scene`/`revert_scene` -- the two ways a media server is
-    actually WRITTEN to -- raise rather than quietly succeeding: a scan
-    reaching either is exactly the regression this class exists to catch."""
+    enumerate the library, one read per query to the configured scraper,
+    and one read per proposal to enrich the winning candidate's own URL.
+    `apply_scene`/`revert_scene` -- the two ways a media server is actually
+    WRITTEN to -- raise rather than quietly succeeding: a scan reaching
+    either is exactly the regression this class exists to catch."""
 
     def __init__(self, scenes=()):
         self._scenes = list(scenes)
@@ -238,6 +239,15 @@ class _ScanStash:
     def scrape_scenes_by_query(self, scraper_id, query):
         self.calls.append(("scrape_scenes_by_query", scraper_id, query))
         return []
+
+    def scrape_scene_url(self, url):
+        # Every scene this fixture set builds ends up muted (see
+        # `_library_scene`), so `examine` never picks a winner and this is
+        # never actually called; it exists only so `build_producer` can
+        # read `stash.scrape_scene_url` off this fake the same way it reads
+        # it off a real `Stash`.
+        self.calls.append(("scrape_scene_url", url))
+        return None
 
     def apply_scene(self, *args, **kwargs):
         raise AssertionError("a scan must never write to the media server")

@@ -555,6 +555,43 @@ class FakeSearch:
         return list(self._results)
 
 
+def scraped(title, url, **over):
+    """A fuller `ScrapedScene`-shaped record, as `Stash.scrape_scene_url`
+    would answer it for the SAME object a thin `candidate()` above stands
+    for — carrying a performer, a studio and a date `candidate()` never
+    does, which is the whole difference enrichment exists to make visible.
+    """
+    row = {"title": title, "url": url, "urls": [url], "code": None,
+           "details": None, "director": None, "date": "2025-11-02",
+           "image": None, "studio": {"stored_id": None, "name": "Amber Vale"},
+           "tags": [], "performers": [{"stored_id": None, "name": "Wren Ashcombe"}]}
+    row.update(over)
+    return row
+
+
+class FakeEnrich:
+    """The injected enrichment lookup `examine(..., enrich=...)` calls with
+    the winning candidate's own URL: answers from a script keyed by URL, or
+    raises, and remembers every URL it was asked to scrape.
+
+    Remembering them is what lets a test tell "enrichment happened once, for
+    the winner alone" from "every candidate was scraped" or "nothing was
+    scraped at all" — the three shapes this whole feature's cost argument
+    turns on.
+    """
+
+    def __init__(self, script=None, raises=None):
+        self._script = dict(script or {})
+        self._raises = raises
+        self.urls = []
+
+    def __call__(self, url):
+        self.urls.append(url)
+        if self._raises is not None:
+            raise self._raises
+        return self._script.get(url)
+
+
 class ExamineTest(unittest.TestCase):
 
     MORNING = candidate("Morning Ritual", "morning-ritual")
@@ -1056,6 +1093,150 @@ class ExamineOwnerOfTest(unittest.TestCase):
             "name": "Amberlight", "source": "folder",
             "competing": "Wren Ashcombe", "rejected_folder": None})
         self.assertEqual(search.queries, ["Amberlight"])
+
+
+class ExamineEnrichmentTest(unittest.TestCase):
+    """`examine(..., enrich=...)` -- scraping the winning candidate's own
+    URL once `decide` has picked it, so a proposal carries more than a
+    title and a link. "Amber Vale"/"Wren Ashcombe" (via `scraped()`) stand
+    in for a measured store and creator; both invented.
+    """
+
+    MORNING_URL = "https://example.invalid/clip/morning-ritual"
+    EVENING_URL = "https://example.invalid/clip/evening-errand"
+    MORNING = candidate("Morning Ritual", "morning-ritual")
+    EVENING = candidate("Evening Errand", "evening-errand")
+    PATH = "/library/Velvet Crane/Morning Ritual.mp4"
+
+    def run_examine(self, enrich, results=None, path=None, threshold=0.5):
+        results = [self.MORNING, self.EVENING] if results is None else results
+        search = FakeSearch(results)
+        return examine(scene(1, path or self.PATH), search=search,
+                       folder=FOLDER, threshold=threshold, enrich=enrich)
+
+    def test_the_winner_is_replaced_by_the_fuller_scrape(self):
+        fuller = scraped("Morning Ritual", self.MORNING_URL)
+        enrich = FakeEnrich({self.MORNING_URL: fuller})
+
+        outcome = self.run_examine(enrich)
+
+        self.assertEqual(outcome.proposal["payload"]["candidate"], fuller)
+
+    def test_only_the_winner_is_enriched_not_a_losing_candidate(self):
+        # HARM: enriching every candidate scored, rather than only the one
+        # that won, spends a lookup per candidate instead of one per
+        # proposal -- exactly the budget this whole module exists to
+        # ration (see MAX_RUNNERS_UP and _SingleFlight for the same
+        # argument made elsewhere in this file).
+        enrich = FakeEnrich({
+            self.MORNING_URL: scraped("Morning Ritual", self.MORNING_URL),
+            self.EVENING_URL: scraped("Evening Errand", self.EVENING_URL)})
+
+        self.run_examine(enrich)
+
+        self.assertEqual(enrich.urls, [self.MORNING_URL])
+
+    def test_a_raising_enrichment_degrades_to_the_thin_candidate(self):
+        # HARM: refusing the proposal here throws away a title and a URL
+        # that are worth writing on their own -- exactly what a proposal
+        # has always carried without enrichment at all. A scrape that
+        # raises is a fact about the network, the same reasoning `examine`
+        # already applies to a failed `search` above.
+        enrich = FakeEnrich(raises=RuntimeError("connection reset"))
+
+        outcome = self.run_examine(enrich)
+
+        self.assertIsNotNone(outcome.proposal)
+        self.assertEqual(outcome.proposal["payload"]["candidate"], self.MORNING)
+
+    def test_a_null_scrape_result_also_keeps_the_thin_candidate(self):
+        # A `None` reply -- "nothing new for this URL", `Stash
+        # .scrape_scene_url`'s own contract for a miss -- is an ordinary
+        # answer, not a failure, and is handled identically to a raise: the
+        # thin candidate stands.
+        enrich = FakeEnrich({self.MORNING_URL: None})
+
+        outcome = self.run_examine(enrich)
+
+        self.assertEqual(outcome.proposal["payload"]["candidate"], self.MORNING)
+
+    def test_enrichment_never_reaches_a_file_that_refuses(self):
+        # A tie or a near miss never picks a winner at all, so there is
+        # nothing for `enrich` to be called with.
+        dawn = candidate("Morning Ritual Dawn", "morning-ritual-dawn")
+        dusk = candidate("Morning Ritual Dusk", "morning-ritual-dusk")
+        enrich = FakeEnrich()
+
+        outcome = self.run_examine(enrich, results=[dawn, dusk])
+
+        self.assertIsNone(outcome.proposal)
+        self.assertEqual(enrich.urls, [])
+
+    def test_enrich_omitted_issues_no_lookup_and_keeps_the_thin_candidate(self):
+        outcome = examine(scene(1, self.PATH),
+                          search=FakeSearch([self.MORNING, self.EVENING]),
+                          folder=FOLDER, threshold=0.5)
+
+        self.assertEqual(outcome.proposal["payload"]["candidate"], self.MORNING)
+
+    def test_the_summary_names_the_enriched_titles_candidate(self):
+        # The summary is read off `winner`, so a scrape that corrects or
+        # cleans up a title (the common reason a full page and a search
+        # index disagree) shows up in the one line a reviewer reads.
+        fuller = scraped("Morning Ritual (Director's Cut)", self.MORNING_URL)
+        enrich = FakeEnrich({self.MORNING_URL: fuller})
+
+        outcome = self.run_examine(enrich)
+
+        self.assertIn('"Morning Ritual (Director\'s Cut)"',
+                      outcome.proposal["summary"])
+
+
+class EnrichmentURLChoice(unittest.TestCase):
+    """Which of a winning candidate's two URL fields `examine` hands to
+    `enrich` -- see `cronicled.scan._enrichment_url`'s own docstring for why
+    the choice mirrors `Stash.apply_scene`'s own `urls`/`url` precedence
+    rather than inventing a second rule for the same object.
+    """
+
+    EVENING = candidate("Evening Errand", "evening-errand")
+    PATH = "/library/Velvet Crane/Morning Ritual.mp4"
+    PLURAL_URL = "https://example.invalid/clip/plural"
+    SINGULAR_URL = "https://example.invalid/clip/singular"
+
+    def run_examine(self, morning, enrich):
+        search = FakeSearch([morning, self.EVENING])
+        return examine(scene(1, self.PATH), search=search, folder=FOLDER,
+                       threshold=0.5, enrich=enrich)
+
+    def test_the_plural_urls_field_is_preferred_over_the_singular(self):
+        morning = dict(candidate("Morning Ritual", "morning-ritual"),
+                      urls=[self.PLURAL_URL], url=self.SINGULAR_URL)
+        enrich = FakeEnrich({self.PLURAL_URL:
+                             scraped("Morning Ritual", self.PLURAL_URL)})
+
+        self.run_examine(morning, enrich)
+
+        self.assertEqual(enrich.urls, [self.PLURAL_URL])
+
+    def test_the_singular_url_is_used_when_the_plural_list_is_empty(self):
+        morning = dict(candidate("Morning Ritual", "morning-ritual"),
+                      urls=[], url=self.SINGULAR_URL)
+        enrich = FakeEnrich({self.SINGULAR_URL:
+                             scraped("Morning Ritual", self.SINGULAR_URL)})
+
+        self.run_examine(morning, enrich)
+
+        self.assertEqual(enrich.urls, [self.SINGULAR_URL])
+
+    def test_a_candidate_with_neither_url_field_skips_enrichment_entirely(self):
+        morning = {"title": "Morning Ritual"}
+        enrich = FakeEnrich()
+
+        outcome = self.run_examine(morning, enrich)
+
+        self.assertEqual(enrich.urls, [])
+        self.assertEqual(outcome.proposal["payload"]["candidate"], morning)
 
 
 # -- running a whole batch ------------------------------------------------- #
@@ -1910,6 +2091,23 @@ class ScanProducerTest(unittest.TestCase):
         self.assertEqual(with_map[0]["payload"]["score"], 1.0)
         # never the applied title, even threaded through the whole producer
         self.assertEqual(with_map[0]["payload"]["candidate"], censored)
+
+    def test_the_enrich_callable_reaches_every_files_examine_call(self):
+        """The same plumbing property `test_the_censorship_map_reaches_
+        every_files_scoring` pins for `censorship`, run here for `enrich`:
+        a mutation that wires it into `__init__` but never forwards it to
+        `_examine`/`examine` would otherwise only show up in
+        `ExamineEnrichmentTest`, which calls `examine` directly and cannot
+        see `ScanProducer`'s own plumbing."""
+        url = "https://example.invalid/clip/winter-ledger"
+        fuller = scraped("Winter Ledger", url)
+        enrich = FakeEnrich({url: fuller})
+
+        proposals = self.scan([scene(7, self.LEDGER_PATH)],
+                              ScriptedSearch(self.SCRIPT), enrich=enrich)
+
+        self.assertEqual(proposals[0]["payload"]["candidate"], fuller)
+        self.assertEqual(enrich.urls, [url])
 
     def test_one_worker_is_accepted(self):
         """The permissive side of the guard, pinned: a scan narrowed to a

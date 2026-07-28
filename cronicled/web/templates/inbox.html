@@ -7,12 +7,14 @@
 <p>Nothing waiting. Proposals appear here after a scan.</p>
 {% endif %}
 <table>
-  <tr><th>File</th><th>Proposed</th><th>Creator</th><th>Score</th><th></th></tr>
+  <tr><th>File</th><th>Proposed</th><th>Creator</th><th>Performers</th><th>Studio</th><th>Score</th><th></th></tr>
   {% for row in rows %}
   <tr{% if row.contested %} class="contested"{% endif %}>
     <td>{{ row.filename }}</td>
     <td>{{ row.proposed_title }}</td>
     <td>{{ row.creator }} <small>(from the {{ row.creator_source }})</small></td>
+    <td>{% for p in row.performers %}{{ p }}{% if not loop.last %}, {% endif %}{% endfor %}</td>
+    <td>{{ row.studio or "" }}</td>
     <td>{{ row.score_text }}</td>
     <td>
       {% if row.undoable %}
@@ -25,18 +27,18 @@
     </td>
   </tr>
   {% if row.error %}
-  <tr class="warning"><td colspan="5">The last attempt to apply this failed, and nothing was written: {{ row.error }}</td></tr>
+  <tr class="warning"><td colspan="7">The last attempt to apply this failed, and nothing was written: {{ row.error }}</td></tr>
   {% endif %}
   {% if row.contested %}
-  <tr class="warning"><td colspan="5">Attribution is contested: {{ row.disagreement }}</td></tr>
+  <tr class="warning"><td colspan="7">Attribution is contested: {{ row.disagreement }}</td></tr>
   {% endif %}
   {% if row.carries_cover and row.state == 'new' %}
-  <tr class="warning"><td colspan="5">Approving this proposal writes a cover image. Undo cannot restore a scene's previous cover, so this write cannot be fully undone.</td></tr>
+  <tr class="warning"><td colspan="7">Approving this proposal writes a cover image. Undo cannot restore a scene's previous cover, so this write cannot be fully undone.</td></tr>
   {% elif row.carries_cover and row.state == 'applied' %}
-  <tr class="warning"><td colspan="5">This proposal's cover image cannot be restored by Undo, even after reverting.</td></tr>
+  <tr class="warning"><td colspan="7">This proposal's cover image cannot be restored by Undo, even after reverting.</td></tr>
   {% endif %}
   {% if row.runners_up %}
-  <tr class="runners"><td colspan="5">Also considered:
+  <tr class="runners"><td colspan="7">Also considered:
     {% for r in row.runners_up %}{{ r.title }} ({{ "%.3f"|format(r.score) }}){% if not loop.last %}, {% endif %}{% endfor %}
   </td></tr>
   {% endif %}

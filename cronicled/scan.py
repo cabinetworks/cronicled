@@ -288,8 +288,32 @@ def _owners_of(search, owner_of):
     return owners_of
 
 
+def _enrichment_url(candidate):
+    """The URL `examine` hands to `enrich` for the winning candidate, or
+    `None` when there is nothing to scrape.
+
+    Prefers `urls` (the plural, forward-looking field), falling back to the
+    deprecated singular `url` only when the plural is empty — the SAME
+    precedence `Stash.apply_scene` already uses when deciding what to write
+    onto the scene (`match.get("urls") or ([match["url"]] if
+    match.get("url") else [])`). Matching that precedence here, rather than
+    inventing a second rule for the same object, is deliberate: it is what
+    guarantees enrichment always scrapes the URL an apply would eventually
+    treat as canonical for this candidate, never a different one a
+    disagreement between the two fields could otherwise produce.
+
+    `None` when the candidate carries neither — there is nothing to enrich
+    with, and `examine` treats that exactly like an `enrich` that was never
+    supplied at all, rather than as a failure.
+    """
+    urls = candidate.get("urls") or []
+    if urls:
+        return urls[0]
+    return candidate.get("url") or None
+
+
 def examine(scene, *, search, folder, threshold=DEFAULT_THRESHOLD, aliases=None,
-           censorship=None, owner_of=None):
+           censorship=None, owner_of=None, enrich=None):
     """Work out what `scene` is, and return what that concluded.
 
     `search` is the injected lookup: called with the resolved creator's name
@@ -320,13 +344,43 @@ def examine(scene, *, search, folder, threshold=DEFAULT_THRESHOLD, aliases=None,
     each candidate's title back to its canonical spelling before it is
     SCORED, so a censored store title still string-matches an uncensored
     local filename. It is never applied to the candidate that reaches the
-    proposal — `winner` below is the object `search` returned, untouched — so
-    a decensored title can influence which candidate wins but can never
+    proposal — `winner` is either the object `search` returned or, after a
+    successful enrichment (see `enrich` below), the fuller object `enrich`
+    returned for the SAME URL; neither is ever the decensored form — so a
+    decensored title can influence which candidate wins but can never
     itself become the applied title. The store called a title what it
     called it; rewriting that and writing the rewrite back would invent a
     title the store never used. `None` (the default, and what every caller
     that has no censorship map to offer should pass) behaves as `{}`, which
     `decensor` defines as a no-op.
+
+    `enrich`, when given, is a one-argument callable: called with the
+    winning candidate's own URL (`_enrichment_url`) and expected to return
+    either a fuller `ScrapedScene`-shaped dict describing the SAME object
+    (ordinarily `Stash.scrape_scene_url`) or `None` when it has nothing new
+    to add. Called at most ONCE per call to `examine`, and only after
+    `decide` has already picked a winner — a losing candidate is never
+    enriched, and a file that mutes or refuses never reaches this at all, so
+    the cost is one extra lookup per PROPOSAL, never per candidate scored
+    and never per file examined. When it returns something, that fuller
+    object REPLACES `winner` for every purpose below: the payload's
+    `candidate`, and the title `summary` reports. When it returns `None`, or
+    when there is no URL to give it (`_enrichment_url` returned `None`),
+    `winner` is left exactly as `search` returned it — the same thin
+    candidate a proposal has always carried.
+
+    A raising `enrich` is handled exactly like a raising `search` above: a
+    fact about the NETWORK, not about the file (see `Only the FINAL search
+    call` below, and `cronicled.stash.Stash.scrape_scene_url`'s own
+    docstring for why a miss there is a `None`, not an exception, in the
+    first place). The proposal is not withheld over it — `winner` is simply
+    left thin, and the title and URL it already carries are exactly what a
+    proposal has always written. A row built from a thin `winner` shows no
+    performers or studio it did not get; see `cronicled.web.rows.to_row` and
+    `carries_cover`, which hold the same discipline for the fields a
+    candidate does carry. Omitted (the default, and what every caller that
+    has no enrichment source to offer should pass), no enrichment call is
+    ever made and `examine` behaves exactly as it always has.
 
     ORDER: the creator is resolved BEFORE anything is scored, and that is
     load-bearing rather than stylistic. `scoring.score(..., artist=)`
@@ -402,6 +456,26 @@ def examine(scene, *, search, folder, threshold=DEFAULT_THRESHOLD, aliases=None,
         return Outcome(reason=decision.reason)
 
     winner = candidates[decision.index]
+    # Enrich ONLY the winner, and only once `decide` has actually picked one
+    # — a losing candidate is never scraped, and neither is anything on a
+    # file that mutes or refuses above this point. A raise here is a fact
+    # about the network, not about the file (the same reasoning `search`'s
+    # own try/except above applies): it degrades to the thin `winner`
+    # `search` already returned rather than costing the file its proposal —
+    # a title and a URL are still worth writing, which is exactly what
+    # happens without `enrich` at all. See `examine`'s own docstring for the
+    # full reasoning and for why a missing URL is treated the same as a
+    # `None` reply rather than as a failure.
+    if enrich is not None:
+        url = _enrichment_url(winner)
+        if url:
+            try:
+                enriched = enrich(url)
+            except Exception:
+                pass
+            else:
+                if enriched:
+                    winner = enriched
     payload = {
         "path": path,
         # The resolver's disagreements, which otherwise go nowhere. A folder
@@ -415,13 +489,16 @@ def examine(scene, *, search, folder, threshold=DEFAULT_THRESHOLD, aliases=None,
             "competing": resolution.competing,
             "rejected_folder": resolution.rejected_folder,
         },
-        # The candidate whole, as the search returned it. This module cannot
-        # know which of a store's fields an applier will need, and a
-        # projection drops them silently. The cost, stated plainly: a search
-        # returning a field that changes between runs (a view count, a signed
-        # thumbnail URL) changes the payload, hence the fingerprint, hence
-        # re-proposes the same file nightly. That failure is visible in the
-        # inbox; a payload missing the field an apply needed is not.
+        # The candidate whole, as `search` returned it — or, when `enrich`
+        # was given a URL and answered with something, the fuller record
+        # `enrich` returned for that SAME object instead (see the block
+        # above). Either way this module cannot know which of a store's
+        # fields an applier will need, and a projection drops them silently.
+        # The cost, stated plainly: a search (or a scrape) returning a field
+        # that changes between runs (a view count, a signed thumbnail URL)
+        # changes the payload, hence the fingerprint, hence re-proposes the
+        # same file nightly. That failure is visible in the inbox; a payload
+        # missing the field an apply needed is not.
         "candidate": winner,
         "score": decision.match.value,
         "runners_up": _runners_up(candidates, matches, decision.index),
@@ -591,6 +668,14 @@ class ScanProducer:
     instead of assuming the first one — see `examine`'s and `_owners_of`'s
     docstrings. `None` (the default) keeps the creator resolved exactly as it
     always was, with no search issued before scoring.
+
+    `enrich` is passed straight through as well, to let `examine` replace
+    the winning candidate with a fuller scrape of its own URL once `decide`
+    has picked it — see `examine`'s docstring for the full contract and for
+    why a raise from it degrades a proposal to its thin candidate rather
+    than costing the file its turn. `None` (the default) keeps a proposal's
+    candidate exactly as `search` returned it, with no second lookup issued
+    at all — today's behaviour, unchanged.
     """
 
     name = "library-scan"
@@ -600,7 +685,7 @@ class ScanProducer:
 
     def __init__(self, stash, search, *, store, folder="library", limit=None,
                  name_filter=None, threshold=DEFAULT_THRESHOLD, aliases=None,
-                 workers=4, censorship=None, owner_of=None):
+                 workers=4, censorship=None, owner_of=None, enrich=None):
         if workers < 1:
             # A pool of nothing would do nothing at all, forever. Refuse it
             # where the mistake was made rather than on a background thread
@@ -615,6 +700,7 @@ class ScanProducer:
         self._threshold = threshold
         self._censorship = censorship or {}
         self._owner_of = owner_of
+        self._enrich = enrich
         # Indexed and checked HERE, for the same reason `workers` is checked
         # here: a duplicated or empty alias line is a wiring mistake that is
         # wrong for every file, and this is the last point at which the caller
@@ -741,7 +827,8 @@ class ScanProducer:
         try:
             return examine(scene, search=search, folder=self._folder,
                            threshold=self._threshold, aliases=self._aliases,
-                           censorship=self._censorship, owner_of=self._owner_of)
+                           censorship=self._censorship, owner_of=self._owner_of,
+                           enrich=self._enrich)
         except Exception as exc:
             # Name the type as well as the message, for the same reason
             # `examine` does: `str(exc)` alone is '' for a bare raise.

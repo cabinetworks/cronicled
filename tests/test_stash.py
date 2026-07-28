@@ -1079,10 +1079,105 @@ class CoverImageIsIrreversible(unittest.TestCase):
         # that mentions the cover, since the false claim would be just as
         # wrong sitting beside the other.
         for doc in (Stash.scrape_scenes_by_query.__doc__,
+                   Stash.scrape_scene_url.__doc__,
                    Stash.scene_scrapers.__doc__):
             for overclaim in ("fully reversible", "can always be undone",
                              "undo is complete", "safe to undo"):
                 self.assertNotIn(overclaim, doc.lower())
+
+
+# -- scraping a clip page directly, by URL ---------------------------------- #
+#
+# `scrape_scene_url` is the enrichment call: given the winning candidate's
+# own URL, it asks the media server to scrape that page directly rather than
+# answer from a free-text search index, which is what lets a proposal carry
+# a creator, a studio and a date instead of just a title and a link. Same
+# discipline as `ScrapeScenesByQuery` above: every test that touches the
+# selection set or the argument shape reads the ACTUAL request through
+# `_QueryRecorder`, never a second copy of the query text.
+
+SCRAPE_URL = "https://example.invalid/clip/copper-kettle"
+
+
+def _scrape_url_request(url=SCRAPE_URL):
+    t = _QueryRecorder({"data": {"scrapeSceneURL": None}})
+    _binding_stash(t).scrape_scene_url(url)
+    return t.only()
+
+
+class ScrapeSceneURL(unittest.TestCase):
+    def test_it_returns_the_scene_the_scraper_found(self):
+        scene = _scraped_scene(title="Copper Kettle")
+        t = _transport([{"data": {"scrapeSceneURL": scene}}])
+        got = _read_stash(t).scrape_scene_url(SCRAPE_URL)
+        self.assertEqual(got, scene)
+
+    def test_no_match_is_none_not_an_error(self):
+        # HARM: `scan.examine`'s enrichment step treats "the scraper had
+        # nothing new for this URL" as an ordinary miss, keeping its thin
+        # candidate rather than treating a plain `None` as a failure to
+        # degrade from.
+        t = _transport([{"data": {"scrapeSceneURL": None}}])
+        got = _read_stash(t).scrape_scene_url(SCRAPE_URL)
+        self.assertIsNone(got)
+
+    def test_a_missing_field_in_the_payload_is_also_none(self):
+        # HARM: the same schema-drift residual `scrape_scenes_by_query`
+        # guards against — a server answering a payload with no
+        # `scrapeSceneURL` key at all (rather than an explicit `null`) must
+        # not raise a bare KeyError somewhere downstream instead of the
+        # ordinary "nothing new" outcome.
+        t = _transport([{"data": {}}])
+        got = _read_stash(t).scrape_scene_url(SCRAPE_URL)
+        self.assertIsNone(got)
+
+
+class ScrapeSceneURLBindings(unittest.TestCase):
+    def test_the_url_binds_to_the_url_argument(self):
+        query, variables = _scrape_url_request()
+        self.assertEqual(_bound_arguments(query, variables, "scrapeSceneURL"),
+                         {"url": SCRAPE_URL})
+
+    def test_the_url_travels_as_a_variable_not_baked_into_the_query(self):
+        query, _ = _scrape_url_request()
+        self.assertIn("$url", query)
+        self.assertNotIn(SCRAPE_URL, query)
+
+    def test_the_url_argument_declares_the_type_the_schema_gives_it(self):
+        query, _ = _scrape_url_request()
+        self.assertEqual(_declared_type_of(query, "scrapeSceneURL", "url"),
+                         "String!")
+
+    def test_the_selection_set_names_every_field_apply_scene_can_write(self):
+        # The same guard `ScrapeScenesByQueryBindings` runs for the name
+        # search, repeated here because this is a SECOND place a field can
+        # go missing from the wire independently of the first.
+        selection = _selection_of(_scrape_url_request()[0], "scrapeSceneURL")
+        for field in ("title", "code", "details", "director", "urls",
+                     "date", "image", "studio", "tags", "performers"):
+            with self.subTest(field=field):
+                self.assertIn(field, selection,
+                              "%s is writable by apply_scene and is not "
+                              "being asked for" % (field,))
+
+    def test_studio_performers_and_tags_carry_the_ids_apply_scene_resolves_by(self):
+        selection = _selection_of(_scrape_url_request()[0], "scrapeSceneURL")
+        for block in ("studio", "tags", "performers"):
+            with self.subTest(block=block):
+                self.assertEqual(set(selection[block]), {"stored_id", "name"})
+
+    def test_the_selection_set_is_identical_to_scrape_scenes_by_query(self):
+        # HARM: the whole reason `examine`'s enrichment step may replace a
+        # thin search result with what this method returns is that both
+        # calls promise the SAME shape for a `ScrapedScene`. Compared as the
+        # selection sets pulled from each ACTUAL request — not against a
+        # hand-copied field list that could drift from either query on its
+        # own — so a field dropped from either one alone, or added to only
+        # one, fails here even though each method's own field-by-field test
+        # above might still pass in isolation.
+        by_query = _selection_of(_scrape_request()[0], "scrapeSingleScene")
+        by_url = _selection_of(_scrape_url_request()[0], "scrapeSceneURL")
+        self.assertEqual(by_query, by_url)
 
 
 def _scrapers_request(**kwargs):
