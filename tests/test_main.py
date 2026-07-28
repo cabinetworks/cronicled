@@ -218,7 +218,8 @@ class ConfigDirThreading(_Base):
                                      "display": "An Invented Store",
                                      "scraper_id": "InventedStore",
                                      "owner_source": "url_segment",
-                                     "owner_segment": 3}]}, fh)
+                                     "owner_segment": 3,
+                                     "title_match_counts_as_ownership": True}]}, fh)
         captured = _CapturedServe()
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop(CONFIG_DIR_ENV_VAR, None)

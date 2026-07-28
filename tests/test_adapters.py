@@ -15,12 +15,27 @@ from cronicled.adapters.registry import load_adapters, get_adapter
 # so the creator sits at index 2.
 URL_SPEC = {"name": "urlsite", "display": "URL Site", "scraper_id": "UrlSite",
             "owner_source": "url_segment", "owner_segment": 2,
-            "catalog_resolvable": True}
+            "catalog_resolvable": True,
+            "title_match_counts_as_ownership": True}
 FIELD_SPEC = {"name": "fieldsite", "display": "Field Site", "scraper_id": "FieldSite",
               "owner_source": "result_field", "owner_field": ["studio", "name"],
-              "catalog_resolvable": True}
+              "catalog_resolvable": True,
+              "title_match_counts_as_ownership": True}
 NONE_SPEC = {"name": "nosite", "display": "No Site", "scraper_id": "NoSite",
-             "owner_source": "none", "catalog_resolvable": False}
+             "owner_source": "none", "catalog_resolvable": False,
+             "title_match_counts_as_ownership": True}
+# The store the bug was found on: no trustworthy owner signal, and a title or
+# URL-slug mention of a creator is not evidence they own the clip -- it is
+# just as likely to be a fan edit or a collaboration clip sold by somebody
+# else. `owner_source` is still "url_segment" here (rather than "none") on
+# purpose, to prove the two checks are independent: the owner-segment match
+# must keep working while the weaker title/slug inference is switched off.
+NO_TITLE_EVIDENCE_SPEC = {
+    "name": "noevidencesite", "display": "No Evidence Site",
+    "scraper_id": "NoEvidenceSite",
+    "owner_source": "url_segment", "owner_segment": 2,
+    "catalog_resolvable": True,
+    "title_match_counts_as_ownership": False}
 
 
 class OwnerFromUrlSegment(unittest.TestCase):
@@ -86,6 +101,53 @@ class OwnerFromResultField(unittest.TestCase):
         self.assertEqual(self.a.artist_from_url("https://example.test/1/2/x"), "")
 
 
+class TitleMatchDoesNotCountAsOwnership(unittest.TestCase):
+    """The bug this ticket fixes: a store whose spec says a title or
+    URL-slug mention proves nothing must not admit a cross-store clip on
+    that mention alone -- while the store's own (stronger) owner-segment
+    attribution must keep working exactly as it does when the flag is on."""
+
+    def setUp(self):
+        self.a = DeclarativeAdapter(NO_TITLE_EVIDENCE_SPEC)
+
+    def test_the_stores_own_owner_segment_match_still_counts(self):
+        r = {"url": "https://example.test/store/velvetcrane/copper-kettle",
+             "title": "Copper Kettle"}
+        self.assertTrue(self.a.clip_features_artist(r, "velvetcrane"))
+
+    def test_the_owner_prefix_leg_still_counts(self):
+        r = {"url": "https://example.test/store/velvetcraneofficial/some-clip",
+             "title": "Some Clip"}
+        self.assertTrue(self.a.clip_features_artist(r, "velvetcrane"))
+
+    def test_a_bare_title_mention_from_another_store_does_not_count(self):
+        # same fixture as OwnerFromUrlSegment's
+        # test_another_store_clip_naming_the_artist_also_counts, which
+        # proves the opposite answer when title_match_counts_as_ownership
+        # is True -- the flag, not the fixture, is what is under test
+        r = {"url": "https://example.test/store/marbleaux/velvet-crane-guest",
+             "title": "Velvet Crane guests"}
+        self.assertFalse(self.a.clip_features_artist(r, "velvetcrane"))
+
+    def test_a_bare_url_slug_mention_does_not_count_either(self):
+        r = {"url": "https://example.test/store/marbleaux/velvetcrane-guest",
+             "title": "unrelated title"}
+        self.assertFalse(self.a.clip_features_artist(r, "velvetcrane"))
+
+
+class SearchOmitsSeed(unittest.TestCase):
+    def test_default_search_query_includes_the_seed(self):
+        a = DeclarativeAdapter(NONE_SPEC)
+        self.assertEqual(a.search_query("velvetcrane", "copper kettle"),
+                         "velvetcrane copper kettle")
+
+    def test_search_omits_seed_drops_it(self):
+        spec = dict(NONE_SPEC, name="omitseedsite", search_omits_seed=True)
+        a = DeclarativeAdapter(spec)
+        self.assertEqual(a.search_query("velvetcrane", "copper kettle"),
+                         "copper kettle")
+
+
 class NoOwnerAnywhere(unittest.TestCase):
     def setUp(self):
         self.a = DeclarativeAdapter(NONE_SPEC)
@@ -137,6 +199,17 @@ class InvalidSpec(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             DeclarativeAdapter(spec)
         self.assertIn("nofield", str(ctx.exception))
+
+    def test_missing_title_match_counts_as_ownership_raises(self):
+        # the safe default for "an adapter that cannot state its ownership
+        # rule" is not knowing, not the permissive reading -- see
+        # DeclarativeAdapter's module docstring
+        spec = dict(NONE_SPEC, name="notitleflag")
+        del spec["title_match_counts_as_ownership"]
+        with self.assertRaises(ValueError) as ctx:
+            DeclarativeAdapter(spec)
+        self.assertIn("notitleflag", str(ctx.exception))
+        self.assertIn("title_match_counts_as_ownership", str(ctx.exception))
 
 
 class Defaults(unittest.TestCase):

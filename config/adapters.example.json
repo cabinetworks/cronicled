@@ -8,6 +8,7 @@
       "owner_source": "url_segment",
       "owner_segment": 2,
       "catalog_resolvable": true,
+      "title_match_counts_as_ownership": true,
       "censorship": {},
       "aliases": {}
     }

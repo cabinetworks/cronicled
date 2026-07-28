@@ -53,6 +53,59 @@ exactly one:
   }
   ```
 
+## `title_match_counts_as_ownership`
+
+Every adapter entry must also set `title_match_counts_as_ownership` (a
+boolean). It answers a question separate from `owner_source`: when a search
+result's title or URL slug merely *names* the artist, but the store's own
+attribution (via `owner_source`) does not match them, is that mention
+trustworthy evidence the clip is theirs?
+
+- `true` — a bare mention counts. This is the right answer for a store where
+  a title naming a creator reliably means the clip is theirs (the "another
+  store's search turning up a guest clip" case aside, which the owner-field
+  check, not this one, is what tells apart).
+- `false` — a bare mention proves nothing, and only the store's own
+  attribution (`owner_source`) counts. This is the right answer for a store
+  whose name search surfaces fan or collaboration clips sold by somebody
+  else: a title containing a creator's name there is not evidence of
+  ownership, and treating it as such attributes someone else's clip to them.
+
+There is no default. A spec that omits the field fails to load — this is
+deliberate: an adapter that cannot say whether its title matches are
+trustworthy must not silently get the permissive reading, since that is
+exactly how a wrong attribution was reaching production. A config written
+before this field existed needs one line added declaring which case its
+store is; guess the wrong one and the choice is between missing real
+matches (`false` where `true` was true) or the original bug (`true` where
+`false` was true) — reason it out per store rather than copying whichever
+value is already in `config/adapters.example.json`.
+
+This is independent of `catalog_resolvable`, which answers "can a name
+search identify this store's creators at all" — a question about running a
+search, not about what one result's title implies once a search has already
+returned it. A store can be `catalog_resolvable: false` and still have
+title matches worth trusting, or vice versa.
+
+```json
+{
+  "name": "examplestore",
+  "owner_source": "url_segment",
+  "owner_segment": 2,
+  "title_match_counts_as_ownership": true
+}
+```
+
+## `search_omits_seed`
+
+Optional, defaults to `false`. `search_query(seed, title_query)` normally
+returns `seed + " " + title_query`; setting `search_omits_seed: true` makes
+it return `title_query` alone, for a store where narrowing the query by the
+creator seed costs recall and buys nothing. As of this writing nothing in
+the production scan path calls `search_query` at all (see its docstring in
+`cronicled/adapters/base.py`), so this only matters if a future caller
+starts using it.
+
 ## Where adapters come from
 
 `cronicled.adapters.registry.load_adapters` reads `adapters.json` out of the
