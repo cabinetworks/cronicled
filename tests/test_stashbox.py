@@ -73,6 +73,8 @@ class PerformerListing(unittest.TestCase):
         self.assertEqual([s["id"] for s in listing.scenes], ["s1", "s2"])
         self.assertTrue(listing.complete)
         self.assertEqual(len(t.calls), 1, "did not ask for a second page")
+        self.assertEqual(listing.total, 2)
+        self.assertEqual(listing.pages_read, 1)
 
     def test_a_performer_with_nothing_is_a_complete_answer(self):
         # Nothing promised and nothing served. This is the most valuable
@@ -88,6 +90,8 @@ class PerformerListing(unittest.TestCase):
         self.assertEqual(listing.scenes, ())
         self.assertTrue(listing.complete)
         self.assertEqual(len(t.calls), 1, "did not page past an empty listing")
+        self.assertEqual(listing.total, 0)
+        self.assertEqual(listing.pages_read, 1)
 
     def test_an_empty_first_page_with_a_count_that_says_otherwise_is_not_complete(self):
         # The source promises scenes and serves none, from the very first
@@ -106,6 +110,8 @@ class PerformerListing(unittest.TestCase):
                 self.assertEqual(listing.scenes, ())
                 self.assertFalse(listing.complete)
                 self.assertEqual(len(t.calls), 1, "stopped at the empty page")
+                self.assertEqual(listing.total, count)
+                self.assertEqual(listing.pages_read, 1)
 
     def test_a_count_that_drops_to_zero_mid_read_is_not_complete(self):
         # Two scenes arrived, then the source said it has none. Its tally
@@ -122,6 +128,12 @@ class PerformerListing(unittest.TestCase):
         self.assertEqual(len(listing.scenes), 2)
         self.assertFalse(listing.complete)
         self.assertEqual(len(t.calls), 2, "stopped at the empty page")
+        # `total` holds the FIRST count the source reported (6), not the
+        # contradicting 0 that ended the read -- the later figure is the
+        # untrustworthy one here, and the first is still the source's
+        # original claim about how much there is.
+        self.assertEqual(listing.total, 6)
+        self.assertEqual(listing.pages_read, 2)
 
     def test_reads_every_page_and_reports_the_read_complete(self):
         t = _transport([
@@ -134,6 +146,8 @@ class PerformerListing(unittest.TestCase):
 
         self.assertEqual([s["id"] for s in listing.scenes], ["s1", "s2", "s3"])
         self.assertTrue(listing.complete)
+        self.assertEqual(listing.total, 3)
+        self.assertEqual(listing.pages_read, 2)
 
     def test_a_read_that_hits_the_page_cap_is_not_complete(self):
         # Six scenes, two per page, but only two pages are allowed. The four
@@ -147,6 +161,10 @@ class PerformerListing(unittest.TestCase):
         self.assertEqual(len(listing.scenes), 4)
         self.assertFalse(listing.complete)
         self.assertEqual(len(t.calls), 2, "stopped asking at the cap")
+        # The ratio a caller can act on: 4 read of the 6 the source promised,
+        # across the 2 pages the cap allowed.
+        self.assertEqual(listing.total, 6)
+        self.assertEqual(listing.pages_read, 2)
 
     def test_a_page_that_returns_nothing_ends_the_read_as_incomplete(self):
         # The count says six and the server hands back nothing. Whatever is
@@ -164,6 +182,8 @@ class PerformerListing(unittest.TestCase):
         self.assertEqual(len(listing.scenes), 4)
         self.assertFalse(listing.complete)
         self.assertEqual(len(t.calls), 3, "stopped at the empty page")
+        self.assertEqual(listing.total, 6)
+        self.assertEqual(listing.pages_read, 3)
 
     def test_a_short_page_is_not_the_end_of_the_read(self):
         # The COUNT is the authority on completeness, not the page length.
@@ -190,6 +210,8 @@ class PerformerListing(unittest.TestCase):
         self.assertEqual(len(listing.scenes), 9)
         self.assertTrue(listing.complete)
         self.assertEqual(len(t.calls), 3, "kept asking past the short page")
+        self.assertEqual(listing.total, 9)
+        self.assertEqual(listing.pages_read, 3)
 
     def test_a_short_page_the_source_never_makes_up_is_not_complete(self):
         # The same short page, and this time the source never delivers the
@@ -211,6 +233,8 @@ class PerformerListing(unittest.TestCase):
         self.assertEqual(len(listing.scenes), 3)
         self.assertFalse(listing.complete)
         self.assertEqual(len(t.calls), 2, "stopped at the empty page")
+        self.assertEqual(listing.total, 9)
+        self.assertEqual(listing.pages_read, 2)
 
     def test_a_transport_failure_part_way_through_raises(self):
         # Pages one and two are discarded rather than returned with
@@ -527,9 +551,13 @@ class RequestShape(unittest.TestCase):
 PERFORMER = "pf-8821"
 
 
-def _listing(scenes=2, complete=True, performer_id=PERFORMER):
-    return SourceListing(performer_id,
-                         [{"id": "s%d" % n} for n in range(scenes)], complete)
+def _listing(scenes=2, complete=True, performer_id=PERFORMER, total=None,
+             pages_read=1):
+    scene_list = [{"id": "s%d" % n} for n in range(scenes)]
+    if total is None:
+        total = len(scene_list)
+    return SourceListing(performer_id, scene_list, complete,
+                         total=total, pages_read=pages_read)
 
 
 def _m(value, contained=False, meaningful_count=2):
@@ -574,13 +602,15 @@ def _every_branch_reason():
     first. Every one of these is prose shown to a person, so the properties
     that hold across all of them are worth asserting across all of them."""
     return [
-        listing_verdict(_listing(), _refused()).reason,
-        listing_verdict(_listing(complete=False), _refused()).reason,
-        listing_verdict(_listing(), _decided()).reason,
-        listing_verdict(_listing(), _ambiguous()).reason,
-        listing_verdict(_listing(), _refused(),
+        listing_verdict(_listing(), _refused(), performer_id=PERFORMER).reason,
+        listing_verdict(_listing(complete=False), _refused(),
+                        performer_id=PERFORMER).reason,
+        listing_verdict(_listing(), _decided(), performer_id=PERFORMER).reason,
+        listing_verdict(_listing(), _ambiguous(), performer_id=PERFORMER).reason,
+        listing_verdict(_listing(), _refused(), performer_id=PERFORMER,
                         attribution_certain=False).reason,
-        listing_verdict(_listing(), _nothing_to_ask_with()).reason,
+        listing_verdict(_listing(), _nothing_to_ask_with(),
+                        performer_id=PERFORMER).reason,
     ]
 
 
@@ -608,7 +638,8 @@ class ListingVerdict(unittest.TestCase):
         # nothing in it is this file, and the reason says so in those terms --
         # naming the performer, because "not in it" is worthless to a reviewer
         # who cannot tell whose listing was searched.
-        verdict = listing_verdict(_listing(complete=True), _refused())
+        verdict = listing_verdict(_listing(complete=True), _refused(),
+                                  performer_id=PERFORMER)
 
         self.assertIs(verdict.unlisted, True)
         self.assertIn("in full", verdict.reason)
@@ -619,7 +650,8 @@ class ListingVerdict(unittest.TestCase):
         # to score. This is the strongest evidence obtainable here and the
         # answer most worth acting on; an implementation that needed scenes in
         # hand before it would commit would refuse exactly here.
-        verdict = listing_verdict(_listing(scenes=0, complete=True), decide([]))
+        verdict = listing_verdict(_listing(scenes=0, complete=True), decide([]),
+                                  performer_id=PERFORMER)
 
         self.assertIs(verdict.unlisted, True)
         self.assertIn("in full", verdict.reason)
@@ -639,7 +671,8 @@ class ListingVerdict(unittest.TestCase):
         for scenes in (0, 2):
             with self.subTest(scenes=scenes):
                 verdict = listing_verdict(
-                    _listing(scenes=scenes, complete=False), _refused())
+                    _listing(scenes=scenes, complete=False), _refused(),
+                    performer_id=PERFORMER)
 
                 self.assertIsNone(
                     verdict.unlisted,
@@ -648,8 +681,24 @@ class ListingVerdict(unittest.TestCase):
                 self.assertIn("stopped early", verdict.reason)
                 self.assertNotIn("in full", verdict.reason)
 
+    def test_a_partial_read_names_how_partial(self):
+        # The ratio is what turns "stopped early" into something a person
+        # can act on: 3 read of 9 promised says there is more to ask for and
+        # names how much; the number of pages says how it stopped so far.
+        # Without it, "stopped early after 3 scenes" is only a reason to
+        # distrust the read, never a reason to go back for the rest.
+        verdict = listing_verdict(
+            _listing(scenes=3, complete=False, total=9, pages_read=4),
+            _refused(), performer_id=PERFORMER)
+
+        self.assertIsNone(verdict.unlisted)
+        self.assertIn("3", verdict.reason)
+        self.assertIn("9", verdict.reason)
+        self.assertIn("4", verdict.reason)
+
     def test_a_decided_match_is_not_an_absence(self):
-        verdict = listing_verdict(_listing(complete=True), _decided())
+        verdict = listing_verdict(_listing(complete=True), _decided(),
+                                  performer_id=PERFORMER)
 
         self.assertIs(verdict.unlisted, False)
         self.assertIn("has this file", verdict.reason)
@@ -661,7 +710,8 @@ class ListingVerdict(unittest.TestCase):
         # survives a short read -- and an implementation that checked the flag
         # before looking at the decision would downgrade this to None and
         # report a found file as unknown.
-        verdict = listing_verdict(_listing(complete=False), _decided())
+        verdict = listing_verdict(_listing(complete=False), _decided(),
+                                  performer_id=PERFORMER)
 
         self.assertIs(verdict.unlisted, False)
 
@@ -674,6 +724,7 @@ class ListingVerdict(unittest.TestCase):
         # answering. The view here is COMPLETE: completeness is not the thing
         # in doubt, whose listing it is is.
         verdict = listing_verdict(_listing(complete=True), _refused(),
+                                  performer_id=PERFORMER,
                                   attribution_certain=False)
 
         self.assertIsNone(verdict.unlisted)
@@ -687,6 +738,7 @@ class ListingVerdict(unittest.TestCase):
         # very failure the resolver's disagreement is warning about. Neither
         # direction is claimable when it is unknown whose listing was read.
         verdict = listing_verdict(_listing(complete=True), _decided(),
+                                  performer_id=PERFORMER,
                                   attribution_certain=False)
 
         self.assertIsNone(verdict.unlisted)
@@ -699,12 +751,51 @@ class ListingVerdict(unittest.TestCase):
         # right there in the listing. Both arrive as match=None, and
         # reporting the second as an absence would send a reviewer hunting a
         # mis-filing while the two candidate entries sit in the same reply.
-        verdict = listing_verdict(_listing(complete=True), _ambiguous())
+        verdict = listing_verdict(_listing(complete=True), _ambiguous(),
+                                  performer_id=PERFORMER)
 
         self.assertIsNone(verdict.unlisted)
         self.assertIsNot(verdict.unlisted, True)
         self.assertIn("competed", verdict.reason)
         self.assertNotIn("in full", verdict.reason)
+
+    def test_a_single_contender_is_not_an_absence_either(self):
+        # `if decision.contenders:` fires at contenders == 1, not only at 2
+        # or more. `decide()` itself never returns exactly one contender
+        # beside a refusal -- a lone eligible candidate always wins outright
+        # -- so nothing on the ordinary decision path exercises this
+        # boundary, and `contenders > 1` would pass every test above just as
+        # well. A future caller that hand-builds a `Decision`, or a `decide`
+        # whose shape changes, must not have this read as "nothing competed"
+        # the moment there is exactly one entry that did -- that is the
+        # loose side of the boundary, and it is the direction that
+        # fabricates an absence.
+        one_contender = Decision(
+            match=None, index=None,
+            reason="a lone candidate that still lost to an ambiguity "
+                   "elsewhere",
+            contenders=1, interrogated=True)
+
+        verdict = listing_verdict(_listing(complete=True), one_contender,
+                                  performer_id=PERFORMER)
+
+        self.assertIsNone(verdict.unlisted)
+        self.assertIsNot(verdict.unlisted, True)
+        self.assertIn("competed", verdict.reason)
+
+    def test_candidates_in_hand_beat_an_unfinished_read_too(self):
+        # The contenders check already runs ahead of the completeness check
+        # in the code, matching the docstring's own ordering rule -- but
+        # nothing pinned THIS combination: an ambiguous refusal over an
+        # INCOMPLETE listing. A mutation that reordered the two checks would
+        # report "the read stopped early" here, inviting a retry that could
+        # never resolve an ambiguity two candidates already produced.
+        verdict = listing_verdict(_listing(scenes=3, complete=False),
+                                  _ambiguous(), performer_id=PERFORMER)
+
+        self.assertIsNone(verdict.unlisted)
+        self.assertIn("competed", verdict.reason)
+        self.assertNotIn("stopped early", verdict.reason)
 
     def test_the_kind_of_refusal_is_read_from_the_count_not_the_prose(self):
         # scan.py already states the rule: a fact worth acting on is asked of
@@ -723,9 +814,11 @@ class ListingVerdict(unittest.TestCase):
             contenders=0, interrogated=True)
 
         self.assertIsNone(
-            listing_verdict(_listing(), looks_like_a_near_miss).unlisted)
+            listing_verdict(_listing(), looks_like_a_near_miss,
+                            performer_id=PERFORMER).unlisted)
         self.assertIs(
-            listing_verdict(_listing(), looks_ambiguous).unlisted, True)
+            listing_verdict(_listing(), looks_ambiguous,
+                            performer_id=PERFORMER).unlisted, True)
 
     def test_a_file_with_nothing_to_ask_with_is_not_an_absence(self):
         # The ticket's own harm, arriving through the door built to stop it.
@@ -740,7 +833,8 @@ class ListingVerdict(unittest.TestCase):
         # -- and the first clause is the one a reviewer acts on. They get sent
         # to hunt a mis-filing the tool never looked for.
         verdict = listing_verdict(_listing(scenes=500, complete=True),
-                                  _nothing_to_ask_with(500))
+                                  _nothing_to_ask_with(500),
+                                  performer_id=PERFORMER)
 
         self.assertIsNone(verdict.unlisted)
         self.assertIsNot(verdict.unlisted, True)
@@ -760,7 +854,7 @@ class ListingVerdict(unittest.TestCase):
         # stocked and complete, which is exactly what makes the wrong answer
         # so confident.
         verdict = listing_verdict(_listing(scenes=500, complete=True),
-                                  decide([]))
+                                  decide([]), performer_id=PERFORMER)
 
         self.assertIsNone(verdict.unlisted)
         self.assertIsNot(verdict.unlisted, True)
@@ -781,7 +875,8 @@ class ListingVerdict(unittest.TestCase):
             contenders=2, interrogated=False)
 
         verdict = listing_verdict(_listing(complete=True),
-                                  competed_on_thin_ground)
+                                  competed_on_thin_ground,
+                                  performer_id=PERFORMER)
 
         self.assertIsNone(verdict.unlisted)
         self.assertIn("competed", verdict.reason)
@@ -799,7 +894,7 @@ class ListingVerdict(unittest.TestCase):
             contenders=1, interrogated=False)
 
         verdict = listing_verdict(_listing(complete=True),
-                                  found_on_thin_ground)
+                                  found_on_thin_ground, performer_id=PERFORMER)
 
         self.assertIs(verdict.unlisted, False)
         self.assertIn("has this file", verdict.reason)
@@ -811,7 +906,8 @@ class ListingVerdict(unittest.TestCase):
         # which is a fact about the listing. A guard that swept this in with
         # the two cases above would stop answering for every short filename
         # and nothing would say why.
-        verdict = listing_verdict(_listing(complete=True), _one_generic_word())
+        verdict = listing_verdict(_listing(complete=True), _one_generic_word(),
+                                  performer_id=PERFORMER)
 
         self.assertIs(verdict.unlisted, True)
         self.assertIn("in full", verdict.reason)
@@ -824,7 +920,8 @@ class ListingVerdict(unittest.TestCase):
         # is a retry which can never come good, and pointing at it is worse
         # than saying nothing.
         verdict = listing_verdict(_listing(scenes=3, complete=False),
-                                  _nothing_to_ask_with(3))
+                                  _nothing_to_ask_with(3),
+                                  performer_id=PERFORMER)
 
         self.assertIsNone(verdict.unlisted)
         self.assertIn("never weighed", verdict.reason)
@@ -858,7 +955,7 @@ class ListingVerdict(unittest.TestCase):
         # a mis-filing for a scene that was simply never submitted, and that
         # search has no undo either.
         verdict = listing_verdict(_listing(scenes=500, complete=True),
-                                  _refused())
+                                  _refused(), performer_id=PERFORMER)
 
         self.assertIs(verdict.unlisted, True)
         self.assertEqual(
@@ -879,7 +976,7 @@ class ListingVerdict(unittest.TestCase):
         # the same breath that the listing holds only what was submitted to
         # it.
         reason = listing_verdict(_listing(scenes=500, complete=True),
-                                 _refused()).reason
+                                 _refused(), performer_id=PERFORMER).reason
 
         self.assertIn("this source's listing", reason)
         self.assertIn("submitted", reason)
@@ -904,7 +1001,7 @@ class ListingVerdict(unittest.TestCase):
         # preventing is a field being ADDED -- a confidence, a score, a
         # candidate -- which would re-create the thing this layer exists to
         # replace, and a sampled assertion is blind to exactly that.
-        verdict = listing_verdict(_listing(), _refused())
+        verdict = listing_verdict(_listing(), _refused(), performer_id=PERFORMER)
 
         self.assertEqual(sorted(vars(verdict)), ["reason", "unlisted"])
 
@@ -914,7 +1011,8 @@ class ListingVerdict(unittest.TestCase):
         # attribution is contested, which is truthy, so the guard would be
         # switched off by exactly the value that should switch it on.
         with self.assertRaises(TypeError):
-            listing_verdict(_listing(), _refused(), False)
+            listing_verdict(_listing(), _refused(), False,
+                            performer_id=PERFORMER)
 
     def test_a_certainty_that_is_not_a_boolean_raises(self):
         # Same mis-wiring, spelled as a keyword. Silently treating a truthy
@@ -925,7 +1023,30 @@ class ListingVerdict(unittest.TestCase):
             with self.subTest(bad=bad):
                 with self.assertRaises(TypeError):
                     listing_verdict(_listing(), _refused(),
+                                    performer_id=PERFORMER,
                                     attribution_certain=bad)
+
+    def test_a_decision_scored_against_a_different_performer_is_refused(self):
+        # Nothing about a bare `Decision` says which performer's scenes it
+        # was scored over. A caller juggling several (listing, decision)
+        # pairs at once -- the wrong one pulled off two ends of a batch, say
+        # -- would otherwise get a confident answer naming the performer
+        # `listing` carries, over candidates actually drawn from somebody
+        # else's. `performer_id` is the caller's own claim about who the
+        # decision was scored against; a mismatch against `listing`'s own
+        # performer refuses outright rather than reporting anything.
+        with self.assertRaises(ValueError):
+            listing_verdict(_listing(performer_id="pf-other"), _refused(),
+                            performer_id=PERFORMER)
+
+    def test_a_decision_scored_against_the_right_performer_is_not_refused(self):
+        # The permissive side: the ordinary, matching case must still work,
+        # or the mismatch guard has swallowed every call along with the one
+        # it exists to catch.
+        verdict = listing_verdict(_listing(performer_id=PERFORMER), _refused(),
+                                  performer_id=PERFORMER)
+
+        self.assertIs(verdict.unlisted, True)
 
 
 class Check(unittest.TestCase):
@@ -1015,6 +1136,28 @@ class Check(unittest.TestCase):
                         Resolution(name="Velvet Crane", competing=None))
 
         self.assertIs(verdict.unlisted, True)
+
+    def test_a_rejected_folder_can_never_be_used_as_though_settled(self):
+        # `competing` is only set when the folder WON and a differing
+        # filename candidate existed. It stays None when the folder's own
+        # text never competed at all -- thrown out by a guard, not checked
+        # against evidence -- and the filename resolved on its own. A guard
+        # is a heuristic tuned against real filing conventions, not a proof
+        # that the rejected text names nobody, so this is not the same as
+        # the folder and the filename having been compared and agreeing.
+        # Reading only `competing` would call this settled.
+        t = _transport([_page(1, [{"id": "s1", "title": "A Totally Different Scene"}])])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        verdict = check(box, "pf-performer", "Velvet Crane - Morning Ritual.mp4",
+                        "2023 September 11",
+                        Resolution(name="Velvet Crane", source="filename",
+                                  competing=None,
+                                  rejected_folder="2023 September 11"))
+
+        self.assertIsNone(verdict.unlisted)
+        self.assertIsNot(verdict.unlisted, True)
+        self.assertIn("different creators", verdict.reason)
 
     def test_the_resolved_name_is_subtracted_as_artist_evidence(self):
         # A file named after nobody but its own creator must not read as a

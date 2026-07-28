@@ -144,16 +144,30 @@ class SourceListing:
     rather than inferred from their length, because the length of a partial
     read and the length of a complete one look exactly alike. It means every
     entry this source holds for the performer was read — nothing more.
+
+    `total` and `pages_read` are what let an incomplete read be reported as
+    partial rather than merely disqualifying: `total` is the entry count the
+    source reported (see `performer_listing`'s own docstring for which of
+    possibly several reported counts this is, and why), and `pages_read` is
+    how many page requests it took to get here. Neither changes what a
+    partial read may claim -- `complete=False` still blocks every claim
+    `listing_verdict` would otherwise make -- they only say how partial: "3
+    of 9" is something a person can act on (raise the page cap, try later),
+    "3" alone is only a reason to stop trusting the read.
     """
 
-    def __init__(self, performer_id, scenes, complete):
+    def __init__(self, performer_id, scenes, complete, *, total, pages_read):
         self.performer_id = performer_id
         self.scenes = tuple(scenes)
         self.complete = complete
+        self.total = total
+        self.pages_read = pages_read
 
     def __repr__(self):
-        return "SourceListing(performer_id=%r, scenes=%d, complete=%r)" % (
-            self.performer_id, len(self.scenes), self.complete)
+        return ("SourceListing(performer_id=%r, scenes=%d, complete=%r, "
+                "total=%r, pages_read=%r)" % (
+                    self.performer_id, len(self.scenes), self.complete,
+                    self.total, self.pages_read))
 
 
 class Verdict:
@@ -194,16 +208,37 @@ class Verdict:
         return "Verdict(unlisted=%r, reason=%r)" % (self.unlisted, self.reason)
 
 
-def listing_verdict(listing, decision, *, attribution_certain=True):
+def listing_verdict(listing, decision, *, performer_id, attribution_certain=True):
     """What `listing` and `decision` together are allowed to claim about a file.
 
     `listing` is a `SourceListing`; `decision` is a
     `cronicled.scoring.Decision` made over candidates drawn from it.
+    `performer_id` names the performer `decision`'s candidates were actually
+    scored against, and must equal `listing.performer_id` — a mismatch
+    refuses outright rather than reporting a verdict at all. Nothing about a
+    bare `Decision` says which performer's scenes it was scored over, so
+    without this a caller that mixed up which listing goes with which
+    decision — the wrong pair pulled off two ends of a batch, say — would get
+    back a confident answer naming the performer `listing` carries, over
+    candidates actually drawn from somebody else's. The check costs little
+    because the information was already here: every reason string below
+    already names `listing.performer_id`, so asking the caller to also state
+    which performer it scored against, and comparing the two, is the whole
+    fix.
     `attribution_certain` says whether the performer whose listing was read is
     agreed to be this file's creator — a caller working from
-    `cronicled.artist.resolve` computes it as `resolution.competing is None`,
-    the resolver's own report that the folder and the filename did not name
-    different people.
+    `cronicled.artist.resolve` computes it as `resolution.competing is None
+    and resolution.rejected_folder is None`. `competing` is the resolver's
+    report that the folder and the filename did not name different people;
+    `rejected_folder` is its report that the folder's own text never
+    competed at all because a guard threw it out first. That second signal
+    matters here for the same reason the first one does: `_is_name`'s guards
+    are heuristics tuned against real filing conventions, not a proof that
+    the rejected text names nobody, so an attribution resting on the
+    filename after the folder was thrown out is not the same as the folder
+    and the filename having been checked and found to agree. Reading only
+    `competing` treats the two as the same thing and calls the weaker one
+    settled.
 
     The strongest thing obtainable here is *this source does not list it*. It
     is worth obtaining: a scorer must always pick a winner from what it is
@@ -268,6 +303,18 @@ def listing_verdict(listing, decision, *, attribution_certain=True):
             "attribution_certain must be True or False, got %r"
             % (attribution_certain,))
 
+    # The transposition this exists to catch: a caller holding several
+    # (listing, decision) pairs at once mismatches them, and every branch
+    # below would still be reachable -- just never on the fact the file
+    # actually needed. `listing_verdict` cannot see how `decision` was
+    # produced, so the caller states it and this refuses rather than
+    # silently judging one performer's listing against another's candidates.
+    if performer_id != listing.performer_id:
+        raise ValueError(
+            "decision was scored against performer %r but listing is for "
+            "performer %r -- refusing to judge one performer's listing "
+            "against another's decision" % (performer_id, listing.performer_id))
+
     if not attribution_certain:
         return Verdict(None, (
             "the folder and the filename name different creators, so whose "
@@ -298,9 +345,13 @@ def listing_verdict(listing, decision, *, attribution_certain=True):
 
     if not listing.complete:
         return Verdict(None, (
-            "the read of this source's listing for performer %s stopped early "
-            "after %d scenes, so the file is not ruled out by what was not "
-            "read" % (listing.performer_id, len(listing.scenes))))
+            "the read of this source's listing for performer %s stopped "
+            "early after %d of %s scenes across %d page%s, so the file is "
+            "not ruled out by what was not read"
+            % (listing.performer_id, len(listing.scenes),
+               listing.total if listing.total is not None else "an unknown",
+               listing.pages_read,
+               "" if listing.pages_read == 1 else "s")))
 
     # The one sentence in this module a person acts on, so it carries its own
     # limit: quoted into a ticket with none of these docs around it, it must
@@ -337,10 +388,14 @@ def check(box, performer_id, name, folder, resolution, *,
     `resolution` is the `cronicled.artist.Resolution` that named
     `performer_id`'s creator. Its `name` is subtracted from the evidence the
     same way `cronicled.scan.examine` subtracts it before scoring (see
-    `scoring.score`'s `artist` argument), and its `competing` is read exactly
-    the way `listing_verdict` documents: `None` means the attribution is
-    settled, anything else means the folder and the filename named different
-    people and the listing being enumerated may not even be this file's
+    `scoring.score`'s `artist` argument), and its `competing` and
+    `rejected_folder` are read together exactly the way `listing_verdict`
+    documents: both `None` means the attribution is settled; a `competing`
+    name means the folder and the filename named different people; a
+    `rejected_folder` means the folder had text at all but a guard -- not a
+    check against evidence -- is why it did not win, which is not the same
+    as the folder having agreed. Either one downgrades the claim, because in
+    either case the listing being enumerated may not even be this file's
     creator's.
 
     Returns a `Verdict` -- see `listing_verdict` for the whole of what
@@ -368,8 +423,15 @@ def check(box, performer_id, name, folder, resolution, *,
                      artist=resolution.name)
                for scene in listing.scenes]
     decision = decide(matches, threshold)
-    attribution_certain = resolution.competing is None
-    return listing_verdict(listing, decision, attribution_certain=attribution_certain)
+    # Both signals, not just the one a competing NAME sets: a folder whose
+    # text a guard threw out never competed either, and the guard is a
+    # heuristic, not a check against evidence -- see `listing_verdict`'s own
+    # docstring for why treating that as settled is the same mistake as
+    # ignoring `competing` outright.
+    attribution_certain = (resolution.competing is None
+                           and resolution.rejected_folder is None)
+    return listing_verdict(listing, decision, performer_id=performer_id,
+                           attribution_certain=attribution_certain)
 
 
 class StashBox:
@@ -421,8 +483,19 @@ class StashBox:
         caller *can* act on: `StashError.transient` says whether retrying is
         worth it, and folding it into the flag would throw that away and make
         a wedged host indistinguishable from an honest partial read.
+
+        `total` on the returned listing is the `count` the FIRST page
+        reported, held fixed for the rest of the read rather than
+        overwritten by whatever a later page says. That matters exactly when
+        a later page disagrees -- the count-drops-to-zero contradiction this
+        method already treats as reason to distrust the read -- where the
+        latest figure is the untrustworthy one and the first is still the
+        source's original claim about how much there is. `pages_read` is
+        simply how many requests it took to get here, whichever way the read
+        ended.
         """
         scenes = []
+        total = None
         for page in range(1, max_pages + 1):
             variables = {"input": {
                 "performers": {"value": [performer_id], "modifier": "INCLUDES"},
@@ -431,13 +504,18 @@ class StashBox:
             }}
             result = self._client.gql(PERFORMER_SCENES, variables, timeout=timeout)
             block = result["queryScenes"]
+            if total is None:
+                total = block["count"]
             if not block["scenes"]:
                 nothing_to_read = block["count"] == 0 and not scenes
-                return SourceListing(performer_id, scenes, complete=nothing_to_read)
+                return SourceListing(performer_id, scenes, complete=nothing_to_read,
+                                     total=total, pages_read=page)
             scenes.extend(block["scenes"])
             if len(scenes) >= block["count"]:
-                return SourceListing(performer_id, scenes, complete=True)
-        return SourceListing(performer_id, scenes, complete=False)
+                return SourceListing(performer_id, scenes, complete=True,
+                                     total=total, pages_read=page)
+        return SourceListing(performer_id, scenes, complete=False,
+                             total=total, pages_read=max_pages)
 
     def known_by_fingerprint(self, fingerprints, timeout=DEFAULT_TIMEOUT):
         """Ask the source, in **one** request, which scenes carry each of

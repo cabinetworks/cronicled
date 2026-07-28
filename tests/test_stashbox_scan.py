@@ -57,8 +57,13 @@ class _FakeBox:
         return self._listings[performer_id]
 
 
-def _listing(scenes=(), complete=True, performer_id="pf-1"):
-    return SourceListing(performer_id, list(scenes), complete)
+def _listing(scenes=(), complete=True, performer_id="pf-1", total=None,
+             pages_read=1):
+    scene_list = list(scenes)
+    if total is None:
+        total = len(scene_list)
+    return SourceListing(performer_id, scene_list, complete,
+                         total=total, pages_read=pages_read)
 
 
 class _Ctx:
