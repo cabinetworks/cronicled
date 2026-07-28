@@ -35,11 +35,20 @@ class _FakeStash:
 
 
 class _FakeStore:
-    def __init__(self, item):
+    def __init__(self, item, dismissed_item=None, muted_subjects=()):
         self.item = item
+        # A separate slot from `item`: `items(state="dismissed")` must
+        # answer for a row `items(state=None)` would never return (the
+        # store's own default view excludes it) -- collapsing the two into
+        # one attribute would make `undismiss` indistinguishable from
+        # `dismiss`/`mute`/`undo`, none of which ever read the hidden view.
+        self.dismissed_item = dismissed_item
+        self._muted_subjects = set(muted_subjects)
         self.calls = []
 
     def items(self, folder=None, state=None, limit=None, offset=0):
+        if state == "dismissed":
+            return [self.dismissed_item] if self.dismissed_item else []
         return [self.item] if self.item else []
 
     def mark_applied(self, fp, prior_state=None):
@@ -56,6 +65,15 @@ class _FakeStore:
 
     def mute(self, subject_type, subject_id, reason=None):
         self.calls.append(("muted", subject_type, subject_id, reason))
+
+    def undismiss(self, fp):
+        self.calls.append(("undismissed", fp))
+
+    def unmute(self, subject_type, subject_id):
+        self.calls.append(("unmuted", subject_type, subject_id))
+
+    def muted_subjects(self):
+        return self._muted_subjects
 
 
 def _item(candidate=None, **over):
@@ -203,6 +221,91 @@ class Reject(unittest.TestCase):
         self.assertNotEqual(dismissed.calls[0][-1], muted.calls[0][-1])
         self.assertIn("dismiss", dismissed.calls[0][-1])
         self.assertIn("mute", muted.calls[0][-1])
+
+
+class _RunnerSpy:
+    """Records every call a scan would make through it. Standing in for the
+    real `JobRunner` in exactly the tests that must prove `unmute`/
+    `undismiss` never reach one -- ticket 75's whole point is that reversing
+    a rejection must never look like asking for a scan."""
+
+    def __init__(self):
+        self.calls = []
+
+    def register(self, producer):
+        self.calls.append(("register", producer))
+
+    def start(self, name):
+        self.calls.append(("start", name))
+        return None
+
+
+class Undismiss(unittest.TestCase):
+    def test_reverses_the_dismissal_of_the_named_proposal(self):
+        store = _FakeStore(item=None, dismissed_item=_item(state="dismissed"))
+        Actions(store, _FakeStash()).undismiss("fp-1")
+        self.assertEqual(store.calls, [("undismissed", "fp-1")])
+
+    def test_an_unknown_fingerprint_raises_rather_than_silently_doing_nothing(self):
+        # Mirrors approve/dismiss/mute/undo's own reasoning: a no-op here is
+        # indistinguishable from a success, and a doubled click on an
+        # already-undismissed row must not look like it worked twice.
+        store = _FakeStore(item=None, dismissed_item=None)
+        with self.assertRaises(UnknownProposal):
+            Actions(store, _FakeStash()).undismiss("fp-1")
+        self.assertEqual(store.calls, [])
+
+    def test_a_row_that_is_currently_visible_not_dismissed_is_unknown(self):
+        # HARM: `_find` (what approve/dismiss/mute/undo use) only ever
+        # searches the VISIBLE set, which by definition never contains a
+        # dismissed row. If `undismiss` reused `_find` here it could never
+        # find the very thing it exists to reverse -- it has to search
+        # `items(state="dismissed")` instead.
+        store = _FakeStore(item=_item(state="new"), dismissed_item=None)
+        with self.assertRaises(UnknownProposal):
+            Actions(store, _FakeStash()).undismiss("fp-1")
+        self.assertEqual(store.calls, [])
+
+    def test_does_not_trigger_a_scan_or_a_lookup(self):
+        store = _FakeStore(item=None, dismissed_item=_item(state="dismissed"))
+        stash = _FakeStash()
+        runner = _RunnerSpy()
+        Actions(store, stash, runner=runner, adapter=object()).undismiss("fp-1")
+        self.assertEqual(stash.calls, [])
+        self.assertEqual(runner.calls, [])
+
+
+class Unmute(unittest.TestCase):
+    def test_reverses_the_mute_on_the_named_subject(self):
+        store = _FakeStore(item=None, muted_subjects={("scene", "42")})
+        Actions(store, _FakeStash()).unmute("scene", "42")
+        self.assertEqual(store.calls, [("unmuted", "scene", "42")])
+
+    def test_an_unmuted_subject_raises_rather_than_silently_doing_nothing(self):
+        store = _FakeStore(item=None, muted_subjects=set())
+        with self.assertRaises(UnknownProposal):
+            Actions(store, _FakeStash()).unmute("scene", "42")
+        self.assertEqual(store.calls, [])
+
+    def test_does_not_trigger_a_scan_or_a_lookup(self):
+        # HARM (the reason acceptance calls this out by name): a click that
+        # spends a third party's rate limit without looking like a scan is a
+        # surprise, and this is the one control that must never cause one.
+        store = _FakeStore(item=None, muted_subjects={("scene", "42")})
+        stash = _FakeStash()
+        runner = _RunnerSpy()
+        Actions(store, stash, runner=runner, adapter=object()).unmute(
+            "scene", "42")
+        self.assertEqual(stash.calls, [])
+        self.assertEqual(runner.calls, [])
+
+    def test_only_the_named_subject_is_unmuted_not_every_muted_subject(self):
+        # HARM: "no bulk actions" -- unmuting must act on exactly the
+        # subject asked about, never on every muted subject at once.
+        store = _FakeStore(item=None,
+                           muted_subjects={("scene", "1"), ("scene", "2")})
+        Actions(store, _FakeStash()).unmute("scene", "1")
+        self.assertEqual(store.calls, [("unmuted", "scene", "1")])
 
 
 class _Adapter:

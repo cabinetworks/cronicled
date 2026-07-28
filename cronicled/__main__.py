@@ -38,7 +38,7 @@ from .store import Store
 from .stash import Stash
 from .web.actions import Actions
 from .web.app import DEFAULT_HOST, DEFAULT_PORT, serve
-from .web.rows import to_rows
+from .web.rows import to_refusal_rows, to_rows
 
 
 def main(argv=None):
@@ -96,6 +96,9 @@ def main(argv=None):
     runner = JobRunner(store)
     actions = Actions(store, stash, runner=runner, adapter=adapter)
     serve(rows=lambda: to_rows(store.items()),
+          muted=store.mutes,
+          dismissed=lambda: to_rows(store.items(state="dismissed")),
+          refused=lambda: to_refusal_rows(store.refusals()),
           actions=actions, scan_status=actions.scan_status,
           host=args.host, port=args.port)
 

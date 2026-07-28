@@ -176,3 +176,25 @@ def to_row(item):
 
 def to_rows(items):
     return [to_row(i) for i in items]
+
+
+def to_refusal_row(entry):
+    """One standing refusal (`Store.refusals()`'s dict shape) -> what the
+    Refused section shows for it.
+
+    `filename`, not the whole path, matching every other row's own
+    editorial choice (`to_row`'s `filename` above) — the directory is the
+    reviewer's own filing, not part of judging why a candidate did not
+    clear the threshold.
+    """
+    return {
+        "subject_type": entry["subject_type"],
+        "subject_id": entry["subject_id"],
+        "filename": os.path.basename(entry["path"]),
+        "reason": entry["reason"],
+        "at": entry["at"],
+    }
+
+
+def to_refusal_rows(entries):
+    return [to_refusal_row(e) for e in entries]

@@ -789,6 +789,16 @@ class ScanProducer:
                 elif outcome.error is not None:
                     errors += 1
                 elif outcome.proposal is None:
+                    # Through the store too, so a refusal — the one outcome a
+                    # person can most often fix (rename a file, add an alias,
+                    # move the threshold) — is visible somewhere other than
+                    # this job's own log. Keyed by subject, not recorded as a
+                    # proposal; see the block above `Store.record_refusal`
+                    # for why reusing `item` here would re-propose the same
+                    # unresolved file as a fresh row every night.
+                    self._store.record_refusal(
+                        SUBJECT_TYPE, subject_id,
+                        _primary_path(futures[future]), outcome.reason)
                     refused += 1
                 else:
                     proposed += 1

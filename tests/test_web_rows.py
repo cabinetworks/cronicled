@@ -2,7 +2,9 @@ import unittest
 
 from cronicled.scan import _runners_up
 from cronicled.scoring import Match
-from cronicled.web.rows import Row, to_row, to_rows
+from cronicled.web.rows import (
+    Row, to_refusal_row, to_refusal_rows, to_row, to_rows,
+)
 
 
 def _real_runners_up(losers, winner_title="The Lantern Room",
@@ -249,6 +251,36 @@ class ToRowsTest(unittest.TestCase):
         items = [_item(fingerprint="fp-1"), _item(fingerprint="fp-2")]
         rows = to_rows(items)
         self.assertEqual([r.fingerprint for r in rows], ["fp-1", "fp-2"])
+
+
+class ToRefusalRowTest(unittest.TestCase):
+    """`Store.refusals()`'s dict shape -> what the Refused section shows."""
+
+    def _entry(self, **over):
+        entry = {"subject_type": "scene", "subject_id": "1",
+                 "path": "/library/Nine Winters/nine-winters-clip.mp4",
+                 "reason": "a tie between two candidates",
+                 "at": "2026-07-27T00:00:00"}
+        entry.update(over)
+        return entry
+
+    def test_shows_the_filename_not_the_whole_path(self):
+        # The same editorial choice `to_row.filename` makes: the directory
+        # is the reviewer's own filing, not part of judging a refusal.
+        row = to_refusal_row(self._entry())
+        self.assertEqual(row["filename"], "nine-winters-clip.mp4")
+
+    def test_carries_the_subject_reason_and_when(self):
+        row = to_refusal_row(self._entry())
+        self.assertEqual(row["subject_type"], "scene")
+        self.assertEqual(row["subject_id"], "1")
+        self.assertEqual(row["reason"], "a tie between two candidates")
+        self.assertEqual(row["at"], "2026-07-27T00:00:00")
+
+    def test_to_refusal_rows_converts_every_entry_and_keeps_their_order(self):
+        entries = [self._entry(subject_id="1"), self._entry(subject_id="2")]
+        rows = to_refusal_rows(entries)
+        self.assertEqual([r["subject_id"] for r in rows], ["1", "2"])
 
 
 class FailedApplyIsNotADeadEnd(unittest.TestCase):

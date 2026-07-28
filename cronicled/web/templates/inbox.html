@@ -90,6 +90,21 @@
                  border: 1px solid var(--line); background: var(--bg);
                  color: var(--fg); cursor: pointer; }
   .note { color: var(--muted); font-size: 0.85rem; }
+
+  /* Muted/Dismissed/Refused: collapsed by default so a person is not made
+     to scroll past sixteen rows of their own past decisions to reach the
+     inbox, but the count beside each summary is plain page text -- present
+     in the markup, and so in a page search, whether or not the section is
+     open. */
+  details.section { border: 1px solid var(--line); border-radius: 6px;
+                    margin: 0 0 0.9rem; background: var(--panel); }
+  details.section summary { padding: 0.6rem 0.9rem; cursor: pointer;
+                            font-weight: 600; }
+  details.section .proposal { margin: 0; border: none;
+                              border-top: 1px solid var(--line);
+                              border-radius: 0; background: transparent; }
+  details.section .proposal:first-of-type { border-top: 1px solid var(--line); }
+  details.section p.empty { margin: 0; padding: 0.7rem 0.9rem; }
 </style>
 
 <h1>Inbox</h1>
@@ -141,6 +156,69 @@
   {% endif %}
 </div>
 {% endfor %}
+
+{% set muted = muted | default([]) %}
+{% set dismissed = dismissed | default([]) %}
+{% set refused = refused | default([]) %}
+
+<details class="section">
+  <summary>Muted ({{ muted | length }})</summary>
+  {% if not muted %}
+  <p class="empty">Nothing muted.</p>
+  {% endif %}
+  {% for m in muted %}
+  <div class="proposal">
+    <div class="head">
+      <div class="what">
+        <p class="file">{{ m.subject_type }} {{ m.subject_id }}</p>
+        <div class="meta">{{ m.reason }} &middot; muted {{ m.at }}</div>
+      </div>
+      <div class="acts">
+        <form method="post" action="/unmute"><input type="hidden" name="subject_type" value="{{ m.subject_type }}"><input type="hidden" name="subject_id" value="{{ m.subject_id }}"><button>Unmute</button></form>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</details>
+
+<details class="section">
+  <summary>Dismissed ({{ dismissed | length }})</summary>
+  {% if not dismissed %}
+  <p class="empty">Nothing dismissed.</p>
+  {% endif %}
+  {% for row in dismissed %}
+  <div class="proposal">
+    <div class="head">
+      <div class="what">
+        <p class="file">{{ row.filename }}</p>
+        <p class="title">{{ row.proposed_title }}</p>
+        <div class="meta"><b>{{ row.creator }}</b> (from the {{ row.creator_source }})</div>
+      </div>
+      <div class="score">{{ row.score_text }}</div>
+      <div class="acts">
+        <form method="post" action="/undismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Undismiss</button></form>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</details>
+
+<details class="section">
+  <summary>Refused ({{ refused | length }})</summary>
+  {% if not refused %}
+  <p class="empty">Nothing refused.</p>
+  {% endif %}
+  {% for r in refused %}
+  <div class="proposal">
+    <div class="head">
+      <div class="what">
+        <p class="file">{{ r.filename }}</p>
+        <div class="meta">{{ r.reason }}</div>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</details>
 
 <h2>Scan</h2>
 <div class="scan">
