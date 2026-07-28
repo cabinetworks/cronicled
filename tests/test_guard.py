@@ -283,6 +283,62 @@ class AllowedTrackedFiles(unittest.TestCase):
         self.assertIn("tracked data file: elsewhere/mkdocs.yml", out)
 
 
+class StagedContentIsScanned(unittest.TestCase):
+    """`git grep` with no revision and no `--cached` reads the WORKING TREE
+    copy of a tracked path, not the index. Content staged (`git add`) and
+    then edited back out of the working tree is invisible to that leg
+    alone even though it is exactly what the next `git commit` would
+    record - reproduced directly below with no simulation needed."""
+
+    def test_a_leak_staged_and_then_reverted_in_the_working_tree_is_still_caught(self):
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n"})
+        path = os.path.join(d, "a.md")
+        with open(path, "w") as fh:
+            fh.write("temporarily contains zzsecretzz\n")
+        subprocess.check_call(["git", "add", "a.md"], cwd=d)
+        with open(path, "w") as fh:
+            fh.write("harmless again\n")
+        # Deliberately no second `git add`: the working tree is now clean,
+        # but the index still holds the leak from the first `git add`, and
+        # that staged blob is what `git commit` would actually record.
+        code, out = _run(d, env={"LEAK_PATTERNS": "zzsecretzz"})
+        self.assertEqual(code, 1, out)
+
+    def test_the_working_tree_leg_alone_would_have_missed_it(self):
+        # Confirms the fixture above actually exercises the gap rather than
+        # coincidentally tripping some other leg (filename, untracked,
+        # history): with nothing committed yet and the working tree clean,
+        # only the staged-content leg can see this.
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n"})
+        path = os.path.join(d, "a.md")
+        with open(path, "w") as fh:
+            fh.write("temporarily contains zzsecretzz\n")
+        subprocess.check_call(["git", "add", "a.md"], cwd=d)
+        with open(path, "w") as fh:
+            fh.write("harmless again\n")
+        code, _ = _run(os.path.join(d), guard=GUARD)
+        self.assertEqual(code, 1)
+        working_tree_only = subprocess.run(
+            ["git", "grep", "-a", "-i", "-F", "-l", "-e", "zzsecretzz", "--", "."],
+            cwd=d, stdout=subprocess.PIPE)
+        self.assertEqual(working_tree_only.returncode, 1,
+                          "fixture is invalid: the working tree copy alone "
+                          "already contains the pattern, so this is not "
+                          "isolating the staged-content leg")
+
+    def test_env_sourced_patterns_redact_a_staged_match(self):
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n"})
+        path = os.path.join(d, "a.md")
+        with open(path, "w") as fh:
+            fh.write("temporarily contains zzsecretzz\n")
+        subprocess.check_call(["git", "add", "a.md"], cwd=d)
+        with open(path, "w") as fh:
+            fh.write("harmless again\n")
+        code, out = _run(d, env={"LEAK_PATTERNS": "zzsecretzz"})
+        self.assertEqual(code, 1, out)
+        self.assertNotIn("zzsecretzz", out)
+
+
 class RedactionBySource(unittest.TestCase):
     """Round 1 redacted the filename legs but left the content legs printing
     paths verbatim - and a path can coincidentally contain the pattern even

@@ -3,10 +3,14 @@
 
 Scans, for every configured pattern:
   (a) the working tree: tracked file CONTENTS and tracked FILENAMES
-  (b) every commit reachable in history: tracked file CONTENTS as they
+  (b) the index: tracked file CONTENTS as staged, independently of the
+      working tree - content that is staged and then edited back out of
+      the working tree is still on its way into the next commit, and is
+      caught here rather than only after that commit exists
+  (c) every commit reachable in history: tracked file CONTENTS as they
       existed at that commit, even if later removed
-  (c) untracked-but-not-ignored files: FILENAMES and CONTENTS
-  (d) every commit message in history
+  (d) untracked-but-not-ignored files: FILENAMES and CONTENTS
+  (e) every commit message in history
 
 The pattern list is deliberately NOT stored here. A committed list would
 enumerate exactly what must stay private - a worse disclosure than any
@@ -173,8 +177,36 @@ def scan_tracked_content(pattern: str) -> list[str]:
     `git grep -I` silently excludes anything git treats as binary -
     including a plain-ASCII file marked `-diff`/`binary` in .gitattributes,
     and any file with a NUL byte anywhere in it. -a forces git to treat
-    every tracked file as text regardless of that heuristic."""
+    every tracked file as text regardless of that heuristic.
+
+    Without a revision or `--cached`, `git grep` reads the WORKING TREE
+    copy of each tracked path - not the index. Content that was staged and
+    then edited back out of the working tree (`git add`, then the file is
+    overwritten again without a second `git add`) is invisible to this leg
+    alone: the working tree no longer contains it, even though it is what
+    the next `git commit` would actually record. See scan_staged_content
+    for the leg that covers exactly that gap."""
     proc = run_git(["grep", "-a", "-i", "-F", "-l", "-e", pattern, "--", "."], allow_returncodes=(0, 1))
+    if proc.returncode == 1:
+        return []
+    return [line for line in proc.stdout.decode("utf-8", "replace").split("\n") if line]
+
+
+def scan_staged_content(pattern: str) -> list[str]:
+    """Forbidden string in tracked file CONTENTS as currently STAGED -
+    `--cached` reads the index instead of the working tree. This is the
+    leg that catches a leak staged and then edited back out of the working
+    tree: scan_tracked_content alone would see only the now-clean working
+    copy, while the staged blob - the one the next commit actually records
+    - still holds the forbidden string. When nothing is staged, the index
+    mirrors HEAD, so this legitimately overlaps scan_tracked_content and
+    scan_history_content in the common case; that overlap is harmless, and
+    narrowing this leg to run only when something is staged would just be
+    another way to get the "is anything staged?" check wrong."""
+    proc = run_git(
+        ["grep", "-a", "-i", "-F", "-l", "-e", pattern, "--cached", "--", "."],
+        allow_returncodes=(0, 1),
+    )
     if proc.returncode == 1:
         return []
     return [line for line in proc.stdout.decode("utf-8", "replace").split("\n") if line]
@@ -318,6 +350,17 @@ def main() -> int:
                     else:
                         print("\n".join(hits), file=sys.stderr)
                         fail("forbidden string in the contents of the file(s) above (working tree)")
+
+                staged_hits = scan_staged_content(pattern)
+                if staged_hits:
+                    if redact:
+                        fail(
+                            f"{len(staged_hits)} staged file(s) contain a configured pattern "
+                            "- run the guard locally to see which"
+                        )
+                    else:
+                        print("\n".join(staged_hits), file=sys.stderr)
+                        fail("forbidden string in the contents of the staged file(s) above")
 
                 names = scan_filenames(enumerate_tracked(), pattern)
                 if names:
