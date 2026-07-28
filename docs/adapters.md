@@ -2,7 +2,9 @@
 
 Matching against a clip store is done through a *site adapter*, configured in
 `config/adapters.json`, which is not tracked by this repo. See
-`config/adapters.example.json` for the shape. No store is built in.
+`config/adapters.example.json` for the shape — it configures one adapter per
+mechanism below, so all three are visible there, not only the one this page
+happens to show first. No store is built in.
 
 Every adapter entry sets `owner_source`, which selects how the creator's name
 is found for a given clip result. There are three mechanisms; an adapter uses
@@ -21,9 +23,20 @@ exactly one:
   {
     "name": "examplestore",
     "owner_source": "url_segment",
-    "owner_segment": 2
+    "owner_segment": 2,
+    "owner_segment_example": {
+      "url": "https://example.test/store/velvetcrane/copper-kettle",
+      "owner": "velvetcrane"
+    }
   }
   ```
+
+  `owner_segment_example` is optional and checked once, at load time: it
+  fails loudly if `owner_segment` does not resolve `"url"` to `"owner"`,
+  which is exactly the off-by-one this section warns about — catching it
+  when the adapter is configured rather than leaving it to be discovered
+  from a library that quietly muted every file for a store it should have
+  identified. An adapter with no example given behaves exactly as before.
 
 - **`result_field`** — the creator's name is a field on the clip's search
   result, addressed by `owner_field`, a list of keys walked in order to reach

@@ -7,8 +7,31 @@
       "scraper_id": "ExampleStore",
       "owner_source": "url_segment",
       "owner_segment": 2,
+      "owner_segment_example": {
+        "url": "https://example.test/store/velvetcrane/copper-kettle",
+        "owner": "velvetcrane"
+      },
       "catalog_resolvable": true,
       "title_match_counts_as_ownership": true,
+      "censorship": {},
+      "aliases": {}
+    },
+    {
+      "name": "examplestore-fields",
+      "display": "Example Store (fields)",
+      "scraper_id": "ExampleStoreFields",
+      "owner_source": "result_field",
+      "owner_field": ["studio", "name"],
+      "catalog_resolvable": true,
+      "censorship": {},
+      "aliases": {}
+    },
+    {
+      "name": "examplestore-uncataloged",
+      "display": "Example Store (no catalog)",
+      "scraper_id": "ExampleStoreUncataloged",
+      "owner_source": "none",
+      "catalog_resolvable": false,
       "censorship": {},
       "aliases": {}
     }

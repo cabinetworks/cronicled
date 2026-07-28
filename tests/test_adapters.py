@@ -212,6 +212,45 @@ class InvalidSpec(unittest.TestCase):
         self.assertIn("title_match_counts_as_ownership", str(ctx.exception))
 
 
+class OwnerSegmentExampleValidatesAtLoadTime(unittest.TestCase):
+    """`owner_segment` counts from after the scheme and includes the host --
+    one off from what a reader used to URL *paths* would assume, and that
+    exact mismatch has already caused a real misconfiguration. An optional
+    `owner_segment_example` lets that be caught at load time instead of only
+    documented and hoped for."""
+
+    URL = "https://example.test/store/velvetcrane/copper-kettle"
+
+    def test_a_matching_example_loads_without_complaint(self):
+        spec = dict(URL_SPEC, name="matches",
+                    owner_segment_example={"url": self.URL, "owner": "velvetcrane"})
+        DeclarativeAdapter(spec)   # must not raise
+
+    def test_an_off_by_one_segment_is_refused_rather_than_silently_wrong(self):
+        # segment 1 on this URL is "store", not the creator -- the exact
+        # shape of the off-by-one this field exists to catch.
+        spec = dict(URL_SPEC, name="offbyone", owner_segment=1,
+                    owner_segment_example={"url": self.URL, "owner": "velvetcrane"})
+        with self.assertRaises(ValueError) as ctx:
+            DeclarativeAdapter(spec)
+        message = str(ctx.exception)
+        self.assertIn("offbyone", message)
+        self.assertIn("velvetcrane", message)
+        self.assertIn("store", message)
+
+    def test_no_example_given_loads_exactly_as_before(self):
+        spec = dict(URL_SPEC, name="noexample")
+        DeclarativeAdapter(spec)   # must not raise; the field is optional
+
+    def test_the_example_is_ignored_for_a_non_url_segment_adapter(self):
+        # owner_segment_example only means anything for url_segment; giving
+        # one alongside a different owner_source is not a contradiction this
+        # class is responsible for catching.
+        spec = dict(FIELD_SPEC, name="fieldwithexample",
+                    owner_segment_example={"url": self.URL, "owner": "wrong"})
+        DeclarativeAdapter(spec)   # must not raise
+
+
 class Defaults(unittest.TestCase):
     def test_censorship_and_aliases_default_to_empty(self):
         a = DeclarativeAdapter(NONE_SPEC)
@@ -227,16 +266,43 @@ class Defaults(unittest.TestCase):
 class ExampleConfig(unittest.TestCase):
     """The shipped example config must itself pass the spec validation added
     alongside it - rejecting the project's own example would be worse than
-    not validating at all."""
+    not validating at all.
 
-    def test_example_config_loads_a_working_adapter(self):
-        loaded = load_adapters(os.path.join("config", "adapters.example.json"))
-        self.assertEqual(sorted(loaded), ["examplestore"])
-        adapter = get_adapter(None, loaded)
+    It also has to keep covering every `owner_source` mechanism: the written
+    documentation (docs/adapters.md) describes all three, and a reader working
+    from the example file alone should be able to find every one of them
+    there too, not just the one the config happened to ship with first.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.loaded = load_adapters(os.path.join("config", "adapters.example.json"))
+
+    def test_example_config_loads_a_working_url_segment_adapter(self):
+        adapter = get_adapter(None, self.loaded)
         self.assertEqual(adapter.name, "examplestore")
         r = {"url": "https://example.test/store/velvetcrane/copper-kettle",
              "title": "Copper Kettle"}
         self.assertEqual(adapter.owner_of(r), "velvetcrane")
+
+    def test_every_owner_source_mechanism_is_represented(self):
+        sources = {a.owner_source for a in self.loaded.values()}
+        self.assertEqual(sources, {"url_segment", "result_field", "none"},
+                         "config/adapters.example.json should carry one "
+                         "adapter per owner_source mechanism, so a reader "
+                         "working from the example alone can find all three "
+                         "documented in docs/adapters.md")
+
+    def test_the_result_field_example_reads_a_nested_studio_name(self):
+        by_source = {a.owner_source: a for a in self.loaded.values()}
+        adapter = by_source["result_field"]
+        r = {"studio": {"name": "Velvet Crane"}}
+        self.assertEqual(adapter.owner_of(r), "Velvet Crane")
+
+    def test_the_none_example_is_marked_not_catalog_resolvable(self):
+        by_source = {a.owner_source: a for a in self.loaded.values()}
+        adapter = by_source["none"]
+        self.assertFalse(adapter.catalog_resolvable)
 
 
 class Registry(unittest.TestCase):
