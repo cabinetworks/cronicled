@@ -1291,6 +1291,13 @@ class ExamineSourcesTest(unittest.TestCase):
     MORNING = candidate("Morning Ritual", "morning-ritual")
     ALPHA_MORNING = candidate("Morning Ritual", "alpha-morning-ritual")
     BETA_MORNING = candidate("Morning Ritual", "beta-morning-ritual")
+    # Two stores naming two DIFFERENT scenes, which is what makes them a
+    # conflict rather than corroboration -- the pair above name the same
+    # one. Both score 0.955 against "Morning Ritual.mp4", i.e. inside
+    # `scoring.AMBIGUITY_MARGIN` of each other, so what a refusal here
+    # rests on is the margin and not a gap in score.
+    ALPHA_DAWN = candidate("Morning Ritual Dawn", "alpha-morning-ritual-dawn")
+    BETA_DUSK = candidate("Morning Ritual Dusk", "beta-morning-ritual-dusk")
 
     def source(self, name, search, catalog_resolvable=True, owner_of=None,
               censorship=None):
@@ -1342,13 +1349,14 @@ class ExamineSourcesTest(unittest.TestCase):
     # -- two winners is a finding, decided without regard to order --------- #
 
     def test_two_non_resolvable_winners_refuse_regardless_of_order(self):
-        """Neither store can confirm ownership, so neither may be preferred
-        over the other on the strength of its own score alone -- refused,
-        and refused the SAME WAY whichever order `sources` lists them in."""
+        """Neither store can confirm ownership, and the two name DIFFERENT
+        scenes, so neither may be preferred over the other on the strength
+        of its own score alone -- refused, and refused the SAME WAY
+        whichever order `sources` lists them in."""
         forward = [
-            self.source("alpha", FakeSearch([self.ALPHA_MORNING]),
+            self.source("alpha", FakeSearch([self.ALPHA_DAWN]),
                        catalog_resolvable=False),
-            self.source("beta", FakeSearch([self.BETA_MORNING]),
+            self.source("beta", FakeSearch([self.BETA_DUSK]),
                        catalog_resolvable=False),
         ]
         backward = list(reversed(forward))
@@ -1363,14 +1371,15 @@ class ExamineSourcesTest(unittest.TestCase):
 
     def test_two_resolvable_winners_are_a_real_conflict_and_refuse(self):
         """Two stores this project trusts to confirm ownership, each
-        independently clearing the threshold for the SAME file -- the
-        "occasionally a real conflict" case named in the ticket. Refused
-        rather than picked by position, the same discipline
-        `scoring.decide` already applies within one store's own candidates."""
+        independently clearing the threshold for the SAME file with a
+        DIFFERENT scene -- the "occasionally a real conflict" case named in
+        the ticket. Refused rather than picked by position, the same
+        discipline `scoring.decide` already applies within one store's own
+        candidates."""
         forward = [
-            self.source("alpha", FakeSearch([self.ALPHA_MORNING]),
+            self.source("alpha", FakeSearch([self.ALPHA_DAWN]),
                        catalog_resolvable=True),
-            self.source("beta", FakeSearch([self.BETA_MORNING]),
+            self.source("beta", FakeSearch([self.BETA_DUSK]),
                        catalog_resolvable=True),
         ]
         backward = list(reversed(forward))
@@ -1445,6 +1454,263 @@ class ExamineSourcesTest(unittest.TestCase):
 
         self.assertNotIn("competing_store", outcome.proposal["payload"])
         self.assertEqual(outcome.proposal["payload"]["store"], "alpha")
+
+    def test_a_single_winner_carries_no_agreeing_stores_key_at_all(self):
+        """The same discipline for the key added by cross-store agreement:
+        one store answering has nobody to agree WITH, and an empty list
+        would read on the page as "corroborated by nothing" rather than as
+        "never in question". ABSENT, and the summary says nothing about it
+        either."""
+        outcome = self.examine([self.source("alpha", FakeSearch([self.MORNING]))])
+
+        self.assertNotIn("agreeing_stores", outcome.proposal["payload"])
+        self.assertNotIn("also named by", outcome.proposal["summary"])
+
+    # -- two stores naming ONE title is agreement, not ambiguity ----------- #
+
+    def test_two_stores_naming_the_same_title_propose_rather_than_refuse(self):
+        """The defect this ticket exists for. Two independent stores
+        returning the same scene at the same score is the strongest text
+        evidence this tool produces, and the cross-store margin refused
+        every one of them -- destroying, from the other side, exactly the
+        information the margin rule exists to protect.
+
+        Asserted over the WHOLE payload, not key by key: a proposal that
+        agreement now produces is one nothing was reading before, and an
+        unlisted key slipping into a payload has gone past a green suite on
+        this project already.
+        """
+        alpha_dawn = candidate("Morning Ritual Dawn", "alpha-dawn")
+        beta_dawn = candidate("Morning Ritual Dawn", "beta-dawn")
+
+        outcome = self.examine([
+            self.source("alpha", FakeSearch([alpha_dawn])),
+            self.source("beta", FakeSearch([beta_dawn])),
+        ])
+
+        self.assertIsNotNone(
+            outcome.proposal,
+            "two stores naming one scene were refused as ambiguous")
+        self.assertEqual(outcome.proposal["payload"], {
+            "path": self.PATH,
+            "creator": {"name": "Velvet Crane", "source": "folder",
+                        "competing": None, "rejected_folder": None},
+            "candidate": alpha_dawn,
+            "score": 0.955,
+            "runners_up": [],
+            "store": "alpha",
+            "agreeing_stores": ["beta"],
+        })
+        self.assertIn("also named by beta", outcome.proposal["summary"])
+
+    def test_every_agreeing_store_is_recorded_not_only_the_one_carried(self):
+        """Three stores naming one scene is a stronger finding than two,
+        and the carried store's name alone cannot express it. All of them
+        are listed, in a fixture where recording only the first, or only
+        the last, or only one of them would each look different."""
+        titles = [("alpha", "alpha-dawn"), ("beta", "beta-dawn"),
+                  ("gamma", "gamma-dawn")]
+        sources = [self.source(name, FakeSearch(
+            [candidate("Morning Ritual Dawn", slug)])) for name, slug in titles]
+
+        outcome = self.examine(sources)
+
+        payload = outcome.proposal["payload"]
+        self.assertEqual(payload["store"], "alpha")
+        self.assertEqual(payload["agreeing_stores"], ["beta", "gamma"])
+        self.assertNotIn("competing_store", payload)
+
+    def test_titles_differing_only_in_case_and_punctuation_agree(self):
+        """`cronicled.text.normalize` is this project's answer to "are
+        these the same string", and stores punctuate and capitalise their
+        own way. Raw string equality here would refuse the same scene for
+        a comma."""
+        plain = candidate("Morning Ritual Dawn", "alpha-dawn")
+        dressed = candidate("morning ritual, dawn!", "beta-dawn")
+
+        outcome = self.examine([
+            self.source("alpha", FakeSearch([plain])),
+            self.source("beta", FakeSearch([dressed])),
+        ])
+
+        self.assertIsNotNone(
+            outcome.proposal,
+            "a comma and a capital made one scene look like two")
+        self.assertEqual(outcome.proposal["payload"]["agreeing_stores"],
+                         ["beta"])
+
+    def test_a_store_that_spells_a_word_around_its_censor_still_agrees(self):
+        """Agreement is judged on the text `_judge` handed the scorer --
+        `decensor` with THIS store's own map -- not on the raw title. A
+        store that writes a word around its own censor and one that does
+        not are two spellings of one title, and the store's own map is the
+        only thing that can say so; the scorer already reads them that way.
+        """
+        plain = candidate("Morning Ritual Dawn", "alpha-dawn")
+        censored = candidate("Morning R*tual Dawn", "beta-dawn")
+
+        outcome = self.examine([
+            self.source("alpha", FakeSearch([plain])),
+            self.source("beta", FakeSearch([censored]),
+                        censorship={"ritual": ["r*tual"]}),
+        ])
+
+        self.assertIsNotNone(
+            outcome.proposal,
+            "one store's own censored spelling was read as a different scene")
+        self.assertEqual(outcome.proposal["payload"]["agreeing_stores"],
+                         ["beta"])
+
+    def test_two_agreeing_and_one_differing_is_still_an_ambiguity(self):
+        """Partial agreement is not agreement. Two of the three tied stores
+        name one scene and the third names another, so there is still a
+        real choice to make and nothing may be proposed. A rule that asked
+        whether SOME PAIR agreed, rather than whether the tied set was
+        unanimous, would propose here.
+        """
+        outcome = self.examine([
+            self.source("alpha", FakeSearch(
+                [candidate("Morning Ritual Dawn", "alpha-dawn")])),
+            self.source("beta", FakeSearch(
+                [candidate("morning ritual dawn", "beta-dawn")])),
+            self.source("gamma", FakeSearch(
+                [candidate("Morning Ritual Dusk", "gamma-dusk")])),
+        ])
+
+        self.assertIsNone(
+            outcome.proposal,
+            "two of three tied stores agreeing was taken for agreement")
+        self.assertIn("ambiguous across stores", outcome.reason)
+
+    def test_a_store_beaten_on_score_neither_agrees_nor_blocks_agreement(self):
+        """The tied set is what agreement is asked about, and it is
+        measured from the top. A store far enough below the margin has
+        already lost on score exactly as it did before this rule existed:
+        it cannot break the agreement of the two above it, and it is
+        recorded as a competing candidate rather than as an agreeing store,
+        because it named a different scene.
+        """
+        alpha_dawn = candidate("Morning Ritual Dawn", "alpha-dawn")
+        beta_dawn = candidate("Morning Ritual Dawn", "beta-dawn")
+        far_behind = candidate("Morning Rituals Reprise", "gamma-reprise")
+
+        outcome = self.examine([
+            self.source("alpha", FakeSearch([alpha_dawn])),
+            self.source("beta", FakeSearch([beta_dawn])),
+            self.source("gamma", FakeSearch([far_behind])),
+        ])
+
+        self.assertIsNotNone(
+            outcome.proposal,
+            "a store beaten on score blocked two agreeing stores above it")
+        payload = outcome.proposal["payload"]
+        self.assertEqual(payload["agreeing_stores"], ["beta"])
+        self.assertEqual(payload["competing_store"],
+                         [{"store": "gamma", "candidate": far_behind,
+                           "score": 0.577}])
+
+    def test_a_winner_exactly_the_margin_below_the_top_is_still_tied(self):
+        """The inclusive side of the margin, which decides how much of the
+        field agreement is asked about. 0.955 and 0.905 are `AMBIGUITY
+        _MARGIN` apart to the three places the scorer rounds to, so the
+        second is a store the margin cannot separate from the first -- and
+        the two name different scenes, so this refuses. A rule that
+        excluded the boundary would leave the second store merely losing
+        and propose the first outright."""
+        top = candidate("Morning Ritual Dawn", "alpha-dawn")
+        exactly_a_margin_behind = candidate("Morning Ritual Dawn Reprise",
+                                            "beta-reprise")
+
+        outcome = self.examine([
+            self.source("alpha", FakeSearch([top])),
+            self.source("beta", FakeSearch([exactly_a_margin_behind])),
+        ])
+
+        self.assertIsNone(outcome.proposal)
+        self.assertIn("ambiguous across stores", outcome.reason)
+
+    def test_a_winner_past_the_margin_has_simply_lost_on_score(self):
+        """The other side of the same boundary, one step out: 0.955 against
+        0.900 is 0.055 apart, past the margin, so the second store has lost
+        on score exactly as it did before agreement existed and the first
+        is proposed over it. Without this, a margin that quietly widened
+        would turn ordinary wins into refusals and nothing would say so."""
+        top = candidate("Morning Ritual Dawn", "alpha-dawn")
+        past_the_margin = candidate("Morning Ritual Dawn Reprise Extended",
+                                    "beta-extended")
+
+        outcome = self.examine([
+            self.source("alpha", FakeSearch([top])),
+            self.source("beta", FakeSearch([past_the_margin])),
+        ])
+
+        payload = outcome.proposal["payload"]
+        self.assertEqual(payload["candidate"], top)
+        self.assertNotIn("agreeing_stores", payload)
+        self.assertEqual(payload["competing_store"],
+                         [{"store": "beta", "candidate": past_the_margin,
+                           "score": 0.9}])
+
+    def test_a_non_resolvable_store_neither_agrees_nor_blocks_agreement(self):
+        """Step 1 still runs first, and it now guards two things rather
+        than one. A store that cannot confirm ownership is not merely
+        barred from being carried: its title is not counted towards
+        agreement (that would launder a bare title match on a store which
+        itself says a title mention proves nothing into corroboration of
+        the stores that CAN confirm), and it cannot break the agreement of
+        the stores that can either."""
+        dawn = candidate("Morning Ritual Dawn", "alpha-dawn")
+        also_dawn = candidate("Morning Ritual Dawn", "beta-dawn")
+        dusk = candidate("Morning Ritual Dusk", "gamma-dusk")
+
+        outcome = self.examine([
+            self.source("alpha", FakeSearch([dawn])),
+            self.source("beta", FakeSearch([also_dawn])),
+            self.source("gamma", FakeSearch([dusk]),
+                        catalog_resolvable=False),
+        ])
+
+        self.assertIsNotNone(
+            outcome.proposal,
+            "a store that cannot confirm ownership broke the agreement of "
+            "two that can")
+        payload = outcome.proposal["payload"]
+        self.assertEqual(payload["agreeing_stores"], ["beta"])
+        self.assertEqual(payload["competing_store"],
+                         [{"store": "gamma", "candidate": dusk,
+                           "score": 0.955}])
+
+    def test_which_agreeing_store_is_carried_ignores_source_order(self):
+        """Re-ordering a config file must not change what a proposal
+        carries. The two stores agree about the title -- the thing being
+        decided -- so which one is carried is a preference among equals,
+        settled by store NAME, the one thing about a store that cannot
+        depend on where it sits.
+
+        The fixture is deliberately not symmetric: each store's candidate
+        carries its own URL, so reversing `sources` and getting the same
+        answer is a real observation rather than a reversal of two
+        identical things.
+        """
+        kappa_dawn = candidate("Morning Ritual Dawn", "kappa-dawn")
+        delta_dawn = candidate("Morning Ritual Dawn", "delta-dawn")
+
+        def sources_in(order):
+            # Rebuilt per direction rather than reordering one pair of
+            # `Source`s, so nothing either run does to a store is carried
+            # into the other.
+            built = {"kappa": self.source("kappa", FakeSearch([kappa_dawn])),
+                     "delta": self.source("delta", FakeSearch([delta_dawn]))}
+            return [built[name] for name in order]
+
+        for order in (("kappa", "delta"), ("delta", "kappa")):
+            outcome = self.examine(sources_in(order))
+
+            payload = outcome.proposal["payload"]
+            self.assertEqual(payload["store"], "delta")
+            self.assertEqual(payload["candidate"]["url"],
+                             "https://example.invalid/clip/delta-dawn")
+            self.assertEqual(payload["agreeing_stores"], ["kappa"])
 
     # -- muting requires EVERY store to be confirmed empty ----------------- #
 
@@ -1649,9 +1915,16 @@ class PerTitleFallbackTest(unittest.TestCase):
         """Two stores each cleared the threshold and the cross-store margin
         refused between them. That is a decision about candidates already in
         hand, not a file nothing was found for, and a third population of
-        candidates cannot resolve it -- it can only add to the tie."""
-        alpha = ScriptedSearch({self.CREATOR: [self.WANTED]})
-        beta = ScriptedSearch({self.CREATOR: [self.WANTED]})
+        candidates cannot resolve it -- it can only add to the tie.
+
+        The two stores name DIFFERENT scenes, which is what makes this a
+        refusal at all: two stores naming the same one is agreement and
+        proposes (see `ExamineSourcesTest`), and this file would then never
+        have reached the fallback question."""
+        dawn = candidate("Morning Ritual Dawn", "morning-ritual-dawn")
+        dusk = candidate("Morning Ritual Dusk", "morning-ritual-dusk")
+        alpha = ScriptedSearch({self.CREATOR: [dawn]})
+        beta = ScriptedSearch({self.CREATOR: [dusk]})
 
         outcome = self.examine([self.source("alpha", alpha),
                                 self.source("beta", beta)])
