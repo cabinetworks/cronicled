@@ -1,11 +1,12 @@
 import re
 import unittest
 
+from cronicled.artist import Resolution
 from cronicled.scoring import Decision, Match, decide
 from cronicled.stash import StashError
 from cronicled.stashbox import (
     PERFORMER_SCENES, SCENES_BY_FINGERPRINT, SourceListing, StashBox,
-    listing_verdict)
+    check, listing_verdict)
 
 
 def _transport(responses):
@@ -925,6 +926,142 @@ class ListingVerdict(unittest.TestCase):
                 with self.assertRaises(TypeError):
                     listing_verdict(_listing(), _refused(),
                                     attribution_certain=bad)
+
+
+class Check(unittest.TestCase):
+    """`check` assembles the whole pipeline `listing_verdict` needs from a
+    live source: read the listing, score THIS source's own titles against
+    the file, decide, and hand the result to `listing_verdict` with the
+    resolver's own attribution-certainty signal. Every property here is
+    about that ASSEMBLY, not about `listing_verdict` itself (see
+    `ListingVerdict` above for that, already pinned by mutation): a mistake
+    here would feed the right function the wrong inputs and every one of
+    its careful branches would still be reachable, just never on the fact
+    this file actually needed.
+    """
+
+    def test_reads_the_named_performers_listing(self):
+        t = _transport([_page(1, [{"id": "s1", "title": "Nothing Close"}])])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        check(box, "pf-performer", "Morning Ritual.mp4", "Velvet Crane",
+             Resolution(name="Velvet Crane"))
+
+        body, _ = t.calls[0]
+        self.assertEqual(body["variables"]["input"]["performers"]["value"],
+                         ["pf-performer"])
+
+    def test_a_matching_title_in_the_listing_is_not_an_absence(self):
+        t = _transport([_page(1, [{"id": "s1", "title": "Morning Ritual"}])])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        verdict = check(box, "pf-performer", "Morning Ritual.mp4",
+                        "Velvet Crane", Resolution(name="Velvet Crane"))
+
+        self.assertIs(verdict.unlisted, False)
+
+    def test_a_complete_listing_with_nothing_close_is_an_absence(self):
+        t = _transport([_page(1, [{"id": "s1", "title": "A Totally Different Scene"}])])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        verdict = check(box, "pf-performer", "Morning Ritual.mp4",
+                        "Velvet Crane", Resolution(name="Velvet Crane"))
+
+        self.assertIs(verdict.unlisted, True)
+        self.assertIn("in full", verdict.reason)
+
+    def test_an_incomplete_listing_can_never_be_an_absence(self):
+        # THE property a mutation must kill: claiming completeness the read
+        # did not achieve is worse than the shrug it replaces -- there is no
+        # undo for a person's wasted afternoon.
+        t = _transport([_page(9, [{"id": "s1", "title": "A Totally Different Scene"}])])
+        box = StashBox("https://box.test", "k", transport=t)
+        # per_page/max_pages chosen so the read stops after one page with
+        # more promised than delivered -- see performer_listing's own tests
+        # for this shape.
+        verdict = check(box, "pf-performer", "Morning Ritual.mp4",
+                        "Velvet Crane", Resolution(name="Velvet Crane"),
+                        per_page=1, max_pages=1)
+
+        self.assertIsNone(verdict.unlisted)
+        self.assertIsNot(verdict.unlisted, True)
+        self.assertNotIn("in full", verdict.reason)
+
+    def test_a_contested_attribution_can_never_be_used_as_though_settled(self):
+        # THE other property a mutation must kill: enumerating the wrong
+        # performer's listing and reporting an absence answers a question
+        # about the wrong person, confidently -- worse than not answering.
+        t = _transport([_page(1, [{"id": "s1", "title": "A Totally Different Scene"}])])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        verdict = check(box, "pf-performer", "Morning Ritual.mp4",
+                        "Velvet Crane",
+                        Resolution(name="Velvet Crane", competing="Ivy Thorn"))
+
+        self.assertIsNone(verdict.unlisted)
+        self.assertIsNot(verdict.unlisted, True)
+        self.assertIn("different creators", verdict.reason)
+
+    def test_an_uncontested_attribution_is_read_as_certain(self):
+        # The permissive side of the same guard: a resolution with NO
+        # competing name must still be allowed to claim an absence, or the
+        # contested check has silently swallowed the common, unambiguous
+        # case along with the one it exists to catch.
+        t = _transport([_page(1, [{"id": "s1", "title": "A Totally Different Scene"}])])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        verdict = check(box, "pf-performer", "Morning Ritual.mp4",
+                        "Velvet Crane",
+                        Resolution(name="Velvet Crane", competing=None))
+
+        self.assertIs(verdict.unlisted, True)
+
+    def test_the_resolved_name_is_subtracted_as_artist_evidence(self):
+        # A file named after nobody but its own creator must not read as a
+        # match on the creator's name alone -- the same zero-evidence rule
+        # `cronicled.scan.examine` relies on `scoring.score`'s `artist`
+        # argument for. Without it, "Velvet Crane.mp4" would contain-match
+        # any title carrying the creator's own name.
+        t = _transport([_page(1, [{"id": "s1", "title": "Velvet Crane Diary"}])])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        verdict = check(box, "pf-performer", "Velvet Crane.mp4",
+                        "Velvet Crane", Resolution(name="Velvet Crane"))
+
+        self.assertIsNone(verdict.unlisted)
+        self.assertIsNot(verdict.unlisted, True)
+        self.assertIn("nothing to match on", verdict.reason)
+
+    def test_censorship_is_applied_to_the_listings_own_titles(self):
+        censorship = {"nightfall": ["n1ghtfall"]}
+        t = _transport([_page(1, [{"id": "s1", "title": "Kestrel N1ghtfall"}])])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        censored = check(box, "pf-performer", "Kestrel Nightfall.mp4",
+                         "Kestrel Hollow", Resolution(name="Kestrel Hollow"),
+                         censorship=censorship)
+        uncensored = check(box, "pf-performer", "Kestrel Nightfall.mp4",
+                           "Kestrel Hollow", Resolution(name="Kestrel Hollow"))
+
+        self.assertIs(censored.unlisted, False)
+        self.assertIsNot(uncensored.unlisted, False)
+
+    def test_the_threshold_argument_reaches_the_decision(self):
+        # A score that clears a low threshold but not a high one -- proof
+        # the argument actually reaches `decide` rather than a
+        # module-level default being used regardless of what was passed.
+        t = _transport([_page(1, [{"id": "s1", "title": "Morning Rituals"}])])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        lenient = check(box, "pf-performer", "Morning Ritual.mp4",
+                        "Velvet Crane", Resolution(name="Velvet Crane"),
+                        threshold=0.1)
+        strict = check(box, "pf-performer", "Morning Ritual.mp4",
+                       "Velvet Crane", Resolution(name="Velvet Crane"),
+                       threshold=0.999)
+
+        self.assertIs(lenient.unlisted, False)
+        self.assertIsNot(strict.unlisted, False)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,8 @@ Like `cronicled.stash`, every call goes through an injected transport, so the
 whole surface is testable without a network.
 """
 
+from cronicled.censorship import decensor
+from cronicled.scoring import DEFAULT_THRESHOLD, decide, score
 from cronicled.stash import DEFAULT_TIMEOUT, Stash, StashError
 
 # stash-box's own default is 25. A listing read is a whole-listing read, so it
@@ -312,6 +314,62 @@ def listing_verdict(listing, decision, *, attribution_certain=True):
         "contributors have submitted, so a file missing from it may simply "
         "never have been submitted: %s"
         % (listing.performer_id, len(listing.scenes), decision.reason)))
+
+
+def check(box, performer_id, name, folder, resolution, *,
+         threshold=DEFAULT_THRESHOLD, censorship=None, per_page=PER_PAGE,
+         max_pages=MAX_PAGES, timeout=DEFAULT_TIMEOUT):
+    """Read `performer_id`'s whole stash-box listing and say what that does
+    and does not establish about `name`/`folder`.
+
+    This is a SECOND opinion, not a re-check of whatever a site-adapter scan
+    already decided: it scores `name`/`folder` against THIS source's own
+    listing -- entries no site search ever saw -- using the exact same
+    `cronicled.scoring` rules a scan already trusts. So its `Decision` is
+    independent of, and may disagree with, whatever `cronicled.scan.examine`
+    concluded for the same file against a different candidate set -- neither
+    call is fed the other's result, and this one asks nothing about it.
+    Deliberately never "a catalogue" here or anywhere downstream of it: see
+    `SourceListing`'s own docstring for why that word is barred -- a listing
+    is what contributors happened to submit, not a performer's output, and
+    the two read very differently to whoever this is quoted to.
+
+    `resolution` is the `cronicled.artist.Resolution` that named
+    `performer_id`'s creator. Its `name` is subtracted from the evidence the
+    same way `cronicled.scan.examine` subtracts it before scoring (see
+    `scoring.score`'s `artist` argument), and its `competing` is read exactly
+    the way `listing_verdict` documents: `None` means the attribution is
+    settled, anything else means the folder and the filename named different
+    people and the listing being enumerated may not even be this file's
+    creator's.
+
+    Returns a `Verdict` -- see `listing_verdict` for the whole of what
+    `unlisted` may and may not be read to mean. Most importantly: `True`
+    says only that THIS SOURCE'S LISTING has no matching entry -- not that
+    the performer never made it, and not that the file does not exist
+    anywhere. A file missing from a listing is at least as likely to mean
+    "no contributor entered it" or "it is filed under someone else here" as
+    it is to mean "it does not exist" -- `listing_verdict`'s own reason
+    string carries that distinction into the one sentence a reviewer
+    actually reads; nothing here may repeat the claim in a shorter, less
+    careful form.
+
+    Reading a whole listing is many pages against a rate-limited public
+    service -- exactly the cost `cronicled.jobs.COST_CLASS_LIMITS["box"]`
+    exists to ration. Nothing here enforces that; it is the caller's job to
+    run this only from inside a producer registered with `cost="box"` (see
+    `cronicled.stashbox_scan.StashBoxCheckProducer`), never inline inside a
+    `scraping`-classed scan, where it would spend a second rate-limited
+    service's budget under a job the "box" limit never counts.
+    """
+    listing = box.performer_listing(performer_id, per_page=per_page,
+                                    max_pages=max_pages, timeout=timeout)
+    matches = [score(name, folder, decensor(scene.get("title") or "", censorship or {}),
+                     artist=resolution.name)
+               for scene in listing.scenes]
+    decision = decide(matches, threshold)
+    attribution_certain = resolution.competing is None
+    return listing_verdict(listing, decision, attribution_certain=attribution_certain)
 
 
 class StashBox:

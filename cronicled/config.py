@@ -91,3 +91,47 @@ def load_server(path=None, env=None):
             "provide them in %s — see config/server.example.json)"
             % (", ".join(missing), path))
     return {"url": url, "api_key": api_key}
+
+
+def default_stashbox_path(env=None):
+    return os.path.join(config_dir(env), "stashbox.json")
+
+
+def load_stashbox(path=None, env=None):
+    """{"url": ..., "api_key": ...} for a stash-box instance, or `None`.
+
+    A stash-box read is what lets a refusal say more than "nothing scored
+    well enough" (see `cronicled.stashbox`), but nothing in this project can
+    run at all without it — a fresh install, or an operator who has not set
+    one up, is a normal state, not a broken one. So this follows the SAME
+    half of the rule `load_adapters` does, not `load_server`'s: absence
+    returns `None` rather than raising, and the caller degrades to the
+    plainer refusal wording instead of failing to start or breaking a scan.
+
+    `$STASHBOX_URL`/`$STASHBOX_API_KEY` win over the file at `path` (default:
+    `stashbox.json` inside `config_dir()`). `env` defaults to `os.environ` but
+    is injectable so a test can supply one without mutating the real
+    environment.
+
+    Only `url` gates whether this is "configured" at all — a stash-box
+    instance that permits anonymous reads has no key to give it, and
+    treating a blank `api_key` as "not configured" would refuse a perfectly
+    usable, keyless endpoint. `api_key` is carried through as `None` when
+    nothing supplies it, exactly as `url` would be if this raised instead of
+    returning `None` for it.
+    """
+    if env is None:
+        env = os.environ
+    if path is None:
+        path = default_stashbox_path(env)
+
+    file_data = {}
+    if os.path.exists(path):
+        with open(path) as fh:
+            file_data = json.load(fh)
+
+    url = env.get("STASHBOX_URL") or file_data.get("url")
+    if not url:
+        return None
+    api_key = env.get("STASHBOX_API_KEY") or file_data.get("api_key")
+    return {"url": url, "api_key": api_key}

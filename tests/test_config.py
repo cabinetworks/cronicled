@@ -3,7 +3,9 @@ import os
 import tempfile
 import unittest
 
-from cronicled.config import config_dir, default_server_path, load_server
+from cronicled.config import (
+    config_dir, default_server_path, default_stashbox_path, load_server,
+    load_stashbox)
 from cronicled.adapters.registry import default_adapters_path, load_adapters
 
 
@@ -84,6 +86,65 @@ class LoadServer(unittest.TestCase):
             self.assertEqual(got["api_key"], "X")
 
 
+class LoadStashbox(unittest.TestCase):
+    """A stash-box endpoint is optional infrastructure -- a better refusal is
+    unavailable without it, nothing more -- so this follows `load_adapters`'s
+    half of the rule stated in `cronicled/config.py`'s module docstring:
+    absence returns `None`, it never raises.
+    """
+
+    def test_environment_wins_over_the_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "stashbox.json")
+            with open(p, "w") as fh:
+                json.dump({"url": "http://file.example.test", "api_key": "F"}, fh)
+            got = load_stashbox(p, env={"STASHBOX_URL": "http://env.example.test",
+                                        "STASHBOX_API_KEY": "E"})
+            self.assertEqual(got, {"url": "http://env.example.test", "api_key": "E"})
+
+    def test_falls_back_to_the_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "stashbox.json")
+            with open(p, "w") as fh:
+                json.dump({"url": "http://file.example.test", "api_key": "F"}, fh)
+            self.assertEqual(load_stashbox(p, env={}),
+                             {"url": "http://file.example.test", "api_key": "F"})
+
+    def test_a_missing_file_and_empty_env_returns_none_not_an_error(self):
+        self.assertIsNone(load_stashbox("/nonexistent/stashbox.json", env={}))
+
+    def test_finds_the_file_under_cronicled_config_dir_with_no_explicit_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "stashbox.json"), "w") as fh:
+                json.dump({"url": "http://file.example.test", "api_key": "F"}, fh)
+            env = {"CRONICLED_CONFIG_DIR": d}
+            self.assertEqual(load_stashbox(env=env)["url"], "http://file.example.test")
+
+    def test_default_path_is_built_under_config_dir(self):
+        env = {"CRONICLED_CONFIG_DIR": "/mnt/config"}
+        self.assertEqual(default_stashbox_path(env), "/mnt/config/stashbox.json")
+
+    def test_a_url_with_no_api_key_is_still_configured(self):
+        # A stash-box instance that permits anonymous reads has no key to
+        # give -- treating that as "unconfigured" would refuse a perfectly
+        # usable endpoint over a field it does not need.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "stashbox.json")
+            with open(p, "w") as fh:
+                json.dump({"url": "http://file.example.test"}, fh)
+            got = load_stashbox(p, env={})
+            self.assertEqual(got, {"url": "http://file.example.test", "api_key": None})
+
+    def test_an_api_key_with_no_url_is_not_configured(self):
+        # Only `url` gates whether this counts as configured at all -- a
+        # stray API key with nothing to point it at is not a usable endpoint.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "stashbox.json")
+            with open(p, "w") as fh:
+                json.dump({"api_key": "F"}, fh)
+            self.assertIsNone(load_stashbox(p, env={}))
+
+
 class LoadAdaptersConfigDir(unittest.TestCase):
     def test_finds_the_file_under_cronicled_config_dir_with_no_explicit_path(self):
         with tempfile.TemporaryDirectory() as d:
@@ -155,6 +216,10 @@ class MissingConfigRule(unittest.TestCase):
             loaded = load_adapters(env={"CRONICLED_CONFIG_DIR": empty})
             self.assertEqual(loaded, {})
             self.assertIsNone(loaded.default)
+
+    def test_a_missing_stashbox_config_is_legitimate_too(self):
+        with tempfile.TemporaryDirectory() as empty:
+            self.assertIsNone(load_stashbox(env={"CRONICLED_CONFIG_DIR": empty}))
 
     def test_the_two_loaders_disagree_deliberately_on_the_same_empty_dir(self):
         # one empty directory, two answers, both correct. If a future change
