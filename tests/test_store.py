@@ -482,6 +482,171 @@ class MutedSubjects(_StoreCase):
         self.assertEqual(self.store.muted_subjects(), set())
 
 
+class Unmuting(_StoreCase):
+    """Reversing `mute` — a person changing their own mind about a
+    subject's FUTURE, never a scan overruling one. `record()`/`select()`
+    are the only things that ever read the `mute` table again, and neither
+    is called by `unmute` itself.
+    """
+
+    def test_an_unmuted_subject_no_longer_blocks_a_record(self):
+        self.store.mute("scene", "1", reason="never identifiable")
+        self.store.unmute("scene", "1")
+        self._record(subject_id="1")
+        self.assertEqual(len(self.store.items()), 1)
+
+    def test_an_unmuted_subject_is_gone_from_muted_subjects(self):
+        self.store.mute("scene", "1")
+        self.store.unmute("scene", "1")
+        self.assertEqual(self.store.muted_subjects(), set())
+
+    def test_unmuting_one_subject_leaves_another_muted(self):
+        self.store.mute("scene", "1")
+        self.store.mute("scene", "2")
+        self.store.unmute("scene", "1")
+        self.assertEqual(self.store.muted_subjects(), {("scene", "2")})
+
+    def test_unmuting_a_subject_that_was_never_muted_is_not_an_error(self):
+        self.store.unmute("scene", "no-such-subject")  # must not raise
+
+    def test_an_integer_subject_id_still_unmutes_the_string_form(self):
+        self.store.mute("scene", 7)
+        self.store.unmute("scene", 7)
+        self.assertEqual(self.store.muted_subjects(), set())
+
+    def test_unmuting_does_not_clear_a_dismissal_on_the_same_fingerprint(self):
+        # HARM: the two rejections are different things and must stay apart.
+        # A subject dismissed and then separately muted (`dismiss`/`mute`
+        # are free to move a row between each other's states) must keep its
+        # dismissal after an unmute -- unmute touches the `mute` table only.
+        #
+        # Dismissed and muted PRE-EMPTIVELY -- before any `item` row exists
+        # -- deliberately: with an existing row, `record()`'s ON CONFLICT
+        # path only ever touches `last_seen_at`, never `state`, so a stale
+        # row already sitting in `state='muted'` would keep `items()` empty
+        # regardless of whether the `dismissal` table was wrongly cleared,
+        # and the test would pass for the wrong reason. Pre-emptively, the
+        # `dismissal` table is the ONLY thing that can still block the
+        # first-ever INSERT for this fingerprint.
+        payload = {"title": "Copper Kettle"}
+        fp = fingerprint("scene-matches", "scene", "1", payload)
+        self.store.dismiss(fp, reason="wrong match")
+        self.store.mute("scene", "1", reason="never identifiable")
+        self.store.unmute("scene", "1")
+        self._record(subject_id="1", payload=payload)
+        self.assertEqual(self.store.items(), [],
+                         "the dismissal must still block a re-record")
+
+
+class Mutes(_StoreCase):
+    """`mutes()` — the reason/timestamp `muted_subjects()` deliberately
+    leaves out, for showing a person what is currently muted."""
+
+    def test_reports_the_reason_and_when(self):
+        self.store.mute("scene", "1", reason="never identifiable",
+                        now="2026-07-01T00:00:00")
+        self.assertEqual(self.store.mutes(), [
+            {"subject_type": "scene", "subject_id": "1",
+             "reason": "never identifiable", "at": "2026-07-01T00:00:00"}])
+
+    def test_nothing_muted_is_an_empty_list(self):
+        self.assertEqual(self.store.mutes(), [])
+
+    def test_unmuting_removes_it_from_the_listing(self):
+        self.store.mute("scene", "1")
+        self.store.unmute("scene", "1")
+        self.assertEqual(self.store.mutes(), [])
+
+
+class Undismissing(_StoreCase):
+    def test_an_undismissed_proposal_is_visible_again(self):
+        fp = self._record()
+        self.store.dismiss(fp, reason="wrong match")
+        self.store.undismiss(fp)
+        self.assertEqual([i["fingerprint"] for i in self.store.items()], [fp])
+
+    def test_an_undismissed_proposal_no_longer_blocks_a_rerecord(self):
+        fp = self._record()
+        self.store.dismiss(fp, reason="wrong match")
+        self.store.undismiss(fp)
+        self._record()  # the producer re-records the identical proposal
+        self.assertEqual(len(self.store.items()), 1)
+        self.assertEqual(self.store.items()[0]["state"], "new")
+
+    def test_undismissing_a_fingerprint_never_dismissed_is_not_an_error(self):
+        self.store.undismiss("nosuchfingerprint")  # must not raise
+
+    def test_undismissing_does_not_clear_a_mute_on_the_same_subject(self):
+        # HARM: symmetric to `Unmuting`'s test above.
+        fp = self._record(subject_id="1")
+        self.store.mute("scene", "1", reason="never identifiable")
+        self.store.dismiss(fp, reason="wrong match")
+        self.store.undismiss(fp)
+        self.assertEqual(self.store.muted_subjects(), {("scene", "1")})
+
+    def test_undismissing_a_row_that_was_since_muted_leaves_it_muted(self):
+        # dismiss then mute moves the row to 'muted' (mute wins the second
+        # move -- see `dismiss`'s docstring). Undismiss must not drag a
+        # row that is now muted back to visible just because it passed
+        # through 'dismissed' on the way there.
+        fp = self._record(subject_id="1")
+        self.store.dismiss(fp, reason="wrong match")
+        self.store.mute("scene", "1", reason="never identifiable")
+        self.store.undismiss(fp)
+        item = next(i for i in self.store.items(state="muted")
+                   if i["fingerprint"] == fp)
+        self.assertEqual(item["state"], "muted")
+
+
+class Refusals(_StoreCase):
+    """Recording and listing a standing refusal — see the block above
+    `Store.record_refusal` for why this is keyed by subject rather than
+    reusing the `item` table's fingerprint."""
+
+    def test_records_and_lists_a_refusal(self):
+        self.store.record_refusal("scene", "1", "/library/x/clip.mp4",
+                                  "too close to call",
+                                  now="2026-07-01T00:00:00")
+        self.assertEqual(self.store.refusals(), [
+            {"subject_type": "scene", "subject_id": "1",
+             "path": "/library/x/clip.mp4", "reason": "too close to call",
+             "at": "2026-07-01T00:00:00"}])
+
+    def test_nothing_refused_is_an_empty_list(self):
+        self.assertEqual(self.store.refusals(), [])
+
+    def test_recording_it_again_replaces_rather_than_accumulates(self):
+        # HARM: reusing a fingerprint-shaped identity here -- one that
+        # changes whenever the score or runners-up do, as `item`'s does --
+        # would grow a fresh row every night the same file stays
+        # unresolved. Keyed by subject, a second refusal for the SAME
+        # subject overwrites the first rather than adding to it.
+        self.store.record_refusal("scene", "1", "/library/x/clip.mp4",
+                                  "a tie", now="2026-07-01T00:00:00")
+        self.store.record_refusal("scene", "1", "/library/x/clip.mp4",
+                                  "a closer tie", now="2026-07-02T00:00:00")
+        self.assertEqual(len(self.store.refusals()), 1)
+        self.assertEqual(self.store.refusals()[0]["reason"], "a closer tie")
+        self.assertEqual(self.store.refusals()[0]["at"], "2026-07-02T00:00:00")
+
+    def test_a_refusal_for_one_subject_does_not_touch_another(self):
+        self.store.record_refusal("scene", "1", "/a.mp4", "a tie")
+        self.store.record_refusal("scene", "2", "/b.mp4", "a tie")
+        self.assertEqual(len(self.store.refusals()), 2)
+
+    def test_a_proposal_for_the_same_subject_clears_its_refusal(self):
+        # A refusal is transient: the moment the subject actually produces a
+        # proposal, the stale "refused" verdict must not sit beside it.
+        self.store.record_refusal("scene", "1", "/library/x/clip.mp4", "a tie")
+        self._record(subject_id="1")
+        self.assertEqual(self.store.refusals(), [])
+
+    def test_a_proposal_for_a_different_subject_does_not_clear_it(self):
+        self.store.record_refusal("scene", "1", "/library/x/clip.mp4", "a tie")
+        self._record(subject_id="2")
+        self.assertEqual(len(self.store.refusals()), 1)
+
+
 class ProducerRuns(_StoreCase):
     """When each producer last ran.
 

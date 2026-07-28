@@ -42,8 +42,17 @@ class _RecordingActions:
     def undo(self, fp):
         return self._do("undo", fp, "reverted")
 
+    def undismiss(self, fp):
+        return self._do("undismiss", fp, "undismissed")
+
     def scan(self, limit):
         return self._do("scan", limit, "started")
+
+    def unmute(self, subject_type, subject_id):
+        if "unmute" in self._fail:
+            raise self._fail["unmute"]
+        self.calls.append(("unmute", subject_type, subject_id))
+        return "unmuted"
 
 
 class _Server:
@@ -95,11 +104,26 @@ class GetNeverWrites(unittest.TestCase):
             self.assertEqual(r.status, 405)
             self.assertEqual(s.actions.calls, [])
 
+    def test_a_get_to_unmute_does_not_perform_it(self):
+        # Acceptance for ticket 75: a GET must never unmute anything.
+        with _Server() as s:
+            r = s.request(
+                "GET", "/unmute?subject_type=scene&subject_id=42")
+            self.assertEqual(r.status, 405)
+            self.assertEqual(s.actions.calls, [])
+
+    def test_a_get_to_undismiss_does_not_perform_it(self):
+        with _Server() as s:
+            r = s.request("GET", "/undismiss?fp=fp-1")
+            self.assertEqual(r.status, 405)
+            self.assertEqual(s.actions.calls, [])
+
 
 class Posts(unittest.TestCase):
     def test_each_action_path_reaches_its_action(self):
         for path, name in (("/approve", "approve"), ("/dismiss", "dismiss"),
-                           ("/mute", "mute"), ("/undo", "undo")):
+                           ("/mute", "mute"), ("/undo", "undo"),
+                           ("/undismiss", "undismiss")):
             with _Server() as s:
                 r = s.request("POST", path, "fp=fp-1")
                 self.assertEqual(s.actions.calls, [(name, "fp-1")])
@@ -111,6 +135,82 @@ class Posts(unittest.TestCase):
             r = s.request("POST", "/approve", "")
             self.assertEqual(r.status, 400)
             self.assertEqual(s.actions.calls, [])
+
+
+class UnmutePost(unittest.TestCase):
+    # `/unmute` carries a different shape from the other five actions: a
+    # mute is keyed by (subject_type, subject_id), not by a proposal's
+    # fingerprint, so there is no single `fp` to post.
+
+    def test_posting_the_subject_reaches_unmute_and_redirects(self):
+        with _Server() as s:
+            r = s.request("POST", "/unmute",
+                          "subject_type=scene&subject_id=42")
+            self.assertEqual(s.actions.calls, [("unmute", "scene", "42")])
+            self.assertEqual(r.status, 303)
+
+    def test_a_post_missing_the_subject_id_is_rejected(self):
+        with _Server() as s:
+            r = s.request("POST", "/unmute", "subject_type=scene")
+            self.assertEqual(r.status, 400)
+            self.assertEqual(s.actions.calls, [])
+
+    def test_a_post_missing_the_subject_type_is_rejected(self):
+        with _Server() as s:
+            r = s.request("POST", "/unmute", "subject_id=42")
+            self.assertEqual(r.status, 400)
+            self.assertEqual(s.actions.calls, [])
+
+    def test_a_cross_site_post_is_refused_and_does_not_fire(self):
+        with _Server() as s:
+            r = s.request("POST", "/unmute",
+                          "subject_type=scene&subject_id=42",
+                          headers={"Sec-Fetch-Site": "cross-site"})
+            self.assertEqual(r.status, 403)
+            self.assertEqual(s.actions.calls, [])
+
+    def test_an_unmute_failure_is_reported_as_an_error_not_a_redirect(self):
+        with _Server(fail={"unmute": UnknownProposal(("scene", "42"))}) as s:
+            r = s.request("POST", "/unmute",
+                          "subject_type=scene&subject_id=42")
+            self.assertEqual(r.status, 400)
+            self.assertEqual(s.actions.calls, [])
+
+
+class MutedDismissedRefusedRendering(unittest.TestCase):
+    """`build_handler`'s three new callables reach the page a GET renders --
+    the plumbing between a store and the template, as opposed to how the
+    template itself renders a given row (covered in
+    tests/test_web_render.py)."""
+
+    def _get(self, **callables):
+        actions = _RecordingActions()
+        handler = build_handler(rows=lambda: [], actions=actions, **callables)
+        httpd = HTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            conn = http.client.HTTPConnection(*httpd.server_address)
+            conn.request("GET", "/")
+            return conn.getresponse().read().decode()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_the_muted_count_reaches_the_page(self):
+        html = self._get(muted=lambda: [
+            {"subject_type": "scene", "subject_id": "1",
+             "reason": "never identifiable", "at": "2026-07-01T00:00:00"}])
+        self.assertIn("Muted (1)", html)
+
+    def test_omitted_sections_default_to_empty_rather_than_erroring(self):
+        # Every existing action-path test's double for `rows`/`actions`
+        # supplies none of these three -- the page must still render, with
+        # every count at zero, not raise.
+        html = self._get()
+        self.assertIn("Muted (0)", html)
+        self.assertIn("Dismissed (0)", html)
+        self.assertIn("Refused (0)", html)
 
 
 class ScanControl(unittest.TestCase):

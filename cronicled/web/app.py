@@ -13,7 +13,8 @@ from .render import render
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8571
 
-_ACTIONS = ("approve", "dismiss", "mute", "undo", "scan")
+_ACTIONS = ("approve", "dismiss", "mute", "undo", "scan",
+           "unmute", "undismiss")
 
 # Pre-filled into the number input so a person is not left guessing a value
 # from nothing -- never read on the code path itself. A request that omits
@@ -54,13 +55,21 @@ def _origin_matches_host(origin, host_header):
     return origin[idx + len(marker):] == host_header
 
 
-def build_handler(rows, actions, scan_status=None):
+def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
+                  refused=None):
     # A separate callable rather than always reaching through `actions`:
     # every existing action-path test builds its own recording double for
     # `actions` and none of them implement `scan_status`, so defaulting it
     # here keeps GET / renderable for a double that only knows the four
     # original writes.
     _scan_status = scan_status or (lambda: None)
+    # Same reasoning, extended to the three new sections: an existing test's
+    # double for `rows`/`actions` knows nothing about muted, dismissed or
+    # refused subjects, so each defaults to reporting none rather than making
+    # every such test wire up three more callables it has no opinion about.
+    _muted = muted or (lambda: [])
+    _dismissed = dismissed or (lambda: [])
+    _refused = refused or (lambda: [])
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, status, body=b"", headers=()):
@@ -84,7 +93,9 @@ def build_handler(rows, actions, scan_status=None):
                 return
             body = render("inbox.html", rows=rows(), counts={},
                          scan=_scan_status(),
-                         scan_default_limit=DEFAULT_SCAN_LIMIT).encode()
+                         scan_default_limit=DEFAULT_SCAN_LIMIT,
+                         muted=_muted(), dismissed=_dismissed(),
+                         refused=_refused()).encode()
             self._send(200, body,
                        [("Content-Type", "text/html; charset=utf-8")])
 
@@ -173,6 +184,22 @@ def build_handler(rows, actions, scan_status=None):
                     self._send(400, str(exc).encode("utf-8"),
                                [("Content-Type", "text/plain; charset=utf-8")])
                     return
+            elif name == "unmute":
+                # Shaped differently from every other action: a mute is keyed
+                # by (subject_type, subject_id), not by a proposal's
+                # fingerprint (see `Store.mute`), so there is no single `fp`
+                # this control can carry -- it posts the pair instead.
+                subject_type = (form.get("subject_type") or [""])[0]
+                subject_id = (form.get("subject_id") or [""])[0]
+                if not subject_type or not subject_id:
+                    self._send(400, b"missing subject")
+                    return
+                try:
+                    actions.unmute(subject_type, subject_id)
+                except Exception as exc:
+                    self._send(400, str(exc).encode("utf-8"),
+                               [("Content-Type", "text/plain; charset=utf-8")])
+                    return
             else:
                 fp = (form.get("fp") or [""])[0]
                 if not fp:
@@ -193,7 +220,8 @@ def build_handler(rows, actions, scan_status=None):
     return Handler
 
 
-def serve(rows, actions, scan_status=None, host=DEFAULT_HOST, port=DEFAULT_PORT):
+def serve(rows, actions, scan_status=None, muted=None, dismissed=None,
+         refused=None, host=DEFAULT_HOST, port=DEFAULT_PORT):
     # `HTTPServer` is single-threaded: one connection wedged on a slow read
     # or a slow downstream call (a media server taking its whole configured
     # timeout to answer an Approve, say) stalls every other request -- an
@@ -236,6 +264,8 @@ def serve(rows, actions, scan_status=None, host=DEFAULT_HOST, port=DEFAULT_PORT)
               "only from this machine; `-p %d:%d` (or -P) publishes this "
               "same unauthenticated page to every network this host is on."
               % (host, DEFAULT_HOST, port, port, port, port))
-    httpd = HTTPServer((host, port), build_handler(rows, actions, scan_status))
+    httpd = HTTPServer((host, port), build_handler(
+        rows, actions, scan_status, muted=muted, dismissed=dismissed,
+        refused=refused))
     print("inbox on http://%s:%d/" % (host, port))
     httpd.serve_forever()

@@ -60,6 +60,14 @@ CREATE TABLE IF NOT EXISTS mute (
 CREATE TABLE IF NOT EXISTS producer_run (
     producer TEXT PRIMARY KEY,
     at       TEXT NOT NULL);
+
+-- A standing, transient record of "examined and refused" -- see the block
+-- above `record_refusal` for why this is its own table, keyed by subject,
+-- rather than a row in `item`.
+CREATE TABLE IF NOT EXISTS refusal (
+    subject_type TEXT NOT NULL, subject_id TEXT NOT NULL,
+    path TEXT NOT NULL, reason TEXT NOT NULL, at TEXT NOT NULL,
+    PRIMARY KEY (subject_type, subject_id));
 """
 
 # On adding to this schema, given databases already exist
@@ -268,6 +276,18 @@ class Store:
             ).fetchone()
             if dismissed or muted:
                 return fp
+            # A refusal is transient: it is true only until scoring, the
+            # catalogue, or the file itself changes enough to clear the
+            # threshold. The moment THIS subject produces a real proposal --
+            # right here -- whatever refusal was standing for it is stale, so
+            # it is cleared in the same transaction as the insert rather than
+            # left to confuse a reviewer reading the Refused section next to
+            # a proposal that already resolved it. See `record_refusal`'s
+            # docstring for why a refusal is keyed by subject at all.
+            self._conn.execute(
+                "DELETE FROM refusal WHERE subject_type = ? AND subject_id = ?",
+                (subject_type, str(subject_id)),
+            )
             self._conn.execute(
                 """
                 INSERT INTO item (fingerprint, folder, subject_type,
@@ -432,6 +452,55 @@ class Store:
             )
             self._conn.commit()
 
+    def undismiss(self, fp):
+        """Reverse `dismiss` for exactly this fingerprint — a person changing
+        their own mind, never a producer overruling them: the only caller is
+        `cronicled.web.actions.Actions.undismiss`, reached from a person's own
+        click, and `record()`'s re-run path is never the one that clears this.
+
+        Two things happen together, in the same transaction:
+
+        1. The `dismissal` row is deleted — that table is the durable block
+           `record()` checks by fingerprint, so this is what makes the
+           fingerprint eligible to be recorded again.
+        2. If (and only if) the `item` row for `fp` is currently sitting in
+           `state = 'dismissed'`, it is moved back to `'new'`. Without this,
+           the row would stay excluded from `items()`'s default view even
+           after its block was lifted — the whole point of "reversible" is
+           that the proposal comes back into the inbox, not merely that a
+           future re-record is no longer refused.
+
+        The `state = 'dismissed'` condition on the UPDATE is load-bearing,
+        not decorative: `dismiss` is free to move a `muted` row to
+        `dismissed` (see its own docstring), so a fingerprint dismissed and
+        THEN separately muted is sitting in `state = 'muted'` by the time
+        this runs. Reversing the dismissal must not silently clear that
+        separate, still-active mute — the `mute` table is untouched here,
+        and the condition stops the UPDATE from moving a muted row anywhere.
+        `unmute` below preserves the same separation in the other direction:
+        it never touches the `dismissal` table or an item's state at all.
+
+        `new` rather than whatever state preceded the dismissal, because
+        nothing here — or in `dismiss` itself — records what that was; there
+        is nothing truer to restore it to, the same gap `mute`/`unmute` have.
+
+        Calling this on a fingerprint that was never dismissed, or whose row
+        has since moved to `applied`/`failed`, is not an error: like
+        `dismiss` itself, a standing rejection may not correspond to any row
+        at all, or the row it named may have moved on since — see
+        `dismiss`'s own docstring for why an unmatched fingerprint there is
+        not a caller mistake either.
+        """
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM dismissal WHERE fingerprint = ?", (fp,))
+            self._conn.execute(
+                "UPDATE item SET state = 'new' "
+                "WHERE fingerprint = ? AND state = 'dismissed'",
+                (fp,),
+            )
+            self._conn.commit()
+
     def mute(self, subject_type, subject_id, reason=None, now=None):
         """Reject ANYTHING about a subject — for a subject that will never
         be identifiable. Outlives any single proposal.
@@ -474,6 +543,64 @@ class Store:
                  subject_type, subject_id),
             )
             self._conn.commit()
+
+    def unmute(self, subject_type, subject_id):
+        """Reverse `mute`: remove the standing block on `subject_type`/
+        `subject_id`, so a future `record()`/`select()` is free to consider
+        it again. A person changing their own mind, never a scan overruling
+        one — the only caller is `cronicled.web.actions.Actions.unmute`,
+        reached from a person's own click, never from `ScanProducer`.
+
+        Deletes the row from the `mute` table — the table `record()` and
+        `select()` actually check — and NOTHING else. In particular, any
+        `item` row(s) already sitting in `state = 'muted'` are left exactly
+        as `mute` left them: there is no snapshot of what such a row looked
+        like before it was muted (the same gap `dismiss`/`undismiss` have),
+        and this deliberately does not guess one by moving the row to `new`.
+        Symmetrically, this never touches the `dismissal` table either — see
+        `undismiss`'s docstring for the same separation held the other way.
+
+        Deliberately triggers no lookup and no scan of its own: making the
+        subject visible again is left entirely to a future scan choosing to
+        examine it and `record()` proposing it afresh, whenever a person
+        next asks for one — see `cronicled.web.actions.Actions.unmute` and
+        `cronicled.scan.select`, neither of which this method calls into.
+
+        Calling this for a subject that is not currently muted is not an
+        error, mirroring `mute`'s own tolerance of a subject with no `item`
+        row at all: "already not blocked" is an ordinary outcome here, not a
+        caller mistake to catch.
+        """
+        subject_id = str(subject_id)
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM mute WHERE subject_type = ? AND subject_id = ?",
+                (subject_type, subject_id),
+            )
+            self._conn.commit()
+
+    def mutes(self):
+        """Every standing mute, as dicts with `subject_type`, `subject_id`,
+        `reason` and `at` — the same `mute` table `muted_subjects()` reads,
+        but keeping the reason and timestamp that method deliberately leaves
+        out (it exists for the batch membership test `select()` needs, not
+        for display — see its own docstring). This is for showing a person
+        what is currently hidden from them, and a bare `(type, id)` pair
+        gives them nothing to judge.
+
+        Ordered by `at` then `subject_id`, the same tie-break `items()` uses
+        for its own listing.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT subject_type, subject_id, reason, at FROM mute "
+                "ORDER BY at, subject_id"
+            ).fetchall()
+        return [
+            {"subject_type": subject_type, "subject_id": subject_id,
+             "reason": reason, "at": at}
+            for subject_type, subject_id, reason, at in rows
+        ]
 
     _HIDDEN_STATES = ("dismissed", "muted")
 
@@ -525,6 +652,73 @@ class Store:
             rows = self._conn.execute(
                 "SELECT subject_type, subject_id FROM mute").fetchall()
         return {(subject_type, subject_id) for subject_type, subject_id in rows}
+
+    # Recording a refusal
+    # -------------------
+    # `scan.examine` returns a refusal (a tie, or nothing over the threshold)
+    # for a file that is genuinely one glance, or one threshold change, away
+    # from being resolved — see `scan.Outcome`'s docstring. Before this, that
+    # verdict was logged and thrown away, so a person had no way to see what
+    # was refused short of reading the job log.
+    #
+    # A refusal is NOT recorded in `item`. `record()`'s fingerprint hashes the
+    # payload, and a refusal's natural payload (scores, runners-up) can change
+    # between runs even when nothing about the file changed — `scan.py`
+    # already documents this exact hazard for a proposal's own payload. Reusing
+    # `item` for a refusal would mean a nightly re-examination of the same
+    # unresolved file recording a FRESH row every night rather than touching
+    # one, which is precisely the noise `record()`'s fingerprint exists to
+    # prevent for a proposal. Keyed by subject instead — the same key `mute`
+    # uses — an upsert keeps exactly one row per refused subject no matter how
+    # many nights it stays refused, so growth here is bounded by how many
+    # DISTINCT subjects a library ever refuses, the same bound the `mute`
+    # table already accepts, not by how many scans have run.
+    #
+    # A refusal is also transient in a way a mute is not: it stops being true
+    # the moment scoring, the catalogue, or the file itself changes enough to
+    # clear the threshold. `record()` clears the row for a subject the moment
+    # THAT subject produces a real proposal — see the comment there — so a
+    # resolved refusal does not linger next to the proposal that resolved it.
+
+    def record_refusal(self, subject_type, subject_id, path, reason, now=None):
+        """Upsert the standing refusal for `subject_type`/`subject_id`.
+
+        `path` and `reason` are overwritten on every call, same as `at`: only
+        the most recent examination's verdict is worth keeping, not a history
+        of every night a file stayed unresolved. `path` is carried so the
+        Refused section can name the file without a second lookup against the
+        media server at render time — see `cronicled.web.rows.to_refusal_row`.
+        """
+        subject_id = str(subject_id)
+        when = now if now is not None else _utcnow()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO refusal (subject_type, subject_id, path, "
+                "reason, at) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(subject_type, subject_id) DO UPDATE SET "
+                "path = excluded.path, reason = excluded.reason, "
+                "at = excluded.at",
+                (subject_type, subject_id, path, reason, when),
+            )
+            self._conn.commit()
+
+    def refusals(self):
+        """Every standing refusal, as dicts with `subject_type`,
+        `subject_id`, `path`, `reason` and `at`.
+
+        Ordered by `at` then `subject_id`, the same tie-break `items()` and
+        `mutes()` use for their own listings.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT subject_type, subject_id, path, reason, at "
+                "FROM refusal ORDER BY at, subject_id"
+            ).fetchall()
+        return [
+            {"subject_type": subject_type, "subject_id": subject_id,
+             "path": path, "reason": reason, "at": at}
+            for subject_type, subject_id, path, reason, at in rows
+        ]
 
     def items(self, folder=None, state=None, limit=None, offset=0):
         """Proposals in the store, as dicts with `payload` (and

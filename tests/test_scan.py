@@ -1987,6 +1987,45 @@ class ScanProducerTest(unittest.TestCase):
         self.assertTrue(any("ambiguous" in m for m in self.ctx.messages),
                         self.ctx.messages)
 
+    def test_a_refusal_is_recorded_with_its_reason_and_file(self):
+        """Not muted and not thrown away either: a refusal is the one
+        outcome a person can most often fix (rename a file, add an alias,
+        move the threshold), and it is unactionable if it is invisible."""
+        dawn = candidate("Morning Ritual Dawn", "morning-ritual-dawn")
+        dusk = candidate("Morning Ritual Dusk", "morning-ritual-dusk")
+        proposals = self.scan([scene(1, self.MORNING_PATH)],
+                              ScriptedSearch({"Velvet Crane": [dawn, dusk]}))
+
+        self.assertEqual(proposals, [])
+        refusals = self.store.refusals()
+        self.assertEqual(len(refusals), 1)
+        self.assertEqual(refusals[0]["subject_type"], SUBJECT_TYPE)
+        self.assertEqual(refusals[0]["subject_id"], "1")
+        self.assertEqual(refusals[0]["path"], self.MORNING_PATH)
+        self.assertIn("ambiguous", refusals[0]["reason"])
+
+    def test_a_later_proposal_for_the_same_file_clears_its_refusal(self):
+        """A refusal is transient -- it stops being true the moment scoring
+        clears the threshold -- so a subsequent scan that DOES propose the
+        file must not leave the stale refusal sitting in the Refused
+        section beside the proposal that resolved it.
+
+        Run through the real `JobRunner` (`run_under_the_runner`), not the
+        bare `self.scan()` helper: clearing a stale refusal happens inside
+        `Store.record()`, and only the runner ever calls that -- `produce()`
+        on its own only YIELDS a proposal, it never records one (see
+        `ScanProducer`'s own docstring for why).
+        """
+        path = "/library/Velvet Crane/Harbour Lights.mp4"
+        self.run_under_the_runner([scene(1, path)], ScriptedSearch(self.SCRIPT))
+        self.assertEqual(len(self.store.refusals()), 1)
+
+        self.run_under_the_runner([scene(1, path)], ScriptedSearch(self.SCRIPT),
+                                  threshold=0.1)
+
+        self.assertEqual(len(self.store.items()), 1)
+        self.assertEqual(self.store.refusals(), [])
+
     def test_a_malformed_scene_costs_that_file_and_no_more(self):
         """`examine` raises on a scene with no file rather than muting it. The
         producer turns that into one file's error: the batch continues, and

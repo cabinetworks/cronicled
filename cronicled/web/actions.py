@@ -12,9 +12,10 @@ from cronicled.web.rows import carries_cover
 
 
 class UnknownProposal(KeyError):
-    """No proposal with that fingerprint. Raised rather than ignored: a
-    no-op here is indistinguishable from a success, and the person is
-    watching a page that will redraw either way."""
+    """No proposal with that fingerprint — or, for `unmute`, no standing mute
+    matching the subject asked about. Raised rather than ignored: a no-op
+    here is indistinguishable from a success, and the person is watching a
+    page that will redraw either way."""
 
 
 class ApplyFailed(RuntimeError):
@@ -140,6 +141,43 @@ class Actions:
         self._store.mute(item["subject_type"], item["subject_id"],
                          reason="muted from the inbox")
         return "muted"
+
+    def undismiss(self, fp):
+        """Reverse a dismissal: the proposal named by `fp` comes back into
+        the inbox, and the standing dismissal that was blocking it is lifted.
+
+        Checked against `items(state="dismissed")`, not `_find` — `_find`
+        searches only the VISIBLE set (`items(state=None)`), which by
+        definition never contains a dismissed row, so it could never find
+        the very thing this action exists to reverse. Raising
+        `UnknownProposal` when no currently-dismissed row matches `fp` is the
+        same "a doubled click must not look like a second success" reasoning
+        `approve`/`dismiss`/`mute`/`undo` already apply to a stale
+        fingerprint.
+        """
+        match = next((item for item in self._store.items(state="dismissed")
+                     if item["fingerprint"] == fp), None)
+        if match is None:
+            raise UnknownProposal(fp)
+        self._store.undismiss(fp)
+        return "undismissed"
+
+    def unmute(self, subject_type, subject_id):
+        """Reverse a mute on `subject_type`/`subject_id`: the subject becomes
+        eligible for the NEXT scan, and nothing else. No lookup and no scan
+        happen here — `Store.unmute` only ever removes the standing block;
+        whatever a future scan finds for this subject is that scan's own
+        decision, made later, only when a person explicitly presses Scan
+        (see `scan` below and `cronicled.scan.select`).
+
+        Checked against `muted_subjects()` first and raised as
+        `UnknownProposal` when the subject is not currently muted, the same
+        "doubled click" reasoning `undismiss` applies above.
+        """
+        if (subject_type, str(subject_id)) not in self._store.muted_subjects():
+            raise UnknownProposal((subject_type, subject_id))
+        self._store.unmute(subject_type, subject_id)
+        return "unmuted"
 
     def scan(self, limit):
         """Start a library scan against the configured adapter and return

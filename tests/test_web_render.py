@@ -339,5 +339,114 @@ class ScanControlWiring(unittest.TestCase):
         self.assertEqual(len(self._FORM_RE.findall(html)), 1)
 
 
+class MutedDismissedRefusedSections(unittest.TestCase):
+    """The three collapsed sections beneath the inbox: a count visible while
+    collapsed, and exactly the control (or lack of one) each row type
+    offers -- mirroring `ButtonWiring`'s "pin the whole set" reasoning for
+    the main list's own controls.
+    """
+
+    _MUTE_FORM_RE = re.compile(
+        r'<form method="post" action="/unmute">'
+        r'<input type="hidden" name="subject_type" value="(?P<type>[^"]*)">'
+        r'<input type="hidden" name="subject_id" value="(?P<id>[^"]*)">'
+        r'<button>Unmute</button></form>')
+    _UNDISMISS_FORM_RE = re.compile(
+        r'<form method="post" action="/undismiss">'
+        r'<input type="hidden" name="fp" value="(?P<fp>[^"]*)">'
+        r'<button>Undismiss</button></form>')
+
+    def test_counts_are_embedded_in_the_page_while_every_section_stays_collapsed(self):
+        # <details> without an `open` attribute renders collapsed in a
+        # browser, but its markup -- the summary text included -- is still
+        # part of the page's own HTML. A mutation that only shows the count
+        # once a section is expanded would not appear at all in a browser's
+        # first paint, which is the failure this pins.
+        html = render("inbox.html", rows=[], counts={},
+                      muted=[{"subject_type": "scene", "subject_id": "1",
+                             "reason": "r", "at": "t"}],
+                      dismissed=[_row(state="dismissed")],
+                      refused=[{"subject_type": "scene", "subject_id": "2",
+                               "filename": "clip.mp4", "reason": "a tie",
+                               "at": "t"}])
+        self.assertIn("Muted (1)", html)
+        self.assertIn("Dismissed (1)", html)
+        self.assertIn("Refused (1)", html)
+        # None of the three is forced open -- collapsed is the default.
+        self.assertNotIn("<details class=\"section\" open", html)
+
+    def test_a_zero_count_still_shows_the_number(self):
+        html = render("inbox.html", rows=[], counts={},
+                      muted=[], dismissed=[], refused=[])
+        self.assertIn("Muted (0)", html)
+        self.assertIn("Dismissed (0)", html)
+        self.assertIn("Refused (0)", html)
+
+    def test_a_muted_subject_offers_exactly_one_unmute_control(self):
+        html = render("inbox.html", rows=[], counts={},
+                      muted=[{"subject_type": "scene", "subject_id": "7",
+                             "reason": "never identifiable", "at": "t"}],
+                      dismissed=[], refused=[])
+        self.assertEqual(self._MUTE_FORM_RE.findall(html), [("scene", "7")])
+
+    def test_two_muted_subjects_each_get_their_own_control_not_a_bulk_one(self):
+        # "No bulk actions" -- unmuting sixteen things at once is exactly
+        # what this control must never offer.
+        html = render("inbox.html", rows=[], counts={},
+                      muted=[{"subject_type": "scene", "subject_id": "1",
+                             "reason": "r", "at": "t"},
+                            {"subject_type": "scene", "subject_id": "2",
+                             "reason": "r", "at": "t"}],
+                      dismissed=[], refused=[])
+        self.assertEqual(self._MUTE_FORM_RE.findall(html),
+                         [("scene", "1"), ("scene", "2")])
+
+    def test_a_dismissed_row_offers_exactly_one_undismiss_control(self):
+        row = _row(state="dismissed")
+        html = render("inbox.html", rows=[], counts={},
+                      muted=[], dismissed=[row], refused=[])
+        self.assertEqual(self._UNDISMISS_FORM_RE.findall(html),
+                         [row.fingerprint])
+
+    def test_a_refused_row_offers_no_control_at_all(self):
+        # "the fix is outside the tool" -- no button may promise an action
+        # the tool cannot perform for a refusal.
+        html = render("inbox.html", rows=[], counts={}, muted=[], dismissed=[],
+                      refused=[{"subject_type": "scene", "subject_id": "9",
+                               "filename": "clip.mp4", "reason": "a tie",
+                               "at": "t"}])
+        section = html[html.index("Refused (1)"):html.index("<h2>Scan</h2>")]
+        self.assertNotIn("<form", section)
+        self.assertIn("clip.mp4", section)
+        self.assertIn("a tie", section)
+
+
+class NewSectionsEscaping(unittest.TestCase):
+    """The same backstop `Autoescaping` runs for a proposal row's fields,
+    aimed at the fields these three new sections add to the page."""
+
+    def test_a_muted_reason_is_escaped(self):
+        html = render("inbox.html", rows=[], counts={},
+                      muted=[{"subject_type": "scene", "subject_id": "1",
+                             "reason": _HOSTILE, "at": "t"}],
+                      dismissed=[], refused=[])
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+    def test_a_refusals_filename_and_reason_are_escaped(self):
+        html = render("inbox.html", rows=[], counts={}, muted=[], dismissed=[],
+                      refused=[{"subject_type": "scene", "subject_id": "1",
+                               "filename": _HOSTILE, "reason": _HOSTILE,
+                               "at": "t"}])
+        self.assertEqual(html.count("<script>"), 0)
+
+    def test_a_dismissed_rows_fields_are_escaped(self):
+        row = _row(state="dismissed")  # built with hostile content by default
+        html = render("inbox.html", rows=[], counts={}, muted=[],
+                      dismissed=[row], refused=[])
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+
 if __name__ == "__main__":
     unittest.main()
