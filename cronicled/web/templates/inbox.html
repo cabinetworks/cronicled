@@ -1,20 +1,119 @@
 {# cronicled/web/templates/inbox.html #}
+{#
+  One proposal is one block, not a table row.
+
+  It was a table, and the buttons sat in the last cell of a row that was then
+  followed by up to four full-width detail rows. Reading down the page, a
+  proposal's buttons appeared BELOW the previous proposal's detail lines and
+  ABOVE its own filename, so they looked like they belonged to the row
+  beneath. That was misread in use -- reported as "the top result showed a
+  button the first time and not the second" -- and on a page whose buttons
+  write to a media library, a control that appears to belong to the wrong row
+  is a hazard rather than an untidiness.
+
+  A block keeps a proposal and its controls in one bordered box, so which
+  buttons act on which file is a fact about the layout rather than something
+  to be inferred from vertical position.
+
+  What a table did better, and what is deliberately preserved: five scores
+  were comparable at a glance down an aligned column. The score here keeps a
+  fixed-width slot at a consistent position in every block, for the same
+  reason.
+
+  No JavaScript and no build step: one stylesheet, inline, short enough to
+  read in a sitting. The form markup below is unchanged from the table
+  version -- tests assert the whole set of controls a row offers, including
+  each action path, and that guarantee is worth more than tidier markup.
+#}
+<style>
+  :root {
+    color-scheme: light dark;
+    --line: #d6d6d6; --bg: #fff; --fg: #1a1a1a; --muted: #616161;
+    --warn-bg: #fff8e1; --warn-line: #c98a00; --warn-fg: #6b4a00;
+    --panel: #fafafa;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --line: #3a3a3a; --bg: #16181a; --fg: #e8e8e8; --muted: #a0a0a0;
+      --warn-bg: #2a2313; --warn-line: #b98900; --warn-fg: #f0d492;
+      --panel: #1e2124;
+    }
+  }
+  body { background: var(--bg); color: var(--fg); margin: 0 auto; padding: 1.5rem;
+         max-width: 68rem; line-height: 1.45;
+         font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  h1, h2 { font-weight: 600; letter-spacing: -0.01em; }
+  h1 { margin: 0 0 1.25rem; font-size: 1.5rem; }
+  h2 { margin: 2rem 0 0.75rem; font-size: 1.1rem; }
+
+  .proposal { border: 1px solid var(--line); border-radius: 6px;
+              margin: 0 0 0.9rem; background: var(--panel); overflow: hidden; }
+  .head { display: flex; gap: 1rem; align-items: flex-start;
+          padding: 0.8rem 0.9rem; }
+  .what { flex: 1 1 auto; min-width: 0; }
+  /* Filenames are long and arbitrary; wrapping mid-word keeps one from
+     pushing the score and the buttons off their line. */
+  .file { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+          font-size: 0.82rem; color: var(--muted);
+          overflow-wrap: anywhere; margin: 0 0 0.15rem; }
+  .title { font-size: 1.05rem; font-weight: 600; margin: 0 0 0.2rem;
+           overflow-wrap: anywhere; }
+  .meta { color: var(--muted); font-size: 0.86rem; }
+  .meta b { color: var(--fg); font-weight: 600; }
+  /* Fixed width and tabular figures so the score sits in the same place in
+     every block -- the one thing the table did better than a block would. */
+  .score { flex: 0 0 4.5rem; text-align: right; font-size: 1.15rem;
+           font-variant-numeric: tabular-nums; font-weight: 600; }
+  .acts { flex: 0 0 auto; display: flex; gap: 0.35rem; align-items: flex-start; }
+  .acts form { margin: 0; }
+  .acts button { font: inherit; font-size: 0.85rem; padding: 0.3rem 0.7rem;
+                 border: 1px solid var(--line); border-radius: 4px;
+                 background: var(--bg); color: var(--fg); cursor: pointer; }
+  .acts button:hover { border-color: var(--muted); }
+
+  /* A warning has to look unlike the runners-up beside it. Both were plain
+     text before, so the sentence that says "do not approve this" read exactly
+     like the list a reviewer can ignore. */
+  .warn { background: var(--warn-bg); color: var(--warn-fg);
+          border-top: 1px solid var(--line);
+          border-left: 3px solid var(--warn-line);
+          padding: 0.5rem 0.9rem; font-size: 0.88rem; }
+  .runners { border-top: 1px solid var(--line); color: var(--muted);
+             padding: 0.45rem 0.9rem; font-size: 0.82rem; }
+  .empty { color: var(--muted); }
+  .scan { border: 1px solid var(--line); border-radius: 6px;
+          background: var(--panel); padding: 0.9rem; }
+  .scan input { font: inherit; width: 6rem; padding: 0.25rem 0.4rem;
+                border: 1px solid var(--line); border-radius: 4px;
+                background: var(--bg); color: var(--fg); }
+  .scan button { font: inherit; padding: 0.3rem 0.9rem; border-radius: 4px;
+                 border: 1px solid var(--line); background: var(--bg);
+                 color: var(--fg); cursor: pointer; }
+  .note { color: var(--muted); font-size: 0.85rem; }
+</style>
+
 <h1>Inbox</h1>
 {% if scan and scan.state == 'running' %}
 <meta http-equiv="refresh" content="3">
 {% endif %}
 {% if not rows %}
-<p>Nothing waiting. Proposals appear here after a scan.</p>
+<p class="empty">Nothing waiting. Proposals appear here after a scan.</p>
 {% endif %}
-<table>
-  <tr><th>File</th><th>Proposed</th><th>Creator</th><th>Score</th><th></th></tr>
-  {% for row in rows %}
-  <tr{% if row.contested %} class="contested"{% endif %}>
-    <td>{{ row.filename }}</td>
-    <td>{{ row.proposed_title }}</td>
-    <td>{{ row.creator }} <small>(from the {{ row.creator_source }})</small></td>
-    <td>{{ row.score_text }}</td>
-    <td>
+
+{% for row in rows %}
+<div class="proposal">
+  <div class="head">
+    <div class="what">
+      <p class="file">{{ row.filename }}</p>
+      <p class="title">{{ row.proposed_title }}</p>
+      <div class="meta">
+        <b>{{ row.creator }}</b> (from the {{ row.creator_source }})
+        {% if row.performers %} &middot; performers: <b>{% for p in row.performers %}{{ p }}{% if not loop.last %}, {% endif %}{% endfor %}</b>{% endif %}
+        {% if row.studio %} &middot; studio: <b>{{ row.studio }}</b>{% endif %}
+      </div>
+    </div>
+    <div class="score">{{ row.score_text }}</div>
+    <div class="acts">
       {% if row.undoable %}
       <form method="post" action="/undo"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Undo</button></form>
       {% elif row.actionable %}
@@ -22,30 +121,33 @@
       <form method="post" action="/dismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Dismiss</button></form>
       <form method="post" action="/mute"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Mute</button></form>
       {% endif %}
-    </td>
-  </tr>
+    </div>
+  </div>
   {% if row.error %}
-  <tr class="warning"><td colspan="5">The last attempt to apply this failed, and nothing was written: {{ row.error }}</td></tr>
+  <div class="warn">The last attempt to apply this failed, and nothing was written: {{ row.error }}</div>
   {% endif %}
   {% if row.contested %}
-  <tr class="warning"><td colspan="5">Attribution is contested: {{ row.disagreement }}</td></tr>
+  <div class="warn">Attribution is contested: {{ row.disagreement }}</div>
   {% endif %}
   {% if row.carries_cover and row.state == 'new' %}
-  <tr class="warning"><td colspan="5">Approving this proposal writes a cover image. Undo cannot restore a scene's previous cover, so this write cannot be fully undone.</td></tr>
+  <div class="warn">Approving this proposal writes a cover image. Undo cannot restore a scene's previous cover, so this write cannot be fully undone.</div>
   {% elif row.carries_cover and row.state == 'applied' %}
-  <tr class="warning"><td colspan="5">This proposal's cover image cannot be restored by Undo, even after reverting.</td></tr>
+  <div class="warn">This proposal's cover image cannot be restored by Undo, even after reverting.</div>
   {% endif %}
   {% if row.runners_up %}
-  <tr class="runners"><td colspan="5">Also considered:
+  <div class="runners">Also considered:
     {% for r in row.runners_up %}{{ r.title }} ({{ "%.3f"|format(r.score) }}){% if not loop.last %}, {% endif %}{% endfor %}
-  </td></tr>
+  </div>
   {% endif %}
-  {% endfor %}
-</table>
+</div>
+{% endfor %}
 
 <h2>Scan</h2>
+<div class="scan">
 {% if scan %}
-<p>Scan {{ scan.id }}: {{ scan.state }} -- {{ scan.message }}</p>
-<p>recorded {{ scan.recorded }}, skipped {{ scan.skipped }}{% if scan.state == 'failed' %} -- FAILED: {{ scan.error }}{% endif %}</p>
+<p>Scan {{ scan.id }}: <b>{{ scan.state }}</b> &mdash; {{ scan.message }}</p>
+<p class="note">recorded {{ scan.recorded }}, skipped {{ scan.skipped }}{% if scan.state == 'failed' %} &mdash; FAILED: {{ scan.error }}{% endif %}</p>
 {% endif %}
-<form method="post" action="/scan"><label>Files to look at (each spends one lookup against the configured scraper, and files already proposed or muted don't count against this): <input type="number" name="limit" value="{{ scan_default_limit }}" min="0"></label> <button>Scan</button></form>
+<form method="post" action="/scan"><label>Files to look at <input type="number" name="limit" value="{{ scan_default_limit }}" min="0"></label> <button>Scan</button></form>
+<p class="note">Each file spends one lookup against the configured scraper. Files already proposed or muted don't count against this.</p>
+</div>

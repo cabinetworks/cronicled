@@ -460,6 +460,57 @@ class Stash:
 
     # -- scraping ---------------------------------------------------------- #
 
+    # The ScrapedScene selection both scraping methods below use — factored
+    # into ONE constant rather than written twice, because the two calls
+    # return the SAME type for the SAME purpose (candidate metadata a
+    # proposal may carry forward), and a selection maintained in two places
+    # can drift apart with nobody noticing: a field added to one query and
+    # not the other becomes present on a candidate the name search returns
+    # and silently absent on the same candidate scraped again by URL (or the
+    # reverse), and nothing raises either way — the field is just missing on
+    # one path. Sharing this string is what makes that drift structurally
+    # impossible instead of merely a thing to remember.
+    #
+    # Every field `apply_scene` can write onto a scene: `title`, `details`,
+    # `date`, `urls`, `code`, `director`, `studio`, `performers`, `tags` and
+    # the cover `image`. `studio`, `performers` and `tags` each carry
+    # `stored_id` alongside `name` — the server's own way of saying "this
+    # scraped entity is already one you have" — which is exactly the shape
+    # `apply_scene`'s `find_or_create` resolution takes for each of them.
+    #
+    # `url` (singular) is also selected, alongside `urls`, even though the
+    # schema marks it deprecated in favour of the plural field. That is
+    # deliberate rather than an oversight: `cronicled.adapters.declarative
+    # .DeclarativeAdapter.owner_of` — the one existing consumer of a
+    # scraped-result URL in this codebase, and the shape
+    # `config/adapters.example.json`'s own example adapter is configured
+    # with — reads a creator's name out of `result.get("url")`, singular,
+    # for every adapter configured with `owner_source: "url_segment"`.
+    # Selecting only `urls` would leave that field absent from every result
+    # either method returns, which does not raise anywhere: it reads back as
+    # an unresolved creator and the scan mutes the file, silently, for every
+    # scene either scraper path ever answers. `apply_scene` itself needs no
+    # help here — its own `urls`/`url` fallback already prefers the plural
+    # field — so `url` is selected for the adapter's sake, not the apply
+    # path's. Reconciling the adapter side to prefer `urls[0]` instead is a
+    # real option, but it belongs to whichever task wires a scraper's
+    # results through the adapter layer, not to this one.
+    #
+    # `image`, when present, is a base64 data URL. Applying it sets the
+    # scene's cover, and that half of an apply cannot be undone:
+    # `apply_scene`'s snapshot has no way to represent a scene's CURRENT
+    # cover (the server only exposes it as a URL, not as the payload an
+    # update accepts), so there is nothing to restore it from. See
+    # `apply_scene`'s docstring. That is a decision already taken, not a gap
+    # in either method here — selecting `image` is deliberate, and nothing
+    # here undoes it.
+    _SCRAPED_SCENE_SELECTION = """
+        title code details director urls url date image
+        studio{ stored_id name }
+        tags{ stored_id name }
+        performers{ stored_id name }
+    """
+
     def scrape_scenes_by_query(self, scraper_id, query):
         """Ask one configured scraper for scenes matching a free-text
         `query`, via `scrapeSingleScene`. Returns a list of scene dicts —
@@ -472,31 +523,20 @@ class Stash:
         text goes in as the input's free-text `query`, the one
         `ScrapeSingleSceneInput` field this method uses.
 
-        The selection set covers every field `apply_scene` can write onto a
-        scene: `title`, `details`, `date`, `urls`, `code`, `director`,
-        `studio`, `performers`, `tags` and the cover `image`. `studio`,
-        `performers` and `tags` each carry `stored_id` alongside `name` —
-        the server's own way of saying "this scraped entity is already one
-        you have" — which is exactly the shape `apply_scene`'s
-        `find_or_create` resolution takes for each of them.
+        The selection set is `_SCRAPED_SCENE_SELECTION`, shared with
+        `scrape_scene_url` below — see that constant's own comment for why a
+        shared string, not a separately-maintained copy, is what keeps the
+        two from returning different fields for the same object.
 
-        `url` (singular) is also selected, alongside `urls`, even though the
-        schema marks it deprecated in favour of the plural field. That is
-        deliberate rather than an oversight: `cronicled.adapters.declarative
-        .DeclarativeAdapter.owner_of` — the one existing consumer of a
-        scraped-result URL in this codebase, and the shape
-        `config/adapters.example.json`'s own example adapter is configured
-        with — reads a creator's name out of `result.get("url")`, singular,
-        for every adapter configured with `owner_source: "url_segment"`.
-        Selecting only `urls` would leave that field absent from every
-        result this method returns, which does not raise anywhere: it reads
-        back as an unresolved creator and the scan mutes the file, silently,
-        for every scene this scraper ever answers. `apply_scene` itself
-        needs no help here — its own `urls`/`url` fallback already prefers
-        the plural field — so `url` is selected for the adapter's sake, not
-        the apply path's. Reconciling the adapter side to prefer `urls[0]`
-        instead is a real option, but it belongs to whichever task wires a
-        scraper's results through the adapter layer, not to this one.
+        A name search's answers are typically much thinner than what
+        scraping the same candidate's own page later returns: this method's
+        selection set is the full shape the schema allows, but the
+        scraper's search index commonly has only a title and a URL to offer
+        for any one hit, leaving `performers`, `studio`, `date` and the rest
+        present as keys with `None`/empty values rather than absent
+        entirely. That is why a caller that wants the fuller record calls
+        `scrape_scene_url` on the winning candidate's own URL rather than
+        trusting this method's answer as final.
 
         `image`, when present, is a base64 data URL. Applying it sets the
         scene's cover, and that half of an apply cannot be undone:
@@ -509,16 +549,52 @@ class Stash:
         """
         q = """
         query($source: ScraperSourceInput!, $input: ScrapeSingleSceneInput!){
-          scrapeSingleScene(source:$source, input:$input){
-            title code details director urls url date image
-            studio{ stored_id name }
-            tags{ stored_id name }
-            performers{ stored_id name }
-          }
-        }"""
+          scrapeSingleScene(source:$source, input:$input){%s}
+        }""" % self._SCRAPED_SCENE_SELECTION
         data = self.gql(q, {"source": {"scraper_id": scraper_id},
                             "input": {"query": query}})
         return data["scrapeSingleScene"] or []
+
+    def scrape_scene_url(self, url):
+        """Scrape ONE clip page directly, via `scrapeSceneURL`, and return
+        the fuller `ScrapedScene` the page itself carries — or `None` when
+        the server has no scraper configured that matches this URL, or the
+        page it fetched had nothing to offer. `None` is a normal answer, not
+        an error: the caller (`cronicled.scan.examine`'s enrichment step)
+        already treats "nothing new to add" as leaving its thin candidate
+        exactly as it was.
+
+        Unlike `scrape_scenes_by_query`, this takes no `scraper_id`: the
+        server itself matches the URL against whichever configured scraper
+        claims it, which is the whole point of asking by URL instead of by
+        a scraper id this client would otherwise have to guess from the
+        link alone.
+
+        The selection set is `_SCRAPED_SCENE_SELECTION` — the SAME constant
+        `scrape_scenes_by_query` uses, not a second copy of the same field
+        list. That is load-bearing, not tidiness: this method exists so a
+        thin name-search result can be replaced by a fuller record of the
+        SAME object, and the caller can only do that safely if both calls
+        promise the same shape. A selection set that drifted between the
+        two — a field added here and not there, or the reverse — would make
+        `examine`'s enrichment step silently produce a candidate with a
+        DIFFERENT field surface than the thin one it replaces, depending on
+        which of the two calls happened to answer a given file.
+
+        `image`, exactly as in `scrape_scenes_by_query`, is a base64 data
+        URL when present. Applying it sets the scene's cover, and that half
+        of an apply cannot be undone: `apply_scene`'s snapshot has no way to
+        represent a scene's CURRENT cover (the server only exposes it as a
+        URL, not as the payload an update accepts), so there is nothing to
+        restore it from. Selecting `image` here is deliberate, not a gap,
+        and nothing here undoes it — see `apply_scene`'s docstring.
+        """
+        q = """
+        query($url: String!){
+          scrapeSceneURL(url:$url){%s}
+        }""" % self._SCRAPED_SCENE_SELECTION
+        data = self.gql(q, {"url": url})
+        return data.get("scrapeSceneURL")
 
     def scene_scrapers(self):
         """The configured scrapers that can scrape a scene, as a list of

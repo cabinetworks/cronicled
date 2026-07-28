@@ -328,6 +328,40 @@ class Store:
             "resolved_at": when,
         })
 
+    def mark_reverted(self, fp, now=None):
+        """Record that an applied proposal was undone.
+
+        Without this an undo left NO trace: the revert happened on the media
+        server, the row stayed `applied`, and the page went on offering an
+        Undo button. A person clicked it, it worked, the page redrew
+        identically, and the only reasonable conclusion was that it had not
+        worked. A working action that looks broken is worse than one that
+        fails loudly.
+
+        Every other decision a reviewer makes here is durable -- a dismissal
+        and a mute both survive re-recording, specifically so a later scan
+        cannot overrule a person. An undo is a decision of the same kind and
+        was the only one leaving no record. It also makes "how often is an
+        approve taken back?" answerable, which is the most direct evidence
+        available about whether the threshold is right.
+
+        `prior_state` is deliberately KEPT rather than cleared. It is the
+        snapshot that was restored, and the only record of what the scene
+        looked like before the apply; discarding it at the moment it was used
+        would throw away the audit trail for the write it just reversed.
+        Keeping it cannot re-trigger anything, because offering Undo requires
+        the `applied` state -- see `web.rows.to_row`.
+
+        A reverted row is NOT closed. The proposal is exactly as live as it
+        was before it was applied, so it can be approved again (undoing by
+        mistake is ordinary), dismissed, or muted. What it is not is
+        `applied`, and that is what stops the Undo button reappearing.
+        """
+        self._set_state(fp, {
+            "state": "reverted",
+            "resolved_at": now if now is not None else _utcnow(),
+        })
+
     def mark_failed(self, fp, error, now=None):
         """Record that applying a proposal failed, and why."""
         when = now if now is not None else _utcnow()

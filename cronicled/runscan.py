@@ -65,6 +65,14 @@ def build_producer(stash, adapter, store, *, limit, folder="library",
     a regression from today's folder-wins default, not the fix this wiring
     exists for. `catalog_resolvable` already existed to answer exactly this
     question; nothing read it before this.
+
+    `stash.scrape_scene_url` is threaded through as `enrich`, unconditionally
+    — unlike `owner_of`, this needs no adapter-level gate: it scrapes the
+    winning candidate's own URL directly, against whichever scraper the
+    media server itself matches to that URL, rather than asking a
+    per-adapter name search to identify anything. See `scan.examine`'s
+    `enrich` paragraph for what happens when a candidate has no URL to give
+    it, or when the scrape itself fails.
     """
     if limit is None:
         raise ValueError(
@@ -78,7 +86,8 @@ def build_producer(stash, adapter, store, *, limit, folder="library",
     return ScanProducer(
         stash, search, store=store, folder=folder, limit=limit,
         name_filter=name_filter, threshold=threshold, aliases=aliases,
-        workers=workers, censorship=adapter.censorship, owner_of=owner_of)
+        workers=workers, censorship=adapter.censorship, owner_of=owner_of,
+        enrich=stash.scrape_scene_url)
 
 
 def configured_adapters(env=None):

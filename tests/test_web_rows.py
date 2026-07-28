@@ -30,7 +30,9 @@ def _item(**over):
         "path": "/library/Nine Winters/nine-winters-the-lantern-room.mp4",
         "creator": {"name": "Nine Winters", "source": "folder",
                     "competing": None, "rejected_folder": None},
-        "candidate": {"id": "c-1", "title": "The Lantern Room", "image": None},
+        "candidate": {"id": "c-1", "title": "The Lantern Room", "image": None,
+                     "performers": [{"stored_id": None, "name": "Ivy Kingsley"}],
+                     "studio": {"stored_id": None, "name": "Amber Vale"}},
         "score": 0.8123,
         "runners_up": _real_runners_up([("The Lantern", 0.61)]),
     }
@@ -133,18 +135,75 @@ class CoverImage(unittest.TestCase):
     def test_a_candidate_carrying_an_image_reports_a_cover(self):
         row = to_row(_item(payload={"candidate": {
             "id": "c-1", "title": "The Lantern Room",
-            "image": "data:image/jpeg;base64,notarealcover"}}))
+            "image": "data:image/jpeg;base64,notarealcover",
+            "performers": [], "studio": None}}))
         self.assertTrue(row.carries_cover)
 
     def test_a_candidate_with_no_image_reports_no_cover(self):
         row = to_row(_item(payload={"candidate": {
-            "id": "c-1", "title": "The Lantern Room", "image": None}}))
+            "id": "c-1", "title": "The Lantern Room", "image": None,
+            "performers": [], "studio": None}}))
         self.assertFalse(row.carries_cover)
 
     def test_a_candidate_with_an_empty_image_reports_no_cover(self):
         row = to_row(_item(payload={"candidate": {
-            "id": "c-1", "title": "The Lantern Room", "image": ""}}))
+            "id": "c-1", "title": "The Lantern Room", "image": "",
+            "performers": [], "studio": None}}))
         self.assertFalse(row.carries_cover)
+
+
+class PerformersAndStudio(unittest.TestCase):
+    """What approving a proposal will actually write onto the scene -- the
+    whole reason `cronicled.scan.examine` now scrapes the winning
+    candidate's own URL rather than carrying only a title and a link.
+    """
+
+    def test_a_candidate_carrying_performers_and_a_studio_shows_both(self):
+        row = to_row(_item())
+        self.assertEqual(row.performers, ("Ivy Kingsley",))
+        self.assertEqual(row.studio, "Amber Vale")
+
+    def test_several_performers_are_kept_in_order(self):
+        row = to_row(_item(payload={"candidate": {
+            "id": "c-1", "title": "The Lantern Room", "image": None,
+            "studio": None,
+            "performers": [{"stored_id": None, "name": "Ivy Kingsley"},
+                          {"stored_id": None, "name": "Wren Ashcombe"}]}}))
+        self.assertEqual(row.performers, ("Ivy Kingsley", "Wren Ashcombe"))
+
+    def test_a_thin_unenriched_candidate_shows_neither(self):
+        # HARM this guards: a row must never show a creator or a store it
+        # did not actually get. A candidate whose enrichment never ran (or
+        # failed and was left thin -- see `cronicled.scan.examine`'s
+        # `enrich` argument) carries `performers: []` and `studio: None`
+        # exactly as a search result always has, and the row must report
+        # that honestly rather than inventing something to show.
+        row = to_row(_item(payload={"candidate": {
+            "id": "c-1", "title": "The Lantern Room", "image": None,
+            "performers": [], "studio": None}}))
+        self.assertEqual(row.performers, ())
+        self.assertIsNone(row.studio)
+
+    def test_a_candidate_missing_the_performers_key_raises(self):
+        # Same discipline as `test_a_candidate_missing_the_image_key_raises`:
+        # both scraping methods select `performers` on every candidate they
+        # return, so a real candidate always answers this key. A payload
+        # missing it entirely must not be read back as "no performers",
+        # which is indistinguishable from the ordinary case.
+        broken = _item(payload={"candidate": {
+            "id": "c-1", "title": "The Lantern Room", "image": None,
+            "studio": None}})
+        with self.assertRaises(KeyError) as cm:
+            to_row(broken)
+        self.assertEqual(cm.exception.args[0], "performers")
+
+    def test_a_candidate_missing_the_studio_key_raises(self):
+        broken = _item(payload={"candidate": {
+            "id": "c-1", "title": "The Lantern Room", "image": None,
+            "performers": []}})
+        with self.assertRaises(KeyError) as cm:
+            to_row(broken)
+        self.assertEqual(cm.exception.args[0], "studio")
 
 
 class RowRequirements(unittest.TestCase):
@@ -225,3 +284,28 @@ class FailedApplyIsNotADeadEnd(unittest.TestCase):
 
     def test_a_row_that_never_failed_carries_no_error(self):
         self.assertIsNone(to_row(_item()).error)
+
+
+class ARevertedRowStopsOfferingUndo(unittest.TestCase):
+    """The visible half of the same fault: `undoable` requires `applied`, so
+    recording the revert is what takes the button away. A reverted row is not
+    closed, though -- the proposal is as live as it was before it was applied,
+    so approving again, dismissing or muting all remain open.
+    """
+
+    def test_a_reverted_row_offers_no_undo(self):
+        row = to_row(_item(state="reverted", prior_state={"title": "was"}))
+        self.assertFalse(row.undoable)
+
+    def test_a_reverted_row_is_still_actionable(self):
+        # Undoing by mistake is ordinary. Nothing about a revert closes the
+        # decision -- only an apply does.
+        row = to_row(_item(state="reverted", prior_state={"title": "was"}))
+        self.assertTrue(row.actionable)
+
+    def test_the_snapshot_is_kept_after_a_revert(self):
+        # It is the only record of what the scene looked like before the
+        # apply. Keeping it is safe precisely because Undo needs `applied`.
+        item = _item(state="reverted", prior_state={"title": "was"})
+        self.assertTrue(item["prior_state"])
+        self.assertFalse(to_row(item).undoable)

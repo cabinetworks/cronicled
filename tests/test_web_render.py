@@ -30,7 +30,8 @@ def _row(runners_up=None, image=None, **over):
         "path": "/library/x/%s.mp4" % _HOSTILE,
         "creator": {"name": _HOSTILE, "source": "folder",
                     "competing": _HOSTILE, "rejected_folder": _HOSTILE},
-        "candidate": {"id": "c-1", "title": _HOSTILE, "image": image},
+        "candidate": {"id": "c-1", "title": _HOSTILE, "image": image,
+                     "performers": [], "studio": None},
         "score": 0.812,
         # Nested under `candidate`, matching what `scan._runners_up` actually
         # emits and what `rows.to_row` requires -- see test_web_rows.py's
@@ -233,6 +234,57 @@ class CoverWarning(unittest.TestCase):
         html = render("inbox.html", rows=[row], counts={})
         self.assertNotIn(cover, html)
         self.assertNotIn("base64", html)
+
+
+class PerformersAndStudioOnThePage(unittest.TestCase):
+    """What approving a proposal will actually write onto the scene now
+    reaches the page -- the whole point of scraping the winning candidate's
+    own URL rather than carrying only a title and a link.
+
+    Built through a dedicated item helper, not `_row`: `_row`'s own `over`
+    only ever replaces `item`'s TOP level (see its docstring), so a
+    `payload={"candidate": ...}` passed through it would drop `path`,
+    `creator` and `score` instead of overriding just the candidate.
+    """
+
+    def _item(self, candidate):
+        payload = {
+            "path": "/library/x/reel.mp4",
+            "creator": {"name": "Someone", "source": "folder",
+                       "competing": None, "rejected_folder": None},
+            "candidate": candidate,
+            "score": 0.812,
+            "runners_up": [],
+        }
+        return {"fingerprint": "fp-1", "state": "new", "summary": "s",
+                "confidence": 0.812, "payload": payload, "prior_state": None}
+
+    def _candidate(self, **over):
+        candidate = {"id": "c-1", "title": "The Lantern Room", "image": None,
+                    "performers": [{"stored_id": None, "name": "Ivy Kingsley"}],
+                    "studio": {"stored_id": None, "name": "Amber Vale"}}
+        candidate.update(over)
+        return candidate
+
+    def test_a_performer_and_a_studio_reach_the_page(self):
+        row = to_row(self._item(self._candidate()))
+        html = render("inbox.html", rows=[row], counts={})
+        self.assertIn("Ivy Kingsley", html)
+        self.assertIn("Amber Vale", html)
+
+    def test_a_thin_unenriched_candidate_shows_neither(self):
+        row = to_row(self._item(self._candidate(performers=[], studio=None)))
+        html = render("inbox.html", rows=[row], counts={})
+        self.assertNotIn("Ivy Kingsley", html)
+        self.assertNotIn("Amber Vale", html)
+
+    def test_hostile_performer_and_studio_names_are_escaped(self):
+        row = to_row(self._item(self._candidate(
+            performers=[{"stored_id": None, "name": _HOSTILE}],
+            studio={"stored_id": None, "name": _HOSTILE})))
+        html = render("inbox.html", rows=[row], counts={})
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
 
 
 class ScanStatusEscaping(unittest.TestCase):

@@ -48,6 +48,9 @@ class _FakeStore:
     def mark_failed(self, fp, error):
         self.calls.append(("failed", fp, error))
 
+    def mark_reverted(self, fp):
+        self.calls.append(("reverted", fp))
+
     def dismiss(self, fp, reason=None):
         self.calls.append(("dismissed", fp, reason))
 
@@ -221,10 +224,11 @@ class _Adapter:
 
 class _ScanStash:
     """Everything a scan wired through `Actions.scan` may touch: one read to
-    enumerate the library, and one read per query to the configured
-    scraper. `apply_scene`/`revert_scene` -- the two ways a media server is
-    actually WRITTEN to -- raise rather than quietly succeeding: a scan
-    reaching either is exactly the regression this class exists to catch."""
+    enumerate the library, one read per query to the configured scraper,
+    and one read per proposal to enrich the winning candidate's own URL.
+    `apply_scene`/`revert_scene` -- the two ways a media server is actually
+    WRITTEN to -- raise rather than quietly succeeding: a scan reaching
+    either is exactly the regression this class exists to catch."""
 
     def __init__(self, scenes=()):
         self._scenes = list(scenes)
@@ -238,6 +242,15 @@ class _ScanStash:
     def scrape_scenes_by_query(self, scraper_id, query):
         self.calls.append(("scrape_scenes_by_query", scraper_id, query))
         return []
+
+    def scrape_scene_url(self, url):
+        # Every scene this fixture set builds ends up muted (see
+        # `_library_scene`), so `examine` never picks a winner and this is
+        # never actually called; it exists only so `build_producer` can
+        # read `stash.scrape_scene_url` off this fake the same way it reads
+        # it off a real `Stash`.
+        self.calls.append(("scrape_scene_url", url))
+        return None
 
     def apply_scene(self, *args, **kwargs):
         raise AssertionError("a scan must never write to the media server")
@@ -381,3 +394,38 @@ class ScanStatus(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UndoLeavesATrace(unittest.TestCase):
+    """An undo used to change nothing in the store. The revert happened on the
+    media server, the row stayed `applied`, and the page went on offering an
+    Undo button -- so a person clicked it, it worked, the page redrew
+    identically, and the only reasonable conclusion was that it had not
+    worked. Reported exactly that way in use.
+    """
+
+    def _applied(self):
+        return _item(state="applied", prior_state={"title": "was"})
+
+    def test_a_successful_undo_is_recorded(self):
+        store, stash = _FakeStore(self._applied()), _FakeStash()
+        Actions(store, stash).undo("fp-1")
+        self.assertIn(("reverted", "fp-1"), store.calls)
+
+    def test_nothing_is_recorded_when_the_revert_fails(self):
+        # Ordering: a row claiming the write was taken back while it is still
+        # applied on the server is worse than one that says nothing.
+        class _Failing(_FakeStash):
+            def revert_scene(self, scene_id, prior):
+                raise RuntimeError("server said no")
+
+        store = _FakeStore(self._applied())
+        with self.assertRaises(RuntimeError):
+            Actions(store, _Failing()).undo("fp-1")
+        self.assertEqual(store.calls, [])
+
+    def test_nothing_is_recorded_when_there_is_no_snapshot(self):
+        store = _FakeStore(_item(state="applied", prior_state=None))
+        with self.assertRaises(ValueError):
+            Actions(store, _FakeStash()).undo("fp-1")
+        self.assertEqual(store.calls, [])
