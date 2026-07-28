@@ -21,10 +21,14 @@
       "display": "Example Store (fields)",
       "scraper_id": "ExampleStoreFields",
       "owner_source": "result_field",
-      "owner_field": ["studio", "name"],
+      "owner_field": [
+        "studio",
+        "name"
+      ],
       "catalog_resolvable": true,
       "censorship": {},
-      "aliases": {}
+      "aliases": {},
+      "title_match_counts_as_ownership": true
     },
     {
       "name": "examplestore-uncataloged",
@@ -33,7 +37,8 @@
       "owner_source": "none",
       "catalog_resolvable": false,
       "censorship": {},
-      "aliases": {}
+      "aliases": {},
+      "title_match_counts_as_ownership": false
     }
   ]
 }
