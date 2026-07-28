@@ -177,13 +177,41 @@ def _view_score(view_raw, title_norm, title_tokens):
     return 0.7 * recall + 0.3 * similarity
 
 
+def _folder_adds_evidence(folder, artist):
+    """Whether the folder has anything to say beyond the artist's own name.
+
+    `_evidence` already treats the artist's name as no evidence at all --
+    every file of theirs carries it, so it distinguishes none of them from
+    each other -- and subtracts it before counting tokens. The folder view
+    scored below is a raw string and was not put through that subtraction,
+    so a folder that names only the artist (a "Velvet Crane" folder holding
+    that artist's clips) scored itself against any candidate title that
+    happens to mention the artist, identically for every file the folder
+    holds: the same view, the same title, the same arithmetic, every time.
+
+    This only answers yes/no; it does not reweight or trim the view itself.
+    A folder that adds a real collection name, a year, or a series still has
+    a token left after the same subtraction, and when it does the raw
+    string is scored exactly as before -- untouched, at full strength. Only
+    a folder that reduces to nothing but the artist's name loses its turn.
+    """
+    folder_tokens = set(tokens(clean_folder(folder)))
+    if not folder_tokens:
+        return False
+    if not artist:
+        return True
+    return bool(folder_tokens - set(tokens(artist)))
+
+
 def score(name, folder, title, artist=None):
     stripped_name = strip_ext(name)
     cleaned_folder = clean_folder(folder)
     title_norm = normalize(title)
     title_tokens = tokens(title)
 
-    views = [stripped_name, cleaned_folder]
+    views = [stripped_name]
+    if _folder_adds_evidence(folder, artist):
+        views.append(cleaned_folder)
     prefix_stripped = _without_series_prefix(stripped_name)
     if prefix_stripped is not None:
         views.append(prefix_stripped)

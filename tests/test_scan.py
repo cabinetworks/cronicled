@@ -678,13 +678,13 @@ class ExamineTest(unittest.TestCase):
         that names only the candidate cannot be judged without opening the
         payload."""
         outcome, _ = self.run_examine(
-            "/library/Velvet Crane/Harbour Lights.mp4",
+            "/library/Velvet Crane/Some Evening Bit.mp4",
             results=[self.MORNING, self.EVENING], threshold=0.1)
 
         self.assertEqual(
             outcome.proposal["summary"],
-            'Harbour Lights.mp4 -> "Evening Errand" by Velvet Crane '
-            '(score 0.138)')
+            'Some Evening Bit.mp4 -> "Evening Errand" by Velvet Crane '
+            '(score 0.393)')
 
     def test_the_runners_up_are_the_highest_scoring_losers_in_order(self):
         """Ordered by score and capped, so the payload stays reviewable and
@@ -716,17 +716,17 @@ class ExamineTest(unittest.TestCase):
         inbox that refills with work already reviewed, which is the harm
         `_runners_up` says it exists to prevent.
         """
-        tied = [candidate("Lantern Copper", "lantern-copper"),
-                candidate("Harbour Errand", "harbour-errand"),
-                candidate("Copper Saffron", "copper-saffron")]
+        tied = [candidate("Meadow Hollow", "meadow-hollow"),
+                candidate("Linden Poplar", "linden-poplar"),
+                candidate("Cobalt Quarry", "cobalt-quarry")]
         outcome, _ = self.run_examine(
             "/library/Velvet Crane/Morning Ritual.mp4",
             results=[self.MORNING] + tied)
 
         self.assertEqual(outcome.proposal["payload"]["runners_up"], [
-            {"candidate": tied[2], "score": 0.092},
-            {"candidate": tied[1], "score": 0.092},
-            {"candidate": tied[0], "score": 0.092},
+            {"candidate": tied[2], "score": 0.089},
+            {"candidate": tied[1], "score": 0.089},
+            {"candidate": tied[0], "score": 0.089},
         ])
 
     # -- the resolver's disagreement, which currently goes nowhere -------- #
@@ -842,12 +842,12 @@ class ExamineTest(unittest.TestCase):
         makes — so this is a refusal, not a verdict that the file can never
         be identified."""
         outcome, _ = self.run_examine(
-            "/library/Velvet Crane/Harbour Lights.mp4",
+            "/library/Velvet Crane/Some Evening Bit.mp4",
             results=[self.MORNING, self.EVENING])
 
         self.assertEqual(outcome, Outcome(
             proposal=None, mute_reason=None, error=None,
-            reason="nothing above the threshold (0.50); best score was 0.138"))
+            reason="nothing above the threshold (0.50); best score was 0.393"))
 
     def test_a_score_resting_on_one_generic_word_yields_no_proposal_and_no_mute(self):
         """The third of `decide`'s refusals to reach here, and the same
@@ -922,7 +922,7 @@ class ExamineTest(unittest.TestCase):
     def test_the_threshold_reaches_the_decision(self):
         """The same file, refused at one threshold and proposed at another —
         so a hard-coded threshold cannot pass both halves."""
-        path = "/library/Velvet Crane/Harbour Lights.mp4"
+        path = "/library/Velvet Crane/Some Evening Bit.mp4"
         results = [self.MORNING, self.EVENING]
 
         refused, _ = self.run_examine(path, results=results, threshold=0.5)
@@ -2374,7 +2374,7 @@ class ScanProducerTest(unittest.TestCase):
         on its own only YIELDS a proposal, it never records one (see
         `ScanProducer`'s own docstring for why).
         """
-        path = "/library/Velvet Crane/Harbour Lights.mp4"
+        path = "/library/Velvet Crane/Some Evening Bit.mp4"
         self.run_under_the_runner([scene(1, path)], ScriptedSearch(self.SCRIPT))
         self.assertEqual(len(self.store.refusals()), 1)
 
@@ -2449,7 +2449,7 @@ class ScanProducerTest(unittest.TestCase):
     def test_the_threshold_reaches_the_decision(self):
         """The same file, refused at one threshold and proposed at another, so
         a hard-coded threshold cannot pass both halves."""
-        path = "/library/Velvet Crane/Harbour Lights.mp4"
+        path = "/library/Velvet Crane/Some Evening Bit.mp4"
 
         refused = self.scan([scene(1, path)], ScriptedSearch(self.SCRIPT))
         proposed = self.scan([scene(1, path)], ScriptedSearch(self.SCRIPT),
