@@ -31,14 +31,31 @@ DEFAULT_TIMEOUT = 180
 
 class StashError(Exception):
     """A failed media-server call. `transient` marks the retryable kind —
-    transport trouble, a wedged host, a 5xx — as opposed to the server
-    rejecting the request itself (a GraphQL error, a 4xx). Callers use the
-    split to decide whether a failure is worth retrying or is a permanent no
-    for this input."""
+    transport trouble, a wedged host, a 5xx, a 429 or a 408 — as opposed to
+    the server rejecting the request itself (a GraphQL error, any other
+    4xx). Callers use the split to decide whether a failure is worth
+    retrying or is a permanent no for this input."""
 
     def __init__(self, message, transient=False):
         Exception.__init__(self, message)
         self.transient = transient
+
+
+# HTTP statuses that mean "come back later" rather than "this request is
+# wrong", even though they are nominally 4xx. 429 Too Many Requests is
+# explicitly a request the server would accept on a second try, just not
+# this one; 408 Request Timeout is the server giving up on a slow client
+# rather than judging what it asked. Both belong with the 5xx family
+# (`e.code >= 500`) below, not with the "will refuse it again" 4xx default.
+#
+# Getting this wrong in the direction of "permanent" is the quiet failure:
+# `apply_scene` drops the performer/studio, marks the scene organized, and
+# nothing ever revisits it, because the scene looks finished. Getting it
+# wrong the other way — retrying forever against a server that is asking
+# for a slower pace — is real too, but nothing here retries yet (see
+# `cronicled.jobs`), so the only question this module answers is the
+# classification, not the retry loop.
+RETRYABLE_STATUSES = frozenset({408, 429})
 
 
 # urlopen(timeout=) bounds socket ops but NOT name resolution — resolving a
@@ -76,10 +93,12 @@ class Stash:
                 return json.loads(resp.read().decode())
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:300]
-            # 5xx is the server having a bad time (worth retrying); 4xx is the
-            # server refusing this request and will refuse it again.
+            # 5xx is the server having a bad time (worth retrying); 429 and
+            # 408 are worth retrying for the same reason despite the 4xx
+            # number (see RETRYABLE_STATUSES); every other 4xx is the server
+            # refusing this request and will refuse it again.
             raise StashError("HTTP %s from the media server: %s" % (e.code, detail),
-                             transient=e.code >= 500)
+                             transient=e.code >= 500 or e.code in RETRYABLE_STATUSES)
         except urllib.error.URLError as e:
             raise StashError("cannot reach the media server at %s: %s" % (self.url, e),
                              transient=True)

@@ -194,6 +194,36 @@ class ErrorClassification(unittest.TestCase):
                                  "HTTP %s is the server refusing this request "
                                  "and will refuse it again" % code)
 
+    def test_a_429_is_retryable(self):
+        # HARM: condemning a 429 drops the performer/studio from the apply
+        # and marks the scene organized even though the server only asked to
+        # come back later and would accept the identical request a moment
+        # after — a rejection this project has not actually observed yet
+        # (the ticket that added this test is explicit about that), but one
+        # whose quiet failure mode is worth guarding regardless.
+        err = self._failure_from(_raising_urlopen(_http_error(429)))
+        self.assertTrue(err.transient,
+                        "HTTP 429 means try again, not never")
+
+    def test_a_408_is_retryable(self):
+        # HARM: a request timeout is the server giving up on a slow
+        # round-trip, not a judgement on what was asked; condemning it is the
+        # same quiet metadata loss a misclassified 429 causes.
+        err = self._failure_from(_raising_urlopen(_http_error(408)))
+        self.assertTrue(err.transient,
+                        "HTTP 408 is a timeout, worth retrying")
+
+    def test_a_4xx_other_than_429_and_408_stays_permanent(self):
+        # HARM: widening the retryable carve-out by accident would let a
+        # genuinely-refused name spin forever, which is the failure the
+        # existing 4xx-is-permanent rule exists to prevent.
+        for code in (400, 401, 404, 422):
+            with self.subTest(code=code):
+                err = self._failure_from(_raising_urlopen(_http_error(code)))
+                self.assertFalse(err.transient,
+                                 "HTTP %s must stay permanent even though "
+                                 "429 and 408 are now carved out" % code)
+
     def test_the_boundary_between_the_two_families_is_499_500(self):
         # HARM: an off-by-one here silently reclassifies a whole family in one
         # direction or the other — every 5xx condemned, or every 4xx retried
