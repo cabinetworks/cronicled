@@ -129,7 +129,7 @@ class ButtonWiring(unittest.TestCase):
     sampled one at a time, so a control silently gaining, losing, or being
     repointed to the wrong path is caught.
 
-    Two mutations matter enough to name explicitly:
+    Three mutations matter enough to name explicitly:
       - the Undo button's `action` swapped from "/undo" to "/approve": the
         one control whose entire job is reversing a write would instead
         repeat it.
@@ -137,6 +137,11 @@ class ButtonWiring(unittest.TestCase):
         Undo would then be offered on exactly the rows where
         `Stash.revert_scene` raises (no snapshot), and withheld on exactly
         the rows where it would work.
+      - Refresh's form gated behind `row.actionable` (or dropped from one of
+        the two branches above) instead of standing outside both: an applied
+        row with no snapshot is precisely the row ticket 86 needs a way off
+        the block it would otherwise leave forever, and it is exactly the row
+        neither branch above ever renders.
 
     The previous fixture here hardcoded `state="new"`/`prior_state=None`, so
     the Undo branch was never reached by any render -- these build both an
@@ -156,29 +161,35 @@ class ButtonWiring(unittest.TestCase):
         return [(m.group("action"), m.group("label"), m.group("fp"))
                 for m in self._FORM_RE.finditer(html)]
 
-    def test_a_new_undecided_row_offers_exactly_approve_dismiss_mute(self):
+    def test_a_new_undecided_row_offers_exactly_approve_dismiss_mute_refresh(self):
         row = _row(state="new", prior_state=None)
         self.assertFalse(row.undoable)
         self.assertEqual(
             self._controls(row),
             [("/approve", "Approve", row.fingerprint),
              ("/dismiss", "Dismiss", row.fingerprint),
-             ("/mute", "Mute", row.fingerprint)])
+             ("/mute", "Mute", row.fingerprint),
+             ("/refresh", "Refresh", row.fingerprint)])
 
-    def test_an_applied_row_with_a_snapshot_offers_exactly_undo(self):
+    def test_an_applied_row_with_a_snapshot_offers_undo_and_refresh(self):
         row = _row(state="applied", prior_state={"title": "old"})
         self.assertTrue(row.undoable)
         self.assertEqual(self._controls(row),
-                         [("/undo", "Undo", row.fingerprint)])
+                         [("/undo", "Undo", row.fingerprint),
+                          ("/refresh", "Refresh", row.fingerprint)])
 
-    def test_an_applied_row_without_a_snapshot_offers_no_control_at_all(self):
+    def test_an_applied_row_without_a_snapshot_offers_only_refresh(self):
         # undoable is False (nothing to revert to) and state is not "new",
-        # so neither template branch fires. Exactly what revert_scene's own
-        # refusal on an empty snapshot demands: no button may promise an
-        # undo the code cannot perform.
+        # so neither of the first two template branches fires. Exactly what
+        # revert_scene's own refusal on an empty snapshot demands: no button
+        # may promise an undo the code cannot perform -- but this is exactly
+        # the row ticket 86 is about, so it must not be a dead end either:
+        # Refresh is the one control offered unconditionally, whatever a
+        # row's own state (see the comment above the button in inbox.html).
         row = _row(state="applied", prior_state=None)
         self.assertFalse(row.undoable)
-        self.assertEqual(self._controls(row), [])
+        self.assertEqual(self._controls(row),
+                         [("/refresh", "Refresh", row.fingerprint)])
 
 
 class CoverWarning(unittest.TestCase):
@@ -340,7 +351,7 @@ class ScanControlWiring(unittest.TestCase):
 
 
 class MutedDismissedRefusedSections(unittest.TestCase):
-    """The three collapsed sections beneath the inbox: a count visible while
+    """The four collapsed sections beneath the inbox: a count visible while
     collapsed, and exactly the control (or lack of one) each row type
     offers -- mirroring `ButtonWiring`'s "pin the whole set" reasoning for
     the main list's own controls.
@@ -368,19 +379,22 @@ class MutedDismissedRefusedSections(unittest.TestCase):
                       dismissed=[_row(state="dismissed")],
                       refused=[{"subject_type": "scene", "subject_id": "2",
                                "filename": "clip.mp4", "reason": "a tie",
-                               "at": "t"}])
+                               "at": "t"}],
+                      superseded=[_row(state="superseded")])
         self.assertIn("Muted (1)", html)
         self.assertIn("Dismissed (1)", html)
         self.assertIn("Refused (1)", html)
-        # None of the three is forced open -- collapsed is the default.
+        self.assertIn("Superseded (1)", html)
+        # None of the four is forced open -- collapsed is the default.
         self.assertNotIn("<details class=\"section\" open", html)
 
     def test_a_zero_count_still_shows_the_number(self):
         html = render("inbox.html", rows=[], counts={},
-                      muted=[], dismissed=[], refused=[])
+                      muted=[], dismissed=[], refused=[], superseded=[])
         self.assertIn("Muted (0)", html)
         self.assertIn("Dismissed (0)", html)
         self.assertIn("Refused (0)", html)
+        self.assertIn("Superseded (0)", html)
 
     def test_a_muted_subject_offers_exactly_one_unmute_control(self):
         html = render("inbox.html", rows=[], counts={},
@@ -420,16 +434,35 @@ class MutedDismissedRefusedSections(unittest.TestCase):
         self.assertIn("clip.mp4", section)
         self.assertIn("a tie", section)
 
+    def test_a_superseded_row_offers_no_control_at_all(self):
+        # Superseding is a one-way retirement -- there is no "un-supersede"
+        # the way there is an Undismiss or an Unmute, because a fresh scan
+        # (not a click here) is what is supposed to replace this row. No
+        # button may promise an action the tool does not offer.
+        row = _row(state="superseded")
+        html = render("inbox.html", rows=[], counts={}, muted=[], dismissed=[],
+                      refused=[], superseded=[row])
+        section = html[html.index("Superseded (1)"):html.index("Refused (")]
+        self.assertNotIn("<form", section)
+        self.assertIn(row.score_text, section)
+
 
 class NewSectionsEscaping(unittest.TestCase):
     """The same backstop `Autoescaping` runs for a proposal row's fields,
-    aimed at the fields these three new sections add to the page."""
+    aimed at the fields these four new sections add to the page."""
 
     def test_a_muted_reason_is_escaped(self):
         html = render("inbox.html", rows=[], counts={},
                       muted=[{"subject_type": "scene", "subject_id": "1",
                              "reason": _HOSTILE, "at": "t"}],
                       dismissed=[], refused=[])
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+    def test_a_superseded_rows_fields_are_escaped(self):
+        row = _row(state="superseded")  # built with hostile content by default
+        html = render("inbox.html", rows=[], counts={}, muted=[],
+                      dismissed=[], refused=[], superseded=[row])
         self.assertNotIn("<script>", html)
         self.assertIn("&lt;script&gt;", html)
 

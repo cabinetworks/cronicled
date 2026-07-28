@@ -87,6 +87,29 @@ def _subjects(rows):
             if row["subject_type"] == SUBJECT_TYPE}
 
 
+# A file whose subject already has a proposal is dropped here (see the
+# `already_proposed` narrowing below) BEFORE this module ever examines it
+# again -- deliberately, since re-examining it would spend a rate-limited
+# lookup on a file a person has already been shown. That is also what makes a
+# proposal from an older, thinner version of this tool permanent: nothing
+# scans past it on its own, which is the whole reason `Store.supersede`
+# exists as an explicit, per-row action instead.
+#
+# A tempting complement is a MARKER on the payload itself -- something
+# recording the shape (schema, producer version) that produced it, so a
+# scan could one day notice "this payload predates the current shape" and
+# offer to refresh it automatically. Deliberately not done here. Nothing in
+# this module would read such a marker without ALSO re-examining an
+# already-proposed file to make use of it, and that re-examination is exactly
+# the cost this narrowing exists to ration -- one lookup per file per run,
+# spent on files a person has already been shown. A marker with no reader is
+# not a smaller first step toward that; it is a field every future producer
+# has to keep populating, and a change to what it means later would be
+# exactly the kind of interpretation `store.py`'s module docstring already
+# warns a payload must stay opaque to. If an automatic staleness check is
+# ever built, it will need its own budget (its own cost class, its own
+# cadence) independent of this one -- at which point stamping a marker
+# becomes worth its cost, because something would finally read it.
 def select(scenes, *, store, folder, name_filter=None, limit=None):
     """The files a scan should work, and why the others were dropped.
 
@@ -142,6 +165,18 @@ def select(scenes, *, store, folder, name_filter=None, limit=None):
     one proposal, not the subject — a better proposal for the same file is
     allowed to arrive tomorrow, and it cannot if the file is never looked at.
     Muting is the mechanism for "stop offering me this file".
+
+    A SUPERSEDED proposal does not suppress its file either, and that is what
+    lets a person explicitly retire a stale proposal and have its file looked
+    at again — the one path a dismissal deliberately does not offer for an
+    `applied` or `failed` row (see `Store.supersede`'s docstring). The check
+    is against `store.superseded_fingerprints()` directly, by fingerprint,
+    rather than against `item.state`: an `applied` or `failed` row's own
+    `state` is left untouched by `supersede` on purpose (its `resolved_at`
+    records a real write, or a real attempt, and when), so `state` alone
+    could never tell this apart from an ordinary still-blocking proposal.
+    The `supersede` table is the only place that distinction is recorded, so
+    it is the only place this can read it from.
     """
     if limit is not None and limit < 0:
         # `scenes[:-1]` would quietly drop the LAST file rather than select
@@ -152,7 +187,9 @@ def select(scenes, *, store, folder, name_filter=None, limit=None):
     pattern = (name_filter or "").casefold()
     muted = {subject_id for subject_type, subject_id in store.muted_subjects()
              if subject_type == SUBJECT_TYPE}
-    proposed = _subjects(store.items(folder=folder))
+    superseded = store.superseded_fingerprints()
+    proposed = _subjects(item for item in store.items(folder=folder)
+                         if item["fingerprint"] not in superseded)
 
     narrowed = []
     filtered_out = muted_count = already_proposed = 0

@@ -99,6 +99,7 @@ def main(argv=None):
           muted=store.mutes,
           dismissed=lambda: to_rows(store.items(state="dismissed")),
           refused=lambda: to_refusal_rows(store.refusals()),
+          superseded=lambda: to_rows(store.items(state="superseded")),
           actions=actions, scan_status=actions.scan_status,
           host=args.host, port=args.port)
 

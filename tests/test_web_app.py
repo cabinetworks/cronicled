@@ -45,6 +45,9 @@ class _RecordingActions:
     def undismiss(self, fp):
         return self._do("undismiss", fp, "undismissed")
 
+    def refresh(self, fp):
+        return self._do("refresh", fp, "refreshed")
+
     def scan(self, limit):
         return self._do("scan", limit, "started")
 
@@ -118,12 +121,20 @@ class GetNeverWrites(unittest.TestCase):
             self.assertEqual(r.status, 405)
             self.assertEqual(s.actions.calls, [])
 
+    def test_a_get_to_refresh_does_not_perform_it(self):
+        # Acceptance for ticket 86: a GET must never supersede anything.
+        with _Server() as s:
+            r = s.request("GET", "/refresh?fp=fp-1")
+            self.assertEqual(r.status, 405)
+            self.assertEqual(s.actions.calls, [])
+
 
 class Posts(unittest.TestCase):
     def test_each_action_path_reaches_its_action(self):
         for path, name in (("/approve", "approve"), ("/dismiss", "dismiss"),
                            ("/mute", "mute"), ("/undo", "undo"),
-                           ("/undismiss", "undismiss")):
+                           ("/undismiss", "undismiss"),
+                           ("/refresh", "refresh")):
             with _Server() as s:
                 r = s.request("POST", path, "fp=fp-1")
                 self.assertEqual(s.actions.calls, [(name, "fp-1")])
@@ -178,7 +189,7 @@ class UnmutePost(unittest.TestCase):
 
 
 class MutedDismissedRefusedRendering(unittest.TestCase):
-    """`build_handler`'s three new callables reach the page a GET renders --
+    """`build_handler`'s four new callables reach the page a GET renders --
     the plumbing between a store and the template, as opposed to how the
     template itself renders a given row (covered in
     tests/test_web_render.py)."""
@@ -203,14 +214,22 @@ class MutedDismissedRefusedRendering(unittest.TestCase):
              "reason": "never identifiable", "at": "2026-07-01T00:00:00"}])
         self.assertIn("Muted (1)", html)
 
+    def test_the_superseded_count_reaches_the_page(self):
+        html = self._get(superseded=lambda: [
+            {"fingerprint": "fp-1", "state": "superseded",
+             "filename": "clip.mp4", "proposed_title": "T", "creator": "N",
+             "creator_source": "folder", "score_text": "0.900"}])
+        self.assertIn("Superseded (1)", html)
+
     def test_omitted_sections_default_to_empty_rather_than_erroring(self):
         # Every existing action-path test's double for `rows`/`actions`
-        # supplies none of these three -- the page must still render, with
+        # supplies none of these four -- the page must still render, with
         # every count at zero, not raise.
         html = self._get()
         self.assertIn("Muted (0)", html)
         self.assertIn("Dismissed (0)", html)
         self.assertIn("Refused (0)", html)
+        self.assertIn("Superseded (0)", html)
 
 
 class ScanControl(unittest.TestCase):
@@ -323,6 +342,16 @@ class CrossOriginWrites(unittest.TestCase):
             self.assertEqual(r.status, 303)
             self.assertEqual(s.actions.calls, [("approve", "fp-1")])
 
+    def test_a_cross_site_refresh_is_refused_and_does_not_fire(self):
+        # Refresh writes to the store (see `Store.supersede`) exactly like
+        # the other fingerprint-keyed actions above, and must refuse a
+        # cross-origin request on the same terms.
+        with _Server() as s:
+            r = s.request("POST", "/refresh", "fp=fp-1",
+                          headers={"Sec-Fetch-Site": "cross-site"})
+            self.assertEqual(r.status, 403)
+            self.assertEqual(s.actions.calls, [])
+
 
 class ExceptionBranch(unittest.TestCase):
     # `Actions.dismiss`/`mute`/`undo` raise `UnknownProposal` for a
@@ -343,6 +372,12 @@ class ExceptionBranch(unittest.TestCase):
                            ApplyFailed("could not apply: a fixture failure")}
                      ) as s:
             r = s.request("POST", "/approve", "fp=fp-1")
+            self.assertEqual(r.status, 400)
+            self.assertEqual(s.actions.calls, [])
+
+    def test_an_unknown_fingerprint_refresh_is_reported_as_an_error_not_a_redirect(self):
+        with _Server(fail={"refresh": UnknownProposal("fp-1")}) as s:
+            r = s.request("POST", "/refresh", "fp=fp-1")
             self.assertEqual(r.status, 400)
             self.assertEqual(s.actions.calls, [])
 

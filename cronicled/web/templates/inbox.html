@@ -136,6 +136,14 @@
       <form method="post" action="/dismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Dismiss</button></form>
       <form method="post" action="/mute"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Mute</button></form>
       {% endif %}
+      {# Offered on every row here, whatever its own state: staleness is a
+         property of WHEN a proposal was made, which nothing here can detect
+         (see the note above cronicled.scan.select for why), so this is never
+         gated on `actionable`/`undoable` the way the three buttons above
+         are -- an applied row with no snapshot, which otherwise offers no
+         control at all, still needs a way off the block it would otherwise
+         leave forever. #}
+      <form method="post" action="/refresh"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Refresh</button></form>
     </div>
   </div>
   {% if row.error %}
@@ -160,6 +168,7 @@
 {% set muted = muted | default([]) %}
 {% set dismissed = dismissed | default([]) %}
 {% set refused = refused | default([]) %}
+{% set superseded = superseded | default([]) %}
 
 <details class="section">
   <summary>Muted ({{ muted | length }})</summary>
@@ -198,6 +207,25 @@
       <div class="acts">
         <form method="post" action="/undismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Undismiss</button></form>
       </div>
+    </div>
+  </div>
+  {% endfor %}
+</details>
+
+<details class="section">
+  <summary>Superseded ({{ superseded | length }})</summary>
+  {% if not superseded %}
+  <p class="empty">Nothing superseded.</p>
+  {% endif %}
+  {% for row in superseded %}
+  <div class="proposal">
+    <div class="head">
+      <div class="what">
+        <p class="file">{{ row.filename }}</p>
+        <p class="title">{{ row.proposed_title }}</p>
+        <div class="meta"><b>{{ row.creator }}</b> (from the {{ row.creator_source }})</div>
+      </div>
+      <div class="score">{{ row.score_text }}</div>
     </div>
   </div>
   {% endfor %}

@@ -1,5 +1,6 @@
-"""What a person can do from the inbox: four things to one proposal, and one
-thing that starts a scan of the whole library.
+"""What a person can do from the inbox: approve, dismiss, mute, undo or
+refresh a proposal, reverse a dismissal or a mute, and start a scan of the
+whole library.
 
 Separated from request handling so the write paths can be tested without a
 socket, and so the handler cannot reach the store, the media server, or the
@@ -139,6 +140,34 @@ class Actions:
         self._store.mute(item["subject_type"], item["subject_id"],
                          reason="muted from the inbox")
         return "muted"
+
+    def refresh(self, fp):
+        """Retire the proposal named by `fp` as superseded -- not wrong, out
+        of date -- and free its subject for the NEXT scan to examine again.
+
+        This is the per-row control ticket 86 asks for: a proposal made by an
+        older, thinner version of this tool can carry only a title and a URL,
+        and `cronicled.scan.select` skips a file whose subject already has a
+        proposal before ever looking at it again, so that thin proposal
+        blocks its file forever, and an `applied` or `failed` row has no
+        other path off that block at all (dismissing only ever frees a `new`
+        row -- see `Store.dismiss`'s and `Store.supersede`'s own docstrings).
+
+        Deliberately NOT `dismiss`: the person is not saying this proposal
+        was wrong, so recording it as a rejection would put a decision in the
+        store they never made. `Store.supersede` is its own action for
+        exactly that reason -- see its docstring for what it does to an
+        `applied` row's state and undo snapshot (nothing) and how
+        `cronicled.scan.select` learns a subject is free again.
+
+        Like `dismiss`/`mute`/`undo`, raises `UnknownProposal` for a
+        fingerprint that is not currently visible -- a doubled click on an
+        already-superseded (and so hidden) row must not look like a second
+        success.
+        """
+        item = self._find(fp)
+        self._store.supersede(item["fingerprint"])
+        return "refreshed"
 
     def undismiss(self, fp):
         """Reverse a dismissal: the proposal named by `fp` comes back into
