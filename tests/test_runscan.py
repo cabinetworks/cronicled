@@ -22,6 +22,7 @@ import unittest
 from unittest import mock
 
 from cronicled.jobs import JobRunner
+from cronicled.scan import IDENTIFIED_BY_FINGERPRINT
 from cronicled.runscan import build_producer, configured_adapters, main
 from cronicled.store import Store
 from tests.fixtures.cast import CENSORSHIP
@@ -72,11 +73,33 @@ class _FakeStash:
     not have to script it to stay green.
     """
 
-    def __init__(self, scenes, script=None, by_url=None):
+    def __init__(self, scenes, script=None, by_url=None, boxes=None,
+                 by_fingerprint=None):
         self._scenes = list(scenes)
         self._script = dict(script or {})
         self._by_url = dict(by_url or {})
+        # No box configured is the default and the ordinary state of a fresh
+        # install: `Stash.stash_boxes` answers `[]` for one, and a scan then
+        # asks nobody. The fake matches that limitation rather than
+        # inventing a box, so every test in this file that is not about
+        # fingerprints exercises exactly the path it did before.
+        self._boxes = list(boxes or [])
+        self._by_fingerprint = dict(by_fingerprint or {})
         self.calls = []
+
+    def stash_boxes(self):
+        self.calls.append(("stash_boxes",))
+        return [dict(box) for box in self._boxes]
+
+    def scrape_scenes_by_fingerprint(self, endpoint, scene_ids):
+        self.calls.append(("scrape_scenes_by_fingerprint", endpoint,
+                           list(scene_ids)))
+        answers = self._by_fingerprint.get(endpoint, {})
+        # One match list per requested scene, in the order requested -- the
+        # real method REFUSES a reply of any other length, so a fake that
+        # could return a shorter one would be offering a shape production
+        # never passes on.
+        return [list(answers.get(str(scene_id), [])) for scene_id in scene_ids]
 
     def unorganized_scenes(self, limit):
         self.calls.append(("unorganized_scenes", limit))
@@ -217,7 +240,9 @@ class BuildProducerWiring(unittest.TestCase):
         for call in stash.calls:
             self.assertIn(call[0], ("unorganized_scenes",
                                     "scrape_scenes_by_query",
-                                    "scrape_scene_url"))
+                                    "scrape_scene_url",
+                                    "stash_boxes",
+                                    "scrape_scenes_by_fingerprint"))
 
 
 class BuildProducerOwnerOfWiring(unittest.TestCase):
@@ -455,3 +480,91 @@ class MainOrchestration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# `example.invalid` is reserved by RFC 2606 and can never resolve.
+BOX = {"name": "north-box", "endpoint": "https://one.example.invalid/gql"}
+
+
+def box_match(title, remote_site_id):
+    return {"title": title, "code": None, "details": None, "director": None,
+            "urls": [], "url": None, "date": None, "image": None,
+            "studio": None, "tags": [], "performers": [],
+            "remote_site_id": remote_site_id}
+
+
+class BuildProducerFingerprintWiring(unittest.TestCase):
+    """The stash-box half of the client reaches the `ScanProducer` it builds,
+    as one run-wide collaborator -- no adapter-level gate and no per-store
+    copy, because a box identifies a file by the file's own fingerprints and
+    has nothing to do with which stores are configured.
+    """
+
+    PATH = "/library/Velvet Crane/Morning Ritual.mp4"
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+
+    def _run_to_completion(self, producer):
+        runner = JobRunner(self.store)
+        runner.register(producer)
+        job = runner.start(producer.name)
+        self.assertTrue(runner.wait(job.id, WAIT))
+        return runner.job(job.id)
+
+    def test_an_install_with_no_box_asks_nobody_and_scans_exactly_as_before(self):
+        candidate = row("Morning Ritual", "https://example.invalid/clip/x")
+        stash = _FakeStash(
+            [scene(1, self.PATH)],
+            script={("scraper-alpha", "Velvet Crane"): [candidate]})
+
+        self._run_to_completion(build_producer(
+            stash, {"store": _Adapter(scraper_id="scraper-alpha")},
+            self.store, limit=10))
+
+        self.assertNotIn("scrape_scenes_by_fingerprint",
+                         [call[0] for call in stash.calls])
+        item = self.store.items(folder="library")[0]
+        self.assertEqual(item["payload"]["score"], 1.0)
+
+    def test_a_box_identified_file_is_recorded_and_never_searched_for(self):
+        # The end-to-end property, run through the whole wiring path: a
+        # composition that asked the boxes but then searched anyway -- or
+        # that never asked at all -- would be caught here and nowhere else.
+        match = box_match("Morning Ritual", "r-77")
+        stash = _FakeStash(
+            [scene(1, self.PATH)], boxes=[BOX],
+            by_fingerprint={BOX["endpoint"]: {"1": [match]}})
+
+        finished = self._run_to_completion(build_producer(
+            stash, {"store": _Adapter(scraper_id="scraper-alpha")},
+            self.store, limit=10))
+
+        self.assertEqual(finished.recorded, 1)
+        item = self.store.items(folder="library")[0]
+        self.assertEqual(item["payload"]["identified_by"],
+                         IDENTIFIED_BY_FINGERPRINT)
+        self.assertEqual(item["payload"]["candidate"], match)
+        self.assertIsNone(item["confidence"])
+        self.assertNotIn("scrape_scenes_by_query",
+                         [call[0] for call in stash.calls])
+
+    def test_the_batch_reaches_the_box_as_the_scene_ids_that_were_selected(self):
+        stash = _FakeStash([scene(1, self.PATH), scene(2, self.PATH)],
+                           boxes=[BOX])
+
+        self._run_to_completion(build_producer(
+            stash, {"store": _Adapter(scraper_id="scraper-alpha")},
+            self.store, limit=10))
+
+        self.assertIn(("scrape_scenes_by_fingerprint", BOX["endpoint"],
+                       ["1", "2"]), stash.calls)
+
+    def test_the_boxes_are_read_at_scan_time_not_at_build_time(self):
+        # A producer built once and run twice must not hold a stale list, and
+        # a box added to the server between the two must be asked.
+        stash = _FakeStash([], boxes=[BOX])
+        build_producer(stash, {"store": _Adapter()}, self.store, limit=10)
+
+        self.assertEqual(stash.calls, [])

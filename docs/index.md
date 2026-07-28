@@ -104,6 +104,17 @@ A few things the shape of that graph is saying:
 How a filename becomes either a match or a refusal. Each box names the module
 that does that step.
 
+This is the path for a file that has to be *searched for*. A file can also be
+*identified*: a scan offers the whole batch to each configured stash-box first,
+and a box that recognises a file by its own fingerprints has answered the
+question outright - no text search, no scoring, no threshold, so none of what
+follows applies to it. That is identity rather than similarity, and it is
+recorded as such: the proposal carries the box that identified it instead of a
+score, because nothing scored it. Two boxes recognising one file as *different*
+scenes is reported as a refusal naming both, never settled by whichever box was
+configured first. A file no box recognises - most files, most boxes - takes the
+path below exactly as it always did.
+
 !!! warning "No module in this package runs this sequence"
 
     There is no function you can call that goes from one end of this diagram to

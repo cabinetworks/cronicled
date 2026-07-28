@@ -3,8 +3,8 @@ import unittest
 from cronicled.scan import _runners_up
 from cronicled.scoring import Match
 from cronicled.web.rows import (
-    Row, scene_url, to_mute_row, to_mute_rows, to_refusal_row,
-    to_refusal_rows, to_row, to_rows,
+    IDENTIFIED_SCORE_TEXT, Row, scene_url, to_mute_row, to_mute_rows,
+    to_refusal_row, to_refusal_rows, to_row, to_rows,
 )
 
 
@@ -562,3 +562,101 @@ class ContestedOnlyWhenSomethingActuallyDisagrees(unittest.TestCase):
         self.assertTrue(row.contested)
         self.assertIn("Ada Marsh", row.disagreement)
         self.assertIn("Downloads", row.disagreement)
+
+
+def _identified_item(**over):
+    """A proposal a stash-box identified by fingerprint, as
+    `scan.fingerprint_outcome` writes it: no creator, no score, no
+    runners-up, and no `confidence` on the item at all."""
+    payload = {
+        "path": "/library/Nine Winters/nine-winters-the-lantern-room.mp4",
+        "candidate": {"id": "c-1", "title": "The Lantern Room", "image": None,
+                     "performers": [{"stored_id": None, "name": "Ivy Kingsley"}],
+                     "studio": {"stored_id": None, "name": "Amber Vale"}},
+        "identified_by": "fingerprint",
+        "box": "north-box",
+        "remote_site_id": "r-77",
+    }
+    payload.update(over.pop("payload", {}))
+    item = {"fingerprint": "fp-2", "state": "new", "summary": "s",
+            "confidence": None, "payload": payload, "prior_state": None,
+            "subject_id": "43"}
+    item.update(over)
+    return item
+
+
+class IdentifiedRow(unittest.TestCase):
+    """A row for a proposal nothing scored.
+
+    The whole reason this shape exists is that a fingerprint hit did not
+    score 1.0 -- it was identified -- so every field a reader would take for
+    the scorer's own output has to be absent rather than filled in with
+    something plausible.
+    """
+
+    def test_it_carries_no_score_at_all(self):
+        # HARM: a number here is one this page invented, shown in the same
+        # column, in the same type, as numbers the scorer really produced --
+        # and read by a person deciding whether to approve.
+        row = to_row(_identified_item())
+        self.assertIsNone(row.score)
+        self.assertEqual(row.score_text, IDENTIFIED_SCORE_TEXT)
+
+    def test_it_names_the_box_that_recognised_the_file(self):
+        self.assertEqual(to_row(_identified_item()).identifying_box,
+                         "north-box")
+
+    def test_it_claims_no_creator_because_none_was_ever_resolved(self):
+        # The file was never searched for by name, so there is no attribution
+        # to show. Naming one anyway would report a resolution that never ran.
+        row = to_row(_identified_item())
+        self.assertIsNone(row.creator)
+        self.assertIsNone(row.creator_source)
+
+    def test_it_still_shows_what_approving_it_would_write(self):
+        row = to_row(_identified_item())
+        self.assertEqual(row.proposed_title, "The Lantern Room")
+        self.assertEqual(row.performers, ("Ivy Kingsley",))
+        self.assertEqual(row.studio, "Amber Vale")
+
+    def test_nothing_about_it_is_contested(self):
+        # Boxes that disagreed never produced a proposal at all, and boxes
+        # that agreed are agreement -- not a warning to spend on every row.
+        row = to_row(_identified_item())
+        self.assertFalse(row.contested)
+        self.assertIsNone(row.disagreement)
+        self.assertEqual(row.runners_up, ())
+
+    def test_a_scored_row_names_no_box(self):
+        # The other side of the same discriminator: the two shapes must not
+        # be readable as one, in either direction.
+        row = to_row(_item())
+        self.assertIsNone(row.identifying_box)
+        self.assertEqual(row.score_text, "0.812")
+
+    def test_the_two_shapes_do_not_produce_the_same_row(self):
+        scored = to_row(_item())
+        identified = to_row(_identified_item())
+        self.assertNotEqual(
+            (scored.score, scored.score_text, scored.identifying_box,
+             scored.creator),
+            (identified.score, identified.score_text,
+             identified.identifying_box, identified.creator))
+
+    def test_a_payload_that_claims_identification_but_names_no_box_raises(self):
+        # HARM: "identified by nobody" is precisely the row a person would
+        # approve without noticing anything was missing.
+        item = _identified_item()
+        del item["payload"]["box"]
+        with self.assertRaises(KeyError):
+            to_row(item)
+
+    def test_a_payload_with_neither_a_score_nor_an_identification_raises(self):
+        # Absence of `identified_by` means a SCORED proposal -- which is what
+        # every payload written before this existed is -- so it must go down
+        # the branch that indexes `score` and `creator` and raises when they
+        # are missing, never down the one that shows a row with neither.
+        item = _item()
+        del item["payload"]["score"]
+        with self.assertRaises(KeyError):
+            to_row(item)
