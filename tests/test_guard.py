@@ -283,6 +283,62 @@ class AllowedTrackedFiles(unittest.TestCase):
         self.assertIn("tracked data file: elsewhere/mkdocs.yml", out)
 
 
+class StagedContentIsScanned(unittest.TestCase):
+    """`git grep` with no revision and no `--cached` reads the WORKING TREE
+    copy of a tracked path, not the index. Content staged (`git add`) and
+    then edited back out of the working tree is invisible to that leg
+    alone even though it is exactly what the next `git commit` would
+    record - reproduced directly below with no simulation needed."""
+
+    def test_a_leak_staged_and_then_reverted_in_the_working_tree_is_still_caught(self):
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n"})
+        path = os.path.join(d, "a.md")
+        with open(path, "w") as fh:
+            fh.write("temporarily contains zzsecretzz\n")
+        subprocess.check_call(["git", "add", "a.md"], cwd=d)
+        with open(path, "w") as fh:
+            fh.write("harmless again\n")
+        # Deliberately no second `git add`: the working tree is now clean,
+        # but the index still holds the leak from the first `git add`, and
+        # that staged blob is what `git commit` would actually record.
+        code, out = _run(d, env={"LEAK_PATTERNS": "zzsecretzz"})
+        self.assertEqual(code, 1, out)
+
+    def test_the_working_tree_leg_alone_would_have_missed_it(self):
+        # Confirms the fixture above actually exercises the gap rather than
+        # coincidentally tripping some other leg (filename, untracked,
+        # history): with nothing committed yet and the working tree clean,
+        # only the staged-content leg can see this.
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n"})
+        path = os.path.join(d, "a.md")
+        with open(path, "w") as fh:
+            fh.write("temporarily contains zzsecretzz\n")
+        subprocess.check_call(["git", "add", "a.md"], cwd=d)
+        with open(path, "w") as fh:
+            fh.write("harmless again\n")
+        code, _ = _run(os.path.join(d), guard=GUARD)
+        self.assertEqual(code, 1)
+        working_tree_only = subprocess.run(
+            ["git", "grep", "-a", "-i", "-F", "-l", "-e", "zzsecretzz", "--", "."],
+            cwd=d, stdout=subprocess.PIPE)
+        self.assertEqual(working_tree_only.returncode, 1,
+                          "fixture is invalid: the working tree copy alone "
+                          "already contains the pattern, so this is not "
+                          "isolating the staged-content leg")
+
+    def test_env_sourced_patterns_redact_a_staged_match(self):
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n"})
+        path = os.path.join(d, "a.md")
+        with open(path, "w") as fh:
+            fh.write("temporarily contains zzsecretzz\n")
+        subprocess.check_call(["git", "add", "a.md"], cwd=d)
+        with open(path, "w") as fh:
+            fh.write("harmless again\n")
+        code, out = _run(d, env={"LEAK_PATTERNS": "zzsecretzz"})
+        self.assertEqual(code, 1, out)
+        self.assertNotIn("zzsecretzz", out)
+
+
 class RedactionBySource(unittest.TestCase):
     """Round 1 redacted the filename legs but left the content legs printing
     paths verbatim - and a path can coincidentally contain the pattern even
@@ -374,6 +430,42 @@ class UnreadableFileFailsClosed(unittest.TestCase):
         self.assertNotIn("check_leaks: clean", out)
 
 
+class DeletedTrackedFileIsReportedClearly(unittest.TestCase):
+    """A plain `rm` of a tracked file - the deletion neither staged nor
+    committed - is an ordinary working-tree state. It used to fail closed
+    with the same message as a genuine permission problem ("file is not
+    readable"), which misdescribes what happened and trains people to
+    distrust or skip the guard. This still fails closed (the working tree
+    cannot be scanned for a file that is not there), but with a message
+    that names the actual cause."""
+
+    def test_a_deleted_tracked_file_gets_its_own_message_not_unreadable(self):
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n", "b.md": "also harmless\n"})
+        os.remove(os.path.join(d, "b.md"))
+        code, out = _run(d, env={"LEAK_PATTERNS": "zzsecretzz"})
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("no longer exists on disk", out)
+        self.assertIn("b.md", out)
+        self.assertNotIn("file is not readable", out)
+
+    def test_a_genuinely_unreadable_file_still_gets_the_permission_message(self):
+        # The two causes must stay distinguishable: this fixture leaves the
+        # file in place (chmod 000, not deleted), so the new "no longer
+        # exists" branch must not swallow this case too.
+        if os.geteuid() == 0:
+            self.skipTest("permission bits do not apply to root")
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n"})
+        path = os.path.join(d, "a.md")
+        os.chmod(path, 0o000)
+        try:
+            code, out = _run(d, env={"LEAK_PATTERNS": "zzsecretzz"})
+        finally:
+            os.chmod(path, 0o644)
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("file is not readable", out)
+        self.assertNotIn("no longer exists on disk", out)
+
+
 class GitFailureFailsClosed(unittest.TestCase):
     """Re-review confirmed clean-exit-on-failure for `git ls-files` (tracked
     and untracked filename legs, and the file-type section) and for
@@ -452,6 +544,61 @@ class PatternListCorruptionVectors(unittest.TestCase):
             fh.write("﻿zzsecretzz\n".encode("utf-8"))
         code, out = _run(d)
         self.assertEqual(code, 1, out)
+
+
+class PatternsMayContainTheCommentCharacter(unittest.TestCase):
+    """A pattern list line is split into pattern and comment at the first
+    '#'. Naively, that also truncates a pattern that legitimately contains
+    '#' anywhere in it, and drops one beginning with '#' entirely (it looks
+    like a pure comment line) - both silently, with no count mismatch to
+    catch it, because the independent candidate-line count is produced by
+    the same kind of unescaped-'#' comment rule. `\\#` escapes a literal
+    '#' into the pattern instead."""
+
+    def test_an_embedded_hash_is_not_truncated_out_of_the_pattern(self):
+        # If the pattern were silently truncated to "zzalphazz" (everything
+        # before the '#'), this file would ALSO match - which is exactly
+        # what the second test below rules out.
+        d = _repo([r"zzalphazz\#zzbetazz"],
+                  {"a.md": "line has zzalphazz#zzbetazz right here\n"})
+        code, _ = _run(d)
+        self.assertEqual(code, 1)
+
+    def test_the_truncated_prefix_alone_does_not_falsely_match(self):
+        # Proves the above match came from the FULL escaped pattern, not
+        # from a truncated "zzalphazz" that would match almost anything
+        # containing that token.
+        d = _repo([r"zzalphazz\#zzbetazz"],
+                  {"a.md": "line has zzalphazz only, no hash tail here\n"})
+        code, _ = _run(d)
+        self.assertEqual(code, 0)
+
+    def test_a_pattern_beginning_with_an_escaped_hash_still_loads(self):
+        # Unescaped, this line would look exactly like a pure comment to
+        # both the Python parser and the independent grep-based candidate
+        # count - so neither side would ever notice it was dropped.
+        d = _repo([r"\#zzhashpattern"], {"a.md": "mentions #zzhashpattern here\n"})
+        code, _ = _run(d)
+        self.assertEqual(code, 1)
+
+    def test_a_real_trailing_comment_after_an_escaped_hash_is_still_stripped(self):
+        d = _repo([r"zzgamma\#zzdelta # this note is not part of the pattern"],
+                  {"a.md": "contains zzgamma#zzdelta in its body\n"})
+        code, _ = _run(d)
+        self.assertEqual(code, 1)
+        # The comment text itself must not have become part of the pattern.
+        d2 = _repo([r"zzgamma\#zzdelta # this note is not part of the pattern"],
+                   {"a.md": "mentions this note is not part of the pattern only\n"})
+        code2, _ = _run(d2)
+        self.assertEqual(code2, 0)
+
+    def test_an_unescaped_hash_still_starts_a_real_comment(self):
+        # Backward compatibility: a genuine comment line, unescaped, must
+        # still be dropped rather than loaded as a literal pattern.
+        d = _repo(["zzsecretzz", "# a genuine comment line"],
+                  {"a.md": "harmless, does not mention the real pattern\n"})
+        code, out = _run(d)
+        self.assertEqual(code, 0, out)
 
 
 class CountCrossCheckFailsClosed(unittest.TestCase):
@@ -705,6 +852,68 @@ class ExtensionListsAgree(unittest.TestCase):
         missing = sorted(self._ignored() - self._guarded() - self.ALLOWLIST_IGNORED_ONLY)
         self.assertEqual(missing, [],
                          "git-ignored but not guarded: %s" % missing)
+
+
+class ExemptionsAgreeWithIgnoreRules(unittest.TestCase):
+    """ALLOWED_TRACKED_PATTERNS (scripts/check_leaks) names specific
+    configuration files back in past the file-type check's deny-by-default
+    rule; .gitignore's own negations ("!...") let the same files back in
+    past its deny-by-default rule. Two lists that must agree, with nothing
+    asserting that until now - the same shape ExtensionListsAgree above
+    already guards for the extension lists themselves."""
+
+    # .gitignore needs a second, directory-anchored negation to reach a
+    # file inside a directory that is ALSO excluded wholesale (see
+    # .gitignore's own comment on `/config/*`): negating the extension
+    # alone cannot rescue a path git never descends into to look for it.
+    # It is not a distinct exemption from the guard's point of view -
+    # "*.example.json" already covers this path, wherever it sits - so it
+    # has no ALLOWED_TRACKED_PATTERNS counterpart of its own.
+    ALLOWLIST_IGNORE_ONLY = frozenset({"config/*.example.json"})
+    ALLOWLIST_GUARD_ONLY = frozenset()
+
+    @staticmethod
+    def _guard_exemptions():
+        # scripts/check_leaks has no .py extension, so importlib cannot
+        # guess a loader for it from the path alone. Executed directly into
+        # a throwaway namespace instead - this does not run main(), which
+        # only happens under `if __name__ == "__main__":`, left False here
+        # because __name__ is not set to "__main__".
+        with open(GUARD) as fh:
+            source = fh.read()
+        namespace = {"__file__": GUARD}
+        exec(compile(source, GUARD, "exec"), namespace)
+        return set(namespace["ALLOWED_TRACKED_PATTERNS"])
+
+    @staticmethod
+    def _ignore_exemptions():
+        exemptions = set()
+        with open(".gitignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line.startswith("!"):
+                    continue
+                entry = line[1:].lstrip("/")
+                if entry.startswith("**/"):
+                    entry = entry[len("**/"):]
+                exemptions.add(entry)
+        return exemptions
+
+    def test_every_guard_exemption_is_also_git_ignore_negated(self):
+        missing = sorted(self._guard_exemptions() - self._ignore_exemptions()
+                          - self.ALLOWLIST_GUARD_ONLY)
+        self.assertEqual(missing, [],
+                         "guard-exempt but not git-ignore-negated: %s" % missing)
+
+    def test_every_git_ignore_negation_is_also_a_guard_exemption(self):
+        # The reverse direction matters just as much: a file .gitignore lets
+        # back in that the guard's own allow-list does not know about is
+        # still refused by check_file_types - wedging a legitimate commit
+        # the ignore rule was written to allow through in the first place.
+        missing = sorted(self._ignore_exemptions() - self._guard_exemptions()
+                          - self.ALLOWLIST_IGNORE_ONLY)
+        self.assertEqual(missing, [],
+                         "git-ignore-negated but not guard-exempt: %s" % missing)
 
 
 class BinaryDetectedContentIsScanned(unittest.TestCase):

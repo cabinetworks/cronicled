@@ -119,3 +119,45 @@ class CiWorkflowForkGating(unittest.TestCase):
         preceding = self.run_script[:idx]
         self.assertNotIn("--file-types-only", self.run_script[idx:])
         self.assertIn("else", preceding[preceding.rfind("elif"):])
+
+
+class CiWorkflowRunsOnEveryBranch(unittest.TestCase):
+    """A feature branch pushed to the public remote is public the moment it
+    lands there. The guard job used to trigger only on a push to the
+    default branch (plus on any pull request), so a branch with no pull
+    request open yet was never scanned at all. The `push:` trigger's
+    `branches:` filter must match every branch, not name the default one."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(CI_YML) as fh:
+            cls.text = fh.read()
+        # The top-level `on:` block: from `on:` up to the `jobs:` key that
+        # starts the next top-level section.
+        on_m = re.search(r"^on:\n(.*?)^jobs:", cls.text, re.S | re.M)
+        assert on_m, "could not find the top-level `on:` block in %s" % CI_YML
+        on_block = on_m.group(1)
+        # `push:`'s own children: consecutive lines indented at least four
+        # spaces (or blank), i.e. everything nested under it before the
+        # next two-space-indented key (`pull_request:`).
+        push_m = re.search(r"push:\n((?:[ ]{4}.*\n|\n)*)", on_block)
+        assert push_m, "could not find the `push:` trigger block in %s" % CI_YML
+        cls.push_block = push_m.group(1)
+
+    def test_the_push_trigger_is_not_restricted_to_the_default_branch(self):
+        self.assertNotRegex(
+            self.push_block, r"branches:\s*\[\s*[\"']?main[\"']?\s*\]",
+            "the push trigger still names only the default branch - a "
+            "feature branch pushed to the public remote is public before "
+            "any pull request exists to bring it through the guard")
+
+    def test_the_push_trigger_matches_every_branch(self):
+        self.assertRegex(
+            self.push_block, r"branches:\s*\[\s*[\"']\*\*[\"']\s*\]",
+            "expected the push trigger's branches filter to match every "
+            "branch (e.g. branches: [\"**\"])")
+
+    def test_release_tags_still_trigger_the_workflow_too(self):
+        # The branch-matching fix must not have dropped the separate tag
+        # trigger the publish job depends on.
+        self.assertRegex(self.push_block, r"tags:\s*\[\s*[\"']v\*[\"']\s*\]")

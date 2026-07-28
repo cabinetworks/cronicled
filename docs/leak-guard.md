@@ -2,9 +2,18 @@
 
 `scripts/check_leaks` fails the build if a forbidden string (configured out
 of band — see the script header — never committed to this repo) shows up in
-tracked file contents or filenames, in untracked-but-not-ignored files, in
-tracked file contents anywhere in history, or in a commit message anywhere in
-history. CI runs it (`./scripts/check_leaks`) on every push and pull request.
+tracked file contents or filenames, in staged content (the index, checked
+independently of the working tree — see below), in untracked-but-not-ignored
+files, in tracked file contents anywhere in history, or in a commit message
+anywhere in history. CI runs it (`./scripts/check_leaks`) on every push, to
+every branch, and on every pull request.
+
+Tracked-file content is scanned twice, deliberately: once in the working
+tree, once in the index. The two usually agree, but not always — content
+that has been `git add`ed and then edited back out of the working tree is
+gone from the working-tree copy while still sitting in the index, staged and
+ready to be committed. Scanning only the working tree would miss exactly
+that content until the commit that carries it already exists.
 
 Separately from the patterns, it refuses tracked files whose *type* could
 carry library data at all — the extension lists in `scripts/data-extensions.txt`
