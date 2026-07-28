@@ -383,5 +383,41 @@ class TheAdaptersDocAgreesWithTheExampleItDescribes(unittest.TestCase):
             "mechanism the prose describes" % (sorted(documented), sorted(configured)))
 
 
+class ThereIsAStandingRuleForProvingANewTestCanFail(unittest.TestCase):
+    """Several tests in this repository have been found to pass for a reason
+    other than the one they name — one passed before the code it tested even
+    existed. The fix for that is a habit, not a line of code, so what a test
+    can pin here is only that the habit is written down where a contributor
+    will actually see it — not that anyone follows it. If this ever starts
+    failing because CONTRIBUTING.md was softened or removed, that is the
+    thing to look at, not this test."""
+
+    def test_contributing_md_exists(self):
+        self.assertTrue(
+            os.path.exists("CONTRIBUTING.md"),
+            "no CONTRIBUTING.md at the repository root")
+
+    def test_it_states_the_standing_rule(self):
+        prose = " ".join(_read("CONTRIBUTING.md").split()).lower()
+        self.assertIn(
+            "watched failing", prose,
+            "CONTRIBUTING.md should say a test that has never been watched "
+            "failing does not hold")
+        self.assertIn(
+            "break the", prose,
+            "CONTRIBUTING.md should instruct breaking the specific "
+            "behaviour a new test names")
+        self.assertIn(
+            "restore the code", prose,
+            "CONTRIBUTING.md should instruct restoring the code once the "
+            "test has been confirmed to fail for the right reason")
+
+    def test_the_readme_links_it(self):
+        self.assertIn(
+            "CONTRIBUTING.md", _read(README),
+            "the README's Documentation section should link CONTRIBUTING.md, "
+            "the same way it links every other doc page")
+
+
 if __name__ == "__main__":
     unittest.main()
