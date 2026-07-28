@@ -783,6 +783,20 @@ class ListingVerdict(unittest.TestCase):
         self.assertIsNot(verdict.unlisted, True)
         self.assertIn("competed", verdict.reason)
 
+    def test_candidates_in_hand_beat_an_unfinished_read_too(self):
+        # The contenders check already runs ahead of the completeness check
+        # in the code, matching the docstring's own ordering rule -- but
+        # nothing pinned THIS combination: an ambiguous refusal over an
+        # INCOMPLETE listing. A mutation that reordered the two checks would
+        # report "the read stopped early" here, inviting a retry that could
+        # never resolve an ambiguity two candidates already produced.
+        verdict = listing_verdict(_listing(scenes=3, complete=False),
+                                  _ambiguous(), performer_id=PERFORMER)
+
+        self.assertIsNone(verdict.unlisted)
+        self.assertIn("competed", verdict.reason)
+        self.assertNotIn("stopped early", verdict.reason)
+
     def test_the_kind_of_refusal_is_read_from_the_count_not_the_prose(self):
         # scan.py already states the rule: a fact worth acting on is asked of
         # the data, never inferred from a reason string, because the wording
