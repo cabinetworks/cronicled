@@ -798,6 +798,68 @@ class ExtensionListsAgree(unittest.TestCase):
                          "git-ignored but not guarded: %s" % missing)
 
 
+class ExemptionsAgreeWithIgnoreRules(unittest.TestCase):
+    """ALLOWED_TRACKED_PATTERNS (scripts/check_leaks) names specific
+    configuration files back in past the file-type check's deny-by-default
+    rule; .gitignore's own negations ("!...") let the same files back in
+    past its deny-by-default rule. Two lists that must agree, with nothing
+    asserting that until now - the same shape ExtensionListsAgree above
+    already guards for the extension lists themselves."""
+
+    # .gitignore needs a second, directory-anchored negation to reach a
+    # file inside a directory that is ALSO excluded wholesale (see
+    # .gitignore's own comment on `/config/*`): negating the extension
+    # alone cannot rescue a path git never descends into to look for it.
+    # It is not a distinct exemption from the guard's point of view -
+    # "*.example.json" already covers this path, wherever it sits - so it
+    # has no ALLOWED_TRACKED_PATTERNS counterpart of its own.
+    ALLOWLIST_IGNORE_ONLY = frozenset({"config/*.example.json"})
+    ALLOWLIST_GUARD_ONLY = frozenset()
+
+    @staticmethod
+    def _guard_exemptions():
+        # scripts/check_leaks has no .py extension, so importlib cannot
+        # guess a loader for it from the path alone. Executed directly into
+        # a throwaway namespace instead - this does not run main(), which
+        # only happens under `if __name__ == "__main__":`, left False here
+        # because __name__ is not set to "__main__".
+        with open(GUARD) as fh:
+            source = fh.read()
+        namespace = {"__file__": GUARD}
+        exec(compile(source, GUARD, "exec"), namespace)
+        return set(namespace["ALLOWED_TRACKED_PATTERNS"])
+
+    @staticmethod
+    def _ignore_exemptions():
+        exemptions = set()
+        with open(".gitignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line.startswith("!"):
+                    continue
+                entry = line[1:].lstrip("/")
+                if entry.startswith("**/"):
+                    entry = entry[len("**/"):]
+                exemptions.add(entry)
+        return exemptions
+
+    def test_every_guard_exemption_is_also_git_ignore_negated(self):
+        missing = sorted(self._guard_exemptions() - self._ignore_exemptions()
+                          - self.ALLOWLIST_GUARD_ONLY)
+        self.assertEqual(missing, [],
+                         "guard-exempt but not git-ignore-negated: %s" % missing)
+
+    def test_every_git_ignore_negation_is_also_a_guard_exemption(self):
+        # The reverse direction matters just as much: a file .gitignore lets
+        # back in that the guard's own allow-list does not know about is
+        # still refused by check_file_types - wedging a legitimate commit
+        # the ignore rule was written to allow through in the first place.
+        missing = sorted(self._ignore_exemptions() - self._guard_exemptions()
+                          - self.ALLOWLIST_IGNORE_ONLY)
+        self.assertEqual(missing, [],
+                         "git-ignore-negated but not guard-exempt: %s" % missing)
+
+
 class BinaryDetectedContentIsScanned(unittest.TestCase):
     """`git grep -I` (the flag both content legs used) silently excludes
     anything git treats as binary: a plain-ASCII file `.gitattributes`
