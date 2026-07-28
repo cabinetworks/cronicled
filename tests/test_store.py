@@ -10,7 +10,7 @@ import unicodedata
 import unittest
 from datetime import datetime, timezone
 
-from cronicled.store import Store, fingerprint
+from cronicled.store import SCHEMA_VERSION, SchemaVersionError, Store, fingerprint
 
 
 class Fingerprint(unittest.TestCase):
@@ -866,6 +866,105 @@ class SchemaAdditionOnAnExistingDatabase(unittest.TestCase):
                          payload={"title": "Anything At All"},
                          producer="nightly-scrape")
             self.assertEqual(store.items(), self.snapshot["visible"])
+
+
+class SchemaVersioning(unittest.TestCase):
+    """`PRAGMA user_version` is the marker a future non-additive change gets
+    to branch on. It is not itself a migration mechanism -- nothing here
+    knows how to carry a version 1 database forward to a version 2 shape --
+    so what these tests pin is narrower: a fresh database gets stamped, a
+    stamped one reopens without complaint, and a version this code does not
+    recognise is refused rather than silently reinterpreted."""
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self.path = os.path.join(self._dir, "s.db")
+        self.addCleanup(shutil.rmtree, self._dir, True)
+
+    def _read_version(self):
+        conn = sqlite3.connect(self.path)
+        try:
+            return conn.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            conn.close()
+
+    def _write_version(self, value):
+        conn = sqlite3.connect(self.path)
+        try:
+            conn.execute("PRAGMA user_version = %d" % value)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_a_freshly_created_database_is_stamped_with_the_current_version(self):
+        with Store(self.path):
+            pass
+        self.assertEqual(self._read_version(), SCHEMA_VERSION)
+
+    def test_reopening_a_stamped_database_does_not_raise(self):
+        with Store(self.path):
+            pass
+        with Store(self.path):     # must not raise
+            pass
+        self.assertEqual(self._read_version(), SCHEMA_VERSION)
+
+    def test_a_database_built_before_the_marker_existed_is_stamped_on_open(self):
+        # Emulates exactly the population this ticket is about: a database
+        # already holding a person's decisions, from before this constant
+        # existed, so its user_version reads 0 -- indistinguishable from a
+        # brand new file. Reopening it must stamp it, not disturb it.
+        with Store(self.path) as store:
+            fp = store.record(folder="scene-matches", subject_type="scene",
+                              subject_id="1", summary="a proposal",
+                              payload={"title": "Copper Kettle"},
+                              producer="nightly-scrape", confidence=0.9)
+            store.dismiss(fp, reason="wrong match")
+        self._write_version(0)     # simulate: never stamped by older code
+        with Store(self.path) as store:
+            self.assertEqual(store.items(state="dismissed")[0]["fingerprint"], fp)
+        self.assertEqual(self._read_version(), SCHEMA_VERSION)
+
+    def test_a_newer_schema_version_refuses_to_open(self):
+        with Store(self.path):
+            pass
+        self._write_version(SCHEMA_VERSION + 1)
+        with self.assertRaises(SchemaVersionError):
+            Store(self.path)
+
+    def test_an_older_stamped_schema_version_refuses_to_open(self):
+        # There is no version below the current one that this code was ever
+        # built to understand -- 0 is the one exception, meaning "never
+        # stamped", not "version zero of the schema" -- so anything else
+        # smaller must refuse exactly as a larger one does.
+        with Store(self.path):
+            pass
+        self._write_version(SCHEMA_VERSION - 1 if SCHEMA_VERSION > 1 else -1)
+        with self.assertRaises(SchemaVersionError):
+            Store(self.path)
+
+    def test_the_refusal_names_both_versions(self):
+        with Store(self.path):
+            pass
+        self._write_version(SCHEMA_VERSION + 1)
+        with self.assertRaises(SchemaVersionError) as ctx:
+            Store(self.path)
+        message = str(ctx.exception)
+        self.assertIn(str(SCHEMA_VERSION + 1), message)
+        self.assertIn(str(SCHEMA_VERSION), message)
+
+    def test_a_refused_open_releases_the_path_for_a_later_retry(self):
+        # The single-instance-per-file guard (see `Store`'s class docstring)
+        # must not mistake a refused-to-open Store for one still holding the
+        # path -- otherwise fixing the file wouldn't be enough; the process
+        # would also have to restart.
+        with Store(self.path):
+            pass
+        self._write_version(SCHEMA_VERSION + 1)
+        with self.assertRaises(SchemaVersionError):
+            Store(self.path)
+        self._write_version(SCHEMA_VERSION)
+        with Store(self.path):     # must not raise "already open"
+            pass
 
 
 class UnmuteBringsTheRowBack(unittest.TestCase):
