@@ -149,7 +149,8 @@ class LoadAdaptersConfigDir(unittest.TestCase):
     def test_finds_the_file_under_cronicled_config_dir_with_no_explicit_path(self):
         with tempfile.TemporaryDirectory() as d:
             with open(os.path.join(d, "adapters.json"), "w") as fh:
-                json.dump({"adapters": [{"name": "site", "owner_source": "none"}]}, fh)
+                json.dump({"adapters": [{"name": "site", "owner_source": "none",
+                                         "title_match_counts_as_ownership": True}]}, fh)
             env = {"CRONICLED_CONFIG_DIR": d}
             loaded = load_adapters(env=env)
             self.assertEqual(sorted(loaded), ["site"])
@@ -158,10 +159,12 @@ class LoadAdaptersConfigDir(unittest.TestCase):
         with tempfile.TemporaryDirectory() as configured, \
              tempfile.TemporaryDirectory() as explicit:
             with open(os.path.join(configured, "adapters.json"), "w") as fh:
-                json.dump({"adapters": [{"name": "configured", "owner_source": "none"}]}, fh)
+                json.dump({"adapters": [{"name": "configured", "owner_source": "none",
+                                         "title_match_counts_as_ownership": True}]}, fh)
             p = os.path.join(explicit, "adapters.json")
             with open(p, "w") as fh:
-                json.dump({"adapters": [{"name": "explicit", "owner_source": "none"}]}, fh)
+                json.dump({"adapters": [{"name": "explicit", "owner_source": "none",
+                                         "title_match_counts_as_ownership": True}]}, fh)
             env = {"CRONICLED_CONFIG_DIR": configured}
             loaded = load_adapters(p, env=env)
             self.assertEqual(sorted(loaded), ["explicit"])
@@ -282,7 +285,8 @@ class ContainerConfigLayout(unittest.TestCase):
             with open(os.path.join(mount, "server.json"), "w") as fh:
                 json.dump({"url": "http://mounted.example.test", "api_key": "M"}, fh)
             with open(os.path.join(mount, "adapters.json"), "w") as fh:
-                json.dump({"adapters": [{"name": "mounted", "owner_source": "none"}]}, fh)
+                json.dump({"adapters": [{"name": "mounted", "owner_source": "none",
+                                         "title_match_counts_as_ownership": True}]}, fh)
             env = {"CRONICLED_CONFIG_DIR": mount}
 
             server = load_server(env=env)

@@ -332,7 +332,8 @@ class ConfiguredAdapters(unittest.TestCase):
             path = os.path.join(d, "adapters.json")
             with open(path, "w") as fh:
                 json.dump({"adapters": [
-                    {"name": "onlystore", "owner_source": "none"}]}, fh)
+                    {"name": "onlystore", "owner_source": "none",
+                     "title_match_counts_as_ownership": True}]}, fh)
             adapters = configured_adapters(env={"CRONICLED_CONFIG_DIR": d})
         self.assertIn("onlystore", adapters)
 

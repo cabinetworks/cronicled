@@ -64,6 +64,7 @@ def run():
     from cronicled.adapters.declarative import DeclarativeAdapter
     adapter = DeclarativeAdapter({
         "name": "selfcheck", "owner_source": "url_segment", "owner_segment": 2,
+        "title_match_counts_as_ownership": True,
     })
     result = {"url": "https://example.test/store/velvetcrane/copper-kettle"}
     _check("adapter built from a spec resolves an owner from a URL segment",

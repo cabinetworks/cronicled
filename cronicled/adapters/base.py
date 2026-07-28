@@ -25,6 +25,20 @@ class SiteAdapter(object):
         raise NotImplementedError
 
     def clip_features_artist(self, result, artist_slug):
+        """True when `result` is evidence that `artist_slug` features in (or
+        owns) the clip.
+
+        A store's own attribution of the result (however this adapter reads
+        it) is always trustworthy evidence. A bare MENTION of the artist's
+        name in the title or URL slug is a much weaker inference, and is not
+        always safe: on a store whose name search surfaces fan or
+        collaboration clips sold by somebody else, a title naming a creator
+        is not evidence they own the clip. A hand-written adapter for a
+        store like that should override this method to ignore title/slug
+        mentions entirely rather than let the generic substring check admit
+        them — see `cronicled.adapters.declarative.DeclarativeAdapter`,
+        whose `title_match_counts_as_ownership` spec field makes that
+        distinction configurable rather than requiring a code override."""
         raise NotImplementedError
 
     def search_query(self, seed, title_query):
