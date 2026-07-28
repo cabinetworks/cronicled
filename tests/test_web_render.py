@@ -17,7 +17,7 @@ def _job(**over):
     return Job(**job)
 
 
-def _row(runners_up=None, image=None, **over):
+def _row(runners_up=None, image=None, base_url=None, **over):
     # `runners_up` and `image` are their own parameters, not folded into
     # `**over`: both live under `payload` in the real item shape, and
     # `item.update(over)` only ever touches the top level. Routing either
@@ -42,9 +42,10 @@ def _row(runners_up=None, image=None, **over):
                         if runners_up is None else runners_up),
     }
     item = {"fingerprint": "fp-1", "state": "new", "summary": "s",
-            "confidence": 0.812, "payload": payload, "prior_state": None}
+            "confidence": 0.812, "payload": payload, "prior_state": None,
+            "subject_id": "1"}
     item.update(over)
-    return to_row(item)
+    return to_row(item, base_url=base_url)
 
 
 class Autoescaping(unittest.TestCase):
@@ -268,7 +269,8 @@ class PerformersAndStudioOnThePage(unittest.TestCase):
             "runners_up": [],
         }
         return {"fingerprint": "fp-1", "state": "new", "summary": "s",
-                "confidence": 0.812, "payload": payload, "prior_state": None}
+                "confidence": 0.812, "payload": payload, "prior_state": None,
+                "subject_id": "1"}
 
     def _candidate(self, **over):
         candidate = {"id": "c-1", "title": "The Lantern Room", "image": None,
@@ -479,6 +481,165 @@ class NewSectionsEscaping(unittest.TestCase):
                       dismissed=[row], refused=[])
         self.assertNotIn("<script>", html)
         self.assertIn("&lt;script&gt;", html)
+
+
+class SceneLinks(unittest.TestCase):
+    """Ticket 97: a row links to its scene on the media server when one is
+    configured, and degrades to plain text -- never a broken link -- when
+    it is not.
+    """
+
+    def test_a_rows_filename_links_to_its_scene_when_configured(self):
+        row = _row(subject_id="42", base_url="http://media.example")
+        html = render("inbox.html", rows=[row], counts={})
+        self.assertIn(
+            '<a href="http://media.example/scenes/42" target="_blank" '
+            'rel="noopener noreferrer">', html)
+
+    def test_the_link_opens_a_new_tab_and_never_a_get_back_here(self):
+        # "A link is a GET to another origin ... it cannot be allowed to
+        # become a way to trigger anything here" -- pinned as a whole
+        # attribute set, not sampled, so a mutation dropping target="_blank"
+        # or rel="noopener noreferrer" is caught the same way `ButtonWiring`
+        # pins a control's whole attribute set.
+        row = _row(subject_id="42", base_url="http://media.example")
+        html = render("inbox.html", rows=[row], counts={})
+        match = re.search(r'<a href="[^"]+"[^>]*>', html)
+        self.assertIsNotNone(match)
+        self.assertIn('target="_blank"', match.group(0))
+        self.assertIn('rel="noopener noreferrer"', match.group(0))
+        self.assertNotIn("<form", match.group(0))
+
+    def test_no_configured_server_degrades_to_plain_text_not_a_broken_link(self):
+        # Ticket 97: "the tool now starts read-only with no server
+        # configured ... the link has to degrade rather than render
+        # broken." No base_url at all here -- row.scene_url is None.
+        row = _row(subject_id="42")
+        html = render("inbox.html", rows=[row], counts={})
+        self.assertNotIn("<a href", html)
+        self.assertNotIn("scenes/42", html)
+
+
+class MutedSubjectFilename(unittest.TestCase):
+    """Ticket 97's headline case: the Muted section names the file, not a
+    bare scene id, whenever the store recovered one -- and marks the
+    genuine exception (no proposal ever recorded) visibly rather than
+    blending it in.
+    """
+
+    def test_a_recoverable_muted_entry_shows_the_filename_not_the_id(self):
+        html = render("inbox.html", rows=[], counts={},
+                      muted=[{"subject_type": "scene", "subject_id": "12962",
+                             "reason": "never identifiable", "at": "t",
+                             "filename": "reel.mp4", "scene_url": None}],
+                      dismissed=[], refused=[])
+        start = html.index("Muted (")
+        section = html[start:html.index("</details>", start)]
+        self.assertIn("reel.mp4", section)
+        self.assertNotIn("scene 12962", section)
+
+    def test_no_recoverable_payload_shows_the_id_marked_as_the_exception(self):
+        # The genuine exception ticket 97 names: muted ahead of any
+        # proposal ever being recorded. Showing the id is honest here, but
+        # it must be visibly the exception -- the `subject-unknown` class
+        # and the explanatory aside are what make it look unlike every
+        # other, ordinary filename row.
+        html = render("inbox.html", rows=[], counts={},
+                      muted=[{"subject_type": "scene", "subject_id": "12962",
+                             "reason": "never identifiable", "at": "t",
+                             "filename": None, "scene_url": None}],
+                      dismissed=[], refused=[])
+        start = html.index("Muted (")
+        section = html[start:html.index("</details>", start)]
+        self.assertIn("scene 12962", section)
+        self.assertIn("subject-unknown", section)
+
+    def test_a_muted_entrys_scene_url_is_a_link(self):
+        html = render("inbox.html", rows=[], counts={},
+                      muted=[{"subject_type": "scene", "subject_id": "7",
+                             "reason": "r", "at": "t", "filename": "reel.mp4",
+                             "scene_url": "http://media.example/scenes/7"}],
+                      dismissed=[], refused=[])
+        self.assertIn('<a href="http://media.example/scenes/7"', html)
+
+
+class ApplifiedSectionRendering(unittest.TestCase):
+    """Ticket 98: applied proposals move to their own collapsed section,
+    with Undo and the cover warning still intact, while the main list
+    excludes them (that exclusion is `cronicled.__main__`'s wiring, tested
+    in `tests/test_main.py` -- this covers what the template does once an
+    `applied` list actually reaches it).
+    """
+
+    def test_an_applied_rows_count_reaches_the_page(self):
+        row = _row(state="applied", prior_state={"title": "old"})
+        html = render("inbox.html", rows=[], counts={}, applied=[row])
+        self.assertIn("Applied (1)", html)
+
+    def test_an_empty_applied_section_says_so(self):
+        html = render("inbox.html", rows=[], counts={}, applied=[])
+        self.assertIn("Applied (0)", html)
+        self.assertIn("Nothing applied yet.", html)
+
+    def test_an_applied_row_still_offers_undo(self):
+        row = _row(state="applied", prior_state={"title": "old"})
+        html = render("inbox.html", rows=[], counts={}, applied=[row])
+        section = html[html.index("Applied ("):html.index("Muted (")]
+        self.assertIn('<form method="post" action="/undo">', section)
+        self.assertIn(row.fingerprint, section)
+
+    def test_the_cover_warning_travels_into_the_section(self):
+        # "The cover-write warning travels with the row into the section.
+        # It is the one write approving cannot take back." -- the fact this
+        # ticket is most explicit must not be lost from row = _row that
+        # carries a cover image once it lives inside Applied.
+        row = _row(state="applied", prior_state={"title": "old"},
+                  image="data:image/jpeg;base64,realcover")
+        html = render("inbox.html", rows=[], counts={}, applied=[row])
+        section = html[html.index("Applied ("):html.index("Muted (")]
+        self.assertIn(
+            "cannot be restored by Undo, even after reverting", section)
+
+    def test_the_section_is_collapsed_by_default(self):
+        row = _row(state="applied", prior_state={"title": "old"})
+        html = render("inbox.html", rows=[], counts={}, applied=[row])
+        self.assertNotIn('<details class="section" open', html)
+
+    _HIGHLIGHT_CLASS = 'class="proposal just-applied"'
+
+    def test_a_fresh_approve_opens_the_section_and_highlights_its_row(self):
+        # The case ticket 98 calls out: the approve just made and
+        # immediately regretted. `just_applied` is the fingerprint the
+        # redirect from a successful /approve carries (see web/app.py).
+        row = _row(state="applied", prior_state={"title": "old"},
+                  fingerprint="fp-just-applied")
+        html = render("inbox.html", rows=[], counts={}, applied=[row],
+                      just_applied="fp-just-applied")
+        applied_section = html[html.index('<details class="section"'
+                                          ' open'):html.index("Muted (")]
+        self.assertIn(self._HIGHLIGHT_CLASS, applied_section)
+
+    def test_a_stale_just_applied_value_does_not_force_the_section_open(self):
+        # A `?applied=` query value naming a row not (or no longer) in
+        # `applied` -- a bookmarked link, another tab's stale redirect --
+        # must not force the section open on nothing.
+        row = _row(state="applied", prior_state={"title": "old"},
+                  fingerprint="fp-1")
+        html = render("inbox.html", rows=[], counts={}, applied=[row],
+                      just_applied="fp-not-in-applied")
+        self.assertNotIn('<details class="section" open', html)
+
+    def test_a_row_that_is_not_just_applied_is_not_marked(self):
+        # Note the CSS rule itself (`.proposal.just-applied`, in the
+        # `<style>` block) legitimately contains the substring
+        # "just-applied" on every render -- asserting against the exact
+        # rendered class attribute, not the bare word, is what keeps this
+        # from passing regardless of the row's own state.
+        row = _row(state="applied", prior_state={"title": "old"},
+                  fingerprint="fp-1")
+        html = render("inbox.html", rows=[], counts={}, applied=[row],
+                      just_applied="fp-other")
+        self.assertNotIn(self._HIGHLIGHT_CLASS, html)
 
 
 if __name__ == "__main__":

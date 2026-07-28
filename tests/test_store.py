@@ -638,7 +638,8 @@ class Mutes(_StoreCase):
                         now="2026-07-01T00:00:00")
         self.assertEqual(self.store.mutes(), [
             {"subject_type": "scene", "subject_id": "1",
-             "reason": "never identifiable", "at": "2026-07-01T00:00:00"}])
+             "reason": "never identifiable", "at": "2026-07-01T00:00:00",
+             "payload": None}])
 
     def test_nothing_muted_is_an_empty_list(self):
         self.assertEqual(self.store.mutes(), [])
@@ -647,6 +648,50 @@ class Mutes(_StoreCase):
         self.store.mute("scene", "1")
         self.store.unmute("scene", "1")
         self.assertEqual(self.store.mutes(), [])
+
+    def test_a_subject_muted_with_no_proposal_ever_recorded_has_no_payload(self):
+        # The genuine exception ticket 97 names: muting ahead of any scan
+        # ever finding the subject. No `item` row exists at all here, so
+        # there is nothing to recover -- `payload` must say so honestly
+        # rather than inventing something.
+        self.store.mute("scene", "1", reason="never identifiable")
+        self.assertIsNone(self.store.mutes()[0]["payload"])
+
+    def test_a_muted_subjects_payload_is_recovered_from_its_proposal(self):
+        # The ordinary case: `mute` never deletes the `item` row it
+        # blocked, it only changes its state (see `mute`'s docstring), so
+        # the payload recorded against the proposal is still there to show.
+        payload = {"path": "/library/Nine Winters/reel.mp4", "title": "X"}
+        self._record(subject_id="1", payload=payload)
+        self.store.mute("scene", "1", reason="never identifiable")
+        self.assertEqual(self.store.mutes()[0]["payload"], payload)
+
+    def test_recovers_the_most_recently_seen_proposal_when_more_than_one_exists(self):
+        # A subject can carry more than one `item` row -- successive
+        # proposals under different payloads before it was ever muted.
+        # `mutes()` must not pick one arbitrarily.
+        older = {"path": "/library/x/older.mp4", "title": "Older"}
+        newer = {"path": "/library/x/newer.mp4", "title": "Newer"}
+        self._record(subject_id="1", payload=older)
+        self.store.record(folder="scene-matches", subject_type="scene",
+                          subject_id="1", summary="a proposal",
+                          payload=newer, producer="test-producer",
+                          confidence=0.9, now="2099-01-01T00:00:00")
+        self.store.mute("scene", "1", reason="never identifiable")
+        self.assertEqual(self.store.mutes()[0]["payload"], newer)
+
+    def test_a_muted_subjects_payload_is_recovered_even_when_the_row_was_applied(self):
+        # `mute` deliberately leaves a terminal (`applied`/`failed`) row's
+        # own `state` untouched -- see `mute`'s docstring -- but the payload
+        # is still sitting in the `item` table regardless, and this must
+        # still find it rather than only looking at rows `mute` itself
+        # flipped to `state='muted'`.
+        fp = self._record(subject_id="1",
+                          payload={"path": "/library/x/reel.mp4"})
+        self.store.mark_applied(fp)
+        self.store.mute("scene", "1", reason="never identifiable")
+        self.assertEqual(self.store.mutes()[0]["payload"],
+                         {"path": "/library/x/reel.mp4"})
 
 
 class Undismissing(_StoreCase):

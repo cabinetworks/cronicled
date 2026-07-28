@@ -37,7 +37,7 @@ from .store import Store
 from .stash import Stash
 from .web.actions import Actions
 from .web.app import DEFAULT_HOST, DEFAULT_PORT, serve
-from .web.rows import to_refusal_rows, to_rows
+from .web.rows import to_mute_rows, to_refusal_rows, to_rows
 
 
 def main(argv=None):
@@ -98,11 +98,37 @@ def main(argv=None):
         adapters = {}
     runner = JobRunner(store)
     actions = Actions(store, stash, runner=runner, adapters=adapters)
-    serve(rows=lambda: to_rows(store.items()),
-          muted=store.mutes,
-          dismissed=lambda: to_rows(store.items(state="dismissed")),
-          refused=lambda: to_refusal_rows(store.refusals()),
-          superseded=lambda: to_rows(store.items(state="superseded")),
+    # The same address already resolved for `stash` above (or `None`,
+    # unconfigured) -- reused here for every row's own link to the media
+    # server (ticket 97). Never re-derived from `stash.url`, which has
+    # `/graphql` appended for the API client's own purposes (see
+    # `Stash.__init__`), and never a second flag of its own: one address,
+    # resolved once, used for both jobs.
+    base_url = args.server
+
+    def _inbox_rows():
+        # Applied proposals get their own section below (ticket 98) -- the
+        # inbox itself only ever shows what still needs a decision, and an
+        # applied row does not. `items()`'s own default already hides
+        # `dismissed`/`muted`/`superseded`; this excludes the one further
+        # state the inbox list has to earn its own way out of, on top of
+        # that -- see `Actions._find`'s docstring for why that default
+        # itself is left untouched: `undo` still needs `items(state=None)`
+        # to include an applied row, and this filtering happens here, not
+        # by narrowing what `items()` returns.
+        return to_rows([item for item in store.items()
+                        if item["state"] != "applied"], base_url=base_url)
+
+    serve(rows=_inbox_rows,
+          muted=lambda: to_mute_rows(store.mutes(), base_url=base_url),
+          dismissed=lambda: to_rows(store.items(state="dismissed"),
+                                    base_url=base_url),
+          refused=lambda: to_refusal_rows(store.refusals(),
+                                          base_url=base_url),
+          superseded=lambda: to_rows(store.items(state="superseded"),
+                                     base_url=base_url),
+          applied=lambda: to_rows(store.items(state="applied"),
+                                  base_url=base_url),
           actions=actions, scan_status=actions.scan_status,
           host=args.host, port=args.port)
 

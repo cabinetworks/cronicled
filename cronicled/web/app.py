@@ -56,22 +56,23 @@ def _origin_matches_host(origin, host_header):
 
 
 def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
-                  refused=None, superseded=None):
+                  refused=None, superseded=None, applied=None):
     # A separate callable rather than always reaching through `actions`:
     # every existing action-path test builds its own recording double for
     # `actions` and none of them implement `scan_status`, so defaulting it
     # here keeps GET / renderable for a double that only knows the four
     # original writes.
     _scan_status = scan_status or (lambda: None)
-    # Same reasoning, extended to the four new sections: an existing test's
+    # Same reasoning, extended to the five new sections: an existing test's
     # double for `rows`/`actions` knows nothing about muted, dismissed,
-    # refused or superseded subjects, so each defaults to reporting none
-    # rather than making every such test wire up four more callables it has
-    # no opinion about.
+    # refused, superseded or applied subjects, so each defaults to reporting
+    # none rather than making every such test wire up five more callables it
+    # has no opinion about.
     _muted = muted or (lambda: [])
     _dismissed = dismissed or (lambda: [])
     _refused = refused or (lambda: [])
     _superseded = superseded or (lambda: [])
+    _applied = applied or (lambda: [])
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, status, body=b"", headers=()):
@@ -84,7 +85,8 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                 self.wfile.write(body)
 
         def do_GET(self):
-            path = urllib.parse.urlparse(self.path).path
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
             if path.lstrip("/") in _ACTIONS:
                 self._send(405, b"use POST",
                            [("Allow", "POST"),
@@ -93,12 +95,25 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
             if path != "/":
                 self._send(404, b"not found")
                 return
+            # `applied` in the query string names the fingerprint a
+            # successful /approve just redirected here with (see
+            # `do_POST`'s own `applied` branch below) -- read-only, and
+            # never trusted as anything more than "open this one row's
+            # section for the person who is looking at the page right
+            # after clicking it". A stale or foreign value simply fails to
+            # match any row the template actually has (see inbox.html's own
+            # `just_applied_rows` guard), so there is nothing here to
+            # validate beyond parsing it out of the query string.
+            just_applied = (urllib.parse.parse_qs(parsed.query)
+                            .get("applied") or [None])[0]
             body = render("inbox.html", rows=rows(), counts={},
                          scan=_scan_status(),
                          scan_default_limit=DEFAULT_SCAN_LIMIT,
                          muted=_muted(), dismissed=_dismissed(),
                          refused=_refused(),
-                         superseded=_superseded()).encode()
+                         superseded=_superseded(),
+                         applied=_applied(),
+                         just_applied=just_applied).encode()
             self._send(200, body,
                        [("Content-Type", "text/html; charset=utf-8")])
 
@@ -163,6 +178,13 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                 return
             form = urllib.parse.parse_qs(
                 self.rfile.read(length).decode("utf-8"))
+            # Overridden below only for a successful "approve" -- the one
+            # write that moves a row into the new Applied section (ticket
+            # 98). Carrying its fingerprint on the redirect is what lets the
+            # very next GET open that section and mark that one row, rather
+            # than requiring the person to go find it themselves among
+            # everything else ever applied.
+            location = "/"
             if name == "scan":
                 # `limit` is required here on the same terms
                 # `cronicled.runscan.build_producer` requires it of the CLI:
@@ -214,8 +236,10 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                     self._send(400, str(exc).encode("utf-8"),
                                [("Content-Type", "text/plain; charset=utf-8")])
                     return
+                if name == "approve":
+                    location = "/?applied=%s" % urllib.parse.quote(fp, safe="")
             # 303 so a refresh redraws the page rather than repeating the write.
-            self._send(303, b"", [("Location", "/")])
+            self._send(303, b"", [("Location", location)])
 
         def log_message(self, fmt, *args):
             pass
@@ -224,7 +248,8 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
 
 
 def serve(rows, actions, scan_status=None, muted=None, dismissed=None,
-         refused=None, superseded=None, host=DEFAULT_HOST, port=DEFAULT_PORT):
+         refused=None, superseded=None, applied=None, host=DEFAULT_HOST,
+         port=DEFAULT_PORT):
     # `HTTPServer` is single-threaded: one connection wedged on a slow read
     # or a slow downstream call (a media server taking its whole configured
     # timeout to answer an Approve, say) stalls every other request -- an
@@ -269,6 +294,6 @@ def serve(rows, actions, scan_status=None, muted=None, dismissed=None,
               % (host, DEFAULT_HOST, port, port, port, port))
     httpd = HTTPServer((host, port), build_handler(
         rows, actions, scan_status, muted=muted, dismissed=dismissed,
-        refused=refused, superseded=superseded))
+        refused=refused, superseded=superseded, applied=applied))
     print("inbox on http://%s:%d/" % (host, port))
     httpd.serve_forever()

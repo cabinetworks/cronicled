@@ -132,6 +132,100 @@ class MainWiring(_Base):
         self.assertEqual(rows[0].filename, "reel.mp4")
 
 
+class AppliedSectionWiring(_Base):
+    """Ticket 98: an applied proposal moves out of the main inbox list and
+    into its own section -- wired here in `main()`'s own callables, not by
+    narrowing `Store.items()`'s default (see `cronicled/__main__.py`'s
+    comment on `_inbox_rows` for why: `Actions._find`, and so `undo`, still
+    needs `items(state=None)` to include an applied row).
+    """
+
+    def _seed_and_apply(self, subject_id="1"):
+        store = Store(self.db_path)
+        fp = store.record(
+            folder="scene-matches", subject_type="scene",
+            subject_id=subject_id, summary="a proposal",
+            payload={"path": "/library/reel.mp4",
+                     "creator": {"name": "Someone", "source": "folder",
+                                 "competing": None, "rejected_folder": None},
+                     "candidate": {"id": "c-1", "title": "A Title",
+                                   "image": None, "performers": [],
+                                   "studio": None},
+                     "score": 0.9, "runners_up": []},
+            producer="test-producer", confidence=0.9)
+        store.mark_applied(fp, prior_state={"title": "old"})
+        store.close()
+        return fp
+
+    def test_an_applied_row_does_not_appear_in_the_main_inbox_list(self):
+        self._seed_and_apply(subject_id="1")
+        self._seed(subject_id="2")  # an ordinary, still-open proposal
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path])
+        rows = captured.kwargs["rows"]()
+        self.assertEqual([r.state for r in rows], ["new"])
+
+    def test_an_applied_row_reaches_the_applied_section(self):
+        fp = self._seed_and_apply()
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path])
+        applied = captured.kwargs["applied"]()
+        self.assertEqual([r.fingerprint for r in applied], [fp])
+
+    def test_a_reverted_row_leaves_applied_and_returns_to_the_inbox(self):
+        # HARM this pins: a reverted row is not an applied one (ticket 98).
+        # Undo already moves it out of `applied` in the store; the wiring
+        # here must not put it back by, say, including "reverted" in
+        # whatever the Applied section asks `items()` for.
+        fp = self._seed_and_apply()
+        store = Store(self.db_path)
+        store.mark_reverted(fp)
+        store.close()
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path])
+        self.assertEqual(captured.kwargs["applied"](), [])
+        rows = captured.kwargs["rows"]()
+        self.assertEqual([r.fingerprint for r in rows], [fp])
+        self.assertEqual(rows[0].state, "reverted")
+
+
+class SceneUrlWiring(_Base):
+    """Ticket 97: the configured `--server` address reaches every row
+    builder as its `base_url` -- reused from the same resolution `Stash`
+    itself was built from, never a second, separate piece of
+    configuration."""
+
+    def test_a_configured_server_reaches_a_rows_scene_url(self):
+        self._seed(subject_id="55")
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path, "--server", "http://media.example"])
+        rows = captured.kwargs["rows"]()
+        self.assertEqual(rows[0].scene_url, "http://media.example/scenes/55")
+
+    def test_no_configured_server_leaves_a_rows_scene_url_none(self):
+        self._seed(subject_id="55")
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path])
+        rows = captured.kwargs["rows"]()
+        self.assertIsNone(rows[0].scene_url)
+
+    def test_the_muted_sections_link_uses_the_same_configured_server(self):
+        store = Store(self.db_path)
+        store.mute("scene", "9", reason="never identifiable")
+        store.close()
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path, "--server", "http://media.example"])
+        muted = captured.kwargs["muted"]()
+        self.assertEqual(muted[0]["scene_url"],
+                         "http://media.example/scenes/9")
+
+
 class HostAndPortEnvironmentDefaults(_Base):
     # Mirrors the coverage --db already has for $CRONICLED_DB: a container
     # can only pass these through ENV (see the Dockerfile), so the flag
