@@ -16,8 +16,13 @@ title — because a lookup per creator, not per file, is the shape the
 measured scoring threshold in `cronicled.scoring` assumed (roughly 99 lookups
 against a real library instead of roughly 5,924).
 `SiteAdapter.search_query(seed, title_query)` describes the OTHER shape, one
-query per title; it is not used here and stays unused — see its own
-docstring for why.
+query per title. This module never builds it: `search(name)` takes whatever
+string it is handed, and `scan.examine_sources` hands it that adapter-built
+query as a FALLBACK — once per (file, store), and only for a file the
+per-creator pass would otherwise refuse, so the cost above is still what a
+resolved file costs. The censored-variant expansion below applies to a
+fallback query exactly as it does to a creator's name, which is what bounds
+one fallback to at most 6 lookups.
 
 `cronicled.censorship.decensor` — the map's other half — is deliberately NOT
 used here. It rewrites a STORE TITLE back to canonical words for SCORING,

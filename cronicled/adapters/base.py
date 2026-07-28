@@ -45,11 +45,14 @@ class SiteAdapter(object):
         """The targeted per-title query: the creator handle plus the title, which
         narrows a catalog search to that creator's own clips.
 
-        Not wired to anything: `cronicled.search.catalog_search` — the
-        production `search` callable `scan.examine` actually calls — queries
-        once per CREATOR, not once per title, so it never builds this query
-        at all. Reading this method as live because it exists would be a
-        mistake; it describes the other shape a search could have taken, not
-        the one that was chosen. See `cronicled.search`'s module docstring.
+        A FALLBACK, never the shape a scan searches in. The per-creator query
+        runs first and costs one lookup per creator rather than one per file
+        (see `cronicled.search`'s module docstring for the measurement that
+        motivated it); only a file that pass would otherwise refuse reaches
+        this method, through `cronicled.scan.examine_sources`, which spends
+        one such query per (file, store) before recording that refusal.
+        `seed` is the resolved creator's name and `title_query` the filename
+        read as a title — `cronicled.scoring.title_view`, the same derivation
+        the scorer weighs, never a second one built at the call site.
         """
         return seed + " " + title_query

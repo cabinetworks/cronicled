@@ -21,6 +21,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from cronicled.adapters.base import SiteAdapter
 from cronicled.jobs import JobRunner
 from cronicled.scan import IDENTIFIED_BY_FINGERPRINT
 from cronicled.runscan import build_producer, configured_adapters, main
@@ -30,7 +31,12 @@ from tests.fixtures.cast import CENSORSHIP
 WAIT = 10
 
 
-class _Adapter:
+class _Adapter(SiteAdapter):
+    """Subclasses the real interface for `search_query` alone — the phrasing
+    the per-title fallback goes through. A double with its own copy of it
+    could agree with this file's assertions while disagreeing with every
+    configured adapter in production."""
+
     def __init__(self, scraper_id="scraper-alpha", censorship=None, name="store",
                  catalog_resolvable=True):
         self.name = name
@@ -219,6 +225,43 @@ class BuildProducerWiring(unittest.TestCase):
             build_producer(stash, {"store": adapter}, self.store, limit=10))
 
         self.assertEqual(finished.recorded, 1)
+
+    def test_a_clip_the_creators_page_missed_is_found_through_the_wiring(self):
+        # The per-title fallback, end to end: the scraper answers the
+        # creator with a page that does not carry this file — the shape a
+        # store with more clips than fit one response returns — and answers
+        # the file itself only when asked for it by title. Nothing but the
+        # wiring supplies `title_query`, so a `build_producer` that stopped
+        # binding it would refuse this file while every test that injects
+        # its own `Source` stayed green.
+        path = "/library/Velvet Crane/Morning Ritual.mp4"
+        other = row("Harbour Lights", "https://example.invalid/clip/w")
+        wanted = row("Morning Ritual", "https://example.invalid/clip/x")
+        stash = _FakeStash(
+            [scene(1, path)],
+            script={("scraper-alpha", "Velvet Crane"): [other],
+                    ("scraper-alpha", "Velvet Crane Morning Ritual"): [wanted]})
+        adapter = _Adapter(scraper_id="scraper-alpha")
+
+        finished = self._run_to_completion(
+            build_producer(stash, {"store": adapter}, self.store, limit=10))
+
+        self.assertEqual(finished.recorded, 1)
+        self.assertIn(
+            ("scrape_scenes_by_query", "scraper-alpha",
+             "Velvet Crane Morning Ritual"),
+            stash.calls)
+
+    def test_the_adapters_own_query_phrasing_is_what_travels(self):
+        # Bound off the adapter rather than rebuilt here: a store whose spec
+        # says narrowing by the creator costs recall phrases its own query,
+        # and a copy of the base phrasing made at this call site could not
+        # honour that.
+        adapter = _Adapter()
+        producer = build_producer(_FakeStash([]), {"store": adapter},
+                                  self.store, limit=10)
+        self.assertEqual(producer._sources[0].title_query,
+                         adapter.search_query)
 
     def test_a_scan_built_this_way_never_writes_to_the_media_server(self):
         # HARM: `ScanProducer` on its own already holds this property (see

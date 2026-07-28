@@ -73,6 +73,16 @@ def build_producer(stash, adapters, store, *, limit, folder="library",
     reason it travels with the `Source` rather than being consulted only
     here and thrown away.
 
+    `adapter.search_query` travels with the `Source` too, as `title_query`:
+    the per-title fallback `examine_sources` spends on a file the per-creator
+    pass could not resolve. It is threaded through UNCONDITIONALLY, with no
+    equivalent of `owner_of`'s `catalog_resolvable` gate — phrasing a query
+    is something every adapter can do (the base class supplies one, and a
+    store whose spec sets `search_omits_seed` overrides it), and a store that
+    cannot attribute a result to a creator can still be asked for a title.
+    Omitting it would leave the fallback dead in production while every test
+    that injects its own `Source` went on passing.
+
     `stash.scrape_scene_url` is threaded through as `enrich`, unconditionally
     and once for the whole run — unlike `owner_of`, this needs no
     adapter-level gate and no per-store copy: it scrapes the winning
@@ -105,7 +115,8 @@ def build_producer(stash, adapters, store, *, limit, folder="library",
               owner_of=(adapter.owner_of if adapter.catalog_resolvable
                         else None),
               catalog_resolvable=adapter.catalog_resolvable,
-              censorship=adapter.censorship)
+              censorship=adapter.censorship,
+              title_query=adapter.search_query)
         for name, adapter in sorted(adapters.items())
     ]
 

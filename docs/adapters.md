@@ -114,10 +114,14 @@ title matches worth trusting, or vice versa.
 Optional, defaults to `false`. `search_query(seed, title_query)` normally
 returns `seed + " " + title_query`; setting `search_omits_seed: true` makes
 it return `title_query` alone, for a store where narrowing the query by the
-creator seed costs recall and buys nothing. As of this writing nothing in
-the production scan path calls `search_query` at all (see its docstring in
-`cronicled/adapters/base.py`), so this only matters if a future caller
-starts using it.
+creator seed costs recall and buys nothing.
+
+A scan searches by CREATOR first — one lookup per creator rather than one
+per file. `search_query` phrases the FALLBACK: a file that pass could not
+resolve is asked for once more, by title, against each configured store,
+before its refusal is recorded. So this field decides how that second query
+is phrased for this store, and it is reached only for a file the cheaper
+question could not answer.
 
 ## Where adapters come from
 
