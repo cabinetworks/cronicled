@@ -194,11 +194,23 @@ class Verdict:
         return "Verdict(unlisted=%r, reason=%r)" % (self.unlisted, self.reason)
 
 
-def listing_verdict(listing, decision, *, attribution_certain=True):
+def listing_verdict(listing, decision, *, performer_id, attribution_certain=True):
     """What `listing` and `decision` together are allowed to claim about a file.
 
     `listing` is a `SourceListing`; `decision` is a
     `cronicled.scoring.Decision` made over candidates drawn from it.
+    `performer_id` names the performer `decision`'s candidates were actually
+    scored against, and must equal `listing.performer_id` — a mismatch
+    refuses outright rather than reporting a verdict at all. Nothing about a
+    bare `Decision` says which performer's scenes it was scored over, so
+    without this a caller that mixed up which listing goes with which
+    decision — the wrong pair pulled off two ends of a batch, say — would get
+    back a confident answer naming the performer `listing` carries, over
+    candidates actually drawn from somebody else's. The check costs little
+    because the information was already here: every reason string below
+    already names `listing.performer_id`, so asking the caller to also state
+    which performer it scored against, and comparing the two, is the whole
+    fix.
     `attribution_certain` says whether the performer whose listing was read is
     agreed to be this file's creator — a caller working from
     `cronicled.artist.resolve` computes it as `resolution.competing is None`,
@@ -267,6 +279,18 @@ def listing_verdict(listing, decision, *, attribution_certain=True):
         raise TypeError(
             "attribution_certain must be True or False, got %r"
             % (attribution_certain,))
+
+    # The transposition this exists to catch: a caller holding several
+    # (listing, decision) pairs at once mismatches them, and every branch
+    # below would still be reachable -- just never on the fact the file
+    # actually needed. `listing_verdict` cannot see how `decision` was
+    # produced, so the caller states it and this refuses rather than
+    # silently judging one performer's listing against another's candidates.
+    if performer_id != listing.performer_id:
+        raise ValueError(
+            "decision was scored against performer %r but listing is for "
+            "performer %r -- refusing to judge one performer's listing "
+            "against another's decision" % (performer_id, listing.performer_id))
 
     if not attribution_certain:
         return Verdict(None, (
@@ -369,7 +393,8 @@ def check(box, performer_id, name, folder, resolution, *,
                for scene in listing.scenes]
     decision = decide(matches, threshold)
     attribution_certain = resolution.competing is None
-    return listing_verdict(listing, decision, attribution_certain=attribution_certain)
+    return listing_verdict(listing, decision, performer_id=performer_id,
+                           attribution_certain=attribution_certain)
 
 
 class StashBox:
