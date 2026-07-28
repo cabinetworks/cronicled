@@ -11,8 +11,8 @@ _HOSTILE = '<script>alert("x")</script>'
 def _job(**over):
     job = dict(id="job-1", producer="library-scan-x", cost="scraping",
                state="running", started_at="2026-07-27T00:00:00+00:00",
-               finished_at=None, message="working", recorded=0, skipped=0,
-               error=None, traceback=None)
+               finished_at=None, duration=None, message="working",
+               recorded=0, skipped=0, error=None, traceback=None)
     job.update(over)
     return Job(**job)
 

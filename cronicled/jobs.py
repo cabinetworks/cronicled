@@ -166,7 +166,18 @@ class Job:
     well as its message — `str(exc)` alone is empty for a bare
     `raise SomeError()`, and a mere `'folder'` for a missing key, neither of
     which a user could act on — and `traceback` keeps the frames that say
-    which line of which producer gave up."""
+    which line of which producer gave up.
+
+    `duration` is the job's own elapsed seconds, `None` while `state` is
+    still `"running"`. It exists because `started_at` and `finished_at` are
+    ISO timestamps truncated to whole seconds (see `_now`), so subtracting
+    them loses every job that finishes inside the same second it started —
+    which is the ordinary case, not the exception, for most producers. This
+    field is measured separately, from a monotonic clock at the moment the
+    job actually started and the moment it actually finished, so it carries
+    sub-second precision and is immune to the wall clock being adjusted
+    mid-job (an NTP step, a DST change) in a way `finished_at - started_at`
+    would not be."""
 
     id: str
     producer: str
@@ -174,6 +185,7 @@ class Job:
     state: str  # "running", "done", or "failed"
     started_at: str
     finished_at: Optional[str]
+    duration: Optional[float]
     message: str
     recorded: int
     skipped: int
@@ -204,12 +216,28 @@ class _JobState:
         self.cost = cost
         self.state = "running"
         self.started_at = _now()
+        # A monotonic reading taken alongside `started_at`, for `duration`
+        # alone — never exposed itself, and never used to derive `started_at`
+        # or `finished_at`. See `Job.duration` for why a second clock is
+        # worth the trouble: the wall-clock timestamps above are truncated to
+        # whole seconds and can also jump if the system clock is adjusted
+        # mid-job, and a monotonic clock has neither problem.
+        self._started_monotonic = time.monotonic()
         self.finished_at = None
+        self.duration = None
         self.message = ""
         self.recorded = 0
         self.skipped = 0
         self.error = None
         self.traceback = None
+
+    def finish(self):
+        """Stamp `finished_at` and `duration` together, from the same
+        monotonic reading, so the two always describe the same instant.
+        Called exactly once, from `_run`'s success and failure branches
+        alike, with `_lock` already held."""
+        self.finished_at = _now()
+        self.duration = time.monotonic() - self._started_monotonic
 
     def snapshot(self):
         return Job(
@@ -219,6 +247,7 @@ class _JobState:
             state=self.state,
             started_at=self.started_at,
             finished_at=self.finished_at,
+            duration=self.duration,
             message=self.message,
             recorded=self.recorded,
             skipped=self.skipped,
@@ -513,11 +542,11 @@ class JobRunner:
                 state.state = "failed"
                 state.error = f"{type(exc).__name__}: {exc}"
                 state.traceback = traceback.format_exc()
-                state.finished_at = _now()
+                state.finish()
         else:
             with self._lock:
                 state.state = "done"
-                state.finished_at = _now()
+                state.finish()
         finally:
             # Release the cost-class slot no matter how the job ended. A
             # crashed scrape that never frees its slot would permanently
