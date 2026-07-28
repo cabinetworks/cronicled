@@ -284,3 +284,28 @@ class FailedApplyIsNotADeadEnd(unittest.TestCase):
 
     def test_a_row_that_never_failed_carries_no_error(self):
         self.assertIsNone(to_row(_item()).error)
+
+
+class ARevertedRowStopsOfferingUndo(unittest.TestCase):
+    """The visible half of the same fault: `undoable` requires `applied`, so
+    recording the revert is what takes the button away. A reverted row is not
+    closed, though -- the proposal is as live as it was before it was applied,
+    so approving again, dismissing or muting all remain open.
+    """
+
+    def test_a_reverted_row_offers_no_undo(self):
+        row = to_row(_item(state="reverted", prior_state={"title": "was"}))
+        self.assertFalse(row.undoable)
+
+    def test_a_reverted_row_is_still_actionable(self):
+        # Undoing by mistake is ordinary. Nothing about a revert closes the
+        # decision -- only an apply does.
+        row = to_row(_item(state="reverted", prior_state={"title": "was"}))
+        self.assertTrue(row.actionable)
+
+    def test_the_snapshot_is_kept_after_a_revert(self):
+        # It is the only record of what the scene looked like before the
+        # apply. Keeping it is safe precisely because Undo needs `applied`.
+        item = _item(state="reverted", prior_state={"title": "was"})
+        self.assertTrue(item["prior_state"])
+        self.assertFalse(to_row(item).undoable)

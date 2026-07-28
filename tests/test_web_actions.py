@@ -48,6 +48,9 @@ class _FakeStore:
     def mark_failed(self, fp, error):
         self.calls.append(("failed", fp, error))
 
+    def mark_reverted(self, fp):
+        self.calls.append(("reverted", fp))
+
     def dismiss(self, fp, reason=None):
         self.calls.append(("dismissed", fp, reason))
 
@@ -391,3 +394,38 @@ class ScanStatus(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UndoLeavesATrace(unittest.TestCase):
+    """An undo used to change nothing in the store. The revert happened on the
+    media server, the row stayed `applied`, and the page went on offering an
+    Undo button -- so a person clicked it, it worked, the page redrew
+    identically, and the only reasonable conclusion was that it had not
+    worked. Reported exactly that way in use.
+    """
+
+    def _applied(self):
+        return _item(state="applied", prior_state={"title": "was"})
+
+    def test_a_successful_undo_is_recorded(self):
+        store, stash = _FakeStore(self._applied()), _FakeStash()
+        Actions(store, stash).undo("fp-1")
+        self.assertIn(("reverted", "fp-1"), store.calls)
+
+    def test_nothing_is_recorded_when_the_revert_fails(self):
+        # Ordering: a row claiming the write was taken back while it is still
+        # applied on the server is worse than one that says nothing.
+        class _Failing(_FakeStash):
+            def revert_scene(self, scene_id, prior):
+                raise RuntimeError("server said no")
+
+        store = _FakeStore(self._applied())
+        with self.assertRaises(RuntimeError):
+            Actions(store, _Failing()).undo("fp-1")
+        self.assertEqual(store.calls, [])
+
+    def test_nothing_is_recorded_when_there_is_no_snapshot(self):
+        store = _FakeStore(_item(state="applied", prior_state=None))
+        with self.assertRaises(ValueError):
+            Actions(store, _FakeStash()).undo("fp-1")
+        self.assertEqual(store.calls, [])

@@ -121,6 +121,11 @@ class Actions:
             raise ValueError(
                 "cannot undo %s: no snapshot was stored for it" % fp)
         self._stash.revert_scene(item["subject_id"], prior)
+        # Recorded only AFTER the revert succeeds. Marking first and then
+        # raising would leave a row claiming the write was taken back while it
+        # is still applied on the server -- the same ordering `approve`
+        # follows, for the same reason.
+        self._store.mark_reverted(fp)
         if carries_cover(item["payload"]["candidate"]):
             return _COVER_NOT_RESTORED
         return "reverted"
