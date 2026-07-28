@@ -73,6 +73,8 @@ class PerformerListing(unittest.TestCase):
         self.assertEqual([s["id"] for s in listing.scenes], ["s1", "s2"])
         self.assertTrue(listing.complete)
         self.assertEqual(len(t.calls), 1, "did not ask for a second page")
+        self.assertEqual(listing.total, 2)
+        self.assertEqual(listing.pages_read, 1)
 
     def test_a_performer_with_nothing_is_a_complete_answer(self):
         # Nothing promised and nothing served. This is the most valuable
@@ -88,6 +90,8 @@ class PerformerListing(unittest.TestCase):
         self.assertEqual(listing.scenes, ())
         self.assertTrue(listing.complete)
         self.assertEqual(len(t.calls), 1, "did not page past an empty listing")
+        self.assertEqual(listing.total, 0)
+        self.assertEqual(listing.pages_read, 1)
 
     def test_an_empty_first_page_with_a_count_that_says_otherwise_is_not_complete(self):
         # The source promises scenes and serves none, from the very first
@@ -106,6 +110,8 @@ class PerformerListing(unittest.TestCase):
                 self.assertEqual(listing.scenes, ())
                 self.assertFalse(listing.complete)
                 self.assertEqual(len(t.calls), 1, "stopped at the empty page")
+                self.assertEqual(listing.total, count)
+                self.assertEqual(listing.pages_read, 1)
 
     def test_a_count_that_drops_to_zero_mid_read_is_not_complete(self):
         # Two scenes arrived, then the source said it has none. Its tally
@@ -122,6 +128,12 @@ class PerformerListing(unittest.TestCase):
         self.assertEqual(len(listing.scenes), 2)
         self.assertFalse(listing.complete)
         self.assertEqual(len(t.calls), 2, "stopped at the empty page")
+        # `total` holds the FIRST count the source reported (6), not the
+        # contradicting 0 that ended the read -- the later figure is the
+        # untrustworthy one here, and the first is still the source's
+        # original claim about how much there is.
+        self.assertEqual(listing.total, 6)
+        self.assertEqual(listing.pages_read, 2)
 
     def test_reads_every_page_and_reports_the_read_complete(self):
         t = _transport([
@@ -134,6 +146,8 @@ class PerformerListing(unittest.TestCase):
 
         self.assertEqual([s["id"] for s in listing.scenes], ["s1", "s2", "s3"])
         self.assertTrue(listing.complete)
+        self.assertEqual(listing.total, 3)
+        self.assertEqual(listing.pages_read, 2)
 
     def test_a_read_that_hits_the_page_cap_is_not_complete(self):
         # Six scenes, two per page, but only two pages are allowed. The four
@@ -147,6 +161,10 @@ class PerformerListing(unittest.TestCase):
         self.assertEqual(len(listing.scenes), 4)
         self.assertFalse(listing.complete)
         self.assertEqual(len(t.calls), 2, "stopped asking at the cap")
+        # The ratio a caller can act on: 4 read of the 6 the source promised,
+        # across the 2 pages the cap allowed.
+        self.assertEqual(listing.total, 6)
+        self.assertEqual(listing.pages_read, 2)
 
     def test_a_page_that_returns_nothing_ends_the_read_as_incomplete(self):
         # The count says six and the server hands back nothing. Whatever is
@@ -164,6 +182,8 @@ class PerformerListing(unittest.TestCase):
         self.assertEqual(len(listing.scenes), 4)
         self.assertFalse(listing.complete)
         self.assertEqual(len(t.calls), 3, "stopped at the empty page")
+        self.assertEqual(listing.total, 6)
+        self.assertEqual(listing.pages_read, 3)
 
     def test_a_short_page_is_not_the_end_of_the_read(self):
         # The COUNT is the authority on completeness, not the page length.
@@ -190,6 +210,8 @@ class PerformerListing(unittest.TestCase):
         self.assertEqual(len(listing.scenes), 9)
         self.assertTrue(listing.complete)
         self.assertEqual(len(t.calls), 3, "kept asking past the short page")
+        self.assertEqual(listing.total, 9)
+        self.assertEqual(listing.pages_read, 3)
 
     def test_a_short_page_the_source_never_makes_up_is_not_complete(self):
         # The same short page, and this time the source never delivers the
@@ -211,6 +233,8 @@ class PerformerListing(unittest.TestCase):
         self.assertEqual(len(listing.scenes), 3)
         self.assertFalse(listing.complete)
         self.assertEqual(len(t.calls), 2, "stopped at the empty page")
+        self.assertEqual(listing.total, 9)
+        self.assertEqual(listing.pages_read, 2)
 
     def test_a_transport_failure_part_way_through_raises(self):
         # Pages one and two are discarded rather than returned with
@@ -527,9 +551,13 @@ class RequestShape(unittest.TestCase):
 PERFORMER = "pf-8821"
 
 
-def _listing(scenes=2, complete=True, performer_id=PERFORMER):
-    return SourceListing(performer_id,
-                         [{"id": "s%d" % n} for n in range(scenes)], complete)
+def _listing(scenes=2, complete=True, performer_id=PERFORMER, total=None,
+             pages_read=1):
+    scene_list = [{"id": "s%d" % n} for n in range(scenes)]
+    if total is None:
+        total = len(scene_list)
+    return SourceListing(performer_id, scene_list, complete,
+                         total=total, pages_read=pages_read)
 
 
 def _m(value, contained=False, meaningful_count=2):
@@ -652,6 +680,21 @@ class ListingVerdict(unittest.TestCase):
                 self.assertIsNot(verdict.unlisted, False)
                 self.assertIn("stopped early", verdict.reason)
                 self.assertNotIn("in full", verdict.reason)
+
+    def test_a_partial_read_names_how_partial(self):
+        # The ratio is what turns "stopped early" into something a person
+        # can act on: 3 read of 9 promised says there is more to ask for and
+        # names how much; the number of pages says how it stopped so far.
+        # Without it, "stopped early after 3 scenes" is only a reason to
+        # distrust the read, never a reason to go back for the rest.
+        verdict = listing_verdict(
+            _listing(scenes=3, complete=False, total=9, pages_read=4),
+            _refused(), performer_id=PERFORMER)
+
+        self.assertIsNone(verdict.unlisted)
+        self.assertIn("3", verdict.reason)
+        self.assertIn("9", verdict.reason)
+        self.assertIn("4", verdict.reason)
 
     def test_a_decided_match_is_not_an_absence(self):
         verdict = listing_verdict(_listing(complete=True), _decided(),

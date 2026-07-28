@@ -144,16 +144,30 @@ class SourceListing:
     rather than inferred from their length, because the length of a partial
     read and the length of a complete one look exactly alike. It means every
     entry this source holds for the performer was read — nothing more.
+
+    `total` and `pages_read` are what let an incomplete read be reported as
+    partial rather than merely disqualifying: `total` is the entry count the
+    source reported (see `performer_listing`'s own docstring for which of
+    possibly several reported counts this is, and why), and `pages_read` is
+    how many page requests it took to get here. Neither changes what a
+    partial read may claim -- `complete=False` still blocks every claim
+    `listing_verdict` would otherwise make -- they only say how partial: "3
+    of 9" is something a person can act on (raise the page cap, try later),
+    "3" alone is only a reason to stop trusting the read.
     """
 
-    def __init__(self, performer_id, scenes, complete):
+    def __init__(self, performer_id, scenes, complete, *, total, pages_read):
         self.performer_id = performer_id
         self.scenes = tuple(scenes)
         self.complete = complete
+        self.total = total
+        self.pages_read = pages_read
 
     def __repr__(self):
-        return "SourceListing(performer_id=%r, scenes=%d, complete=%r)" % (
-            self.performer_id, len(self.scenes), self.complete)
+        return ("SourceListing(performer_id=%r, scenes=%d, complete=%r, "
+                "total=%r, pages_read=%r)" % (
+                    self.performer_id, len(self.scenes), self.complete,
+                    self.total, self.pages_read))
 
 
 class Verdict:
@@ -322,9 +336,13 @@ def listing_verdict(listing, decision, *, performer_id, attribution_certain=True
 
     if not listing.complete:
         return Verdict(None, (
-            "the read of this source's listing for performer %s stopped early "
-            "after %d scenes, so the file is not ruled out by what was not "
-            "read" % (listing.performer_id, len(listing.scenes))))
+            "the read of this source's listing for performer %s stopped "
+            "early after %d of %s scenes across %d page%s, so the file is "
+            "not ruled out by what was not read"
+            % (listing.performer_id, len(listing.scenes),
+               listing.total if listing.total is not None else "an unknown",
+               listing.pages_read,
+               "" if listing.pages_read == 1 else "s")))
 
     # The one sentence in this module a person acts on, so it carries its own
     # limit: quoted into a ticket with none of these docs around it, it must
@@ -446,8 +464,19 @@ class StashBox:
         caller *can* act on: `StashError.transient` says whether retrying is
         worth it, and folding it into the flag would throw that away and make
         a wedged host indistinguishable from an honest partial read.
+
+        `total` on the returned listing is the `count` the FIRST page
+        reported, held fixed for the rest of the read rather than
+        overwritten by whatever a later page says. That matters exactly when
+        a later page disagrees -- the count-drops-to-zero contradiction this
+        method already treats as reason to distrust the read -- where the
+        latest figure is the untrustworthy one and the first is still the
+        source's original claim about how much there is. `pages_read` is
+        simply how many requests it took to get here, whichever way the read
+        ended.
         """
         scenes = []
+        total = None
         for page in range(1, max_pages + 1):
             variables = {"input": {
                 "performers": {"value": [performer_id], "modifier": "INCLUDES"},
@@ -456,13 +485,18 @@ class StashBox:
             }}
             result = self._client.gql(PERFORMER_SCENES, variables, timeout=timeout)
             block = result["queryScenes"]
+            if total is None:
+                total = block["count"]
             if not block["scenes"]:
                 nothing_to_read = block["count"] == 0 and not scenes
-                return SourceListing(performer_id, scenes, complete=nothing_to_read)
+                return SourceListing(performer_id, scenes, complete=nothing_to_read,
+                                     total=total, pages_read=page)
             scenes.extend(block["scenes"])
             if len(scenes) >= block["count"]:
-                return SourceListing(performer_id, scenes, complete=True)
-        return SourceListing(performer_id, scenes, complete=False)
+                return SourceListing(performer_id, scenes, complete=True,
+                                     total=total, pages_read=page)
+        return SourceListing(performer_id, scenes, complete=False,
+                             total=total, pages_read=max_pages)
 
     def known_by_fingerprint(self, fingerprints, timeout=DEFAULT_TIMEOUT):
         """Ask the source, in **one** request, which scenes carry each of
