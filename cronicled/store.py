@@ -551,20 +551,34 @@ class Store:
         one — the only caller is `cronicled.web.actions.Actions.unmute`,
         reached from a person's own click, never from `ScanProducer`.
 
-        Deletes the row from the `mute` table — the table `record()` and
-        `select()` actually check — and NOTHING else. In particular, any
-        `item` row(s) already sitting in `state = 'muted'` are left exactly
-        as `mute` left them: there is no snapshot of what such a row looked
-        like before it was muted (the same gap `dismiss`/`undismiss` have),
-        and this deliberately does not guess one by moving the row to `new`.
-        Symmetrically, this never touches the `dismissal` table either — see
-        `undismiss`'s docstring for the same separation held the other way.
+        Removes the standing block AND brings back the `item` row(s) `mute`
+        hid, by returning any still sitting in `state = 'muted'` to `new`.
 
-        Deliberately triggers no lookup and no scan of its own: making the
-        subject visible again is left entirely to a future scan choosing to
-        examine it and `record()` proposing it afresh, whenever a person
-        next asks for one — see `cronicled.web.actions.Actions.unmute` and
-        `cronicled.scan.select`, neither of which this method calls into.
+        Both halves are needed, and doing only the first was tried: the block
+        lifted, `items()` still filtered the row out as `muted`, and a person
+        clicking Unmute saw the page redraw completely unchanged. That is the
+        same failure an undo had -- an action that works and looks broken --
+        and it is worse than the fault it replaced, because a control that
+        appears to do nothing gets pressed again.
+
+        `new` rather than a remembered previous state, because none is
+        stored, and because `new` is what the state means here: this
+        proposal is waiting for a decision. The alternative readings are
+        `seen` (claims a person looked at it, which nothing knows) and
+        leaving it hidden (the bug above).
+
+        A row that reached a TERMINAL state keeps it. `mute` deliberately
+        leaves `applied` and `failed` alone -- muting a subject does not
+        un-apply a write that already happened -- so there is nothing for
+        this to restore, and forcing such a row to `new` would offer a fresh
+        Approve for a proposal already written to the library.
+
+        Never touches the `dismissal` table -- see `undismiss`'s docstring
+        for the same separation held the other way. A mute and a dismissal
+        are different rejections and reversing one must not quietly reverse
+        the other.
+
+        Deliberately triggers no lookup and no scan of its own.
 
         Calling this for a subject that is not currently muted is not an
         error, mirroring `mute`'s own tolerance of a subject with no `item`
@@ -575,6 +589,27 @@ class Store:
         with self._lock:
             self._conn.execute(
                 "DELETE FROM mute WHERE subject_type = ? AND subject_id = ?",
+                (subject_type, subject_id),
+            )
+            # Only rows this mute actually hid. `state = 'muted'` is the
+            # exact condition `mute` wrote and `items()` filters on, so this
+            # cannot disturb a row that reached `applied` or `failed` before
+            # the mute was applied.
+            #
+            # A row DISMISSED before it was muted goes back to `dismissed`,
+            # not to `new`. `mute` overwrites the state, so the dismissal is
+            # no longer legible from the row itself -- only the `dismissal`
+            # table still remembers it. Restoring everything to `new` was
+            # tried and resurrected a proposal the person had already
+            # rejected: reversing one rejection must not quietly reverse the
+            # other, which is the separation `undismiss` holds from the
+            # opposite side.
+            self._conn.execute(
+                "UPDATE item SET state = CASE"
+                "   WHEN EXISTS (SELECT 1 FROM dismissal d"
+                "                WHERE d.fingerprint = item.fingerprint)"
+                "   THEN 'dismissed' ELSE 'new' END "
+                "WHERE subject_type = ? AND subject_id = ? AND state = 'muted'",
                 (subject_type, subject_id),
             )
             self._conn.commit()

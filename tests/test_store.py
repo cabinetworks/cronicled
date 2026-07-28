@@ -866,3 +866,64 @@ class SchemaAdditionOnAnExistingDatabase(unittest.TestCase):
                          payload={"title": "Anything At All"},
                          producer="nightly-scrape")
             self.assertEqual(store.items(), self.snapshot["visible"])
+
+
+class UnmuteBringsTheRowBack(unittest.TestCase):
+    """Lifting the block is only half of an unmute.
+
+    Removing the `mute` row alone left the `item` still sitting in
+    `state = 'muted'`, which `items()` filters out -- so a person clicked
+    Unmute, it worked, and the page redrew completely unchanged. That is the
+    same shape as an undo that recorded nothing: an action that works and
+    looks broken, which gets pressed again.
+
+    `undismiss` already restored its row; only `unmute` did not. The two are
+    symmetric now.
+    """
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._dir, ignore_errors=True)
+        self.store = Store(os.path.join(self._dir, "s.sqlite3"))
+        self.addCleanup(self.store.close)
+
+    def _record(self, subject_id):
+        return self.store.record(
+            "library", "scene", subject_id, "summary",
+            {"path": "/library/%s.mp4" % subject_id,
+             "creator": {"name": "Nine Winters", "source": "folder",
+                         "competing": None, "rejected_folder": None},
+             "candidate": {"id": "c-1", "title": "A Title", "image": None},
+             "score": 0.9, "runners_up": []},
+            producer="test", confidence=0.9)
+
+    def test_an_unmuted_proposal_is_visible_again(self):
+        self._record("7")
+        self.store.mute("scene", "7")
+        self.assertEqual(len(self.store.items()), 0)
+        self.store.unmute("scene", "7")
+        self.assertEqual(
+            len(self.store.items()), 1,
+            "unmute lifted the block but left the row hidden, so the page "
+            "would redraw unchanged")
+
+    def test_an_applied_row_keeps_its_state_through_mute_and_unmute(self):
+        # Muting deliberately leaves a terminal row alone -- it does not
+        # un-apply a write that already happened -- so there is nothing for
+        # unmute to restore. Forcing it to `new` would offer a fresh Approve
+        # for something already written to the library.
+        fp = self._record("8")
+        self.store.mark_applied(fp, prior_state={"title": "was"})
+        self.store.mute("scene", "8")
+        self.store.unmute("scene", "8")
+        self.assertEqual([i["state"] for i in self.store.items(state="applied")],
+                         ["applied"])
+
+    def test_unmuting_does_not_lift_a_separate_dismissal(self):
+        # Different rejections. Reversing one must not quietly reverse the
+        # other.
+        fp = self._record("9")
+        self.store.dismiss(fp)
+        self.store.mute("scene", "9")
+        self.store.unmute("scene", "9")
+        self.assertEqual(len(self.store.items()), 0)
