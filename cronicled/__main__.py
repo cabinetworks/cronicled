@@ -105,7 +105,21 @@ def main(argv=None):
     # `Stash.__init__`), and never a second flag of its own: one address,
     # resolved once, used for both jobs.
     base_url = args.server
-    serve(rows=lambda: to_rows(store.items(), base_url=base_url),
+
+    def _inbox_rows():
+        # Applied proposals get their own section below (ticket 98) -- the
+        # inbox itself only ever shows what still needs a decision, and an
+        # applied row does not. `items()`'s own default already hides
+        # `dismissed`/`muted`/`superseded`; this excludes the one further
+        # state the inbox list has to earn its own way out of, on top of
+        # that -- see `Actions._find`'s docstring for why that default
+        # itself is left untouched: `undo` still needs `items(state=None)`
+        # to include an applied row, and this filtering happens here, not
+        # by narrowing what `items()` returns.
+        return to_rows([item for item in store.items()
+                        if item["state"] != "applied"], base_url=base_url)
+
+    serve(rows=_inbox_rows,
           muted=lambda: to_mute_rows(store.mutes(), base_url=base_url),
           dismissed=lambda: to_rows(store.items(state="dismissed"),
                                     base_url=base_url),
@@ -113,6 +127,8 @@ def main(argv=None):
                                           base_url=base_url),
           superseded=lambda: to_rows(store.items(state="superseded"),
                                      base_url=base_url),
+          applied=lambda: to_rows(store.items(state="applied"),
+                                  base_url=base_url),
           actions=actions, scan_status=actions.scan_status,
           host=args.host, port=args.port)
 

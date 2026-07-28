@@ -563,5 +563,84 @@ class MutedSubjectFilename(unittest.TestCase):
         self.assertIn('<a href="http://media.example/scenes/7"', html)
 
 
+class ApplifiedSectionRendering(unittest.TestCase):
+    """Ticket 98: applied proposals move to their own collapsed section,
+    with Undo and the cover warning still intact, while the main list
+    excludes them (that exclusion is `cronicled.__main__`'s wiring, tested
+    in `tests/test_main.py` -- this covers what the template does once an
+    `applied` list actually reaches it).
+    """
+
+    def test_an_applied_rows_count_reaches_the_page(self):
+        row = _row(state="applied", prior_state={"title": "old"})
+        html = render("inbox.html", rows=[], counts={}, applied=[row])
+        self.assertIn("Applied (1)", html)
+
+    def test_an_empty_applied_section_says_so(self):
+        html = render("inbox.html", rows=[], counts={}, applied=[])
+        self.assertIn("Applied (0)", html)
+        self.assertIn("Nothing applied yet.", html)
+
+    def test_an_applied_row_still_offers_undo(self):
+        row = _row(state="applied", prior_state={"title": "old"})
+        html = render("inbox.html", rows=[], counts={}, applied=[row])
+        section = html[html.index("Applied ("):html.index("Muted (")]
+        self.assertIn('<form method="post" action="/undo">', section)
+        self.assertIn(row.fingerprint, section)
+
+    def test_the_cover_warning_travels_into_the_section(self):
+        # "The cover-write warning travels with the row into the section.
+        # It is the one write approving cannot take back." -- the fact this
+        # ticket is most explicit must not be lost from row = _row that
+        # carries a cover image once it lives inside Applied.
+        row = _row(state="applied", prior_state={"title": "old"},
+                  image="data:image/jpeg;base64,realcover")
+        html = render("inbox.html", rows=[], counts={}, applied=[row])
+        section = html[html.index("Applied ("):html.index("Muted (")]
+        self.assertIn(
+            "cannot be restored by Undo, even after reverting", section)
+
+    def test_the_section_is_collapsed_by_default(self):
+        row = _row(state="applied", prior_state={"title": "old"})
+        html = render("inbox.html", rows=[], counts={}, applied=[row])
+        self.assertNotIn('<details class="section" open', html)
+
+    _HIGHLIGHT_CLASS = 'class="proposal just-applied"'
+
+    def test_a_fresh_approve_opens_the_section_and_highlights_its_row(self):
+        # The case ticket 98 calls out: the approve just made and
+        # immediately regretted. `just_applied` is the fingerprint the
+        # redirect from a successful /approve carries (see web/app.py).
+        row = _row(state="applied", prior_state={"title": "old"},
+                  fingerprint="fp-just-applied")
+        html = render("inbox.html", rows=[], counts={}, applied=[row],
+                      just_applied="fp-just-applied")
+        applied_section = html[html.index('<details class="section"'
+                                          ' open'):html.index("Muted (")]
+        self.assertIn(self._HIGHLIGHT_CLASS, applied_section)
+
+    def test_a_stale_just_applied_value_does_not_force_the_section_open(self):
+        # A `?applied=` query value naming a row not (or no longer) in
+        # `applied` -- a bookmarked link, another tab's stale redirect --
+        # must not force the section open on nothing.
+        row = _row(state="applied", prior_state={"title": "old"},
+                  fingerprint="fp-1")
+        html = render("inbox.html", rows=[], counts={}, applied=[row],
+                      just_applied="fp-not-in-applied")
+        self.assertNotIn('<details class="section" open', html)
+
+    def test_a_row_that_is_not_just_applied_is_not_marked(self):
+        # Note the CSS rule itself (`.proposal.just-applied`, in the
+        # `<style>` block) legitimately contains the substring
+        # "just-applied" on every render -- asserting against the exact
+        # rendered class attribute, not the bare word, is what keeps this
+        # from passing regardless of the row's own state.
+        row = _row(state="applied", prior_state={"title": "old"},
+                  fingerprint="fp-1")
+        html = render("inbox.html", rows=[], counts={}, applied=[row],
+                      just_applied="fp-other")
+        self.assertNotIn(self._HIGHLIGHT_CLASS, html)
+
+
 if __name__ == "__main__":
     unittest.main()

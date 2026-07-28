@@ -102,11 +102,11 @@
      not as an ordinary filename that merely happens to be short. */
   .subject-unknown { font-style: italic; }
 
-  /* Muted/Dismissed/Refused/Superseded: collapsed by default so a person is
-     not made to scroll past sixteen rows of their own past decisions to
-     reach the inbox, but the count beside each summary is plain page text --
-     present in the markup, and so in a page search, whether or not the
-     section is open. */
+  /* Muted/Dismissed/Refused/Superseded/Applied: collapsed by default so a
+     person is not made to scroll past sixteen rows of their own past
+     decisions to reach the inbox, but the count beside each summary is
+     plain page text -- present in the markup, and so in a page search,
+     whether or not the section is open. */
   details.section { border: 1px solid var(--line); border-radius: 6px;
                     margin: 0 0 0.9rem; background: var(--panel); }
   details.section summary { padding: 0.6rem 0.9rem; cursor: pointer;
@@ -116,25 +116,29 @@
                               border-radius: 0; background: transparent; }
   details.section .proposal:first-of-type { border-top: 1px solid var(--line); }
   details.section p.empty { margin: 0; padding: 0.7rem 0.9rem; }
+
+  /* The row an Approve just produced, inside the Applied section it now
+     lives in -- a visible marker so undoing it is still a glance away, not
+     a search through the whole section's history. */
+  details.section .proposal.just-applied { border-left: 3px solid var(--warn-line); }
 </style>
 
-{# The one place this template builds a link to the media server: an anchor
-   when a scene URL was computed (see `cronicled.web.rows.scene_url`), plain
-   text otherwise. Never bakes in the address itself -- `url` always arrives
-   already built from the configured server, so this only ever decides
-   whether to wrap it, not what it is. #}
+{# `identifier` and `proposal_block` are shared by the live inbox list and
+   the Applied section below -- an applied row is not a different SHAPE of
+   row, just this same shape living in a different place on the page, so it
+   renders through the identical macro rather than a second, hand-copied
+   block that could drift from the first (the cover-write warning most of
+   all -- ticket 98 is explicit that it "must keep carrying it inside the
+   section").
+
+   `section` is the shape ticket 97 and 98 both ask to share across what is
+   now five collapsed sections: a count visible while collapsed, and what an
+   empty one says. Only Applied ever opens itself (see below); the other
+   four stay exactly as collapsed-by-default as before. #}
 {% macro identifier(text, url) %}{% if url %}<a href="{{ url }}" target="_blank" rel="noopener noreferrer">{{ text }}</a>{% else %}{{ text }}{% endif %}{% endmacro %}
 
-<h1>Inbox</h1>
-{% if scan and scan.state == 'running' %}
-<meta http-equiv="refresh" content="3">
-{% endif %}
-{% if not rows %}
-<p class="empty">Nothing waiting. Proposals appear here after a scan.</p>
-{% endif %}
-
-{% for row in rows %}
-<div class="proposal">
+{% macro proposal_block(row, highlight=False) %}
+<div class="proposal{% if highlight %} just-applied{% endif %}">
   <div class="head">
     <div class="what">
       <p class="file">{{ identifier(row.filename, row.scene_url) }}</p>
@@ -181,18 +185,54 @@
   </div>
   {% endif %}
 </div>
+{% endmacro %}
+
+{% macro section(name, entries, empty_text, open=False) %}
+<details class="section"{% if open %} open{% endif %}>
+  <summary>{{ name }} ({{ entries | length }})</summary>
+  {% if not entries %}
+  <p class="empty">{{ empty_text }}</p>
+  {% endif %}
+  {{ caller() }}
+</details>
+{% endmacro %}
+
+<h1>Inbox</h1>
+{% if scan and scan.state == 'running' %}
+<meta http-equiv="refresh" content="3">
+{% endif %}
+{% if not rows %}
+<p class="empty">Nothing waiting. Proposals appear here after a scan.</p>
+{% endif %}
+
+{% for row in rows %}
+{{ proposal_block(row) }}
 {% endfor %}
 
 {% set muted = muted | default([]) %}
 {% set dismissed = dismissed | default([]) %}
 {% set refused = refused | default([]) %}
 {% set superseded = superseded | default([]) %}
+{% set applied = applied | default([]) %}
+{% set just_applied = just_applied | default(None) %}
+{# The one case that gets the section open on load: an approve made THIS
+   redirect just produced (see web/app.py's do_POST), and only when the
+   fingerprint it names is actually still sitting in `applied` -- a stale or
+   foreign `?applied=` query value must not force the section open on
+   nothing. Undo staying reachable for "the approve you just made and
+   immediately regretted" is ticket 98's stated bar; opening automatically
+   for exactly that one row, rather than always or never, is how this meets
+   it without leaving the section expanded by default for everyone reading
+   a link days later. #}
+{% set just_applied_rows = (applied | selectattr("fingerprint", "equalto", just_applied) | list) if just_applied else [] %}
 
-<details class="section">
-  <summary>Muted ({{ muted | length }})</summary>
-  {% if not muted %}
-  <p class="empty">Nothing muted.</p>
-  {% endif %}
+{% call section("Applied", applied, "Nothing applied yet.", open=(just_applied_rows | length > 0)) %}
+  {% for row in applied %}
+  {{ proposal_block(row, highlight=(row.fingerprint == just_applied)) }}
+  {% endfor %}
+{% endcall %}
+
+{% call section("Muted", muted, "Nothing muted.") %}
   {% for m in muted %}
   <div class="proposal">
     <div class="head">
@@ -210,13 +250,9 @@
     </div>
   </div>
   {% endfor %}
-</details>
+{% endcall %}
 
-<details class="section">
-  <summary>Dismissed ({{ dismissed | length }})</summary>
-  {% if not dismissed %}
-  <p class="empty">Nothing dismissed.</p>
-  {% endif %}
+{% call section("Dismissed", dismissed, "Nothing dismissed.") %}
   {% for row in dismissed %}
   <div class="proposal">
     <div class="head">
@@ -232,13 +268,9 @@
     </div>
   </div>
   {% endfor %}
-</details>
+{% endcall %}
 
-<details class="section">
-  <summary>Superseded ({{ superseded | length }})</summary>
-  {% if not superseded %}
-  <p class="empty">Nothing superseded.</p>
-  {% endif %}
+{% call section("Superseded", superseded, "Nothing superseded.") %}
   {% for row in superseded %}
   <div class="proposal">
     <div class="head">
@@ -251,13 +283,9 @@
     </div>
   </div>
   {% endfor %}
-</details>
+{% endcall %}
 
-<details class="section">
-  <summary>Refused ({{ refused | length }})</summary>
-  {% if not refused %}
-  <p class="empty">Nothing refused.</p>
-  {% endif %}
+{% call section("Refused", refused, "Nothing refused.") %}
   {% for r in refused %}
   <div class="proposal">
     <div class="head">
@@ -268,7 +296,7 @@
     </div>
   </div>
   {% endfor %}
-</details>
+{% endcall %}
 
 <h2>Scan</h2>
 <div class="scan">

@@ -148,6 +148,46 @@ class Posts(unittest.TestCase):
             self.assertEqual(s.actions.calls, [])
 
 
+class ApproveRedirectCarriesTheFingerprint(unittest.TestCase):
+    """Ticket 98: undo has to stay reachable for the approve just made and
+    immediately regretted. Carrying the fingerprint on `/approve`'s own
+    redirect is what lets the very next GET open the Applied section on
+    exactly that row -- see inbox.html's `just_applied_rows` guard.
+    """
+
+    def test_a_successful_approve_redirects_with_its_own_fingerprint(self):
+        with _Server() as s:
+            r = s.request("POST", "/approve", "fp=fp-7")
+            self.assertEqual(r.status, 303)
+            self.assertEqual(r.getheader("Location"), "/?applied=fp-7")
+
+    def test_other_actions_redirect_to_the_plain_index(self):
+        # Only approve moves a row into Applied -- every other action must
+        # not carry this query param at all.
+        for path, name in (("/dismiss", "dismiss"), ("/mute", "mute"),
+                           ("/undo", "undo"), ("/undismiss", "undismiss"),
+                           ("/refresh", "refresh")):
+            with _Server() as s:
+                r = s.request("POST", path, "fp=fp-7")
+                self.assertEqual(r.getheader("Location"), "/", name)
+
+    def test_a_failed_approve_does_not_redirect_at_all(self):
+        # `ApplyFailed` is reported as an error (see `ExceptionBranch`), not
+        # a redirect -- nothing here to carry a fingerprint on.
+        with _Server(fail={"approve":
+                           ApplyFailed("could not apply: a fixture failure")}
+                     ) as s:
+            r = s.request("POST", "/approve", "fp=fp-7")
+            self.assertEqual(r.status, 400)
+
+    def test_the_fingerprint_is_url_encoded(self):
+        with _Server() as s:
+            r = s.request("POST", "/approve", "fp=fp%2Fwith%2Fslashes")
+            self.assertEqual(s.actions.calls, [("approve", "fp/with/slashes")])
+            self.assertEqual(r.getheader("Location"),
+                             "/?applied=fp%2Fwith%2Fslashes")
+
+
 class UnmutePost(unittest.TestCase):
     # `/unmute` carries a different shape from the other five actions: a
     # mute is keyed by (subject_type, subject_id), not by a proposal's
@@ -189,12 +229,12 @@ class UnmutePost(unittest.TestCase):
 
 
 class MutedDismissedRefusedRendering(unittest.TestCase):
-    """`build_handler`'s four new callables reach the page a GET renders --
+    """`build_handler`'s five new callables reach the page a GET renders --
     the plumbing between a store and the template, as opposed to how the
     template itself renders a given row (covered in
     tests/test_web_render.py)."""
 
-    def _get(self, **callables):
+    def _get(self, path="/", **callables):
         actions = _RecordingActions()
         handler = build_handler(rows=lambda: [], actions=actions, **callables)
         httpd = HTTPServer(("127.0.0.1", 0), handler)
@@ -202,7 +242,7 @@ class MutedDismissedRefusedRendering(unittest.TestCase):
         thread.start()
         try:
             conn = http.client.HTTPConnection(*httpd.server_address)
-            conn.request("GET", "/")
+            conn.request("GET", path)
             return conn.getresponse().read().decode()
         finally:
             httpd.shutdown()
@@ -221,15 +261,42 @@ class MutedDismissedRefusedRendering(unittest.TestCase):
              "creator_source": "folder", "score_text": "0.900"}])
         self.assertIn("Superseded (1)", html)
 
+    def test_the_applied_count_reaches_the_page(self):
+        html = self._get(applied=lambda: [
+            {"fingerprint": "fp-1", "state": "applied",
+             "filename": "clip.mp4", "proposed_title": "T", "creator": "N",
+             "creator_source": "folder", "score_text": "0.900"}])
+        self.assertIn("Applied (1)", html)
+
     def test_omitted_sections_default_to_empty_rather_than_erroring(self):
         # Every existing action-path test's double for `rows`/`actions`
-        # supplies none of these four -- the page must still render, with
+        # supplies none of these five -- the page must still render, with
         # every count at zero, not raise.
         html = self._get()
         self.assertIn("Muted (0)", html)
         self.assertIn("Dismissed (0)", html)
         self.assertIn("Refused (0)", html)
         self.assertIn("Superseded (0)", html)
+        self.assertIn("Applied (0)", html)
+
+    def test_the_applied_query_param_opens_that_rows_section(self):
+        # The wiring half of ticket 98's "keep undo reachable" story: a GET
+        # carrying `?applied=fp-1` -- exactly the shape `/approve`'s own
+        # redirect now produces -- must reach the template as
+        # `just_applied`, not be dropped on the floor between the query
+        # string and `render()`.
+        html = self._get(path="/?applied=fp-1", applied=lambda: [
+            {"fingerprint": "fp-1", "state": "applied",
+             "filename": "clip.mp4", "proposed_title": "T", "creator": "N",
+             "creator_source": "folder", "score_text": "0.900"}])
+        self.assertIn('<details class="section" open', html)
+
+    def test_no_applied_query_param_leaves_every_section_collapsed(self):
+        html = self._get(applied=lambda: [
+            {"fingerprint": "fp-1", "state": "applied",
+             "filename": "clip.mp4", "proposed_title": "T", "creator": "N",
+             "creator_source": "folder", "score_text": "0.900"}])
+        self.assertNotIn('<details class="section" open', html)
 
 
 class ScanControl(unittest.TestCase):
