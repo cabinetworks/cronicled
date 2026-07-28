@@ -514,6 +514,40 @@ class SelectTest(unittest.TestCase):
             total=2, already_proposed=0, muted=0, filtered_out=0, selected=2,
             deferred=0))
 
+    def test_a_superseded_proposal_frees_its_file_for_re_examination(self):
+        """The whole reason `Store.supersede` exists (ticket 86): an old,
+        thin proposal must not block its file forever once a person has
+        explicitly retired it."""
+        self.propose(1)
+        fps = {item["subject_id"]: item["fingerprint"]
+              for item in self.store.items()}
+        self.store.supersede(fps["1"])
+        scenes = [scene(1, "/library/one.mp4"), scene(2, "/library/two.mp4")]
+
+        selected, counts = select(scenes, store=self.store, folder=FOLDER)
+
+        self.assertEqual([s["id"] for s in selected], ["1", "2"])
+        self.assertEqual(counts, Counts(
+            total=2, already_proposed=0, muted=0, filtered_out=0, selected=2,
+            deferred=0))
+
+    def test_superseding_an_applied_proposal_also_frees_its_file(self):
+        """An `applied` row keeps its own `state` untouched by `supersede`
+        (see its docstring), so `items()` alone still reports this subject
+        as proposed -- this is the case that actually proves `select` reads
+        the `supersede` table, not just `item.state`."""
+        fp = self.propose(1)
+        self.store.mark_applied(fp, prior_state={"title": "x"})
+        self.store.supersede(fp)
+
+        selected, counts = select([scene(1, "/library/one.mp4")],
+                                  store=self.store, folder=FOLDER)
+
+        self.assertEqual([s["id"] for s in selected], ["1"])
+        self.assertEqual(counts, Counts(
+            total=1, already_proposed=0, muted=0, filtered_out=0, selected=1,
+            deferred=0))
+
     def test_a_scene_without_an_id_raises(self):
         with self.assertRaises(KeyError):
             select([{"files": []}], store=self.store, folder=FOLDER)

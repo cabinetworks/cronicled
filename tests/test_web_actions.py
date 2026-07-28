@@ -72,6 +72,9 @@ class _FakeStore:
     def unmute(self, subject_type, subject_id):
         self.calls.append(("unmuted", subject_type, subject_id))
 
+    def supersede(self, fp):
+        self.calls.append(("superseded", fp))
+
     def muted_subjects(self):
         return self._muted_subjects
 
@@ -221,6 +224,38 @@ class Reject(unittest.TestCase):
         self.assertNotEqual(dismissed.calls[0][-1], muted.calls[0][-1])
         self.assertIn("dismiss", dismissed.calls[0][-1])
         self.assertIn("mute", muted.calls[0][-1])
+
+
+class Refresh(unittest.TestCase):
+    # Ticket 86: an explicit, per-row way to supersede a stale proposal and
+    # free its file for the next scan to examine again.
+
+    def test_refresh_supersedes_this_fingerprint(self):
+        store = _FakeStore(_item())
+        Actions(store, _FakeStash()).refresh("fp-1")
+        self.assertEqual(store.calls, [("superseded", "fp-1")])
+
+    def test_refresh_never_dismisses(self):
+        # Superseding must not be a rejection recorded on the person's
+        # behalf -- see `Store.supersede`'s docstring. A mutation routing
+        # `refresh` through `dismiss` instead would still redraw the page,
+        # so this has to check the store call itself, not just the return
+        # value.
+        store = _FakeStore(_item())
+        Actions(store, _FakeStash()).refresh("fp-1")
+        self.assertEqual([c[0] for c in store.calls], ["superseded"])
+
+    def test_refresh_reaches_an_applied_rows_fingerprint_too(self):
+        # The one case ticket 86 is actually about: an applied row has no
+        # other path off the block it leaves in `scan.select`.
+        item = _item(state="applied", prior_state={"title": "was"})
+        store = _FakeStore(item)
+        Actions(store, _FakeStash()).refresh("fp-1")
+        self.assertEqual(store.calls, [("superseded", "fp-1")])
+
+    def test_an_unknown_fingerprint_raises_rather_than_silently_doing_nothing(self):
+        with self.assertRaises(UnknownProposal):
+            Actions(_FakeStore(None), _FakeStash()).refresh("fp-nope")
 
 
 class _RunnerSpy:

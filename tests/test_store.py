@@ -251,6 +251,97 @@ class RejectionDoesNotOverwriteATerminalResolution(_StoreCase):
         self.assertEqual(len(self.store.items(state="new")), 0)
 
 
+class Superseding(_StoreCase):
+    """Ticket 86: an explicit way to retire a stale proposal and free its
+    file for the next scan, without recording a rejection nobody made."""
+
+    def test_a_new_proposal_moves_to_superseded_and_is_hidden_by_default(self):
+        fp = self._record()
+        self.store.supersede(fp)
+        self.assertEqual(self.store.items(), [])
+        superseded = self.store.items(state="superseded")
+        self.assertEqual(len(superseded), 1)
+        self.assertEqual(superseded[0]["fingerprint"], fp)
+        self.assertEqual(superseded[0]["state"], "superseded")
+
+    def test_superseding_does_not_record_a_dismissal(self):
+        fp = self._record()
+        self.store.supersede(fp)
+        self.assertEqual(self.store.items(state="dismissed"), [])
+        self.assertEqual(self.store.items(state="superseded")[0]["state"],
+                         "superseded")
+
+    def test_superseding_does_not_block_a_rerecord_of_the_same_payload(self):
+        # The clearest proof this is not a dismissal in disguise: `record()`
+        # checks the `dismissal` table before writing, so if superseding
+        # routed through `dismiss` internally, re-recording the IDENTICAL
+        # payload below would be silently dropped -- exactly the block a
+        # dismissal exists to apply, and precisely the decision this action
+        # must never make on a person's behalf. `last_seen_at` only ever
+        # changes on a genuine upsert, so it is what proves the write
+        # actually happened rather than being swallowed.
+        payload = {"title": "Copper Kettle"}
+        fp = self._record(payload=payload)
+        self.store.supersede(fp)
+        before = self.store.items(state="superseded")[0]["last_seen_at"]
+
+        again = self.store.record(
+            folder="scene-matches", subject_type="scene", subject_id="1",
+            summary="a proposal", payload=payload, producer="test-producer",
+            confidence=0.9, now="2099-01-01T00:00:00")
+
+        self.assertEqual(again, fp)
+        after = self.store.items(state="superseded")[0]["last_seen_at"]
+        self.assertNotEqual(after, before)
+
+    def test_superseding_an_applied_proposal_leaves_its_state_and_snapshot_alone(self):
+        fp = self._record()
+        self.store.mark_applied(fp, prior_state={"title": "Old Title"},
+                                now="2020-01-01T00:00:00")
+        before = self.store.items(state="applied")[0]
+
+        self.store.supersede(fp, now="2020-06-01T00:00:00")
+
+        after = self.store.items(state="applied")[0]
+        self.assertEqual(after["state"], "applied")
+        self.assertEqual(after["resolved_at"], before["resolved_at"])
+        self.assertEqual(after["prior_state"], {"title": "Old Title"})
+
+    def test_superseding_a_failed_proposal_leaves_its_state_and_error_alone(self):
+        fp = self._record(subject_id="7")
+        self.store.mark_failed(fp, error="server refused the name",
+                               now="2020-01-01T00:00:00")
+        before = self.store.items(state="failed")[0]
+
+        self.store.supersede(fp, now="2020-06-01T00:00:00")
+
+        after = self.store.items(state="failed")[0]
+        self.assertEqual(after["state"], "failed")
+        self.assertEqual(after["resolved_at"], before["resolved_at"])
+        self.assertEqual(after["error"], "server refused the name")
+
+    def test_an_applied_proposal_is_freed_in_the_supersede_table_despite_its_state(self):
+        # This is the case `item.state` alone can never answer: an applied
+        # row's own state never changes (see the test above), so the ONLY
+        # place a scan can learn its file is free again is this table.
+        fp = self._record(subject_id="7")
+        self.store.mark_applied(fp, prior_state={"title": "x"})
+        self.assertEqual(self.store.superseded_fingerprints(), set())
+
+        self.store.supersede(fp)
+
+        self.assertEqual(self.store.superseded_fingerprints(), {fp})
+
+    def test_superseding_an_unknown_fingerprint_raises(self):
+        # Unlike dismiss/mute, there is no "pre-emptive supersede" -- this
+        # describes something happening to an already-recorded proposal.
+        with self.assertRaises(KeyError):
+            self.store.supersede("nosuchfingerprint")
+
+    def test_nothing_superseded_is_an_empty_set(self):
+        self.assertEqual(self.store.superseded_fingerprints(), set())
+
+
 class ConfidenceValidation(_StoreCase):
     def test_confidence_above_one_raises(self):
         with self.assertRaises(ValueError):
@@ -866,6 +957,40 @@ class SchemaAdditionOnAnExistingDatabase(unittest.TestCase):
                          payload={"title": "Anything At All"},
                          producer="nightly-scrape")
             self.assertEqual(store.items(), self.snapshot["visible"])
+
+
+class SupersedeTableAddedOnAnExistingDatabase(unittest.TestCase):
+    """The same additive-change guarantee `SchemaAdditionOnAnExistingDatabase`
+    checks for `producer_run`, now for `supersede`: a database written before
+    this ticket gains the table on open and keeps everything already in it."""
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self.path = os.path.join(self._dir, "s.db")
+        self.addCleanup(shutil.rmtree, self._dir, True)
+        with Store(self.path) as store:
+            self.fp = store.record(
+                folder="scene-matches", subject_type="scene", subject_id="1",
+                summary="a proposal", payload={"title": "Copper Kettle"},
+                producer="nightly-scrape")
+        connection = sqlite3.connect(self.path)
+        connection.execute("DROP TABLE supersede")
+        connection.commit()
+        tables = {row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        connection.close()
+        self.assertNotIn("supersede", tables)
+
+    def test_the_missing_table_is_created_on_open(self):
+        with Store(self.path) as store:
+            self.assertEqual(store.superseded_fingerprints(), set())
+            store.supersede(self.fp)
+            self.assertEqual(store.superseded_fingerprints(), {self.fp})
+
+    def test_the_pre_existing_row_survives_the_addition(self):
+        with Store(self.path) as store:
+            self.assertEqual(len(store.items()), 1)
+            self.assertEqual(store.items()[0]["fingerprint"], self.fp)
 
 
 class SchemaVersioning(unittest.TestCase):

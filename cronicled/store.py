@@ -57,6 +57,12 @@ CREATE TABLE IF NOT EXISTS mute (
     reason TEXT, at TEXT NOT NULL,
     PRIMARY KEY (subject_type, subject_id));
 
+-- A durable record that a proposal has been superseded -- see the block
+-- above `Store.supersede` for why this is its own table, keyed by
+-- fingerprint, rather than a row in `dismissal`.
+CREATE TABLE IF NOT EXISTS supersede (
+    fingerprint TEXT PRIMARY KEY, at TEXT NOT NULL);
+
 CREATE TABLE IF NOT EXISTS producer_run (
     producer TEXT PRIMARY KEY,
     at       TEXT NOT NULL);
@@ -703,7 +709,110 @@ class Store:
             for subject_type, subject_id, reason, at in rows
         ]
 
-    _HIDDEN_STATES = ("dismissed", "muted")
+    # Superseding a proposal
+    # ----------------------
+    # A proposal made by an older version of this tool can carry only what an
+    # early producer offered -- a title and a URL, none of a fuller scrape's
+    # detail -- and `select()` skips a file whose subject already has a
+    # visible proposal BEFORE examining it, so that thin proposal blocks its
+    # file from ever being looked at again. Dismissing frees a `new` row (see
+    # `dismiss`'s docstring for why hiding it is what does that), but an
+    # `applied` or `failed` row keeps its state and its `resolved_at` by
+    # design, and goes on blocking forever.
+    #
+    # Superseding is deliberately NOT a dismissal. A person superseding a
+    # proposal is not saying it was wrong -- they are saying it is out of
+    # date, and a `dismiss` recorded on their behalf would put a rejection in
+    # the store they never made, plus block this exact fingerprint (via the
+    # `dismissal` table `record()` checks) from ever being written again,
+    # which is nonsensical for a payload nothing was ever proposed to be wrong
+    # about. That is why this is its OWN table, keyed by fingerprint like
+    # `dismissal` is, but never consulted by `record()` -- nothing here stops
+    # the identical payload being proposed again, because there was never
+    # anything wrong with it to begin with.
+    def supersede(self, fp, now=None):
+        """Retire the proposal named by `fp` and free its subject for the
+        next scan to examine again.
+
+        Unlike `dismiss`/`mute`, this describes something happening to an
+        ALREADY-RECORDED proposal, never a standing rejection that might
+        precede one -- there is no "pre-emptive supersede" the way there is a
+        pre-emptive mute, so an unknown fingerprint is a caller mistake and
+        raises `KeyError`, the same contract `mark_seen`/`mark_applied`/
+        `mark_failed` already hold (see `_set_state`).
+
+        Two things happen, together:
+
+        1. `fp` is recorded in the `supersede` table. This is the actual
+           mechanism that frees the subject -- `scan.select` reads it
+           directly, alongside `store.items()`, rather than trusting `state`
+           alone (see the point below for why `state` is not enough on its
+           own).
+        2. The `item` row's own `state`/`resolved_at` are updated to
+           `superseded` -- UNLESS the row is already in one of
+           `_TERMINAL_STATES` (`applied`/`failed`), in which case they are
+           left exactly as they are. This is the same CASE `dismiss`/`mute`
+           already use to protect a terminal resolution, applied here for the
+           same reason: `applied` plus its `resolved_at` records that a real
+           write already happened and when, and `failed` plus its
+           `resolved_at` records that one was attempted and when -- either
+           overwritten would erase that fact. It is also why point 1 cannot
+           be dropped in favour of just checking `state`: an `applied` row
+           whose `state` never changes still has to stop blocking
+           `scan.select`, and the only place that is recorded is this table.
+
+        The `dismissal` and `mute` tables are untouched -- superseding is
+        neither. And `prior_state` -- an applied row's undo snapshot -- is
+        untouched too: superseding only ever touches `state` and
+        `resolved_at`, never the column an Undo depends on, so an applied
+        row stays exactly as undoable after being superseded as before.
+        """
+        when = now if now is not None else _utcnow()
+        placeholders = ", ".join("?" for _ in self._TERMINAL_STATES)
+        with self._lock:
+            cursor = self._conn.execute(
+                f"""
+                UPDATE item SET
+                    state = CASE WHEN state IN ({placeholders})
+                                 THEN state ELSE 'superseded' END,
+                    resolved_at = CASE WHEN state IN ({placeholders})
+                                       THEN resolved_at ELSE ? END
+                WHERE fingerprint = ?
+                """,
+                (*self._TERMINAL_STATES, *self._TERMINAL_STATES, when, fp),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(fp)
+            self._conn.execute(
+                "INSERT OR REPLACE INTO supersede (fingerprint, at) "
+                "VALUES (?, ?)",
+                (fp, when),
+            )
+            self._conn.commit()
+
+    def superseded_fingerprints(self):
+        """Every fingerprint ever superseded, as a set.
+
+        The membership test `scan.select` needs to free a subject whose
+        visible proposal has been superseded -- a set, rather than a
+        per-fingerprint `is_superseded`, for the same reason
+        `muted_subjects()` answers a set: selection asks about every
+        candidate file's existing proposal at once, and one round trip per
+        file is the cost this exists to avoid.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT fingerprint FROM supersede").fetchall()
+        return {fp for (fp,) in rows}
+
+    # `superseded` joins `dismissed`/`muted` here for the same reason both of
+    # those are hidden: a superseded proposal has already been retired by a
+    # person's own action and is no longer outstanding work. See `supersede`
+    # above for why a row can carry this state at all, and why `applied`/
+    # `failed` rows never do -- their subject is freed through the separate
+    # `supersede` TABLE instead, precisely because their own `state` is left
+    # untouched.
+    _HIDDEN_STATES = ("dismissed", "muted", "superseded")
 
     def has(self, fp):
         """Whether `fp` names a row currently in a visible state — i.e. one
