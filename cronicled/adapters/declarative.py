@@ -45,6 +45,7 @@ class DeclarativeAdapter(SiteAdapter):
         self._owner_segment = spec.get("owner_segment")
         self._owner_field = spec.get("owner_field") or []
         self._search_omits_seed = bool(spec.get("search_omits_seed", False))
+        owner_segment_example = spec.get("owner_segment_example")
 
         valid = ("url_segment", "result_field", "none")
         if self._owner_source not in valid:
@@ -55,6 +56,27 @@ class DeclarativeAdapter(SiteAdapter):
                 raise ValueError("adapter %r: owner_segment must be a non-negative "
                                  "integer when owner_source is 'url_segment'"
                                  % self.name)
+            if owner_segment_example is not None:
+                # `owner_segment` counts from after the scheme and INCLUDES
+                # the host -- one off from what a reader familiar with URL
+                # *paths* would assume, and that mismatch has already caused
+                # a real misconfiguration. This is optional (an existing
+                # config with no example keeps working unchanged), but when
+                # given, it is checked right now, at load time, rather than
+                # left to be documented and hoped for: a wrong index is
+                # otherwise silent right up until a scan mutes every file for
+                # a store this adapter was supposed to identify.
+                url = owner_segment_example.get("url")
+                expected = owner_segment_example.get("owner")
+                actual = self.artist_from_url(url)
+                if actual != expected:
+                    raise ValueError(
+                        "adapter %r: owner_segment_example says owner_segment "
+                        "%d on %r should resolve to %r, but it resolves to "
+                        "%r -- owner_segment counts from after the scheme and "
+                        "INCLUDES the host, not from the start of the path "
+                        "(see docs/adapters.md)"
+                        % (self.name, self._owner_segment, url, expected, actual))
         if self._owner_source == "result_field" and not self._owner_field:
             raise ValueError("adapter %r: owner_field is required when "
                              "owner_source is 'result_field'" % self.name)
@@ -70,6 +92,14 @@ class DeclarativeAdapter(SiteAdapter):
                 "not say does not get the permissive answer." % self.name)
         self._title_match_counts_as_ownership = bool(
             spec["title_match_counts_as_ownership"])
+    @property
+    def owner_source(self):
+        """Which of the three mechanisms this adapter resolves an owner
+        with: `'url_segment'`, `'result_field'`, or `'none'`. Public so
+        asking "which mechanisms does this config actually use" -- which
+        the shipped example's own tests do -- doesn't mean reaching into a
+        private attribute."""
+        return self._owner_source
 
     def _segments(self, url):
         # drop scheme, then query and fragment: a tracking parameter must not

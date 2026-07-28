@@ -19,6 +19,7 @@ edit away from drifting, and none of them fails anything when it does:
 None of this needs a YAML parser or a Markdown parser, and deliberately so -
 the suite runs on a bare interpreter with nothing installed.
 """
+import json
 import os
 import re
 import subprocess
@@ -26,12 +27,19 @@ import tempfile
 import unittest
 
 from cronicled import selfcheck
+from cronicled.adapters.registry import load_adapters
 
 README = "README.md"
 INDEX = os.path.join("docs", "index.md")
+ADAPTERS_DOC = os.path.join("docs", "adapters.md")
+ADAPTERS_EXAMPLE = os.path.join("config", "adapters.example.json")
 CI_YML = os.path.join(".github", "workflows", "ci.yml")
 
 _FENCE_RE = re.compile(r"^```mermaid\n(.*?)^```$", re.S | re.M)
+# Adapter examples sit inside a markdown bullet list, so their fences are
+# indented a couple of spaces rather than starting at column 0 - unlike the
+# mermaid fences above, which are always top-level.
+_JSON_FENCE_RE = re.compile(r"^[ \t]*```json\n(.*?)^[ \t]*```$", re.S | re.M)
 _COUNT_RE = re.compile(r"selfcheck ready \((\d+) modules imported\)")
 
 
@@ -323,6 +331,93 @@ class TheDeployGoesOnlyToTheDefaultBranch(unittest.TestCase):
                     "%s still mentions %r. The site is published by GitHub "
                     "Pages now; a stale reference sends a reader looking for "
                     "configuration that does not exist." % (path, needle))
+
+
+class TheAdaptersDocAgreesWithTheExampleItDescribes(unittest.TestCase):
+    """docs/adapters.md walks through `owner_segment` with a worked example -
+    a URL, an index, and the owner that index resolves to - because getting
+    that index wrong (it counts from after the scheme and INCLUDES the host)
+    has already caused a real misconfiguration. That worked example and
+    config/adapters.example.json's own `owner_segment_example` are two
+    hand-written copies of the same fact; this fails if they drift apart,
+    the same shape as the module-map duplication pinned above."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.doc = _read(ADAPTERS_DOC)
+        cls.loaded = load_adapters(ADAPTERS_EXAMPLE)
+
+    def _url_segment_fence(self):
+        for fence in _JSON_FENCE_RE.findall(self.doc):
+            payload = json.loads(fence)
+            if payload.get("owner_source") == "url_segment":
+                return payload
+        self.fail("no ```json fence in docs/adapters.md configures "
+                  "owner_source: url_segment")
+
+    def test_the_docs_url_segment_example_is_itself_valid_json(self):
+        self._url_segment_fence()   # raises via self.fail if absent/invalid
+
+    def test_the_docs_example_and_the_shipped_config_pick_the_same_segment(self):
+        doc_spec = self._url_segment_fence()
+        config_adapter = self.loaded["examplestore"]
+        self.assertEqual(doc_spec["owner_segment"], 2)
+        self.assertEqual(config_adapter.owner_source, "url_segment")
+        # The doc's own worked example must resolve exactly as documented -
+        # this is the guard against the doc's prose and its own code fence
+        # disagreeing about what index 2 picks out.
+        example = doc_spec["owner_segment_example"]
+        self.assertEqual(config_adapter.artist_from_url(example["url"]),
+                         example["owner"])
+
+    def test_every_owner_source_mechanism_documented_is_also_in_the_example(self):
+        documented = {json.loads(f)["owner_source"]
+                     for f in _JSON_FENCE_RE.findall(self.doc)
+                     if "owner_source" in json.loads(f)}
+        configured = {a.owner_source for a in self.loaded.values()}
+        self.assertEqual(
+            documented, configured,
+            "docs/adapters.md documents owner_source mechanisms %s but "
+            "config/adapters.example.json only configures %s - a reader "
+            "working from the example alone should be able to find every "
+            "mechanism the prose describes" % (sorted(documented), sorted(configured)))
+
+
+class ThereIsAStandingRuleForProvingANewTestCanFail(unittest.TestCase):
+    """Several tests in this repository have been found to pass for a reason
+    other than the one they name — one passed before the code it tested even
+    existed. The fix for that is a habit, not a line of code, so what a test
+    can pin here is only that the habit is written down where a contributor
+    will actually see it — not that anyone follows it. If this ever starts
+    failing because CONTRIBUTING.md was softened or removed, that is the
+    thing to look at, not this test."""
+
+    def test_contributing_md_exists(self):
+        self.assertTrue(
+            os.path.exists("CONTRIBUTING.md"),
+            "no CONTRIBUTING.md at the repository root")
+
+    def test_it_states_the_standing_rule(self):
+        prose = " ".join(_read("CONTRIBUTING.md").split()).lower()
+        self.assertIn(
+            "watched failing", prose,
+            "CONTRIBUTING.md should say a test that has never been watched "
+            "failing does not hold")
+        self.assertIn(
+            "break the", prose,
+            "CONTRIBUTING.md should instruct breaking the specific "
+            "behaviour a new test names")
+        self.assertIn(
+            "restore the code", prose,
+            "CONTRIBUTING.md should instruct restoring the code once the "
+            "test has been confirmed to fail for the right reason")
+
+    def test_the_readme_links_it(self):
+        self.assertIn(
+            "CONTRIBUTING.md", _read(README),
+            "the README's Documentation section should link CONTRIBUTING.md, "
+            "the same way it links every other doc page")
+
 
 if __name__ == "__main__":
     unittest.main()

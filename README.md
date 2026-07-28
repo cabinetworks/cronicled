@@ -151,6 +151,7 @@ below is documented in exactly one of those pages, not in both.
   test invocations, the image and its mounts
 - [Leak guard](docs/leak-guard.md) — what `scripts/check_leaks` scans, and the
   local `commit-msg` hook
+- [Contributing](CONTRIBUTING.md) — the standing rule for trusting a new test
 
 ## The published image
 

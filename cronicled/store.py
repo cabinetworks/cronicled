@@ -82,11 +82,58 @@ CREATE TABLE IF NOT EXISTS refusal (
 # in the tests pins it.
 #
 # That covers *additive* change only. Altering or dropping something that
-# already holds data is a different problem and this offers nothing for it —
-# there is no version column here, and the first change of that kind has to
-# add one. The store's spec deferred migrations because there was no user data
-# to preserve; there is now, so the deferral survives only for as long as
-# every change stays additive.
+# already holds data is a different problem, and this schema offers nothing
+# for it on its own — see `SCHEMA_VERSION` below for the marker that at least
+# lets it be detected.
+
+# The shape's version, stamped into the database file itself via SQLite's
+# built-in `PRAGMA user_version` (an integer the engine reserves for
+# application use and never touches itself).
+#
+# This is a MARKER, not a migration mechanism — nothing here knows how to
+# carry a version 1 database forward to a version 2 shape. What it buys is
+# narrower and still worth having: code opening a database can now tell
+# whether the shape it is looking at is the one it understands, instead of
+# guessing from `sqlite_master` or assuming.
+#
+# Every database in existence today — including ones written by code before
+# this constant existed — has an unset `user_version`, which SQLite reports
+# as 0. That is indistinguishable from "brand new, empty file", and
+# deliberately treated the same way: `Store.__init__` stamps a 0 straight to
+# `SCHEMA_VERSION` on open, because right now every such database, new or
+# old, has this exact shape — the same fact `SchemaAdditionOnAnExistingDatabase`
+# checks for `producer_run`. That is what makes stamping safe to do now,
+# before any non-additive change exists: it costs nothing today and gives the
+# first such change something to branch on, rather than starting that change
+# from the same PRAGMA user_version = 0 every database has always had.
+#
+# A `user_version` that is neither 0 nor `SCHEMA_VERSION` means this code does
+# not recognise the shape it opened — a newer version from code run after a
+# migration this build has never heard of, or an older one left mid-upgrade.
+# `Store.__init__` refuses to open in that case rather than run the current
+# schema and queries against a shape it cannot vouch for: a dismissal or mute
+# is a person's standing decision, re-applying rules built for the wrong
+# shape risks reading or writing it wrong in a way nothing would ever surface
+# — a refusal that stops the process is recoverable (fix the file, or the
+# code, and try again); a silent misread of a mute is not.
+SCHEMA_VERSION = 1
+
+
+class SchemaVersionError(RuntimeError):
+    """Raised by `Store.__init__` when a database's `PRAGMA user_version`
+    is neither 0 (unstamped — treated as this same, current shape) nor
+    `SCHEMA_VERSION` (already stamped and matching).
+
+    Either reading means this build does not know the shape it opened: a
+    version ahead of what this code understands (opened by something newer,
+    or a migration this build predates), or a version behind it with no
+    migration here to carry it forward (there is none yet — see
+    `SCHEMA_VERSION`'s comment). Refusing to open is the only honest answer
+    to either: this store's whole point is that a reviewer's dismissals and
+    mutes durably outrank a producer's repetition, and silently running
+    today's rules against a shape they were not written for is exactly the
+    kind of misread that would never announce itself.
+    """
 
 
 def _nfc(value):
@@ -211,6 +258,25 @@ class Store:
                 self._conn.execute("PRAGMA journal_mode=WAL")
                 self._conn.executescript(SCHEMA)
                 self._conn.commit()
+                found = self._conn.execute("PRAGMA user_version").fetchone()[0]
+                if found == 0:
+                    # Unstamped — either brand new, or written before this
+                    # marker existed. Both are this exact shape today (see
+                    # `SCHEMA_VERSION`'s comment), so stamping is safe and
+                    # costs nothing; it is what gives the first genuinely
+                    # non-additive change something to compare against
+                    # instead of the same unstamped 0 every database has
+                    # always had.
+                    self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                    self._conn.commit()
+                elif found != SCHEMA_VERSION:
+                    raise SchemaVersionError(
+                        f"{canonical_path!r} is stamped schema version "
+                        f"{found}, but this code understands version "
+                        f"{SCHEMA_VERSION}. Refusing to open rather than "
+                        f"run this version's rules against a shape it was "
+                        f"not written for."
+                    )
             self._finalizer = weakref.finalize(self, _release_path, canonical_path)
         except Exception:
             _release_path(canonical_path)
