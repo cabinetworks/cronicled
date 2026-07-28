@@ -286,8 +286,11 @@ class DerivedPerformerIdsReachTheCheck(unittest.TestCase):
             mocks["Stash"].return_value = self._FakeStash([scene], [performer])
             box = mock.Mock()
             box.url = BOX_ENDPOINT
+            # `total`/`pages_read` are required: a listing has to say how
+            # much of itself it read, because "complete" is a claim about a
+            # paged read and nothing else may stand in for it.
             box.performer_listing.return_value = SourceListing(
-                "pf-1", [], complete=True)
+                "pf-1", [], complete=True, total=0, pages_read=1)
             mocks["StashBox"].return_value = box
             mocks["Store"].return_value = Store(":memory:")
 
