@@ -490,6 +490,61 @@ class PatternListCorruptionVectors(unittest.TestCase):
         self.assertEqual(code, 1, out)
 
 
+class PatternsMayContainTheCommentCharacter(unittest.TestCase):
+    """A pattern list line is split into pattern and comment at the first
+    '#'. Naively, that also truncates a pattern that legitimately contains
+    '#' anywhere in it, and drops one beginning with '#' entirely (it looks
+    like a pure comment line) - both silently, with no count mismatch to
+    catch it, because the independent candidate-line count is produced by
+    the same kind of unescaped-'#' comment rule. `\\#` escapes a literal
+    '#' into the pattern instead."""
+
+    def test_an_embedded_hash_is_not_truncated_out_of_the_pattern(self):
+        # If the pattern were silently truncated to "zzalphazz" (everything
+        # before the '#'), this file would ALSO match - which is exactly
+        # what the second test below rules out.
+        d = _repo([r"zzalphazz\#zzbetazz"],
+                  {"a.md": "line has zzalphazz#zzbetazz right here\n"})
+        code, _ = _run(d)
+        self.assertEqual(code, 1)
+
+    def test_the_truncated_prefix_alone_does_not_falsely_match(self):
+        # Proves the above match came from the FULL escaped pattern, not
+        # from a truncated "zzalphazz" that would match almost anything
+        # containing that token.
+        d = _repo([r"zzalphazz\#zzbetazz"],
+                  {"a.md": "line has zzalphazz only, no hash tail here\n"})
+        code, _ = _run(d)
+        self.assertEqual(code, 0)
+
+    def test_a_pattern_beginning_with_an_escaped_hash_still_loads(self):
+        # Unescaped, this line would look exactly like a pure comment to
+        # both the Python parser and the independent grep-based candidate
+        # count - so neither side would ever notice it was dropped.
+        d = _repo([r"\#zzhashpattern"], {"a.md": "mentions #zzhashpattern here\n"})
+        code, _ = _run(d)
+        self.assertEqual(code, 1)
+
+    def test_a_real_trailing_comment_after_an_escaped_hash_is_still_stripped(self):
+        d = _repo([r"zzgamma\#zzdelta # this note is not part of the pattern"],
+                  {"a.md": "contains zzgamma#zzdelta in its body\n"})
+        code, _ = _run(d)
+        self.assertEqual(code, 1)
+        # The comment text itself must not have become part of the pattern.
+        d2 = _repo([r"zzgamma\#zzdelta # this note is not part of the pattern"],
+                   {"a.md": "mentions this note is not part of the pattern only\n"})
+        code2, _ = _run(d2)
+        self.assertEqual(code2, 0)
+
+    def test_an_unescaped_hash_still_starts_a_real_comment(self):
+        # Backward compatibility: a genuine comment line, unescaped, must
+        # still be dropped rather than loaded as a literal pattern.
+        d = _repo(["zzsecretzz", "# a genuine comment line"],
+                  {"a.md": "harmless, does not mention the real pattern\n"})
+        code, out = _run(d)
+        self.assertEqual(code, 0, out)
+
+
 class CountCrossCheckFailsClosed(unittest.TestCase):
     """The `grep -c` calls that produce the independent candidate count (in
     load_ext_list) and the input/survived counts (in pattern-list

@@ -1,5 +1,7 @@
 # One pattern per line, matched case-insensitively against tracked file
-# contents and tracked filenames. '#' starts a comment.
+# contents and tracked filenames. '#' starts a comment. A pattern that must
+# itself contain a literal '#' escapes it as '\#'; a literal '\' right
+# before a real comment or before a literal '#' escapes as '\\'.
 #
 # Put here anything that must never become public: a predecessor project name,
 # your real name, an email domain, hostnames, home-directory paths, and any

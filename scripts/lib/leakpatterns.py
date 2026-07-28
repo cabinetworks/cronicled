@@ -86,6 +86,40 @@ def _run_grep(args: list[str], data: bytes, what: str) -> int:
         raise GuardError(f"grep produced a non-numeric count while {what}: {out!r}") from exc
 
 
+def _split_at_unescaped_hash(line: str) -> tuple[str, str]:
+    """Split `line` into (pattern_text, comment_text) at the first
+    UNESCAPED '#'. `\\#` is a literal '#' folded into the pattern rather
+    than the start of a comment; `\\\\` is a literal '\\', so a pattern
+    that must end in a literal backslash right before a real comment
+    (`\\\\ # note`) still has a way to say so. Any other backslash - one not
+    immediately followed by '#' or '\\' - is not a recognised escape and is
+    copied through unchanged: this is a plain pattern list, not a general
+    escaping language, and a pattern that happens to contain a backslash
+    (a Windows-style path, say) must not be silently mangled by a rule
+    that exists only to let '#' through.
+
+    Without this, a pattern containing '#' is silently truncated at that
+    character (`git grep -F` never sees the tail), and a pattern that
+    begins with '#' is dropped as a full-line comment - both with nothing
+    to catch it, because the independent candidate-line count in
+    load_patterns is produced by a shell comment regex that reads a
+    literal, non-escaped '#' the same way this does."""
+    out: list[str] = []
+    i = 0
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if ch == "\\" and i + 1 < n and line[i + 1] in ("#", "\\"):
+            out.append(line[i + 1])
+            i += 2
+            continue
+        if ch == "#":
+            return "".join(out), line[i:]
+        out.append(ch)
+        i += 1
+    return "".join(out), ""
+
+
 def _clean_pattern_lines(raw: str) -> list[str]:
     """Per-line cleaning for the pattern list: strip an inline comment,
     strip surrounding whitespace, drop the line if it is now empty.
@@ -102,7 +136,8 @@ def _clean_pattern_lines(raw: str) -> list[str]:
     exactly that."""
     entries: list[str] = []
     for line in raw.splitlines():
-        entry = line.split("#", 1)[0].strip()
+        entry, _comment = _split_at_unescaped_hash(line)
+        entry = entry.strip()
         if not entry:
             continue
         entries.append(entry)
