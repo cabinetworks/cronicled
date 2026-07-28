@@ -29,7 +29,7 @@ run and achieves nothing.
 import posixpath
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from cronicled.artist import Aliases, creator_folder, resolve
 from cronicled.censorship import decensor
@@ -947,6 +947,262 @@ def examine_sources(scene, *, sources, folder, threshold=DEFAULT_THRESHOLD,
     )
 
 
+# --- Identifying a file before searching for it -----------------------------
+#
+# Everything above this line identifies a file by SEARCHING for it: a creator
+# is resolved off the path, a store's catalogue is searched by that name, and
+# the results are scored against the filename. What follows does not search at
+# all. A stash-box is asked which scene a file's own fingerprints belong to,
+# and either it has seen that exact file or it has not.
+#
+# The two are not alternatives and this one does not replace the other:
+# measured against a real library, fingerprints identified 13 of 23 files the
+# text path had refused, and answered nothing at all for the other 10. Absence
+# of a fingerprint hit is not evidence about a file — most files, most boxes —
+# so the text path stays exactly as it is for everything a box does not
+# recognise.
+
+
+# What a proposal's payload records in place of a score when a box identified
+# the file. Named rather than inlined so a reader of the payload, a row
+# builder and a test agree on one string, and so that a second way of
+# identifying a file has to add to this deliberately.
+IDENTIFIED_BY_FINGERPRINT = "fingerprint"
+
+
+@dataclass(frozen=True)
+class Identified:
+    """One file a stash-box recognised by its own fingerprints.
+
+    `box` is the box that is the source of `candidate` — the whole
+    `ScrapedScene` it returned, the same shape a text scrape produces, so it
+    can be carried into a payload and applied by the same code.
+
+    `remote_site_id` is that box's own id for the scene, kept because it is
+    the only thing that makes two boxes' answers COMPARABLE — see
+    `_resolve_claims`. It may be `None`: a box that recognised the file but
+    named no id has still identified it, and nothing downstream needs the id
+    to record or apply the match.
+
+    `agreeing` names the other boxes that returned the SAME
+    `remote_site_id`. Agreement is not a disagreement to report, but it is
+    worth recording: it is the difference between one box's word and three.
+    """
+    box: str
+    candidate: dict
+    remote_site_id: str = None
+    agreeing: tuple = ()
+
+
+@dataclass(frozen=True)
+class Conflict:
+    """Boxes that recognised one file as DIFFERENT scenes.
+
+    Never resolved here, and deliberately not resolvable: two boxes that
+    both computed a hash off the same bytes and reached different scenes are
+    not a tie to break by whichever was configured first — they are evidence
+    that at least one box's record is wrong about this file, which is the
+    single most useful thing a reviewer could be told about it. This project
+    has removed silent iteration-order resolution from candidate scoring,
+    artist resolution, alias-key collisions and cross-store winners; this is
+    not the place to add a fifth.
+
+    `claims` holds every one of them, `(box_name, remote_site_id, candidate)`
+    in the order the boxes were tried, so the refusal can name them all.
+    """
+    claims: tuple
+
+
+@dataclass(frozen=True)
+class FingerprintPass:
+    """What asking every configured box about a whole batch concluded.
+
+    `identified` maps a scene's subject id to its `Identified` or `Conflict`.
+    A scene NO box recognised is simply absent — the ordinary case, and the
+    one that falls through to the text path unchanged.
+
+    `errors` holds one line per box that could not be asked or could not be
+    trusted. A box erroring is a fact about that box, never about the batch:
+    the other boxes' answers are kept, and every file the remaining boxes did
+    not recognise still reaches the text path.
+    """
+    identified: dict = field(default_factory=dict)
+    errors: tuple = ()
+
+
+def _resolve_claims(claims):
+    """What a file's collected `(box_name, match)` claims amount to.
+
+    `None` when nothing recognised it, an `Identified` when the claims all
+    name one scene, a `Conflict` when they do not.
+
+    Agreement requires every claim to carry a NON-NULL `remote_site_id` and
+    for all of them to be equal. The null half of that is the guard, not
+    bookkeeping: comparing ids with a missing one treated as a value would
+    make two boxes that each declined to name a scene look like two boxes
+    naming the SAME scene, and a default that happens to skip a guard is how
+    this project has been bitten before. Uncertainty withholds evidence; it
+    never supplies it.
+
+    A single claim needs no comparison and is taken as it stands, id or no
+    id — there is nothing for it to disagree with.
+
+    When several claims DO agree, the first is the one carried forward. That
+    is the boxes' configured order, which is the operator's own stated
+    preference and the order the caller was told to try them in — not an
+    accident of dict iteration, and not a tie being broken: the claims agree
+    about which scene this is, so what is being chosen is only whose copy of
+    the same scene's metadata to record, and the others are recorded beside
+    it in `agreeing` rather than dropped.
+    """
+    if not claims:
+        return None
+    first_box, first_match = claims[0]
+    ids = [match.get("remote_site_id") for _, match in claims]
+    if len(claims) == 1:
+        return Identified(box=first_box, candidate=first_match,
+                          remote_site_id=ids[0])
+    if None in ids or len(set(ids)) != 1:
+        return Conflict(claims=tuple(
+            (box, match.get("remote_site_id"), match)
+            for box, match in claims))
+    agreeing = tuple(dict.fromkeys(box for box, _ in claims[1:]
+                                   if box != first_box))
+    return Identified(box=first_box, candidate=first_match,
+                      remote_site_id=ids[0], agreeing=agreeing)
+
+
+def identify_by_fingerprint(scene_ids, *, boxes, lookup):
+    """Ask every one of `boxes`, in the order given, which of `scene_ids` it
+    recognises by fingerprint, and return a `FingerprintPass`.
+
+    `boxes` is a list of `{"name", "endpoint"}` — `Stash.stash_boxes`'s own
+    return shape, in the server's configured order. `lookup` is
+    `(endpoint, scene_ids) -> [[match, ...], ...]`, ordinarily
+    `Stash.scrape_scenes_by_fingerprint`: ONE call per box for the WHOLE
+    batch, not one per file. A real installation had three boxes configured
+    and only one returned any match, so every box is asked and none is
+    assumed to answer.
+
+    EVERY box is asked, and one that raises does not cost the others. Its
+    failure is recorded in `errors` and the loop goes on, for the same
+    reason `examine_sources` isolates a store's search failure to that
+    store: an outage at one box is one fact about the run, and letting it
+    end the pass would take the batch's OTHER identifications with it, and
+    the text fallback for every file in the batch besides.
+
+    The reply is checked to be exactly as long as the request before any of
+    it is used. `lookup` is injected and this function cannot assume it is
+    the client method that already makes the same check — and the failure
+    being guarded is silent: entry `i` is the answer for `scene_ids[i]` and
+    nothing else ties the two together, so a short or long reply zipped
+    against the ids attributes one file's box metadata to a different file.
+    That is a wrong automatic write nobody notices; refusing the box's whole
+    answer costs a run of fingerprint identification that the text path then
+    covers.
+    """
+    scene_ids = [str(scene_id) for scene_id in scene_ids]
+    claims = {scene_id: [] for scene_id in scene_ids}
+    errors = []
+    for box in boxes:
+        name = box["name"]
+        try:
+            per_scene = lookup(box["endpoint"], scene_ids)
+        except Exception as exc:
+            errors.append("%s: %s: %s" % (name, type(exc).__name__, exc))
+            continue
+        if len(per_scene) != len(scene_ids):
+            errors.append(
+                "%s: answered %d match lists for %d scenes, so nothing it "
+                "returned can be matched to the file it belongs to"
+                % (name, len(per_scene), len(scene_ids)))
+            continue
+        for scene_id, matches in zip(scene_ids, per_scene):
+            for match in matches:
+                claims[scene_id].append((name, match))
+
+    identified = {}
+    for scene_id in scene_ids:
+        resolved = _resolve_claims(claims[scene_id])
+        if resolved is not None:
+            identified[scene_id] = resolved
+    return FingerprintPass(identified=identified, errors=tuple(errors))
+
+
+def _conflict_detail(claims):
+    """Every disagreeing box named, with the scene it named — the whole of
+    what a reviewer needs to go and look at both."""
+    return "; ".join(
+        "%s says %s (%r)" % (box, remote_site_id, (match or {}).get("title"))
+        for box, remote_site_id, match in claims)
+
+
+def fingerprint_outcome(scene, identification, *, folder):
+    """The `Outcome` for a file a box recognised — or for one they disagreed
+    about.
+
+    A hit is a PROPOSAL, and it is recorded so that nothing downstream can
+    mistake it for a scored one. It carries no `score`, no `confidence` and
+    no `runners_up`: it did not score 1.0, it was identified, and nothing
+    computed a number for it. Writing one in would put a value in the
+    payload that no scorer produced, which the row view, the threshold
+    control and the runners-up display would every one of them read as the
+    scorer's own output. What it carries instead is `identified_by`, the box
+    that identified it, and that box's own id for the scene.
+
+    A `Conflict` is a REFUSAL — neither a mute nor an error, the third of
+    `Outcome`'s three kinds of "no proposal": a human should look, and both
+    boxes' answers are in the reason so they can. It deliberately does NOT
+    fall through to the text path. Falling through would resolve, by
+    scoring a filename, a question two sources that hashed the actual bytes
+    could not agree on — the weaker mechanism silently settling what the
+    stronger one flagged. A refusal is visible in the inbox and recoverable;
+    a scored proposal built over a known conflict is neither.
+    """
+    path = _primary_path(scene)
+    name = posixpath.basename(path)
+    subject_id = str(scene["id"])
+    if isinstance(identification, Conflict):
+        return Outcome(reason=(
+            "fingerprint conflict: %s — the boxes recognised this file as "
+            "different scenes, so none of them is taken"
+            % _conflict_detail(identification.claims)))
+
+    candidate = identification.candidate
+    payload = {
+        "path": path,
+        # The whole match as the box returned it, for the same reason a
+        # scored proposal carries the whole candidate: this module cannot
+        # know which field an applier will need, and a projection drops them
+        # silently.
+        "candidate": candidate,
+        "identified_by": IDENTIFIED_BY_FINGERPRINT,
+        "box": identification.box,
+        "remote_site_id": identification.remote_site_id,
+    }
+    summary = '%s -> "%s" identified by fingerprint (%s)' % (
+        name, candidate.get("title"), identification.box)
+    if identification.agreeing:
+        payload["agreeing_boxes"] = list(identification.agreeing)
+        summary += " [also identified by %s]" % ", ".join(
+            identification.agreeing)
+    return Outcome(
+        proposal={
+            "folder": folder,
+            "subject_type": SUBJECT_TYPE,
+            "subject_id": subject_id,
+            "summary": summary,
+            # No `confidence` key at all, deliberately. `Store.record` takes
+            # it as optional and stores NULL for a proposal that has none,
+            # which is the honest record here: nothing measured this file
+            # against anything, so there is no number to store and none is
+            # invented.
+            "payload": payload,
+        },
+        reason=summary,
+    )
+
+
 # --- Running a batch -------------------------------------------------------
 
 
@@ -1103,6 +1359,20 @@ class ScanProducer:
     the file its turn. `None` (the default) keeps a proposal's candidate
     exactly as `search` returned it, with no second lookup issued at all —
     today's behaviour, unchanged.
+
+    `identify`, when given, is a one-argument callable taking the whole
+    batch's subject ids and returning a `FingerprintPass` — ordinarily
+    `identify_by_fingerprint` bound to a `Stash`'s own boxes and lookup (see
+    `cronicled.runscan.build_producer`). It runs ONCE, for the whole batch,
+    BEFORE a single store is searched, and that order is the point rather
+    than an optimisation: a file a box recognises by its own hashes is
+    already identified, and searching a store for it afterwards would spend
+    a rate-limited lookup re-deriving an answer that is already in hand and
+    would offer a scored guess beside an identification. So a file the pass
+    identifies never reaches `examine_sources` at all — no store search, no
+    scoring, no threshold — and every file it does not identify reaches it
+    exactly as it does today. `None` (the default) skips the pass entirely
+    and this class behaves precisely as it always has.
     """
 
     name = "library-scan"
@@ -1114,7 +1384,7 @@ class ScanProducer:
 
     def __init__(self, stash, sources, *, store, folder="library", limit=None,
                  name_filter=None, threshold=DEFAULT_THRESHOLD, aliases=None,
-                 workers=4, enrich=None):
+                 workers=4, enrich=None, identify=None):
         if workers < 1:
             # A pool of nothing would do nothing at all, forever. Refuse it
             # where the mistake was made rather than on a background thread
@@ -1137,6 +1407,7 @@ class ScanProducer:
         self._name_filter = name_filter
         self._threshold = threshold
         self._enrich = enrich
+        self._identify = identify
         # Indexed and checked HERE, for the same reason `workers` is checked
         # here: a duplicated or empty alias line is a wiring mistake that is
         # wrong for every file, and this is the last point at which the caller
@@ -1171,6 +1442,13 @@ class ScanProducer:
           that is one glance from being resolved;
         * an error is logged and nothing else: that is evidence about the
           network, not about the file.
+
+        When `identify` was given, every selected file is offered to the
+        configured stash-boxes FIRST, in one batch, and the files a box
+        recognised are proposed from what it returned without any store
+        being searched for them at all. Only what is left goes to the pool
+        below. See this class's own `identify` paragraph for why that order
+        is the point.
         """
         # No alias validation here: `__init__` built the index, which is where
         # the map is now checked. Doing it again on the first line of a run
@@ -1204,6 +1482,20 @@ class ScanProducer:
                 counts.muted, counts.filtered_out, counts.deferred))
         ctx.log(selection)
 
+        # The fingerprint pass runs HERE — before a single `_SingleFlight` is
+        # built, before the pool exists, before any store is asked anything.
+        # A file a box recognises is identified, and a store search for it
+        # afterwards would spend a rate-limited lookup producing a scored
+        # guess about a file that is no longer in question.
+        identified, box_errors = self._identify_batch(selected)
+        by_fingerprint = [(scene, identified[str(scene["id"])])
+                          for scene in selected
+                          if str(scene["id"]) in identified]
+        # Everything a box did not recognise, in the order it was selected —
+        # the text path's input, unchanged in every respect but its length.
+        remaining = [scene for scene in selected
+                     if str(scene["id"]) not in identified]
+
         # One `_SingleFlight` PER SOURCE, never one shared across sources: the
         # same creator name against two different stores is two different
         # lookups, and collapsing them into one cache entry would silently
@@ -1219,41 +1511,33 @@ class ScanProducer:
                   censorship=source.censorship)
             for source, flight in zip(self._sources, flights)
         ]
-        proposed = muted = refused = errors = 0
+        tally = {"proposed": 0, "muted": 0, "refused": 0, "errors": 0}
+        done = 0
+        # Files a box identified are recorded first, in selection order —
+        # they are already decided, so there is nothing to wait for and no
+        # reason to hold them behind the pool's first completion.
+        for scene, identification in by_fingerprint:
+            outcome = fingerprint_outcome(scene, identification,
+                                          folder=self._folder)
+            tally[self._record(scene, outcome)] += 1
+            done += 1
+            ctx.log("%d/%d scene %s: %s" % (
+                done, len(selected), str(scene["id"]), outcome.reason))
+            if outcome.proposal is not None:
+                yield outcome.proposal
+
         pool = ThreadPoolExecutor(max_workers=self._workers,
                                   thread_name_prefix=self.name)
         try:
             futures = {pool.submit(self._examine, scene, sources): scene
-                       for scene in selected}
-            for done, future in enumerate(as_completed(futures), start=1):
-                subject_id = str(futures[future]["id"])
+                       for scene in remaining}
+            for future in as_completed(futures):
+                scene = futures[future]
                 outcome = future.result()
-                if outcome.mute_reason is not None:
-                    # Through the store, with the reason, so a later reader
-                    # learns whether the catalogue had nothing for a creator
-                    # we did identify or the layout named nobody at all —
-                    # only the second is fixed by an alias.
-                    self._store.mute(SUBJECT_TYPE, subject_id,
-                                     reason=outcome.mute_reason)
-                    muted += 1
-                elif outcome.error is not None:
-                    errors += 1
-                elif outcome.proposal is None:
-                    # Through the store too, so a refusal — the one outcome a
-                    # person can most often fix (rename a file, add an alias,
-                    # move the threshold) — is visible somewhere other than
-                    # this job's own log. Keyed by subject, not recorded as a
-                    # proposal; see the block above `Store.record_refusal`
-                    # for why reusing `item` here would re-propose the same
-                    # unresolved file as a fresh row every night.
-                    self._store.record_refusal(
-                        SUBJECT_TYPE, subject_id,
-                        _primary_path(futures[future]), outcome.reason)
-                    refused += 1
-                else:
-                    proposed += 1
+                tally[self._record(scene, outcome)] += 1
+                done += 1
                 ctx.log("%d/%d scene %s: %s" % (
-                    done, len(selected), subject_id, outcome.reason))
+                    done, len(selected), str(scene["id"]), outcome.reason))
                 if outcome.proposal is not None:
                     yield outcome.proposal
         finally:
@@ -1282,9 +1566,80 @@ class ScanProducer:
         # deserves to see what it actually cost this run, not just how many
         # files it was spent on.
         lookups = sum(flight.calls for flight in flights)
+        # The fingerprint note is appended only when the pass actually did
+        # something — identified a file, or had a box fail. A run with no box
+        # configured (every install today) logs exactly the line it always
+        # did, and an absent note therefore means "nothing was identified by
+        # fingerprint and no box erred" rather than "this run did not look".
+        # Box errors belong HERE rather than on a per-file reason: a box being
+        # unreachable is one fact about the run, not one fact per file, and
+        # this closing line is the one message `JobRunner` keeps.
+        note = ""
+        if by_fingerprint or box_errors:
+            note = "; %d identified by fingerprint" % len(by_fingerprint)
+            if box_errors:
+                note += " (box errors: %s)" % "; ".join(box_errors)
         ctx.log("finished: %d proposed, %d muted, %d refused, %d errors, "
-                "%d lookups; %s"
-                % (proposed, muted, refused, errors, lookups, selection))
+                "%d lookups; %s%s"
+                % (tally["proposed"], tally["muted"], tally["refused"],
+                   tally["errors"], lookups, selection, note))
+
+    def _identify_batch(self, selected):
+        """Ask the configured boxes about the whole batch, and never let that
+        question cost the batch.
+
+        Returns `(identified, box_errors)` — empty and `()` when no
+        `identify` was given, which is every install with no box configured.
+
+        A raising `identify` is caught here and reported as one error rather
+        than ending the run. That is the same reasoning
+        `identify_by_fingerprint` applies to a single box that raises, one
+        level up: reading the server's box configuration can fail on its own,
+        and a scan that died there would lose the text path for every file in
+        the batch over an addition that is only ever supposed to save some of
+        them a lookup.
+        """
+        if self._identify is None or not selected:
+            return {}, ()
+        try:
+            result = self._identify([str(scene["id"]) for scene in selected])
+        except Exception as exc:
+            return {}, ("fingerprint lookup failed: %s: %s"
+                        % (type(exc).__name__, exc),)
+        return dict(result.identified), tuple(result.errors)
+
+    def _record(self, scene, outcome):
+        """Record one file's outcome through the store, and name the bucket
+        it fell in.
+
+        One place, shared by the fingerprint pass and the text path, because
+        the three kinds of "no proposal" mean the same things and call for
+        the same writes whichever path produced them — and a second copy of
+        this branch would be free to disagree about which one mutes.
+        """
+        subject_id = str(scene["id"])
+        if outcome.mute_reason is not None:
+            # Through the store, with the reason, so a later reader
+            # learns whether the catalogue had nothing for a creator
+            # we did identify or the layout named nobody at all —
+            # only the second is fixed by an alias.
+            self._store.mute(SUBJECT_TYPE, subject_id,
+                             reason=outcome.mute_reason)
+            return "muted"
+        if outcome.error is not None:
+            return "errors"
+        if outcome.proposal is None:
+            # Through the store too, so a refusal — the one outcome a
+            # person can most often fix (rename a file, add an alias,
+            # move the threshold) — is visible somewhere other than
+            # this job's own log. Keyed by subject, not recorded as a
+            # proposal; see the block above `Store.record_refusal`
+            # for why reusing `item` here would re-propose the same
+            # unresolved file as a fresh row every night.
+            self._store.record_refusal(SUBJECT_TYPE, subject_id,
+                                       _primary_path(scene), outcome.reason)
+            return "refused"
+        return "proposed"
 
     def _examine(self, scene, sources):
         """One file's turn, with its exceptions kept to itself.

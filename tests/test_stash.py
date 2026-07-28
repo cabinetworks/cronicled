@@ -3605,3 +3605,200 @@ class CompositeFieldsAreSelectedWithSubfields(unittest.TestCase):
                         "so every call using it fails -- and no fake "
                         "transport will ever notice.\n  in: %s"
                         % (field, " ".join(doc.split())[:160]))
+
+
+# -- identifying a file by its own fingerprints ---------------------------- #
+#
+# The stash-box half of this client. Nothing here searches for text: the
+# server computes a scene's hashes and asks a box which scene they belong to,
+# and the box either recognises the file or does not.
+#
+# Every fixture below is invented. `example.invalid` is reserved by RFC 2606
+# and can never resolve.
+
+BOX_ONE = {"name": "north-box", "endpoint": "https://one.example.invalid/gql"}
+BOX_TWO = {"name": "south-box", "endpoint": "https://two.example.invalid/gql"}
+
+
+def _boxes_reply(boxes):
+    return {"data": {"configuration": {"general": {"stashBoxes": boxes}}}}
+
+
+def _match(title, remote_site_id):
+    """One `ScrapedScene` as a box returns it, carrying the box's own id for
+    the scene alongside the fields an apply would write."""
+    return {"title": title, "code": None, "details": None, "director": None,
+            "urls": [], "url": None, "date": None, "image": None,
+            "studio": None, "tags": [], "performers": [],
+            "remote_site_id": remote_site_id}
+
+
+class ConfiguredStashBoxes(unittest.TestCase):
+    def test_it_returns_every_configured_box_in_the_server_s_own_order(self):
+        # The order is the operator's configured order and callers are told
+        # to try boxes in it, so a client that re-ordered (or de-duplicated,
+        # or sorted) would silently change which box's copy of a scene a
+        # proposal carries.
+        t = _transport([_boxes_reply([BOX_TWO, BOX_ONE])])
+        got = Stash("http://example.test", "k", transport=t).stash_boxes()
+        self.assertEqual(got, [BOX_TWO, BOX_ONE])
+
+    def test_no_boxes_configured_is_an_empty_list_not_a_failure(self):
+        # A fresh install has none. Fingerprint identification is an addition
+        # to the text path, never a replacement, so having nobody to ask is an
+        # ordinary state and must not raise.
+        t = _transport([_boxes_reply(None)])
+        self.assertEqual(
+            Stash("http://example.test", "k", transport=t).stash_boxes(), [])
+
+    def test_the_query_asks_the_server_s_configuration_for_its_boxes(self):
+        # Asserted as PROPERTIES of the document, never against a constant the
+        # client also builds the request from: a query swapped for a sibling
+        # that returns a different thing would move both sides together.
+        t = _transport([_boxes_reply([])])
+        Stash("http://example.test", "k", transport=t).stash_boxes()
+        query = t.calls[0][0]["query"]
+        self.assertIn("configuration", query)
+        self.assertIn("general", query)
+        self.assertIn("stashBoxes", query)
+
+    def test_it_selects_the_two_fields_a_caller_needs_to_ask_a_box(self):
+        # A name to report and an endpoint to address. Selecting only one of
+        # them leaves a caller unable either to name the box in a proposal or
+        # to send it anything.
+        t = _transport([_boxes_reply([])])
+        Stash("http://example.test", "k", transport=t).stash_boxes()
+        query = t.calls[0][0]["query"]
+        self.assertIn("name", query)
+        self.assertIn("endpoint", query)
+
+    def test_the_box_api_key_is_never_asked_for(self):
+        # HARM: the server holds each box's key and uses it on our behalf
+        # when we name the endpoint, so this client has no use for one.
+        # Selecting a secret in order to discard it puts it in a response
+        # body, and in whatever ever logs one.
+        t = _transport([_boxes_reply([])])
+        Stash("http://example.test", "k", transport=t).stash_boxes()
+        self.assertNotIn("api_key", t.calls[0][0]["query"])
+
+
+class FingerprintLookup(unittest.TestCase):
+
+    def _stash(self, responses):
+        return Stash("http://example.test", "k", transport=_transport(responses))
+
+    def _reply(self, per_scene):
+        return {"data": {"scrapeMultiScenes": per_scene}}
+
+    def test_the_answer_keeps_the_order_the_scenes_were_asked_about_in(self):
+        # Only some scenes match, and the two that do match DIFFERENTLY, at
+        # positions that are not mirror images of each other. A fixture where
+        # every scene matched could not tell a preserved order from a
+        # shuffled one -- and neither could a symmetric one: a single hit in
+        # the middle of three survives being reversed unchanged, which is
+        # exactly the mutation this test exists to catch.
+        ledger = _match("Winter Ledger", "r-77")
+        morning = _match("Morning Ritual", "r-12")
+        t = _transport([self._reply([[], [ledger], [morning], []])])
+        got = Stash("http://example.test", "k", transport=t
+                    ).scrape_scenes_by_fingerprint(
+                        BOX_ONE["endpoint"], ["11", "12", "13", "14"])
+        self.assertEqual(got, [[], [ledger], [morning], []])
+
+    def test_the_source_names_a_box_endpoint_and_the_input_the_scene_ids(self):
+        # The whole variables shape, not a sampled key: supplying
+        # `scraper_id` here instead would point the same query at a site
+        # scraper, which answers about TEXT, and an added key would travel to
+        # the server unnoticed.
+        t = _transport([self._reply([[]])])
+        Stash("http://example.test", "k", transport=t
+              ).scrape_scenes_by_fingerprint(BOX_ONE["endpoint"], ["4"])
+        self.assertEqual(t.calls[0][0]["variables"], {
+            "source": {"stash_box_endpoint": BOX_ONE["endpoint"]},
+            "input": {"scene_ids": ["4"]},
+        })
+
+    def test_scene_ids_travel_as_strings_whatever_the_caller_held(self):
+        t = _transport([self._reply([[], []])])
+        Stash("http://example.test", "k", transport=t
+              ).scrape_scenes_by_fingerprint(BOX_ONE["endpoint"], [7, 8])
+        self.assertEqual(t.calls[0][0]["variables"]["input"],
+                         {"scene_ids": ["7", "8"]})
+
+    def test_an_empty_batch_asks_the_box_nothing_at_all(self):
+        t = _transport([self._reply([])])
+        got = Stash("http://example.test", "k", transport=t
+                    ).scrape_scenes_by_fingerprint(BOX_ONE["endpoint"], [])
+        self.assertEqual(got, [])
+        self.assertEqual(t.calls, [])
+
+    def test_a_short_reply_is_refused_rather_than_matched_up_by_position(self):
+        # HARM: the reply carries no scene ids -- position is the ONLY thing
+        # tying a match to its scene. Zipping a short reply against the
+        # request would attribute one file's box metadata to a different
+        # file, and nothing afterwards could detect it.
+        t = _transport([self._reply([[_match("Winter Ledger", "r-1")]])])
+        with self.assertRaises(StashError) as ctx:
+            Stash("http://example.test", "k", transport=t
+                  ).scrape_scenes_by_fingerprint(BOX_ONE["endpoint"],
+                                                 ["1", "2", "3"])
+        self.assertIn("3", str(ctx.exception))
+
+    def test_a_long_reply_is_refused_too(self):
+        # The other side of the same guard. A guard that only refuses one
+        # direction is half a guard, and the surplus direction is just as
+        # unalignable.
+        t = _transport([self._reply([[], [], []])])
+        with self.assertRaises(StashError):
+            Stash("http://example.test", "k", transport=t
+                  ).scrape_scenes_by_fingerprint(BOX_ONE["endpoint"], ["1"])
+
+    def test_a_reply_with_no_list_at_all_is_refused(self):
+        t = _transport([self._reply(None)])
+        with self.assertRaises(StashError):
+            Stash("http://example.test", "k", transport=t
+                  ).scrape_scenes_by_fingerprint(BOX_ONE["endpoint"], ["1"])
+
+    def test_a_reply_of_exactly_the_right_length_is_accepted(self):
+        # The permissive side of the length guard, pinned so a mutation that
+        # tightened it into refusing everything would fail something. A guard
+        # that drifts too strict is as wrong as one too loose, and quieter.
+        t = _transport([self._reply([[], []])])
+        got = Stash("http://example.test", "k", transport=t
+                    ).scrape_scenes_by_fingerprint(BOX_ONE["endpoint"],
+                                                   ["1", "2"])
+        self.assertEqual(got, [[], []])
+
+    def test_the_query_asks_the_multi_scene_scrape_for_the_box_s_own_id(self):
+        # Properties of the document. `remote_site_id` is the only thing that
+        # makes two boxes' answers comparable, so a selection that dropped it
+        # would leave a caller unable to tell agreement from conflict.
+        t = _transport([self._reply([[]])])
+        Stash("http://example.test", "k", transport=t
+              ).scrape_scenes_by_fingerprint(BOX_ONE["endpoint"], ["1"])
+        query = t.calls[0][0]["query"]
+        self.assertIn("scrapeMultiScenes", query)
+        self.assertIn("remote_site_id", query)
+
+    def test_it_selects_everything_an_apply_would_write_from_a_match(self):
+        # A box match is carried into a proposal and applied by exactly the
+        # same code a text-scraped candidate is, so a field missing here is a
+        # field silently absent from the write. Named individually rather
+        # than compared against the client's own selection constant, which
+        # would move with any change to it.
+        t = _transport([self._reply([[]])])
+        Stash("http://example.test", "k", transport=t
+              ).scrape_scenes_by_fingerprint(BOX_ONE["endpoint"], ["1"])
+        query = t.calls[0][0]["query"]
+        for field in ("title", "details", "date", "urls", "code", "director",
+                      "image", "studio", "performers", "tags"):
+            self.assertIn(field, query)
+
+    def test_the_ids_travel_as_variables_rather_than_baked_into_the_query(self):
+        t = _transport([self._reply([[]])])
+        Stash("http://example.test", "k", transport=t
+              ).scrape_scenes_by_fingerprint(BOX_ONE["endpoint"], ["9"])
+        body = t.calls[0][0]
+        self.assertNotIn("9", body["query"])
+        self.assertIn("ScrapeMultiScenesInput!", body["query"])
+        self.assertIn("ScraperSourceInput!", body["query"])
