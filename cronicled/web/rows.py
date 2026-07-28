@@ -21,8 +21,12 @@ class Row:
     # address is threaded in here rather than typed a second time.
     scene_url: str | None
     proposed_title: str
-    creator: str
-    creator_source: str
+    # `None` on a proposal a stash-box identified by fingerprint: no creator
+    # was resolved for it, because nothing needed one — the file was never
+    # searched for by name. `identifying_box` below is what such a row says
+    # instead, and the template picks between them.
+    creator: str | None
+    creator_source: str | None
     contested: bool
     disagreement: str | None
     carries_cover: bool
@@ -39,8 +43,19 @@ class Row:
     # second, parallel signal saying the same thing could drift from it.
     performers: tuple
     studio: str | None
-    score: float
+    # `None` on a fingerprint-identified proposal, and that is the whole
+    # point of the field being nullable. Such a proposal did not score 1.0 —
+    # nothing scored it at all — so any number here would be one this page
+    # invented and then displayed in the same column, in the same type, as
+    # numbers the scorer really produced. `score_text` says so in words
+    # instead; see `to_row`.
+    score: float | None
     score_text: str
+    # The stash-box that recognised this file by its own fingerprints, or
+    # `None` for an ordinary scored proposal. Both are never set at once:
+    # the two are different ways of arriving at a candidate and a row shows
+    # whichever one this proposal used.
+    identifying_box: str | None
     runners_up: tuple
     undoable: bool
     # Why an apply failed, for a row in the `failed` state. Without it the page
@@ -206,17 +221,51 @@ def _disagreement(creator, filename_stem, competing_store=None):
     return "; ".join(parts) if parts else None
 
 
+# What `to_row` shows in the score column for a proposal nothing scored. Not
+# a number and not blank: a blank column reads as a value that failed to
+# render, and any number at all reads as the scorer's own output. This is the
+# one place the difference is visible to a person, so it says so in words.
+IDENTIFIED_SCORE_TEXT = "id'd"
+
+
 def to_row(item, base_url=None):
     payload = item["payload"]
-    # Indexed, not .get(): a proposal without a creator is malformed, and a
-    # blank creator column reads as "nothing disagreed" — the reading that
-    # gets a wrong row approved.
-    creator = payload["creator"]
     filename = os.path.basename(payload["path"])
-    disagreement = _disagreement(creator, os.path.splitext(filename)[0],
-                                 competing_store=payload.get("competing_store"))
     candidate = payload["candidate"]
-    score = payload["score"]
+    # The discriminator between the two kinds of proposal, read off the
+    # payload the producer wrote (`scan.IDENTIFIED_BY_FINGERPRINT`). Absent
+    # means a scored proposal — which is what every payload written before
+    # fingerprint identification existed is, so absence is the right default
+    # here rather than a guess: it sends such a payload down the branch that
+    # INDEXES `creator` and `score` and raises if either is missing, never
+    # down the branch that would quietly show a row with neither.
+    identified_by = payload.get("identified_by")
+    if identified_by is None:
+        # Indexed, not .get(): a scored proposal without a creator is
+        # malformed, and a blank creator column reads as "nothing disagreed"
+        # — the reading that gets a wrong row approved.
+        creator = payload["creator"]
+        creator_name = creator["name"]
+        creator_source = creator["source"]
+        score = payload["score"]
+        score_text = "%.3f" % score
+        identifying_box = None
+        disagreement = _disagreement(
+            creator, os.path.splitext(filename)[0],
+            competing_store=payload.get("competing_store"))
+    else:
+        # A box identified this file; no creator was ever resolved for it and
+        # nothing scored it. Indexed, not .get(): a payload that says it was
+        # identified and cannot say by which box is malformed, and "identified
+        # by nobody" is precisely the row a person would approve without
+        # noticing.
+        creator_name = creator_source = score = None
+        score_text = IDENTIFIED_SCORE_TEXT
+        identifying_box = payload["box"]
+        # Nothing to contest: two boxes that disagreed never produced a
+        # proposal at all (see `scan.fingerprint_outcome`), and boxes that
+        # AGREED are agreement, which is not a warning.
+        disagreement = None
     return Row(
         fingerprint=item["fingerprint"],
         state=item["state"],
@@ -228,16 +277,19 @@ def to_row(item, base_url=None):
         # handles on its own terms.
         scene_url=scene_url(base_url, item["subject_id"]),
         proposed_title=candidate["title"],
-        creator=creator["name"],
-        creator_source=creator["source"],
+        creator=creator_name,
+        creator_source=creator_source,
         contested=disagreement is not None,
         disagreement=disagreement,
         carries_cover=carries_cover(candidate),
         performers=_performer_names(candidate),
         studio=_studio_name(candidate),
         score=score,
-        # Three places, matching the precision the decision was made at.
-        score_text="%.3f" % score,
+        # Three places, matching the precision the decision was made at —
+        # for a scored proposal. For an identified one there is no decision
+        # and no precision; see IDENTIFIED_SCORE_TEXT.
+        score_text=score_text,
+        identifying_box=identifying_box,
         runners_up=tuple(_runner_up_view(r)
                          for r in (payload.get("runners_up") or ())),
         # An applied row with no snapshot cannot be reverted — revert_scene

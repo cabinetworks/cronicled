@@ -22,7 +22,8 @@ import sys
 from cronicled.adapters.registry import load_adapters
 from cronicled.config import load_server
 from cronicled.jobs import JobRunner
-from cronicled.scan import DEFAULT_THRESHOLD, ScanProducer, Source
+from cronicled.scan import (DEFAULT_THRESHOLD, ScanProducer, Source,
+                            identify_by_fingerprint)
 from cronicled.search import catalog_search
 from cronicled.stash import Stash
 from cronicled.store import Store
@@ -80,6 +81,17 @@ def build_producer(stash, adapters, store, *, limit, folder="library",
     name search to identify anything. See `scan.examine`'s `enrich`
     paragraph for what happens when a candidate has no URL to give it, or
     when the scrape itself fails.
+
+    `identify` is wired the same way and for the same reasons: one
+    collaborator for the whole run, no adapter-level gate and no per-store
+    copy, because a stash-box identifies a file by the file's own
+    fingerprints and has nothing to do with which stores are configured.
+    The boxes are read at SCAN time, not here — `stash.stash_boxes()` is
+    called inside the closure, so a box added to the server between building
+    a producer and running it is asked, and a producer built once and run
+    twice does not hold a stale list. An install with no box configured
+    answers `[]`, the closure asks nobody, and every file takes the text
+    path exactly as it does today.
     """
     if limit is None:
         raise ValueError(
@@ -96,10 +108,16 @@ def build_producer(stash, adapters, store, *, limit, folder="library",
               censorship=adapter.censorship)
         for name, adapter in sorted(adapters.items())
     ]
+
+    def identify(scene_ids):
+        return identify_by_fingerprint(
+            scene_ids, boxes=stash.stash_boxes(),
+            lookup=stash.scrape_scenes_by_fingerprint)
+
     return ScanProducer(
         stash, sources, store=store, folder=folder, limit=limit,
         name_filter=name_filter, threshold=threshold, aliases=aliases,
-        workers=workers, enrich=stash.scrape_scene_url)
+        workers=workers, enrich=stash.scrape_scene_url, identify=identify)
 
 
 def configured_adapters(env=None):

@@ -135,6 +135,14 @@
    now five collapsed sections: a count visible while collapsed, and what an
    empty one says. Only Applied ever opens itself (see below); the other
    four stay exactly as collapsed-by-default as before. #}
+{# A row says how its candidate was arrived at, and the two ways are not
+   interchangeable: a scored proposal names the creator it was searched
+   under and where that name was read from, while a fingerprint-identified
+   one names the stash-box that recognised the file and had no creator
+   resolved for it at all. One macro, used by all three places that show
+   this, so the two cannot drift apart per section. #}
+{% macro attribution(row) %}{% if row.identifying_box %}identified by fingerprint (<b>{{ row.identifying_box }}</b>){% else %}<b>{{ row.creator }}</b> (from the {{ row.creator_source }}){% endif %}{% endmacro %}
+
 {% macro identifier(text, url) %}{% if url %}<a href="{{ url }}" target="_blank" rel="noopener noreferrer">{{ text }}</a>{% else %}{{ text }}{% endif %}{% endmacro %}
 
 {% macro proposal_block(row, highlight=False) %}
@@ -144,7 +152,7 @@
       <p class="file">{{ identifier(row.filename, row.scene_url) }}</p>
       <p class="title">{{ row.proposed_title }}</p>
       <div class="meta">
-        <b>{{ row.creator }}</b> (from the {{ row.creator_source }})
+        {{ attribution(row) }}
         {% if row.performers %} &middot; performers: <b>{% for p in row.performers %}{{ p }}{% if not loop.last %}, {% endif %}{% endfor %}</b>{% endif %}
         {% if row.studio %} &middot; studio: <b>{{ row.studio }}</b>{% endif %}
       </div>
@@ -259,7 +267,7 @@
       <div class="what">
         <p class="file">{{ identifier(row.filename, row.scene_url) }}</p>
         <p class="title">{{ row.proposed_title }}</p>
-        <div class="meta"><b>{{ row.creator }}</b> (from the {{ row.creator_source }})</div>
+        <div class="meta">{{ attribution(row) }}</div>
       </div>
       <div class="score">{{ row.score_text }}</div>
       <div class="acts">
@@ -277,7 +285,7 @@
       <div class="what">
         <p class="file">{{ identifier(row.filename, row.scene_url) }}</p>
         <p class="title">{{ row.proposed_title }}</p>
-        <div class="meta"><b>{{ row.creator }}</b> (from the {{ row.creator_source }})</div>
+        <div class="meta">{{ attribution(row) }}</div>
       </div>
       <div class="score">{{ row.score_text }}</div>
     </div>
