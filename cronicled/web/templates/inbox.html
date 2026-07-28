@@ -140,8 +140,15 @@
    under and where that name was read from, while a fingerprint-identified
    one names the stash-box that recognised the file and had no creator
    resolved for it at all. One macro, used by all three places that show
-   this, so the two cannot drift apart per section. #}
-{% macro attribution(row) %}{% if row.identifying_box %}identified by fingerprint (<b>{{ row.identifying_box }}</b>){% else %}<b>{{ row.creator }}</b> (from the {{ row.creator_source }}){% endif %}{% endmacro %}
+   this, so the two cannot drift apart per section.
+
+   A scored row also says which OTHER stores named the same candidate, when
+   any did. It hangs off the attribution rather than off the warning below
+   it because it is corroboration, not a contest: two independent stores
+   naming one scene is the strongest text evidence this tool produces, and
+   putting it where warnings live would teach a reviewer to read past the
+   warnings. #}
+{% macro attribution(row) %}{% if row.identifying_box %}identified by fingerprint (<b>{{ row.identifying_box }}</b>){% else %}<b>{{ row.creator }}</b> (from the {{ row.creator_source }}){% if row.agreeing_stores %} &middot; corroborated by <b>{% for s in row.agreeing_stores %}{{ s }}{% if not loop.last %}, {% endif %}{% endfor %}</b>{% endif %}{% endif %}{% endmacro %}
 
 {% macro identifier(text, url) %}{% if url %}<a href="{{ url }}" target="_blank" rel="noopener noreferrer">{{ text }}</a>{% else %}{{ text }}{% endif %}{% endmacro %}
 
