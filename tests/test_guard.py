@@ -3,8 +3,9 @@ times in ways code review missed. These tests exercise it as a black box."""
 import os
 import shutil
 import subprocess
-import tempfile
 import unittest
+
+from tests.fixtures.tempdirs import TempDirCleanup, mkdtemp
 
 GUARD = os.path.abspath("scripts/check_leaks")
 EXT_LIST_NAMES = ("data-extensions.txt", "media-extensions.txt")
@@ -12,7 +13,7 @@ EXT_LIST_NAMES = ("data-extensions.txt", "media-extensions.txt")
 
 def _repo(patterns, files, subdir=None):
     """A throwaway git repo with `files` committed and `patterns` configured."""
-    d = tempfile.mkdtemp()
+    d = mkdtemp()
     subprocess.check_call(["git", "init", "-q", "-b", "main"], cwd=d)
     subprocess.check_call(["git", "config", "user.email", "t@example.test"], cwd=d)
     subprocess.check_call(["git", "config", "user.name", "t"], cwd=d)
@@ -55,7 +56,7 @@ def _fake_git_dir(fail_match):
     call's failure is handled correctly without needing to actually corrupt
     a repository to make that call fail for real."""
     real_git = shutil.which("git")
-    d = tempfile.mkdtemp()
+    d = mkdtemp()
     script = os.path.join(d, "git")
     with open(script, "w") as fh:
         fh.write("#!/usr/bin/env bash\n")
@@ -78,7 +79,7 @@ def _fake_grep_dir(fail_exact_args):
     shutil.which rather than a bare "grep" exec, so this cannot recurse into
     itself even if something in the environment shadows the name."""
     real_grep = shutil.which("grep")
-    d = tempfile.mkdtemp()
+    d = mkdtemp()
     script = os.path.join(d, "grep")
     with open(script, "w") as fh:
         fh.write("#!/usr/bin/env bash\n")
@@ -105,7 +106,7 @@ def _fake_git_dir_with_commit_side_effect(repo_dir, trigger_args, new_filename, 
     effect is synchronous, fired by whichever git call the test picks as the
     "during the scan" moment."""
     real_git = shutil.which("git")
-    d = tempfile.mkdtemp()
+    d = mkdtemp()
     script = os.path.join(d, "git")
     marker = os.path.join(d, ".fired")
     with open(script, "w") as fh:
@@ -140,7 +141,7 @@ def _guard_with_ext_lists(missing=(), empty=(), whitespace_only=(), raw_content=
     `include_lib=False` omits scripts/lib/leakpatterns.py from the copy, for
     exercising the guard's own fail-closed behaviour when its shared
     pattern-loading dependency is missing (see PatternsLibFailClosed)."""
-    d = tempfile.mkdtemp()
+    d = mkdtemp()
     shutil.copy(GUARD, os.path.join(d, "check_leaks"))
     src_dir = os.path.dirname(GUARD)
     raw_content = raw_content or {}
@@ -170,7 +171,7 @@ def _guard_with_ext_lists(missing=(), empty=(), whitespace_only=(), raw_content=
     return os.path.join(d, "check_leaks")
 
 
-class OutputDiscipline(unittest.TestCase):
+class OutputDiscipline(TempDirCleanup, unittest.TestCase):
     # These use LEAK_PATTERNS (the CI secret path), not the local file: CI
     # logs are public, so this is where redaction is guaranteed by default.
     # See RedactionBySource below for the file-mode and --redact behaviour.
@@ -188,7 +189,7 @@ class OutputDiscipline(unittest.TestCase):
         self.assertIn("1", out)
 
 
-class WorkingDirectory(unittest.TestCase):
+class WorkingDirectory(TempDirCleanup, unittest.TestCase):
     def test_finds_the_pattern_file_from_a_subdirectory(self):
         d = _repo(["zzsecretzz"], {"a.md": "harmless\n"}, subdir="nested/deep")
         code, out = _run(os.path.join(d, "nested", "deep"))
@@ -202,7 +203,7 @@ class WorkingDirectory(unittest.TestCase):
         self.assertEqual(code, 1)
 
 
-class FailClosed(unittest.TestCase):
+class FailClosed(TempDirCleanup, unittest.TestCase):
     def test_no_patterns_anywhere_is_a_failure(self):
         d = _repo(["zzsecretzz"], {"a.md": "harmless\n"})
         os.remove(os.path.join(d, ".leak-patterns"))
@@ -211,7 +212,7 @@ class FailClosed(unittest.TestCase):
         self.assertIn("no patterns", out.lower())
 
 
-class FileTypesOnly(unittest.TestCase):
+class FileTypesOnly(TempDirCleanup, unittest.TestCase):
     def test_no_patterns_does_not_fail_in_file_types_only_mode(self):
         # A fork PR has no access to the LEAK_PATTERNS secret. This mode must
         # not demand patterns that cannot exist in that context.
@@ -236,7 +237,7 @@ class FileTypesOnly(unittest.TestCase):
         self.assertEqual(code, 0, out)
 
 
-class AllowedTrackedFiles(unittest.TestCase):
+class AllowedTrackedFiles(TempDirCleanup, unittest.TestCase):
     """`*.yml` is a data file type, deny-by-default, because a .yml is a
     perfectly good place for library data to hide. A handful of specific
     configuration files the project cannot work without are named back in
@@ -339,7 +340,7 @@ class StagedContentIsScanned(unittest.TestCase):
         self.assertNotIn("zzsecretzz", out)
 
 
-class RedactionBySource(unittest.TestCase):
+class RedactionBySource(TempDirCleanup, unittest.TestCase):
     """Round 1 redacted the filename legs but left the content legs printing
     paths verbatim - and a path can coincidentally contain the pattern even
     when a *content* leg is what matched, whenever a file's name and body
@@ -392,7 +393,7 @@ class RedactionBySource(unittest.TestCase):
         self.assertNotIn("zzsecretzz", out)
 
 
-class UnreadableFileFailsClosed(unittest.TestCase):
+class UnreadableFileFailsClosed(TempDirCleanup, unittest.TestCase):
     """`git grep` and plain `grep` both report "no match" (their normal exit
     code for a genuinely clean result) for a file they cannot open at all -
     the same shape of bug as the extension list, one layer down: a read
@@ -466,7 +467,7 @@ class DeletedTrackedFileIsReportedClearly(unittest.TestCase):
         self.assertNotIn("no longer exists on disk", out)
 
 
-class GitFailureFailsClosed(unittest.TestCase):
+class GitFailureFailsClosed(TempDirCleanup, unittest.TestCase):
     """Re-review confirmed clean-exit-on-failure for `git ls-files` (tracked
     and untracked filename legs, and the file-type section) and for
     `git log -1 --format=%B` (the commit-message leg), and rejected the
@@ -512,7 +513,7 @@ class GitFailureFailsClosed(unittest.TestCase):
         self.assertNotIn("check_leaks: clean", out)
 
 
-class PatternListCorruptionVectors(unittest.TestCase):
+class PatternListCorruptionVectors(TempDirCleanup, unittest.TestCase):
     """The re-review that fixed load_ext_list's whitespace-only-line vector
     asked whether the pattern list has equivalent coverage for the SAME two
     vectors that then hit load_ext_list a second time (a missing trailing
@@ -601,7 +602,7 @@ class PatternsMayContainTheCommentCharacter(unittest.TestCase):
         self.assertEqual(code, 0, out)
 
 
-class CountCrossCheckFailsClosed(unittest.TestCase):
+class CountCrossCheckFailsClosed(TempDirCleanup, unittest.TestCase):
     """The `grep -c` calls that produce the independent candidate count (in
     load_ext_list) and the input/survived counts (in pattern-list
     preprocessing) were not exit-status-checked. If one failed, it yielded
@@ -635,7 +636,7 @@ class CountCrossCheckFailsClosed(unittest.TestCase):
         self.assertNotIn("check_leaks: clean", out)
 
 
-class Section5SeesFreshState(unittest.TestCase):
+class Section5SeesFreshState(TempDirCleanup, unittest.TestCase):
     """Section 5 (the data/media extension check) runs last, after every
     pattern-based leg. An earlier version of this script took one
     tracked-file snapshot near the top and reused it everywhere, including
@@ -657,7 +658,7 @@ class Section5SeesFreshState(unittest.TestCase):
         self.assertIn("tracked data file: secrets.env", out)
 
 
-class ExtensionListFailClosed(unittest.TestCase):
+class ExtensionListFailClosed(TempDirCleanup, unittest.TestCase):
     """Extracting the extension lists to scripts/*.txt (round 2) introduced a
     new instance of this file's recurring defect class: a failure to load
     external configuration must abort, not continue. A missing or unreadable
@@ -815,7 +816,7 @@ class ExtensionListFailClosed(unittest.TestCase):
         self.assertEqual(code, 0, out)
 
 
-class ExtensionListsAgree(unittest.TestCase):
+class ExtensionListsAgree(TempDirCleanup, unittest.TestCase):
     # Extensions permitted to exist in only one list, with the reason.
     ALLOWLIST_GUARDED_ONLY = frozenset()
     # .pyc and .egg-info/ are Python build hygiene (bytecode caches, packaging
@@ -916,7 +917,7 @@ class ExemptionsAgreeWithIgnoreRules(unittest.TestCase):
                          "git-ignore-negated but not guard-exempt: %s" % missing)
 
 
-class BinaryDetectedContentIsScanned(unittest.TestCase):
+class BinaryDetectedContentIsScanned(TempDirCleanup, unittest.TestCase):
     """`git grep -I` (the flag both content legs used) silently excludes
     anything git treats as binary: a plain-ASCII file `.gitattributes`
     marks `-diff` or `binary`, and any file containing a NUL byte anywhere
@@ -981,7 +982,7 @@ class BinaryDetectedContentIsScanned(unittest.TestCase):
         self.assertIn("binlike.txt", out)
 
 
-class PatternsLibFailClosed(unittest.TestCase):
+class PatternsLibFailClosed(TempDirCleanup, unittest.TestCase):
     """scripts/check_leaks imports scripts/lib/leakpatterns.py (shared with
     scripts/hooks/commit-msg) rather than carrying its own copy of
     pattern-loading logic. A missing or unreadable shared library must

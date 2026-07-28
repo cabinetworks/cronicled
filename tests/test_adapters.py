@@ -2,6 +2,7 @@
 specs are invented, and exercise each owner-source mechanism."""
 import json
 import os
+import shutil
 import tempfile
 import unittest
 
@@ -168,6 +169,7 @@ class ExampleConfig(unittest.TestCase):
 class Registry(unittest.TestCase):
     def _write(self, payload):
         d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
         p = os.path.join(d, "adapters.json")
         with open(p, "w") as fh:
             json.dump(payload, fh)
@@ -207,6 +209,7 @@ class Registry(unittest.TestCase):
 
     def test_malformed_config_raises_rather_than_loading_silently(self):
         d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
         p = os.path.join(d, "adapters.json")
         with open(p, "w") as fh:
             fh.write("{not valid json")
