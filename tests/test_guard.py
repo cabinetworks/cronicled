@@ -374,6 +374,42 @@ class UnreadableFileFailsClosed(unittest.TestCase):
         self.assertNotIn("check_leaks: clean", out)
 
 
+class DeletedTrackedFileIsReportedClearly(unittest.TestCase):
+    """A plain `rm` of a tracked file - the deletion neither staged nor
+    committed - is an ordinary working-tree state. It used to fail closed
+    with the same message as a genuine permission problem ("file is not
+    readable"), which misdescribes what happened and trains people to
+    distrust or skip the guard. This still fails closed (the working tree
+    cannot be scanned for a file that is not there), but with a message
+    that names the actual cause."""
+
+    def test_a_deleted_tracked_file_gets_its_own_message_not_unreadable(self):
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n", "b.md": "also harmless\n"})
+        os.remove(os.path.join(d, "b.md"))
+        code, out = _run(d, env={"LEAK_PATTERNS": "zzsecretzz"})
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("no longer exists on disk", out)
+        self.assertIn("b.md", out)
+        self.assertNotIn("file is not readable", out)
+
+    def test_a_genuinely_unreadable_file_still_gets_the_permission_message(self):
+        # The two causes must stay distinguishable: this fixture leaves the
+        # file in place (chmod 000, not deleted), so the new "no longer
+        # exists" branch must not swallow this case too.
+        if os.geteuid() == 0:
+            self.skipTest("permission bits do not apply to root")
+        d = _repo(["zzsecretzz"], {"a.md": "harmless\n"})
+        path = os.path.join(d, "a.md")
+        os.chmod(path, 0o000)
+        try:
+            code, out = _run(d, env={"LEAK_PATTERNS": "zzsecretzz"})
+        finally:
+            os.chmod(path, 0o644)
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("file is not readable", out)
+        self.assertNotIn("no longer exists on disk", out)
+
+
 class GitFailureFailsClosed(unittest.TestCase):
     """Re-review confirmed clean-exit-on-failure for `git ls-files` (tracked
     and untracked filename legs, and the file-type section) and for

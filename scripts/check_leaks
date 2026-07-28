@@ -144,8 +144,23 @@ def readability_preflight(paths: list[str]) -> None:
     any pattern is tested. `git grep` and plain `grep` both report "no
     match" - their normal exit code for a genuinely clean result - for a
     file they cannot open at all. Without this, an unreadable file holding
-    an uncommitted leak would report clean."""
+    an uncommitted leak would report clean.
+
+    A tracked path that no longer exists on disk gets its own message,
+    distinct from a permission problem: `git rm`-less deletion (a plain
+    `rm` of a tracked file, with the removal neither staged nor committed)
+    is an ordinary working-tree state, not file corruption, and it used to
+    fail this same check with "file is not readable" - a message that
+    describes a permissions fault and trains people to distrust or skip the
+    guard when what actually happened is far more mundane."""
     for path in paths:
+        if not os.path.exists(path):
+            raise GuardError(
+                f"tracked file no longer exists on disk: {path}\n"
+                "  It has been deleted, but the deletion is not yet staged "
+                "or committed. `git add` (or `git rm`) the removal, or "
+                "restore the file, then run the guard again."
+            )
         if not os.access(path, os.R_OK):
             raise GuardError(
                 f"file is not readable: {path}\n"
