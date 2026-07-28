@@ -1,6 +1,7 @@
 import threading
 import unittest
 
+from cronicled.adapters.base import SiteAdapter
 from cronicled.jobs import JobRejected, JobRunner
 from cronicled.store import Store
 from cronicled.web.actions import Actions, ApplyFailed, UnknownProposal
@@ -343,13 +344,18 @@ class Unmute(unittest.TestCase):
         self.assertEqual(store.calls, [("unmuted", "scene", "1")])
 
 
-class _Adapter:
+class _Adapter(SiteAdapter):
     """The minimum `build_producer` needs off a site adapter: a scraper id
     to search under, no censorship map, and `catalog_resolvable=False` --
     so `examine` never asks `owner_of` anything (it would raise if it did),
     and resolves each file's creator from its own name and folder alone.
     None of these fixture scenes name anything a real adapter would
-    recognise, so every one of them ends up muted, never proposed."""
+    recognise, so every one of them ends up muted, never proposed.
+
+    It inherits `search_query` rather than restating it: the per-title
+    fallback phrases its query through that method, and a double carrying
+    its own copy of the phrasing could agree with itself while disagreeing
+    with the adapter it stands in for."""
     name = "test-adapter"
     scraper_id = "scraper-test"
     censorship = {}

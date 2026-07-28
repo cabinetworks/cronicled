@@ -3,8 +3,61 @@ the tests here state the wrong match each rule prevents."""
 import unittest
 
 from cronicled.scoring import (
-    DEFAULT_THRESHOLD, Decision, Match, decide, meaningful_tokens, score)
+    DEFAULT_THRESHOLD, Decision, Match, decide, meaningful_tokens, score,
+    title_view)
 from cronicled.vocab import CONTAINER_EXTS
+
+
+class TitleView(unittest.TestCase):
+    """The filename read as a title. Two things read it: the scorer, which
+    weighs this view against every candidate, and the per-title fallback
+    query in `scan.examine_sources`, which asks a store for it. The wrong
+    match this prevents is the quiet one -- a store asked for one string
+    while its answers are judged against another, so the right clip is never
+    returned and the file refuses for a reason that names the wrong problem.
+    """
+
+    def test_a_container_extension_is_not_part_of_the_title(self):
+        self.assertEqual(title_view("Morning Ritual.mp4"), "Morning Ritual")
+
+    def test_a_series_prefix_goes_too(self):
+        # A store asked for "Backyard Sessions Morning Ritual" by a creator
+        # who files everything under that series gets the series page back,
+        # not the clip -- the same repetition the scorer strips before
+        # comparing.
+        self.assertEqual(
+            title_view("Backyard Sessions - Morning Ritual.mp4"),
+            "Morning Ritual")
+
+    def test_both_dash_conventions_are_read_as_the_boundary(self):
+        for name in ("Backyard Sessions - Morning Ritual.mp4",
+                     "Backyard Sessions -- Morning Ritual.mp4"):
+            self.assertEqual(title_view(name), "Morning Ritual", name)
+
+    def test_a_hyphenated_word_is_not_a_boundary(self):
+        # No whitespace around the dash: a hyphenated name is one word, and
+        # cutting it would ask a store for half a title.
+        self.assertEqual(title_view("Wren-Copper Marchcroft.mp4"),
+                         "Wren-Copper Marchcroft")
+
+    def test_a_separator_with_nothing_after_it_keeps_the_whole_name(self):
+        # Stripping here would leave nothing to search for at all.
+        self.assertEqual(title_view("Morning Ritual - .mp4"),
+                         "Morning Ritual - ")
+
+    def test_an_unrecognised_suffix_stays_in_the_title(self):
+        # The deliberate difference from `meaningful_tokens`, which drops an
+        # extension-SHAPED suffix so it cannot inflate the evidence count.
+        # Here the direction of harm is reversed: the count gate only ever
+        # gets stricter for a token it refuses to believe, but a QUERY built
+        # without ".Final" asks the store for less than the file says,
+        # and a store that indexes the full title never answers.
+        self.assertEqual(title_view("Morning Ritual.Final"),
+                         "Morning Ritual.Final")
+        self.assertEqual(
+            meaningful_tokens("Morning Ritual.Final", ""),
+            {"morning", "ritual"},
+            "the evidence count still refuses to count an unknown suffix")
 
 
 class MeaningfulTokens(unittest.TestCase):

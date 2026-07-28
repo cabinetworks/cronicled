@@ -35,6 +35,9 @@ import unittest
 from unittest import mock
 
 import cronicled.artist
+import cronicled.scan
+from cronicled.adapters.base import SiteAdapter
+from cronicled.adapters.declarative import DeclarativeAdapter
 from cronicled.artist import Aliases
 from cronicled.jobs import COST_CLASS_LIMITS, JobRunner
 from cronicled.scan import (
@@ -43,6 +46,7 @@ from cronicled.scan import (
     ScanProducer, Source, SUBJECT_TYPE, _SingleFlight, examine,
     examine_sources, fingerprint_outcome, identify_by_fingerprint, select,
 )
+from cronicled.scoring import title_view
 from cronicled.store import Store
 from tests.fixtures.cast import CENSORSHIP
 
@@ -1577,6 +1581,272 @@ class ExamineSourcesTest(unittest.TestCase):
             examine_sources(scene(1, self.PATH), sources=[], folder=FOLDER)
 
 
+class PerTitleFallbackTest(unittest.TestCase):
+    """The per-title query, which is a FALLBACK and never a replacement.
+
+    A store's search answers with a page, not a catalogue: a creator with
+    more clips than fit one page can have the wanted clip missing from
+    everything that came back, and no scoring recovers a candidate that was
+    never returned. So a file the per-creator pass could not resolve is
+    asked for once more, by title, before the refusal is recorded.
+
+    The cost is the reason every test here asserts the whole conversation
+    with a store rather than just the outcome. The per-creator shape was
+    chosen because it spends one lookup per CREATOR rather than one per
+    FILE; the fallback is what re-introduces a per-file query, and it is
+    only affordable while it stays on the files that were going to be
+    refused anyway.
+
+    `title_query` is bound from the REAL `SiteAdapter` rather than a lambda
+    that phrases a query its own way -- the phrasing is what the assertions
+    are about, and a double with its own copy of it could only confirm that
+    this file agrees with itself.
+    """
+
+    PATH = "/library/Velvet Crane/Morning Ritual.mp4"
+    CREATOR = "Velvet Crane"
+    # The whole string, not a fragment: a query that appended the title on
+    # the wrong side of the space, or dropped the separator, would still
+    # contain the seed.
+    BY_TITLE = "Velvet Crane Morning Ritual"
+    WANTED = candidate("Morning Ritual", "morning-ritual")
+    # One page of the creator's OTHER clips -- what a store answers for a
+    # creator whose catalogue does not fit in one response. Neither of these
+    # scores anywhere near a threshold against "Morning Ritual.mp4".
+    OTHER_PAGE = [candidate("Harbour Lights", "harbour-lights"),
+                  candidate("Copper Kettle", "copper-kettle")]
+
+    def source(self, name, search, **over):
+        kwargs = dict(name=name, search=search, owner_of=None,
+                      catalog_resolvable=True, censorship={},
+                      title_query=SiteAdapter().search_query)
+        kwargs.update(over)
+        return Source(**kwargs)
+
+    def examine(self, sources, path=None, threshold=0.5):
+        return examine_sources(scene(1, path or self.PATH), sources=sources,
+                               folder=FOLDER, threshold=threshold)
+
+    # -- the cheap pass stays cheap ---------------------------------------- #
+
+    def test_a_file_the_creator_query_resolved_spends_no_second_lookup(self):
+        """The cost this protects: one lookup per creator, not one per file.
+        Running the fallback unconditionally would put a per-file query back
+        on every file in the library -- roughly 5,924 lookups against the
+        library the per-creator shape was measured on, instead of 99.
+        Asserted on the store's own record of what it was asked, not on a
+        count, so an extra query cannot hide behind a matching total."""
+        search = ScriptedSearch({self.CREATOR: [self.WANTED],
+                                 self.BY_TITLE: [self.WANTED]})
+
+        outcome = self.examine([self.source("alpha", search)])
+
+        self.assertIsNotNone(outcome.proposal)
+        self.assertEqual(search.queries, [self.CREATOR])
+        self.assertEqual(outcome.fallback_queries, 0)
+
+    def test_stores_that_agreed_too_closely_to_call_are_not_asked_again(self):
+        """Two stores each cleared the threshold and the cross-store margin
+        refused between them. That is a decision about candidates already in
+        hand, not a file nothing was found for, and a third population of
+        candidates cannot resolve it -- it can only add to the tie."""
+        alpha = ScriptedSearch({self.CREATOR: [self.WANTED]})
+        beta = ScriptedSearch({self.CREATOR: [self.WANTED]})
+
+        outcome = self.examine([self.source("alpha", alpha),
+                                self.source("beta", beta)])
+
+        self.assertIsNone(outcome.proposal)
+        self.assertIn("ambiguous across stores", outcome.reason)
+        self.assertEqual(alpha.queries, [self.CREATOR])
+        self.assertEqual(beta.queries, [self.CREATOR])
+        self.assertEqual(outcome.fallback_queries, 0)
+
+    def test_a_file_with_no_meaningful_token_is_not_asked_by_title(self):
+        """Withheld because it is provably useless, not to save a lookup:
+        `scoring._is_eligible` bars a file with no meaningful token at any
+        score against every candidate, so no answer a store could give would
+        change this file's outcome. Every other file gets its turn."""
+        search = ScriptedSearch({self.CREATOR: self.OTHER_PAGE})
+
+        outcome = self.examine([self.source("alpha", search)],
+                               path="/library/Velvet Crane/   .mp4")
+
+        self.assertIsNone(outcome.proposal)
+        self.assertEqual(search.queries, [self.CREATOR])
+        self.assertEqual(outcome.fallback_queries, 0)
+
+    # -- and rescues what it can ------------------------------------------- #
+
+    def test_a_clip_missing_from_the_creators_page_is_found_by_title(self):
+        """The defect itself: the store holds the clip, its page for the
+        creator did not carry it, and the per-creator pass alone refuses a
+        file the store could have answered."""
+        search = ScriptedSearch({self.CREATOR: self.OTHER_PAGE,
+                                 self.BY_TITLE: [self.WANTED]})
+
+        outcome = self.examine([self.source("alpha", search)])
+
+        self.assertEqual(search.queries, [self.CREATOR, self.BY_TITLE])
+        self.assertEqual(outcome.proposal["payload"]["candidate"], self.WANTED)
+        self.assertEqual(outcome.fallback_queries, 1)
+
+    def test_the_query_is_the_seed_and_the_scorers_own_view_of_the_title(self):
+        """The whole query string, against a filename that exercises every
+        part of the derivation at once: the container extension goes, the
+        repeated series prefix goes, and the unrecognised `.Final`
+        suffix STAYS -- a store that indexes the full title never answers a
+        query built without it. A query that phrased any of those three
+        differently from the view the scorer weighs is a recall loss with no
+        symptom: the store answers what it was asked, and the answers are
+        judged against something else."""
+        search = ScriptedSearch({self.CREATOR: self.OTHER_PAGE})
+        path = "/library/Velvet Crane/Velvet Crane - Morning Ritual.Final.mp4"
+
+        self.examine([self.source("alpha", search)], path=path)
+
+        self.assertEqual(search.queries,
+                         [self.CREATOR, "Velvet Crane Morning Ritual.Final"])
+
+    def test_the_title_text_is_the_scorers_derivation_not_a_second_one(self):
+        """The same property stated as the relationship rather than as a
+        string: the query's title half IS `scoring.title_view`. A local
+        derivation in the scan that happened to agree today would drift the
+        moment either side changed."""
+        search = ScriptedSearch({self.CREATOR: self.OTHER_PAGE})
+        path = "/library/Velvet Crane/Velvet Crane - Morning Ritual.Final.mp4"
+
+        self.examine([self.source("alpha", search)], path=path)
+
+        title = title_view("Velvet Crane - Morning Ritual.Final.mp4")
+        self.assertEqual(search.queries[1], self.CREATOR + " " + title)
+        self.assertIs(cronicled.scan.title_view, title_view)
+
+    def test_a_store_that_omits_the_seed_is_asked_for_the_title_alone(self):
+        """A store whose spec says narrowing by the creator costs recall.
+        The flag's effect has to survive the wiring, not just the adapter:
+        read the other way round, this store would be asked for a seed it
+        answers nothing for."""
+        omitting = DeclarativeAdapter(dict(
+            name="omitseedstore", owner_source="none",
+            title_match_counts_as_ownership=False, search_omits_seed=True))
+        keeping = DeclarativeAdapter(dict(
+            name="seedstore", owner_source="none",
+            title_match_counts_as_ownership=False))
+        alpha = ScriptedSearch({self.CREATOR: self.OTHER_PAGE})
+        beta = ScriptedSearch({self.CREATOR: self.OTHER_PAGE})
+
+        self.examine([self.source("alpha", alpha,
+                                  title_query=omitting.search_query),
+                      self.source("beta", beta,
+                                  title_query=keeping.search_query)])
+
+        self.assertEqual(alpha.queries, [self.CREATOR, "Morning Ritual"])
+        self.assertEqual(beta.queries, [self.CREATOR, self.BY_TITLE])
+
+    def test_a_store_with_no_title_query_configured_is_asked_once_only(self):
+        """`title_query=None` is a store that contributes no fallback. It
+        must cost that store's recall and nothing else -- not the run."""
+        alpha = ScriptedSearch({self.CREATOR: self.OTHER_PAGE})
+        beta = ScriptedSearch({self.CREATOR: self.OTHER_PAGE,
+                               self.BY_TITLE: [self.WANTED]})
+
+        outcome = self.examine([self.source("alpha", alpha, title_query=None),
+                                self.source("beta", beta)])
+
+        self.assertEqual(alpha.queries, [self.CREATOR])
+        self.assertEqual(outcome.proposal["payload"]["store"], "beta")
+        self.assertEqual(outcome.fallback_queries, 1)
+
+    # -- muting is held to the same bar ------------------------------------ #
+
+    def test_a_file_no_store_listed_is_asked_by_title_before_it_is_muted(self):
+        """A mute stops a file being looked at ever again. Reaching that
+        verdict on the cheaper question alone hides a file the store would
+        have answered the moment it was asked for the file itself."""
+        search = ScriptedSearch({self.CREATOR: [], self.BY_TITLE: [self.WANTED]})
+
+        outcome = self.examine([self.source("alpha", search)])
+
+        self.assertIsNone(outcome.mute_reason)
+        self.assertEqual(outcome.proposal["payload"]["candidate"], self.WANTED)
+
+    def test_a_file_neither_pass_can_answer_is_still_muted(self):
+        search = ScriptedSearch({self.CREATOR: [], self.BY_TITLE: []})
+
+        outcome = self.examine([self.source("alpha", search)])
+
+        self.assertEqual(outcome.mute_reason, MUTE_NO_CANDIDATES)
+        self.assertEqual(search.queries, [self.CREATOR, self.BY_TITLE])
+        self.assertEqual(outcome.fallback_queries, 1)
+
+    # -- a store failing costs that store, and only that store ------------- #
+
+    def test_a_store_raising_in_the_fallback_keeps_another_stores_rescue(self):
+        boom = RuntimeError("scraper unreachable")
+        alpha = ScriptedSearch({self.CREATOR: self.OTHER_PAGE,
+                                self.BY_TITLE: boom})
+        beta = ScriptedSearch({self.CREATOR: [], self.BY_TITLE: [self.WANTED]})
+
+        outcome = self.examine([self.source("alpha", alpha),
+                                self.source("beta", beta)])
+
+        self.assertEqual(outcome.proposal["payload"]["candidate"], self.WANTED)
+        self.assertEqual(outcome.proposal["payload"]["store"], "beta")
+        self.assertIn("alpha: RuntimeError: scraper unreachable",
+                      outcome.reason)
+
+    def test_a_store_raising_in_the_fallback_still_refuses_the_file(self):
+        """The refusal is not lost, and is not upgraded to an error or a
+        mute either: the per-creator pass did answer, and what it answered
+        was not good enough. The store's failure is appended to the reason
+        so the run's log says a lookup went missing."""
+        boom = RuntimeError("scraper unreachable")
+        search = ScriptedSearch({self.CREATOR: self.OTHER_PAGE,
+                                 self.BY_TITLE: boom})
+
+        outcome = self.examine([self.source("alpha", search)])
+
+        self.assertIsNone(outcome.proposal)
+        self.assertIsNone(outcome.mute_reason)
+        self.assertIsNone(outcome.error)
+        self.assertIn("nothing above the threshold", outcome.reason)
+        self.assertIn("store errors: alpha: RuntimeError: scraper unreachable",
+                      outcome.reason)
+
+    def test_a_store_that_already_failed_is_not_asked_a_second_time(self):
+        """Its failure is already recorded against this file, and a second
+        query is another round trip to a store that is failing right now --
+        the cost `_SingleFlight` refuses to pay per file, which it cannot
+        refuse here because a different query is a different cache entry."""
+        alpha = ScriptedSearch({self.CREATOR: RuntimeError("unreachable"),
+                                self.BY_TITLE: [self.WANTED]})
+        beta = ScriptedSearch({self.CREATOR: self.OTHER_PAGE,
+                               self.BY_TITLE: [self.WANTED]})
+
+        outcome = self.examine([self.source("alpha", alpha),
+                                self.source("beta", beta)])
+
+        self.assertEqual(alpha.queries, [self.CREATOR])
+        self.assertEqual(beta.queries, [self.CREATOR, self.BY_TITLE])
+        self.assertEqual(outcome.fallback_queries, 1)
+
+    # -- what the count counts --------------------------------------------- #
+
+    def test_the_count_is_queries_issued_not_files_examined(self):
+        """One file, two stores, two queries. A count of FILES would report
+        1 here and understate what the fallback actually spends -- the
+        multiplier a person choosing a file limit needs to see."""
+        alpha = ScriptedSearch({self.CREATOR: self.OTHER_PAGE})
+        beta = ScriptedSearch({self.CREATOR: self.OTHER_PAGE})
+
+        outcome = self.examine([self.source("alpha", alpha),
+                                self.source("beta", beta)])
+
+        self.assertIsNone(outcome.proposal)
+        self.assertEqual(outcome.fallback_queries, 2)
+
+
 # -- running a whole batch ------------------------------------------------- #
 
 class FakeStash:
@@ -2315,7 +2585,7 @@ class ScanProducerTest(unittest.TestCase):
                         self.ctx.messages)
         self.assertEqual(
             self.ctx.message,
-            "finished: 1 proposed, 0 muted, 0 refused, 1 errors, 2 lookups; selected 2 "
+            "finished: 1 proposed, 0 muted, 0 refused, 1 errors, 2 lookups, 0 per-title fallback queries; selected 2 "
             "of 2 files (0 already proposed, 0 already muted, 0 outside the "
             "filter, 0 deferred)")
 
@@ -2587,9 +2857,54 @@ class ScanProducerTest(unittest.TestCase):
         self.assertEqual(beta.queries, ["Velvet Crane"])
         self.assertEqual(
             self.ctx.message,
-            "finished: 2 proposed, 0 muted, 0 refused, 0 errors, 2 lookups; "
+            "finished: 2 proposed, 0 muted, 0 refused, 0 errors, 2 lookups, 0 per-title fallback queries; "
             "selected 2 of 2 files (0 already proposed, 0 already muted, "
             "0 outside the filter, 0 deferred)")
+
+    # -- the per-title fallback, through the whole producer ----------------- #
+
+    def test_a_configured_stores_own_query_phrasing_reaches_the_fallback(self):
+        """`produce` rebuilds every `Source` around a `_SingleFlight`, and a
+        rebuild that dropped `title_query` would leave the fallback dead in
+        production while every test injecting its own `Source` went on
+        passing. The store here answers the creator with a page that does
+        not carry the file, and answers the file only when asked for it by
+        title."""
+        alpha = ScriptedSearch({"Velvet Crane": [self.LEDGER],
+                                "Velvet Crane Morning Ritual": [self.MORNING]})
+        sources = [Source(name="alpha", search=alpha,
+                          title_query=SiteAdapter().search_query)]
+
+        proposals = self.scan([scene(1, self.MORNING_PATH)], None,
+                              sources=sources)
+
+        self.assertEqual(alpha.queries,
+                         ["Velvet Crane", "Velvet Crane Morning Ritual"])
+        self.assertEqual(proposals[0]["payload"]["candidate"], self.MORNING)
+
+    def test_the_closing_line_reports_the_fallback_queries_a_run_issued(self):
+        """One file against two stores is TWO fallback queries, not one: the
+        number is queries issued, and a count of files would understate the
+        multiplier a person choosing a file limit is actually paying. Kept
+        beside `lookups` (four here -- two creator queries and two by title)
+        rather than folded into it, so the conditional second query stays
+        visible rather than inferred."""
+        alpha = ScriptedSearch({"Velvet Crane": [self.LEDGER]})
+        beta = ScriptedSearch({"Velvet Crane": [self.LEDGER]})
+        sources = [Source(name="alpha", search=alpha,
+                          title_query=SiteAdapter().search_query),
+                  Source(name="beta", search=beta,
+                        title_query=SiteAdapter().search_query)]
+
+        proposals = self.scan([scene(1, self.MORNING_PATH)], None,
+                              sources=sources)
+
+        self.assertEqual(proposals, [])
+        self.assertEqual(
+            self.ctx.message,
+            "finished: 0 proposed, 0 muted, 1 refused, 0 errors, 4 lookups, "
+            "2 per-title fallback queries; selected 1 of 1 files (0 already "
+            "proposed, 0 already muted, 0 outside the filter, 0 deferred)")
 
     def test_two_different_creators_against_two_stores_cost_four_lookups(self):
         """The other half of the same measurement: TWO distinct creators,
@@ -2632,7 +2947,7 @@ class ScanProducerTest(unittest.TestCase):
         # opening line above.
         self.assertEqual(
             self.ctx.message,
-            "finished: 2 proposed, 0 muted, 0 refused, 0 errors, 2 lookups; "
+            "finished: 2 proposed, 0 muted, 0 refused, 0 errors, 2 lookups, 0 per-title fallback queries; "
             "selected 2 of 5 files (0 already proposed, 1 already muted, "
             "1 outside the filter, 1 deferred)")
 
@@ -2643,7 +2958,7 @@ class ScanProducerTest(unittest.TestCase):
             "selected 1 of 1 files (0 already proposed, 0 already muted, "
             "0 outside the filter, 0 deferred)",
             "1/1 scene 9: chosen with score 1.000",
-            "finished: 1 proposed, 0 muted, 0 refused, 0 errors, 1 lookups; "
+            "finished: 1 proposed, 0 muted, 0 refused, 0 errors, 1 lookups, 0 per-title fallback queries; "
             "selected 1 of 1 files (0 already proposed, 0 already muted, "
             "0 outside the filter, 0 deferred)",
         ])
@@ -2674,12 +2989,12 @@ class ScanProducerTest(unittest.TestCase):
 
         self.assertEqual(
             suppressed.message,
-            "finished: 0 proposed, 0 muted, 0 refused, 0 errors, 0 lookups; "
+            "finished: 0 proposed, 0 muted, 0 refused, 0 errors, 0 lookups, 0 per-title fallback queries; "
             "selected 0 of 3 files (0 already proposed, 3 already muted, "
             "0 outside the filter, 0 deferred)")
         self.assertEqual(
             empty.message,
-            "finished: 0 proposed, 0 muted, 0 refused, 0 errors, 0 lookups; "
+            "finished: 0 proposed, 0 muted, 0 refused, 0 errors, 0 lookups, 0 per-title fallback queries; "
             "selected 0 of 0 files (0 already proposed, 0 already muted, "
             "0 outside the filter, 0 deferred)")
         # The residual, pinned rather than papered over: the two runs really
@@ -2707,7 +3022,7 @@ class ScanProducerTest(unittest.TestCase):
         # counters swapped by an edit would report the same line.
         self.assertEqual(
             self.ctx.message,
-            "finished: 1 proposed, 1 muted, 2 refused, 1 errors, 3 lookups; "
+            "finished: 1 proposed, 1 muted, 2 refused, 1 errors, 3 lookups, 0 per-title fallback queries; "
             "selected 5 of 5 files (0 already proposed, 0 already muted, "
             "0 outside the filter, 0 deferred)")
 
