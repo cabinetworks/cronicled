@@ -41,7 +41,7 @@ _COVER_NOT_RESTORED = ("reverted -- except the cover image, which cannot be "
 
 
 class Actions:
-    def __init__(self, store, stash, runner=None, adapter=None):
+    def __init__(self, store, stash, runner=None, adapters=None):
         self._store = store
         # `stash` is None when the entry point was started without a
         # configured media server -- see cronicled/__main__.py. Every method
@@ -49,13 +49,19 @@ class Actions:
         # raises a message naming what is missing, rather than falling
         # through to an AttributeError on `None`.
         self._stash = stash
-        # `runner`/`adapter` are None on exactly the same terms as `stash`:
-        # a fresh install, or one with no site adapter configured yet
-        # (`adapters.json` -- see `cronicled.adapters.registry`). Only
-        # `scan` needs either, and it checks and refuses explicitly, the
-        # same shape `approve`/`undo` already use for a missing `stash`.
+        # `runner`/`adapters` are None (or empty) on exactly the same terms
+        # as `stash`: a fresh install, or one with no site adapter
+        # configured yet (`adapters.json` -- see
+        # `cronicled.adapters.registry`). Only `scan` needs either, and it
+        # checks and refuses explicitly, the same shape `approve`/`undo`
+        # already use for a missing `stash`.
+        #
+        # `adapters` is the WHOLE configured mapping (name -> `SiteAdapter`)
+        # -- every store this scan searches, never one singled out. See
+        # `cronicled.runscan.build_producer` for why a scan searches all of
+        # them rather than one chosen adapter.
         self._runner = runner
-        self._adapter = adapter
+        self._adapters = adapters
 
     def _find(self, fp):
         # A single call, not one per state: `items(state=None)` already
@@ -207,7 +213,7 @@ class Actions:
         return "unmuted"
 
     def scan(self, limit):
-        """Start a library scan against the configured adapter and return
+        """Start a library scan against EVERY configured adapter and return
         the started job.
 
         `limit` is passed straight through to `cronicled.runscan.build_producer`,
@@ -224,15 +230,15 @@ class Actions:
         running; the caller must not swallow that and answer as though this
         one started too.
         """
-        if self._runner is None or self._adapter is None:
+        if self._runner is None or not self._adapters:
             raise RuntimeError(
-                "no site adapter is configured -- a scan needs one to "
-                "search against; set up adapters.json (see "
+                "no site adapter is configured -- a scan needs at least "
+                "one to search against; set up adapters.json (see "
                 "config/adapters.example.json for the shape), then try "
                 "again")
         if self._stash is None:
             raise RuntimeError(_NO_STASH)
-        producer = build_producer(self._stash, self._adapter, self._store,
+        producer = build_producer(self._stash, self._adapters, self._store,
                                   limit=limit)
         # A fresh `ScanProducer` is built above for every call, because
         # `limit` has to be enforced at construction (see `build_producer`'s

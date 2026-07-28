@@ -305,7 +305,7 @@ class Undismiss(unittest.TestCase):
         store = _FakeStore(item=None, dismissed_item=_item(state="dismissed"))
         stash = _FakeStash()
         runner = _RunnerSpy()
-        Actions(store, stash, runner=runner, adapter=object()).undismiss("fp-1")
+        Actions(store, stash, runner=runner, adapters={"only": object()}).undismiss("fp-1")
         self.assertEqual(stash.calls, [])
         self.assertEqual(runner.calls, [])
 
@@ -329,7 +329,7 @@ class Unmute(unittest.TestCase):
         store = _FakeStore(item=None, muted_subjects={("scene", "42")})
         stash = _FakeStash()
         runner = _RunnerSpy()
-        Actions(store, stash, runner=runner, adapter=object()).unmute(
+        Actions(store, stash, runner=runner, adapters={"only": object()}).unmute(
             "scene", "42")
         self.assertEqual(stash.calls, [])
         self.assertEqual(runner.calls, [])
@@ -437,7 +437,7 @@ class ScanNotConfigured(unittest.TestCase):
         self.addCleanup(store.close)
         runner = JobRunner(store)
         self.addCleanup(runner.close)
-        actions = Actions(store, None, runner=runner, adapter=_Adapter())
+        actions = Actions(store, None, runner=runner, adapters={"only": _Adapter()})
         with self.assertRaises(RuntimeError) as ctx:
             actions.scan(5)
         self.assertIn("no media server is configured", str(ctx.exception))
@@ -458,7 +458,7 @@ class Scan(unittest.TestCase):
         stash = _ScanStash([_library_scene(1), _library_scene(2),
                             _library_scene(3)])
         actions = Actions(self.store, stash, runner=self.runner,
-                          adapter=_Adapter())
+                          adapters={"only": _Adapter()})
         job = actions.scan(1)
         self.assertTrue(self.runner.wait(job.id, WAIT))
         finished = self.runner.job(job.id)
@@ -467,7 +467,7 @@ class Scan(unittest.TestCase):
     def test_never_writes_to_the_media_server(self):
         stash = _ScanStash([_library_scene(1)])
         actions = Actions(self.store, stash, runner=self.runner,
-                          adapter=_Adapter())
+                          adapters={"only": _Adapter()})
         job = actions.scan(10)
         self.assertTrue(self.runner.wait(job.id, WAIT))
         self.assertGreater(len(stash.calls), 0)
@@ -482,7 +482,7 @@ class Scan(unittest.TestCase):
         # so this must not raise "already registered" on the second call.
         stash = _ScanStash([_library_scene(1)])
         actions = Actions(self.store, stash, runner=self.runner,
-                          adapter=_Adapter())
+                          adapters={"only": _Adapter()})
         first = actions.scan(1)
         self.assertTrue(self.runner.wait(first.id, WAIT))
         second = actions.scan(1)  # must not raise
@@ -498,7 +498,7 @@ class Scan(unittest.TestCase):
         # one producer no matter how many scans have run.
         stash = _ScanStash([_library_scene(1)])
         actions = Actions(self.store, stash, runner=self.runner,
-                          adapter=_Adapter())
+                          adapters={"only": _Adapter()})
         for _ in range(3):
             job = actions.scan(1)
             self.assertTrue(self.runner.wait(job.id, WAIT))
@@ -511,7 +511,7 @@ class Scan(unittest.TestCase):
         # instead of one recurring activity a person could recognise.
         stash = _ScanStash([_library_scene(1)])
         actions = Actions(self.store, stash, runner=self.runner,
-                          adapter=_Adapter())
+                          adapters={"only": _Adapter()})
         names = []
         for _ in range(3):
             job = actions.scan(1)
@@ -522,7 +522,7 @@ class Scan(unittest.TestCase):
     def test_a_second_scan_while_one_runs_is_refused_not_swallowed(self):
         gate = threading.Event()
         actions = Actions(self.store, _BlockingScanStash(gate),
-                          runner=self.runner, adapter=_Adapter())
+                          runner=self.runner, adapters={"only": _Adapter()})
         first = actions.scan(1)
         try:
             with self.assertRaises(JobRejected):
@@ -544,7 +544,7 @@ class ScanStatus(unittest.TestCase):
         runner = JobRunner(store)
         self.addCleanup(runner.close)
         actions = Actions(store, _ScanStash([]), runner=runner,
-                          adapter=_Adapter())
+                          adapters={"only": _Adapter()})
         self.assertIsNone(actions.scan_status())
 
     def test_reports_the_most_recently_started_scan(self):
@@ -553,7 +553,7 @@ class ScanStatus(unittest.TestCase):
         runner = JobRunner(store)
         self.addCleanup(runner.close)
         actions = Actions(store, _ScanStash([_library_scene(1)]),
-                          runner=runner, adapter=_Adapter())
+                          runner=runner, adapters={"only": _Adapter()})
         job = actions.scan(1)
         self.assertTrue(runner.wait(job.id, WAIT))
         status = actions.scan_status()

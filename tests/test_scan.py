@@ -39,7 +39,8 @@ from cronicled.artist import Aliases
 from cronicled.jobs import COST_CLASS_LIMITS, JobRunner
 from cronicled.scan import (
     Counts, MAX_RUNNERS_UP, MUTE_NO_CANDIDATES, MUTE_UNRESOLVED_CREATOR,
-    Outcome, ScanProducer, SUBJECT_TYPE, _SingleFlight, examine, select,
+    Outcome, ScanProducer, Source, SUBJECT_TYPE, _SingleFlight, examine,
+    examine_sources, select,
 )
 from cronicled.store import Store
 from tests.fixtures.cast import CENSORSHIP
@@ -1273,6 +1274,308 @@ class EnrichmentURLChoice(unittest.TestCase):
         self.assertEqual(outcome.proposal["payload"]["candidate"], morning)
 
 
+class ExamineSourcesTest(unittest.TestCase):
+    """`examine_sources` -- searching EVERY configured store before deciding
+    anything, rather than stopping at the first that answers. The two
+    invented stores below are named `alpha`/`beta` throughout, deliberately
+    generic: the property under test is which STORE answered and whether
+    that mattered, not which real site either name might otherwise suggest.
+    """
+
+    PATH = "/library/Velvet Crane/Morning Ritual.mp4"
+    MORNING = candidate("Morning Ritual", "morning-ritual")
+    ALPHA_MORNING = candidate("Morning Ritual", "alpha-morning-ritual")
+    BETA_MORNING = candidate("Morning Ritual", "beta-morning-ritual")
+
+    def source(self, name, search, catalog_resolvable=True, owner_of=None,
+              censorship=None):
+        return Source(name=name, search=search, owner_of=owner_of,
+                      catalog_resolvable=catalog_resolvable,
+                      censorship=censorship or {})
+
+    def examine(self, sources, path=None, threshold=0.5, aliases=None,
+               enrich=None):
+        return examine_sources(
+            scene(1, path or self.PATH), sources=sources, folder=FOLDER,
+            threshold=threshold, aliases=aliases, enrich=enrich)
+
+    # -- every store is searched, never just the first that matches ------- #
+
+    def test_every_store_is_searched_even_after_an_earlier_one_wins(self):
+        """The mutation this whole ticket exists to kill: stopping at the
+        first store that matches would leave `beta` never asked at all.
+        Assert the SECOND store's own query fired, not just that a proposal
+        came back -- a proposal alone cannot tell "beta was never asked"
+        from "beta was asked and had nothing"."""
+        alpha_search = FakeSearch([self.MORNING])
+        beta_search = FakeSearch([])
+        sources = [self.source("alpha", alpha_search),
+                  self.source("beta", beta_search)]
+
+        outcome = self.examine(sources)
+
+        self.assertIsNotNone(outcome.proposal)
+        self.assertEqual(alpha_search.queries, ["Velvet Crane"])
+        self.assertEqual(beta_search.queries, ["Velvet Crane"],
+                         "beta was never searched -- the scan stopped at "
+                         "the first store that matched")
+
+    def test_a_losing_stores_search_does_not_stop_a_later_ones(self):
+        """The other direction: the FIRST store has nothing, and the scan
+        must still go on to ask the second rather than concluding early."""
+        alpha_search = FakeSearch([])
+        beta_search = FakeSearch([self.MORNING])
+        sources = [self.source("alpha", alpha_search),
+                  self.source("beta", beta_search)]
+
+        outcome = self.examine(sources)
+
+        self.assertIsNotNone(outcome.proposal)
+        self.assertEqual(alpha_search.queries, ["Velvet Crane"])
+        self.assertEqual(beta_search.queries, ["Velvet Crane"])
+
+    # -- two winners is a finding, decided without regard to order --------- #
+
+    def test_two_non_resolvable_winners_refuse_regardless_of_order(self):
+        """Neither store can confirm ownership, so neither may be preferred
+        over the other on the strength of its own score alone -- refused,
+        and refused the SAME WAY whichever order `sources` lists them in."""
+        forward = [
+            self.source("alpha", FakeSearch([self.ALPHA_MORNING]),
+                       catalog_resolvable=False),
+            self.source("beta", FakeSearch([self.BETA_MORNING]),
+                       catalog_resolvable=False),
+        ]
+        backward = list(reversed(forward))
+
+        first = self.examine(forward)
+        second = self.examine(backward)
+
+        self.assertIsNone(first.proposal)
+        self.assertIsNone(second.proposal)
+        self.assertEqual(first.reason, second.reason)
+        self.assertIn("ambiguous across stores", first.reason)
+
+    def test_two_resolvable_winners_are_a_real_conflict_and_refuse(self):
+        """Two stores this project trusts to confirm ownership, each
+        independently clearing the threshold for the SAME file -- the
+        "occasionally a real conflict" case named in the ticket. Refused
+        rather than picked by position, the same discipline
+        `scoring.decide` already applies within one store's own candidates."""
+        forward = [
+            self.source("alpha", FakeSearch([self.ALPHA_MORNING]),
+                       catalog_resolvable=True),
+            self.source("beta", FakeSearch([self.BETA_MORNING]),
+                       catalog_resolvable=True),
+        ]
+        backward = list(reversed(forward))
+
+        first = self.examine(forward)
+        second = self.examine(backward)
+
+        self.assertIsNone(first.proposal)
+        self.assertIsNone(second.proposal)
+        self.assertEqual(first.reason, second.reason)
+        self.assertIn("ambiguous across stores", first.reason)
+        self.assertIn("alpha", first.reason)
+        self.assertIn("beta", first.reason)
+
+    def test_two_resolvable_stores_agreeing_is_the_common_case_not_a_refusal(self):
+        """Refusing every time two trustworthy stores both match would make
+        the ticket's OWN common case -- "most often the same work published
+        in both places" -- as disruptive as the rare real conflict. A CLEAR
+        score leader (well outside `scoring.AMBIGUITY_MARGIN`) is proposed,
+        with the other store's own candidate recorded as `competing_store`
+        -- reported, exactly as a folder and a filename disagreeing already
+        is, rather than silently dropped OR refused outright."""
+        stronger = candidate("Morning Ritual", "morning-ritual")   # scores 1.000
+        weaker = candidate("Morning Errand", "morning-errand")     # scores 0.564
+        sources = [
+            self.source("alpha", FakeSearch([stronger]), catalog_resolvable=True),
+            self.source("beta", FakeSearch([weaker]), catalog_resolvable=True),
+        ]
+
+        outcome = self.examine(sources, threshold=0.5)
+
+        self.assertIsNotNone(outcome.proposal)
+        payload = outcome.proposal["payload"]
+        self.assertEqual(payload["candidate"], stronger)
+        self.assertEqual(payload["store"], "alpha")
+        self.assertEqual(payload["competing_store"],
+                         [{"store": "beta", "candidate": weaker, "score": 0.564}])
+
+    def test_a_resolvable_winner_is_chosen_over_a_non_resolvable_one(self):
+        """A store that cannot confirm ownership must not out-rank, or tie
+        with, one that can -- the rule `Source.catalog_resolvable` exists
+        to enforce. Both winners score identically (score is not what
+        decides this), and the choice does not depend on which one
+        `sources` lists first."""
+        forward = [
+            self.source("resolvable", FakeSearch([self.ALPHA_MORNING]),
+                       catalog_resolvable=True),
+            self.source("unresolvable", FakeSearch([self.BETA_MORNING]),
+                       catalog_resolvable=False),
+        ]
+        backward = list(reversed(forward))
+
+        for sources in (forward, backward):
+            outcome = self.examine(sources)
+            self.assertIsNotNone(outcome.proposal)
+            payload = outcome.proposal["payload"]
+            self.assertEqual(payload["candidate"], self.ALPHA_MORNING)
+            self.assertEqual(payload["store"], "resolvable")
+            self.assertEqual(payload["competing_store"], [
+                {"store": "unresolvable", "candidate": self.BETA_MORNING,
+                 "score": 1.0},
+            ])
+            self.assertIn("also matched by unresolvable",
+                         outcome.proposal["summary"])
+
+    def test_a_single_winner_carries_no_competing_store_key_at_all(self):
+        """The ordinary, single-store-answers case must not grow a
+        `competing_store` key at all -- not an empty list, ABSENT -- so a
+        payload from an unremarkable file stays exactly the shape it always
+        was, one key added (`store`) and nothing else."""
+        outcome = self.examine([self.source("alpha", FakeSearch([self.MORNING]))])
+
+        self.assertNotIn("competing_store", outcome.proposal["payload"])
+        self.assertEqual(outcome.proposal["payload"]["store"], "alpha")
+
+    # -- muting requires EVERY store to be confirmed empty ----------------- #
+
+    def test_muted_only_when_every_store_answers_with_nothing(self):
+        outcome = self.examine([
+            self.source("alpha", FakeSearch([])),
+            self.source("beta", FakeSearch([])),
+        ])
+
+        self.assertEqual(outcome.mute_reason, MUTE_NO_CANDIDATES)
+
+    def test_not_muted_when_only_some_stores_are_empty(self):
+        """`alpha` found nothing; `beta` found candidates that did not
+        clear the threshold -- a human should look, because a real catalogue
+        DID have something to weigh, so this is a refusal, not a mute."""
+        dawn = candidate("Morning Ritual Dawn", "morning-ritual-dawn")
+        dusk = candidate("Morning Ritual Dusk", "morning-ritual-dusk")
+        outcome = self.examine([
+            self.source("alpha", FakeSearch([])),
+            self.source("beta", FakeSearch([dawn, dusk])),
+        ])
+
+        self.assertIsNone(outcome.mute_reason)
+        self.assertIsNone(outcome.proposal)
+        self.assertIn("beta:", outcome.reason)
+
+    def test_the_closest_refusal_does_not_depend_on_store_order(self):
+        """Two stores, tied on the identical losing candidate -- the reason
+        must name the same store either way, broken by NAME rather than by
+        position in `sources`."""
+        weak = candidate("Harbour Lights", "harbour-lights")
+        forward = [self.source("beta", FakeSearch([weak])),
+                  self.source("alpha", FakeSearch([weak]))]
+        backward = list(reversed(forward))
+
+        first = self.examine(forward, threshold=0.9)
+        second = self.examine(backward, threshold=0.9)
+
+        self.assertEqual(first.reason, second.reason)
+        self.assertTrue(first.reason.startswith("alpha:"), first.reason)
+
+    # -- a store's own search error is isolated to that store -------------- #
+
+    def test_a_stores_search_error_does_not_block_another_stores_winner(self):
+        outcome = self.examine([
+            self.source("alpha", FakeSearch([], raises=RuntimeError("down"))),
+            self.source("beta", FakeSearch([self.MORNING])),
+        ])
+
+        self.assertIsNotNone(outcome.proposal)
+        self.assertEqual(outcome.proposal["payload"]["store"], "beta")
+        # Visible, not silent: the failing store still shows up in the
+        # reason a reviewer or a log line reads.
+        self.assertIn("RuntimeError", outcome.reason)
+        self.assertIn("alpha", outcome.reason)
+
+    def test_every_store_erroring_is_reported_as_an_error_not_a_mute(self):
+        outcome = self.examine([
+            self.source("alpha", FakeSearch([], raises=RuntimeError("down"))),
+            self.source("beta", FakeSearch([], raises=TimeoutError())),
+        ])
+
+        self.assertIsNone(outcome.mute_reason)
+        self.assertIsNotNone(outcome.error)
+        self.assertIn("alpha", outcome.error)
+        self.assertIn("beta", outcome.error)
+
+    def test_one_store_erroring_with_the_rest_confirmed_empty_is_an_error(self):
+        """An error is evidence about the network, not a confirmed-empty
+        catalogue -- it must not be treated as though every store had
+        genuinely offered nothing, which is the only case that earns a
+        mute."""
+        outcome = self.examine([
+            self.source("alpha", FakeSearch([], raises=RuntimeError("down"))),
+            self.source("beta", FakeSearch([])),
+        ])
+
+        self.assertIsNone(outcome.mute_reason)
+        self.assertIsNotNone(outcome.error)
+
+    # -- ownership evidence pools across every confirmable store ------------ #
+
+    def test_ownership_evidence_pools_across_catalog_resolvable_stores(self):
+        """The candidate search that actually confirms "Wren Ashcombe"
+        lives on a DIFFERENT store than the one asked about the losing
+        folder name -- resolving this at all proves the evidence was
+        pooled, not read off one store alone."""
+        owned = dict(candidate("Morning Ritual", "morning-ritual"),
+                     owner="Wren Ashcombe")
+
+        def owner_of(result):
+            return (result or {}).get("owner", "")
+
+        sources = [
+            Source(name="alpha", search=ScriptedSearch({"Amberlight": []}),
+                  owner_of=owner_of, catalog_resolvable=True),
+            Source(name="beta",
+                  search=ScriptedSearch({"Wren Ashcombe": [owned]}),
+                  owner_of=owner_of, catalog_resolvable=True),
+        ]
+
+        outcome = examine_sources(
+            scene(1, "/library/Amberlight/Wren Ashcombe - Morning Ritual.mp4"),
+            sources=sources, folder=FOLDER, threshold=0.5)
+
+        self.assertEqual(outcome.proposal["payload"]["creator"]["name"],
+                         "Wren Ashcombe")
+
+    def test_a_non_resolvable_stores_search_contributes_no_ownership_evidence(self):
+        """A store with `owner_of=None` (`catalog_resolvable=False`) is
+        simply never asked -- it must not manufacture support for a
+        candidate neither queryable store actually backs."""
+        def owner_of(result):
+            return (result or {}).get("owner", "")
+
+        sources = [
+            Source(name="alpha",
+                  search=ScriptedSearch({"Amberlight": [], "Wren Ashcombe": []}),
+                  owner_of=owner_of, catalog_resolvable=True),
+            Source(name="beta", search=FakeSearch([]), owner_of=None,
+                  catalog_resolvable=False),
+        ]
+
+        outcome = examine_sources(
+            scene(1, "/library/Amberlight/Wren Ashcombe - Morning Ritual.mp4"),
+            sources=sources, folder=FOLDER, threshold=0.5)
+
+        self.assertEqual(outcome.mute_reason, MUTE_UNRESOLVED_CREATOR)
+
+    # -- malformed input ----------------------------------------------------- #
+
+    def test_no_sources_raises(self):
+        with self.assertRaises(ValueError):
+            examine_sources(scene(1, self.PATH), sources=[], folder=FOLDER)
+
+
 # -- running a whole batch ------------------------------------------------- #
 
 class FakeStash:
@@ -1603,10 +1906,23 @@ class ScanProducerTest(unittest.TestCase):
         self.ctx = FakeCtx()
         self.stash = None
 
-    def build(self, scenes, search, store=None, **kwargs):
+    def build(self, scenes, search, store=None, censorship=None, owner_of=None,
+             catalog_resolvable=True, source_name="store", sources=None,
+             **kwargs):
+        """Build a `ScanProducer` against ONE store, named `source_name`,
+        wrapping `search` (and this store's own `censorship`/`owner_of`) in
+        a single-element `sources` list — the shape every pre-existing test
+        in this class exercises, now expressed through the same `sources`
+        list a real multi-store scan uses. Pass `sources` explicitly (a list
+        of `Source`) instead of `search` to exercise more than one store."""
         self.stash = FakeStash(scenes)
         kwargs.setdefault("folder", FOLDER)
-        return ScanProducer(self.stash, search,
+        if sources is None:
+            sources = [Source(name=source_name, search=search,
+                              owner_of=owner_of,
+                              catalog_resolvable=catalog_resolvable,
+                              censorship=censorship or {})]
+        return ScanProducer(self.stash, sources,
                             store=self.store if store is None else store,
                             **kwargs)
 
@@ -1665,7 +1981,12 @@ class ScanProducerTest(unittest.TestCase):
         """Asserted as one whole shape: the runner passes these fields
         straight to `record()`, which hashes the payload, so a field added
         here changes every fingerprint and a field missing here is a
-        `KeyError` on a background thread."""
+        `KeyError` on a background thread.
+
+        `"store"` names which configured source the winning candidate came
+        from -- present even with only one store configured, the same as
+        every scan now searches through `examine_sources` regardless of how
+        many sources it is given."""
         proposals = self.scan([scene(7, self.LEDGER_PATH)],
                               ScriptedSearch(self.SCRIPT))
 
@@ -1683,12 +2004,15 @@ class ScanProducerTest(unittest.TestCase):
                 "candidate": self.LEDGER,
                 "score": 1.0,
                 "runners_up": [],
+                "store": "store",
             },
         }])
 
     def test_the_default_folder_reaches_the_proposal(self):
-        producer = ScanProducer(FakeStash([scene(1, self.LEDGER_PATH)]),
-                                ScriptedSearch(self.SCRIPT), store=self.store)
+        producer = ScanProducer(
+            FakeStash([scene(1, self.LEDGER_PATH)]),
+            [Source(name="store", search=ScriptedSearch(self.SCRIPT))],
+            store=self.store)
         proposals = list(producer.produce(self.ctx))
 
         self.assertEqual([p["folder"] for p in proposals], ["library"])
@@ -1990,7 +2314,7 @@ class ScanProducerTest(unittest.TestCase):
                         self.ctx.messages)
         self.assertEqual(
             self.ctx.message,
-            "finished: 1 proposed, 0 muted, 0 refused, 1 errors; selected 2 "
+            "finished: 1 proposed, 0 muted, 0 refused, 1 errors, 2 lookups; selected 2 "
             "of 2 files (0 already proposed, 0 already muted, 0 outside the "
             "filter, 0 deferred)")
 
@@ -2196,8 +2520,92 @@ class ScanProducerTest(unittest.TestCase):
         """It would do nothing at all, forever. Refused where the mistake was
         made rather than on a background thread hours later."""
         with self.assertRaises(ValueError):
-            ScanProducer(FakeStash([]), ScriptedSearch(), store=self.store,
-                         workers=0)
+            ScanProducer(FakeStash([]),
+                        [Source(name="store", search=ScriptedSearch())],
+                        store=self.store, workers=0)
+
+    def test_no_sources_configured_is_refused_at_construction(self):
+        """A scan with nothing to search against would mute or refuse every
+        file for a reason that has nothing to do with any of them -- refused
+        here, at construction, rather than discovered file by file."""
+        with self.assertRaises(ValueError):
+            ScanProducer(FakeStash([]), [], store=self.store)
+
+    # -- multiple configured stores ----------------------------------------- #
+
+    def test_every_configured_store_is_searched_for_every_file(self):
+        """The production-level version of the same property
+        `ExamineSourcesTest` pins directly: a real batch, through the real
+        pool, still asks every configured store rather than stopping once
+        one of them answers."""
+        alpha = ScriptedSearch({"Velvet Crane": [], "Ivy Kingsley": []})
+        beta = ScriptedSearch(self.SCRIPT)
+        sources = [Source(name="alpha", search=alpha),
+                  Source(name="beta", search=beta)]
+        proposals = self.scan(
+            [scene(1, self.MORNING_PATH), scene(2, self.LEDGER_PATH)],
+            None, sources=sources)
+
+        self.assertEqual(sorted(alpha.queries), ["Ivy Kingsley", "Velvet Crane"])
+        self.assertEqual(sorted(beta.queries), ["Ivy Kingsley", "Velvet Crane"])
+        self.assertEqual(self.ids(proposals), ["1", "2"])
+
+    def test_a_winner_names_which_store_it_came_from(self):
+        alpha = ScriptedSearch({"Velvet Crane": []})
+        beta = ScriptedSearch(self.SCRIPT)
+        sources = [Source(name="alpha", search=alpha),
+                  Source(name="beta", search=beta)]
+        proposals = self.scan([scene(1, self.MORNING_PATH)], None,
+                              sources=sources)
+
+        self.assertEqual(proposals[0]["payload"]["store"], "beta")
+
+    def test_lookups_are_counted_per_store_not_shared_across_stores(self):
+        """The multiplier the ticket asks to be measured: two files sharing
+        one creator, searched against two stores, cost exactly two lookups
+        (one per STORE, collapsed per creator within each) -- never one
+        (which would mean the stores were wrongly sharing a cache) and
+        never four (which would mean nothing collapsed the repeat file).
+
+        `beta` is scripted empty for every query, deliberately: this test's
+        subject is the LOOKUP COUNT, not the cross-store winner rule, so
+        `alpha` is left to propose alone rather than tying with `beta` on
+        an identical candidate (see `ExamineSourcesTest` for that rule's own
+        tests) -- an empty search still counts as one real lookup, which is
+        exactly what this test needs to measure.
+        """
+        alpha = ScriptedSearch({"Velvet Crane": [self.MORNING, self.EVENING]})
+        beta = ScriptedSearch({})
+        sources = [Source(name="alpha", search=alpha),
+                  Source(name="beta", search=beta)]
+
+        self.scan([scene(1, self.MORNING_PATH), scene(2, self.EVENING_PATH)],
+                  None, sources=sources)
+
+        self.assertEqual(alpha.queries, ["Velvet Crane"])
+        self.assertEqual(beta.queries, ["Velvet Crane"])
+        self.assertEqual(
+            self.ctx.message,
+            "finished: 2 proposed, 0 muted, 0 refused, 0 errors, 2 lookups; "
+            "selected 2 of 2 files (0 already proposed, 0 already muted, "
+            "0 outside the filter, 0 deferred)")
+
+    def test_two_different_creators_against_two_stores_cost_four_lookups(self):
+        """The other half of the same measurement: TWO distinct creators,
+        each searched against BOTH stores, is four lookups -- the
+        per-creator collapse must not also collapse across creators, and
+        the per-store separation must not also merge the two stores."""
+        alpha = ScriptedSearch(self.SCRIPT)
+        beta = ScriptedSearch(self.SCRIPT)
+        sources = [Source(name="alpha", search=alpha),
+                  Source(name="beta", search=beta)]
+
+        self.scan([scene(1, self.MORNING_PATH), scene(2, self.LEDGER_PATH)],
+                  None, sources=sources)
+
+        self.assertEqual(sorted(alpha.queries), ["Ivy Kingsley", "Velvet Crane"])
+        self.assertEqual(sorted(beta.queries), ["Ivy Kingsley", "Velvet Crane"])
+        self.assertIn("4 lookups", self.ctx.message)
 
     # -- what the log says -------------------------------------------------- #
 
@@ -2223,9 +2631,9 @@ class ScanProducerTest(unittest.TestCase):
         # opening line above.
         self.assertEqual(
             self.ctx.message,
-            "finished: 2 proposed, 0 muted, 0 refused, 0 errors; selected 2 "
-            "of 5 files (0 already proposed, 1 already muted, 1 outside the "
-            "filter, 1 deferred)")
+            "finished: 2 proposed, 0 muted, 0 refused, 0 errors, 2 lookups; "
+            "selected 2 of 5 files (0 already proposed, 1 already muted, "
+            "1 outside the filter, 1 deferred)")
 
     def test_each_completed_file_is_logged_with_what_it_concluded(self):
         self.scan([scene(9, self.LEDGER_PATH)], ScriptedSearch(self.SCRIPT))
@@ -2234,9 +2642,9 @@ class ScanProducerTest(unittest.TestCase):
             "selected 1 of 1 files (0 already proposed, 0 already muted, "
             "0 outside the filter, 0 deferred)",
             "1/1 scene 9: chosen with score 1.000",
-            "finished: 1 proposed, 0 muted, 0 refused, 0 errors; selected 1 "
-            "of 1 files (0 already proposed, 0 already muted, 0 outside the "
-            "filter, 0 deferred)",
+            "finished: 1 proposed, 0 muted, 0 refused, 0 errors, 1 lookups; "
+            "selected 1 of 1 files (0 already proposed, 0 already muted, "
+            "0 outside the filter, 0 deferred)",
         ])
 
     def test_the_closing_line_tells_a_suppressed_batch_from_an_empty_one(self):
@@ -2265,14 +2673,14 @@ class ScanProducerTest(unittest.TestCase):
 
         self.assertEqual(
             suppressed.message,
-            "finished: 0 proposed, 0 muted, 0 refused, 0 errors; selected 0 "
-            "of 3 files (0 already proposed, 3 already muted, 0 outside the "
-            "filter, 0 deferred)")
+            "finished: 0 proposed, 0 muted, 0 refused, 0 errors, 0 lookups; "
+            "selected 0 of 3 files (0 already proposed, 3 already muted, "
+            "0 outside the filter, 0 deferred)")
         self.assertEqual(
             empty.message,
-            "finished: 0 proposed, 0 muted, 0 refused, 0 errors; selected 0 "
-            "of 0 files (0 already proposed, 0 already muted, 0 outside the "
-            "filter, 0 deferred)")
+            "finished: 0 proposed, 0 muted, 0 refused, 0 errors, 0 lookups; "
+            "selected 0 of 0 files (0 already proposed, 0 already muted, "
+            "0 outside the filter, 0 deferred)")
         # The residual, pinned rather than papered over: the two runs really
         # are identical in the counted fields, so the message is carrying the
         # whole of the distinction and a summary that dropped the breakdown
@@ -2298,9 +2706,9 @@ class ScanProducerTest(unittest.TestCase):
         # counters swapped by an edit would report the same line.
         self.assertEqual(
             self.ctx.message,
-            "finished: 1 proposed, 1 muted, 2 refused, 1 errors; selected 5 "
-            "of 5 files (0 already proposed, 0 already muted, 0 outside the "
-            "filter, 0 deferred)")
+            "finished: 1 proposed, 1 muted, 2 refused, 1 errors, 3 lookups; "
+            "selected 5 of 5 files (0 already proposed, 0 already muted, "
+            "0 outside the filter, 0 deferred)")
 
 
 if __name__ == "__main__":

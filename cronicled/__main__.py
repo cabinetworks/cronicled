@@ -30,7 +30,6 @@ other two.
 import argparse
 import os
 
-from .adapters.registry import get_adapter
 from .config import CONFIG_DIR_ENV_VAR, config_dir
 from .jobs import JobRunner
 from .runscan import configured_adapters
@@ -90,11 +89,15 @@ def main(argv=None):
         # Omitting it leaves the flag half-working -- the directory printed
         # above would be the one asked for, while the adapters came from
         # somewhere else -- and nothing would raise to say so.
-        adapter = get_adapter(None, configured_adapters(env=env))
+        #
+        # The WHOLE mapping, every configured adapter -- there is no single
+        # "the" adapter any more (see `cronicled.runscan.build_producer`): a
+        # scan searches every one of them.
+        adapters = configured_adapters(env=env)
     except (ValueError, RuntimeError, KeyError):
-        adapter = None
+        adapters = {}
     runner = JobRunner(store)
-    actions = Actions(store, stash, runner=runner, adapter=adapter)
+    actions = Actions(store, stash, runner=runner, adapters=adapters)
     serve(rows=lambda: to_rows(store.items()),
           muted=store.mutes,
           dismissed=lambda: to_rows(store.items(state="dismissed")),

@@ -117,21 +117,24 @@ def _studio_name(candidate):
     return studio["name"] if studio else None
 
 
-def _disagreement(creator, filename_stem):
-    """One line naming what the resolver passed over, or None when nothing it
-    passed over actually disagrees.
+def _disagreement(creator, filename_stem, competing_store=None):
+    """One line naming what the resolver (or a multi-store search) passed
+    over, or None when nothing passed over actually disagrees.
 
-    The two kinds are kept apart deliberately upstream and are phrased apart
-    here: `competing` is a name a reviewer could go and search for;
-    `rejected_folder` is folder text that failed the guards, and treating it
-    as a name is the mistake the resolver exists to prevent.
+    Three kinds, kept apart deliberately upstream and phrased apart here:
+    `competing` is a name a reviewer could go and search for; `rejected_folder`
+    is folder text that failed the guards, and treating it as a name is the
+    mistake the resolver exists to prevent; `competing_store` (see below) is
+    another configured store that ALSO matched this file above the
+    threshold, with a candidate the one actually proposed did not carry.
 
-    The resolver goes on recording both, unchanged -- deciding what is worth
-    interrupting a person about belongs here, not there. Two of the things it
-    records are not disagreements at all, and measured against a real library
-    they produced six warnings of which one meant anything. A warning that
-    fires on almost every row stops being read, and then the one that matters
-    goes past unread with the rest of them.
+    The resolver (and the multi-store search) go on recording all three,
+    unchanged -- deciding what is worth interrupting a person about belongs
+    here, not there. Two of the first kind are not disagreements at all, and
+    measured against a real library they produced six warnings of which one
+    meant anything. A warning that fires on almost every row stops being
+    read, and then the one that matters goes past unread with the rest of
+    them.
 
     **A folder that is the filename repeated.** One file per folder is an
     ordinary layout, and such a folder was never going to name anyone: it
@@ -148,6 +151,15 @@ def _disagreement(creator, filename_stem):
     containing the winner, or contained by it, is one person written two ways
     rather than two candidates. `slug_match` is this project's existing answer
     to "are these the same name", so this asks it rather than deciding again.
+
+    **Another store matching the same file.** `competing_store` is
+    `payload.get("competing_store")` -- present only when
+    `cronicled.scan.examine_sources` chose a winner despite another
+    configured store ALSO clearing the threshold for this file (see
+    `_choose_winner`). Reported the same way a folder/filename disagreement
+    already is: not withheld, and not treated as a reason to refuse the
+    proposal on its own -- a reviewer sees it and decides, exactly as they
+    already do for a folder naming a different creator than the filename.
     """
     competing = creator.get("competing")
     rejected = creator.get("rejected_folder")
@@ -156,6 +168,11 @@ def _disagreement(creator, filename_stem):
         parts.append("the filename names %s instead" % competing)
     if rejected and spaceless(rejected) != spaceless(filename_stem):
         parts.append("the folder text %r was not usable as a name" % rejected)
+    if competing_store:
+        stores = ", ".join(entry["store"] for entry in competing_store)
+        parts.append(
+            "another store (%s) also matched this file with a different "
+            "candidate" % stores)
     return "; ".join(parts) if parts else None
 
 
@@ -166,7 +183,8 @@ def to_row(item):
     # gets a wrong row approved.
     creator = payload["creator"]
     filename = os.path.basename(payload["path"])
-    disagreement = _disagreement(creator, os.path.splitext(filename)[0])
+    disagreement = _disagreement(creator, os.path.splitext(filename)[0],
+                                 competing_store=payload.get("competing_store"))
     candidate = payload["candidate"]
     score = payload["score"]
     return Row(

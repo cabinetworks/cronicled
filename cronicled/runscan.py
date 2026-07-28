@@ -19,60 +19,67 @@ import argparse
 import os
 import sys
 
-from cronicled.adapters.registry import get_adapter, load_adapters
+from cronicled.adapters.registry import load_adapters
 from cronicled.config import load_server
 from cronicled.jobs import JobRunner
-from cronicled.scan import DEFAULT_THRESHOLD, ScanProducer
+from cronicled.scan import DEFAULT_THRESHOLD, ScanProducer, Source
 from cronicled.search import catalog_search
 from cronicled.stash import Stash
 from cronicled.store import Store
 
 
-def build_producer(stash, adapter, store, *, limit, folder="library",
+def build_producer(stash, adapters, store, *, limit, folder="library",
                    name_filter=None, threshold=DEFAULT_THRESHOLD,
                    aliases=None, workers=4):
-    """The `ScanProducer` that scans `adapter`'s store through `stash`,
+    """The `ScanProducer` that scans EVERY one of `adapters` through `stash`,
     recording through `store`.
+
+    `adapters` is the whole configured mapping (name -> `SiteAdapter`) —
+    ordinarily `configured_adapters()`'s own return value — not one adapter
+    singled out. A scan searches every configured store for every file; see
+    `cronicled.scan.examine_sources` for why deciding once over everything
+    that comes back, rather than stopping at the first store that answers,
+    is the whole point of this ticket. Sorted by name before becoming
+    `Source`s below so the ORDER `ScanProducer` sees never depends on
+    whatever order a dict, or a JSON file's own key order, happened to
+    produce — nothing about which store wins should be able to depend on
+    that.
 
     `limit` is REQUIRED and has no permissive default — it does not even
     accept the keyword unless the caller supplies it, and `None` is refused
     rather than treated as "unlimited". `scan.select` treats `limit=None` as
     "take every survivor of narrowing", and every one it takes spends a
-    lookup against a rate-limited third party (the configured scraper). A
-    first run against a whole library must not be reachable by a caller who
-    simply forgot the flag; this is the same rule `scan.select` states for
-    its own `limit=0` (a distinct, honoured instruction, not a missing
-    limit) applied one level up, at the one call site nothing else guards.
-    Pass `limit=0` deliberately to run the batch accounting — the log line
-    naming how many files exist, how many are already muted or proposed —
-    with no lookups spent at all.
+    lookup against a rate-limited third party (the configured scraper) FOR
+    EVERY CONFIGURED STORE. A first run against a whole library must not be
+    reachable by a caller who simply forgot the flag; this is the same rule
+    `scan.select` states for its own `limit=0` (a distinct, honoured
+    instruction, not a missing limit) applied one level up, at the one call
+    site nothing else guards. Pass `limit=0` deliberately to run the batch
+    accounting — the log line naming how many files exist, how many are
+    already muted or proposed — with no lookups spent at all.
 
-    `adapter.censorship` reaches both halves of the scan through different
-    paths: `catalog_search` expands the QUERY with it before any lookup
-    happens, and it is threaded through to `ScanProducer` as well so
-    `scan.examine` can decensor each candidate's TITLE for scoring — see
-    `scan.examine`'s docstring for why those are two distinct uses and why
-    conflating them would let a decensored title reach a proposal.
-
-    `adapter.owner_of` is threaded through the same way, so `scan.examine`'s
-    call into `cronicled.artist.resolve` can check a candidate name against
-    the catalogue instead of assuming the first one — but ONLY when
-    `adapter.catalog_resolvable` says a name search can identify this
-    store's creators at all. An adapter configured `owner_source: "none"`
-    returns "" from `owner_of` for every result, no matter the candidate;
-    passed through unconditionally, every ambiguous file against such a
-    store would find zero support for anything and come back unresolved —
-    a regression from today's folder-wins default, not the fix this wiring
-    exists for. `catalog_resolvable` already existed to answer exactly this
-    question; nothing read it before this.
+    Each adapter's own `censorship` and `owner_of` stay bound to that
+    adapter's `Source`, never pooled into one map or one reader for the
+    whole run — see `Source`'s own docstring for what each does. `owner_of`
+    is threaded through only when `adapter.catalog_resolvable` says a name
+    search can identify that store's creators at all: an adapter configured
+    `owner_source: "none"` returns "" from `owner_of` for every result, no
+    matter the candidate, and passed through unconditionally would find
+    zero support for anything on an ambiguous file — a regression from the
+    folder-wins default, not the fix this wiring exists for.
+    `catalog_resolvable` doubles as the discriminator `_choose_winner` uses
+    when more than one store matches the same file, which is the whole
+    reason it travels with the `Source` rather than being consulted only
+    here and thrown away.
 
     `stash.scrape_scene_url` is threaded through as `enrich`, unconditionally
-    — unlike `owner_of`, this needs no adapter-level gate: it scrapes the
-    winning candidate's own URL directly, against whichever scraper the
-    media server itself matches to that URL, rather than asking a
-    per-adapter name search to identify anything. See `scan.examine`'s
-    `enrich` paragraph for what happens when a candidate has no URL to give
-    it, or when the scrape itself fails.
+    and once for the whole run — unlike `owner_of`, this needs no
+    adapter-level gate and no per-store copy: it scrapes the winning
+    candidate's own URL directly, against whichever scraper the media
+    server itself matches to that URL, rather than asking any one store's
+    name search to identify anything. See `scan.examine`'s `enrich`
+    paragraph for what happens when a candidate has no URL to give it, or
+    when the scrape itself fails.
     """
     if limit is None:
         raise ValueError(
@@ -81,13 +88,18 @@ def build_producer(stash, adapter, store, *, limit, folder="library",
             "file it selects spends a lookup against a rate-limited "
             "scraper. Pass an explicit limit (0 runs the selection "
             "accounting with no lookups spent, if that is what is wanted).")
-    search = catalog_search(stash, adapter)
-    owner_of = adapter.owner_of if adapter.catalog_resolvable else None
+    sources = [
+        Source(name=name, search=catalog_search(stash, adapter),
+              owner_of=(adapter.owner_of if adapter.catalog_resolvable
+                        else None),
+              catalog_resolvable=adapter.catalog_resolvable,
+              censorship=adapter.censorship)
+        for name, adapter in sorted(adapters.items())
+    ]
     return ScanProducer(
-        stash, search, store=store, folder=folder, limit=limit,
+        stash, sources, store=store, folder=folder, limit=limit,
         name_filter=name_filter, threshold=threshold, aliases=aliases,
-        workers=workers, censorship=adapter.censorship, owner_of=owner_of,
-        enrich=stash.scrape_scene_url)
+        workers=workers, enrich=stash.scrape_scene_url)
 
 
 def configured_adapters(env=None):
@@ -102,7 +114,12 @@ def configured_adapters(env=None):
     against. Raising HERE, at the one call site that actually needs an
     adapter to exist, keeps `load_adapters` honest about its own contract
     while still refusing loudly rather than failing obscurely three calls
-    later inside `get_adapter` or `catalog_search`.
+    later inside `catalog_search`.
+
+    The WHOLE mapping is returned, every configured adapter — there is no
+    "the one adapter" any more. `build_producer` searches every one of them
+    for every file (see its own docstring); a caller that wants a single
+    named adapter for some other purpose indexes this mapping directly.
     """
     adapters = load_adapters(env=env)
     if not adapters:
@@ -121,10 +138,6 @@ def main(argv=None):
                     "server and site adapter, and record what it finds.")
     parser.add_argument("--db", default=os.environ.get(
         "CRONICLED_DB", "cronicled.sqlite3"))
-    parser.add_argument("--adapter", default=None,
-                        help="adapter name; defaults to the configured "
-                             "default adapter (or the only one, if there "
-                             "is exactly one)")
     parser.add_argument("--folder", default="library",
                         help="the store's proposal namespace this run "
                              "writes into (default: %(default)r)")
@@ -143,7 +156,6 @@ def main(argv=None):
     try:
         server = load_server()
         adapters = configured_adapters()
-        adapter = get_adapter(args.adapter, adapters)
     except (ValueError, RuntimeError, KeyError) as exc:
         print("cannot start a scan: %s" % exc, file=sys.stderr)
         return 1
@@ -153,13 +165,14 @@ def main(argv=None):
     try:
         runner = JobRunner(store)
         producer = build_producer(
-            stash, adapter, store, limit=args.limit, folder=args.folder,
+            stash, adapters, store, limit=args.limit, folder=args.folder,
             name_filter=args.name_filter, threshold=args.threshold,
             workers=args.workers)
         runner.register(producer)
 
         job = runner.start(producer.name)
-        print("scan %s started against adapter %r" % (job.id, adapter.name))
+        print("scan %s started against stores %s"
+             % (job.id, ", ".join(sorted(adapters))))
         runner.wait(job.id)
         finished = runner.job(job.id)
         print("scan %s finished: %s" % (finished.id, finished.message))
