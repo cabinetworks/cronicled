@@ -34,9 +34,16 @@ def strip_html(text):
 
     Tags become a single space so words don't run together across them; entities
     are unescaped after tag removal (so a literal ``&lt;p&gt;`` in the text is
-    preserved, not re-stripped). Idempotent and safe on plain text."""
+    preserved, not re-stripped). Idempotent and safe on plain text.
+
+    Falsy input (``None`` or ``""``) returns ``""``, the same contract
+    `normalize` and `clean_folder` use elsewhere in this module: an absent
+    string and an empty one are the same fact for a caller of a string
+    helper, and every caller here already treats them that way (see
+    `cronicled.adapters.declarative`'s own `node or ""` guard, which this
+    makes redundant rather than wrong)."""
     if not text:
-        return text
+        return ""
     stripped = re.sub(r"<[^>]+>", " ", text)                 # tags -> space
     stripped = html.unescape(stripped)                        # &amp; -> &, &#39; -> ', ...
     stripped = _BACKSLASH_ESCAPE_RE.sub(r"\1", stripped)      # \' \" \/ \\ -> ' " / \
@@ -51,7 +58,17 @@ def strip_ext(name):
     worth walking". Answering it from the walker's list left a file muxed as
     `.mpeg` carrying a token its `.mp4` twin did not, and scored the two
     differently for it.
+
+    Falsy input (``None`` or ``""``) returns ``""``, the same contract
+    `normalize` and `clean_folder` use. Before this, `None` reached
+    `os.path.splitext` and raised `TypeError`, which every caller that could
+    see a `None` here already worked around with an explicit `name or ""`
+    (see `cronicled.artist` and `cronicled.dates`) — those guards are now
+    redundant, not wrong, and are left in place rather than removed as part
+    of this fix.
     """
+    if not name:
+        return ""
     root, ext = os.path.splitext(name)
     return root if ext.lower() in CONTAINER_EXTS else name
 

@@ -77,6 +77,16 @@ class StripHtml(unittest.TestCase):
         self.assertEqual(strip_html("<p>Copper</p>   <p>Kettle</p>"),
                          "Copper Kettle")
 
+    def test_empty_and_none_are_empty(self):
+        # The anomalous case ticket #24 flags: this helper used to return
+        # its input unchanged (None stayed None) while `normalize` and
+        # `clean_folder` both already returned "". Nothing in the codebase
+        # relied on getting None back — every caller that could pass one
+        # already guarded with `x or ""` before this helper ever saw it —
+        # so unifying the contract here changes no caller's behaviour.
+        self.assertEqual(strip_html(""), "")
+        self.assertEqual(strip_html(None), "")
+
 
 class StripExt(unittest.TestCase):
     def test_drops_a_video_extension(self):
@@ -108,6 +118,17 @@ class StripExt(unittest.TestCase):
         for name in ("Copper Kettle.zqx", "Copper Kettle.vidx",
                      "Copper Kettle.Extended"):
             self.assertEqual(strip_ext(name), name)
+
+    def test_empty_and_none_are_empty(self):
+        # The other anomalous case ticket #24 flags: this helper used to
+        # raise TypeError on None (os.path.splitext(None) does not accept
+        # it), which every caller that could see a None here already worked
+        # around with an explicit `name or ""` (cronicled.artist,
+        # cronicled.dates). Now it agrees with `normalize` and
+        # `clean_folder` directly, and those guards become redundant rather
+        # than load-bearing.
+        self.assertEqual(strip_ext(""), "")
+        self.assertEqual(strip_ext(None), "")
 
 
 class TheTwoExtensionLists(unittest.TestCase):
