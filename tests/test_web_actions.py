@@ -442,9 +442,9 @@ class Scan(unittest.TestCase):
 
     def test_two_scans_in_turn_both_start(self):
         # HARM: `ScanProducer.name` is a fixed class attribute
-        # ("library-scan"); reusing it across calls to `JobRunner.register`
-        # would make every scan after the first one ever run against this
-        # runner refuse with "already registered", not "busy".
+        # ("library-scan"), and `scan` now reuses it as-is across calls --
+        # via `JobRunner.reregister`, which replaces rather than refuses --
+        # so this must not raise "already registered" on the second call.
         stash = _ScanStash([_library_scene(1)])
         actions = Actions(self.store, stash, runner=self.runner,
                           adapter=_Adapter())
@@ -453,6 +453,36 @@ class Scan(unittest.TestCase):
         second = actions.scan(1)  # must not raise
         self.assertTrue(self.runner.wait(second.id, WAIT))
         self.assertNotEqual(first.id, second.id)
+
+    def test_repeated_scans_do_not_grow_the_producer_registry(self):
+        # The regression this control used to accept: a fresh generated name
+        # per scan meant the runner's producer registry -- which has no
+        # eviction of its own -- grew by one small object every time a
+        # person clicked Scan, for the life of the process. `reregister`
+        # replaces the one entry instead, so the registry stays at exactly
+        # one producer no matter how many scans have run.
+        stash = _ScanStash([_library_scene(1)])
+        actions = Actions(self.store, stash, runner=self.runner,
+                          adapter=_Adapter())
+        for _ in range(3):
+            job = actions.scan(1)
+            self.assertTrue(self.runner.wait(job.id, WAIT))
+        self.assertEqual(len(self.runner.producers()), 1)
+        self.assertEqual(self.runner.producers()[0].name, "library-scan")
+
+    def test_repeated_scans_share_one_recognisable_producer_name(self):
+        # The other half of the same complaint: a generated name per scan
+        # made the job history read as a different producer every time,
+        # instead of one recurring activity a person could recognise.
+        stash = _ScanStash([_library_scene(1)])
+        actions = Actions(self.store, stash, runner=self.runner,
+                          adapter=_Adapter())
+        names = []
+        for _ in range(3):
+            job = actions.scan(1)
+            self.assertTrue(self.runner.wait(job.id, WAIT))
+            names.append(self.runner.job(job.id).producer)
+        self.assertEqual(names, ["library-scan"] * 3)
 
     def test_a_second_scan_while_one_runs_is_refused_not_swallowed(self):
         gate = threading.Event()

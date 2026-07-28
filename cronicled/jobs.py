@@ -349,6 +349,42 @@ class JobRunner:
             )
         self._producers[producer.name] = producer
 
+    def reregister(self, producer):
+        """Deliberately replace whatever is registered under `producer.name`,
+        including its cost class if the new producer's differs. This is the
+        "own method" `register()`'s docstring reserves for a caller that
+        genuinely wants to replace a registration, rather than doing it by
+        accident.
+
+        The caller this exists for: a producer built fresh per run with a
+        parameter `produce(ctx)` itself takes no argument for (a scan's
+        `limit`, say), started under one fixed name rather than a name
+        invented per call so the registry does not grow by one small object
+        every time a person clicks a button. See
+        `cronicled.web.actions.Actions.scan`.
+
+        Safe with a job already running under the previous object at the
+        same name: `start()` reads the producer out of this registry once,
+        at the moment it is called, and hands that exact object's own
+        `produce(ctx)` generator to the worker thread directly. Nothing in
+        `_run` looks a producer back up by name mid-job, so replacing the
+        registry entry here cannot reach into a job already in flight. The
+        cost-class limit `start()` enforces is unaffected either way, since
+        it counts currently-running jobs by `producer.cost` at the moment
+        `start()` is called, not by the identity of whichever object is
+        sitting in the registry.
+
+        Still refuses an unknown cost class, on the same terms as
+        `register()` — a typo here is exactly as much a wiring mistake as
+        it is there.
+        """
+        if producer.cost not in COST_CLASS_LIMITS:
+            raise ValueError(
+                f"unknown cost class {producer.cost!r} for producer "
+                f"{producer.name!r} (known: {sorted(COST_CLASS_LIMITS)})"
+            )
+        self._producers[producer.name] = producer
+
     def producers(self):
         """Every registered producer, in the order they were registered.
 

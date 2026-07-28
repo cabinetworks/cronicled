@@ -280,6 +280,62 @@ class ProducerContract(_RunnerCase):
         self.assertEqual(len(self.store.items()), 0)
 
 
+class Reregistering(_RunnerCase):
+    """`register()`'s own docstring reserves a separate method for a caller
+    that genuinely wants to replace a registration -- this is it. The
+    caller it exists for is a producer rebuilt fresh per run with its own
+    parameter baked in at construction (a scan's `limit`), started under one
+    fixed name rather than a name invented per call that would otherwise
+    accumulate in the registry forever."""
+
+    def test_replaces_the_producer_registered_under_the_same_name(self):
+        first = _Producer(name="scan", cost="local", count=1)
+        second = _Producer(name="scan", cost="local", count=1)
+        self.runner.register(first)
+        self.runner.reregister(second)
+        self.assertEqual(self.runner.producers(), [second])
+
+    def test_a_name_never_registered_before_works_the_same_as_register(self):
+        producer = _Producer(name="scan", cost="local")
+        self.runner.reregister(producer)   # must not raise
+        self.assertEqual(self.runner.producers(), [producer])
+
+    def test_the_cost_class_can_change_on_a_deliberate_replace(self):
+        # Unlike `register`, which refuses a duplicate name specifically so
+        # a cost class cannot swap by accident -- this is the caller opting
+        # in on purpose, so a genuine change of cost class is not refused.
+        self.runner.register(_Producer(name="scan", cost="local"))
+        self.runner.reregister(_Producer(name="scan", cost="scraping"))
+        self.assertEqual(self.runner.producers()[0].cost, "scraping")
+
+    def test_an_unknown_cost_class_is_still_refused(self):
+        self.runner.register(_Producer(name="scan", cost="local"))
+        with self.assertRaises(ValueError):
+            self.runner.reregister(_Producer(name="scan", cost="nonsense"))
+
+    def test_a_job_already_running_under_the_old_producer_is_unaffected(self):
+        # The registry entry is swapped, but a job already in flight was
+        # handed its own producer and generator directly by `start()` --
+        # nothing here can reach into it.
+        gate = threading.Event()
+        old = _Producer(name="scan", cost="local", count=1, gate=gate)
+        self.runner.register(old)
+        job = self.runner.start("scan")
+        self.runner.reregister(_Producer(name="scan", cost="local", count=1))
+        gate.set()
+        self.assertTrue(self.runner.wait(job.id, timeout=5))
+        finished = self.runner.job(job.id)
+        self.assertEqual(finished.state, "done")
+        self.assertEqual(finished.recorded, 1)
+
+    def test_starting_after_a_replace_runs_the_new_producer(self):
+        self.runner.register(_Producer(name="scan", cost="local", count=1))
+        self.runner.reregister(_Producer(name="scan", cost="local", count=5))
+        job = self.runner.start("scan")
+        self.assertTrue(self.runner.wait(job.id, timeout=5))
+        self.assertEqual(self.runner.job(job.id).recorded, 5)
+
+
 class WhatIsRegistered(_RunnerCase):
     """A schedule reads a producer's own declared cadence off the object, so
     it needs the objects and not just their names."""

@@ -5,8 +5,6 @@ Separated from request handling so the write paths can be tested without a
 socket, and so the handler cannot reach the store, the media server, or the
 job runner directly and grow another kind of write nobody reviewed.
 """
-import uuid
-
 from cronicled.runscan import build_producer
 from cronicled.web.rows import carries_cover
 
@@ -207,16 +205,24 @@ class Actions:
             raise RuntimeError(_NO_STASH)
         producer = build_producer(self._stash, self._adapter, self._store,
                                   limit=limit)
-        # `ScanProducer.name` is a fixed class attribute ("library-scan"),
-        # and `JobRunner.register` refuses a second producer under a name
-        # already registered -- reusing that name across scans would let
-        # exactly one scan ever run per process. A fresh name per call sidesteps
-        # that at a real, accepted cost: the runner's producer registry (unlike
-        # its bounded job history) has no eviction, so one small object per
-        # scan ever started through this control stays live for the life of
-        # the process. See the report for this ticket.
-        producer.name = "library-scan-%s" % uuid.uuid4()
-        self._runner.register(producer)
+        # A fresh `ScanProducer` is built above for every call, because
+        # `limit` has to be enforced at construction (see `build_producer`'s
+        # own docstring) -- there is no later point to hand it in. `register`
+        # refuses a second producer under a name already registered, so
+        # reusing `ScanProducer.name` ("library-scan") as-is across scans
+        # would let exactly one scan ever run per process.
+        #
+        # `reregister` is the deliberate escape hatch for exactly this: it
+        # replaces whatever is currently registered under the name rather
+        # than refusing, so every scan this control starts is filed under
+        # one stable, recognisable name instead of a fresh one invented per
+        # click that stayed in the registry forever (the registry, unlike
+        # the bounded job history beside it, has no eviction of its own). A
+        # scan already running under the previous object is untouched by the
+        # swap -- see `JobRunner.reregister`'s own docstring -- and `start`
+        # below still refuses with `JobRejected` in that case, on the same
+        # terms as before.
+        self._runner.reregister(producer)
         return self._runner.start(producer.name)
 
     def scan_status(self):
