@@ -33,7 +33,7 @@ from dataclasses import dataclass
 
 from cronicled.artist import Aliases, creator_folder, resolve
 from cronicled.censorship import decensor
-from cronicled.scoring import DEFAULT_THRESHOLD, decide, score
+from cronicled.scoring import AMBIGUITY_MARGIN, DEFAULT_THRESHOLD, decide, score
 
 # Selection deals in one kind of subject. It is named rather than inlined so
 # a test and the store agree on the same string, and so a future second kind
@@ -572,6 +572,381 @@ def _runners_up(candidates, matches, winning_index):
             for value, _, c in losers[:MAX_RUNNERS_UP]]
 
 
+# --- Searching every configured store, not one ------------------------------
+#
+# `examine` above works ONE store: it is the primitive, still fully valid on
+# its own, and every test in `ExamineTest` continues to exercise exactly that
+# — one search callable, one owner_of, one censorship map, for a caller with
+# exactly one store configured and no interest in a second. What follows is
+# the layer above it: a real installation configures several stores, and a
+# scan must search all of them before it decides anything, never stop at the
+# first that answers. See `examine_sources`'s own docstring for the whole
+# design; `ScanProducer` is its only production caller.
+
+
+@dataclass(frozen=True)
+class Source:
+    """One configured store's contribution to a scan that searches every one
+    of them — see `examine_sources`.
+
+    `name` identifies the store in a proposal's payload and in a cross-store
+    finding. Two sources sharing a name is a caller's wiring mistake — a
+    duplicate config entry — not something this module can catch on its
+    own; `ScanProducer` is where every configured store is actually
+    assembled and is where such a mistake would need to be refused.
+
+    `search` is this store's own single-argument lookup — the same contract
+    `examine`'s own `search` argument documents: called with a creator's
+    RESOLVED name, returns that creator's whole catalogue from THIS store as
+    a list of dicts, each carrying at least a `title`.
+
+    `owner_of`, when given, reads the owner off one of THIS store's own
+    search results (`SiteAdapter.owner_of`), and is used only to help
+    resolve which creator a file belongs to — see `_combined_owners_of`. It
+    is never used to filter or re-weight this store's own candidate titles,
+    which are scored on their text alone, exactly as a single store's
+    always were. `None` — the same value
+    `cronicled.runscan.build_producer` already passes for a store whose
+    `catalog_resolvable` is False — means this store contributes no
+    ownership evidence at all; the caller is trusted to keep the two
+    consistent, the same trust `build_producer` already places in itself
+    for a single store.
+
+    `catalog_resolvable` mirrors `SiteAdapter.catalog_resolvable`. Beyond
+    gating `owner_of`, it decides one further thing: when more than one
+    store's own search independently clears the threshold for the SAME file
+    (see `_choose_winner`), a store that cannot confirm ownership must not
+    out-rank, or tie with, one that can — stores are not interchangeable,
+    and a bare title match on a store that itself says a title mention
+    proves nothing must never be merged onto equal terms with a
+    catalogue-resolvable store's winner.
+
+    `censorship` is this store's own word-substitution map, applied only to
+    ITS OWN candidates before they are scored — the same reasoning
+    `examine`'s own `censorship` argument documents, now kept apart PER
+    STORE rather than assumed to be one map for the whole run: two stores
+    can censor the same word two different ways, or censor two different
+    words, and neither's substitutions belong on the other's titles.
+    """
+    name: str
+    search: object
+    owner_of: object = None
+    catalog_resolvable: bool = True
+    censorship: dict = None
+
+
+class _StoreDecision:
+    """One store's own verdict on one file: the candidates it returned, the
+    matches they scored, and what `scoring.decide` made of them — exactly
+    what a single-store `examine` would have computed internally, kept
+    apart per store so `examine_sources` can compare stores' verdicts to
+    EACH OTHER, not only to a threshold."""
+
+    __slots__ = ("source", "candidates", "matches", "decision")
+
+    def __init__(self, source, candidates, matches, decision):
+        self.source = source
+        self.candidates = candidates
+        self.matches = matches
+        self.decision = decision
+
+
+def _combined_owners_of(sources):
+    """The `owners_of` collaborator `resolve` uses to confirm a candidate
+    creator name, pooling evidence from every source that can offer any —
+    see `Source.owner_of`.
+
+    A source with `owner_of=None` (a store `catalog_resolvable` says cannot
+    attribute a result to anyone) contributes nothing: it is simply absent
+    from the list asked, exactly as a single such store already contributes
+    nothing to `_owners_of` today. That is what keeps a non-attributing
+    store from being merged onto equal terms with a catalogue-resolvable
+    one at the CREATOR-RESOLUTION step — the same discipline `_choose_winner`
+    applies at the CANDIDATE step below, for the other place two stores can
+    disagree.
+
+    Returns None — "no way to check a candidate against any catalogue" —
+    when not one configured source can answer, the same as `_owners_of`
+    already returns for a single store with no `owner_of` at all; `resolve`
+    then falls back to its ordinary folder-wins default.
+    """
+    confirmable = [s for s in sources if s.owner_of is not None]
+    if not confirmable:
+        return None
+    per_source = [_owners_of(s.search, s.owner_of) for s in confirmable]
+
+    def owners_of(candidate):
+        names = []
+        for owners in per_source:
+            names.extend(owners(candidate))
+        return names
+    return owners_of
+
+
+def _choose_winner(winners):
+    """Which store's own eligible candidate a proposal is built from, and
+    which OTHER winning stores are recorded as a cross-store finding.
+
+    `winners` is every `_StoreDecision` whose own `decide()` cleared the
+    threshold for this file — never fewer than one; the empty case is
+    handled by `examine_sources` before this is called.
+
+    A single winner needs no choice at all: returned with an empty
+    `competing` list. More than one is the finding this whole module exists
+    to get right — see `examine_sources`'s docstring for why it is a
+    finding and not a tie, and note the shape it must NOT take: refusing
+    outright every time two stores agree would make the common case (the
+    ticket's own "most often the same work published in both places") as
+    disruptive as the rare one, which is not what a folder and a filename
+    disagreeing already does — that case still proposes, with the loser
+    recorded, and this follows the same shape.
+
+    Resolved in two steps:
+
+    1. NEVER let a store that cannot confirm ownership out-rank, or tie
+       with, one that can. If at least one winner is catalogue-resolvable,
+       only catalogue-resolvable winners are candidates for `chosen` at
+       all — a non-resolvable winner can still be reported as `competing`,
+       just never picked. Only when EVERY winner is non-resolvable are
+       they compared to each other on the same footing.
+    2. Among whichever set step 1 leaves, rank by SCORE — content, never
+       position — and pick the top. If the runner-up is within
+       `scoring.AMBIGUITY_MARGIN` of it, that is a genuine tie between
+       equally-trustworthy evidence, and this refuses (`(None, None)`)
+       rather than let a fraction of a rounding difference, or worse, list
+       order, decide it — the same discipline `scoring.decide` already
+       applies to two candidates scored within one store. Ties within the
+       margin are broken by store NAME only for building the refusal's own
+       message, never to still pick a winner.
+
+    Never resolved by where a store happens to sit in `sources`: nothing
+    above reads position, only `catalog_resolvable` and each winner's own
+    score, so re-ordering a config file cannot change which store's
+    candidate a proposal carries, or whether one is picked at all.
+    """
+    if len(winners) == 1:
+        return winners[0], []
+    resolvable = [w for w in winners if w.source.catalog_resolvable]
+    eligible = resolvable if resolvable else winners
+
+    ranked = sorted(eligible, key=lambda sd: (-sd.decision.match.value,
+                                              sd.source.name))
+    top = ranked[0]
+    if len(ranked) > 1:
+        runner_up_value = ranked[1].decision.match.value
+        # Rounded to the same three places `scoring.score` rounds a value
+        # to, for the identical reason `scoring.decide` does: an unrounded
+        # float subtraction would decide this by representation rather than
+        # by intent.
+        if round(top.decision.match.value - runner_up_value, 3) <= AMBIGUITY_MARGIN:
+            return None, None
+    competing = [w for w in winners if w is not top]
+    return top, competing
+
+
+def _closest_refusal(per_store):
+    """Among stores whose own `decide()` found nothing eligible, the one
+    whose best candidate came closest — by raw score, not by where the
+    store sits in `sources` — so that reordering a config file never
+    changes which store's reason a refusal reports. Ties broken by the
+    store's NAME, the one thing about it that cannot depend on position.
+    """
+    def best_value(store_decision):
+        return max((m.value for m in store_decision.matches), default=0.0)
+    ranked = sorted(per_store,
+                    key=lambda sd: (-best_value(sd), sd.source.name))
+    return ranked[0]
+
+
+def examine_sources(scene, *, sources, folder, threshold=DEFAULT_THRESHOLD,
+                    aliases=None, enrich=None):
+    """Work out what `scene` is by searching EVERY one of `sources`, and
+    decide once over everything that came back.
+
+    This is `examine`'s multi-store sibling, not a wrapper around it:
+    creator resolution has to pool evidence across every catalogue-
+    resolvable store BEFORE any store is searched for candidates (see
+    `_combined_owners_of`), which `examine`'s single-callable `owners_of`
+    contract cannot express — so this reimplements the flow, sharing
+    `resolve`, `score`, `decide`, `decensor`, `_runners_up` and
+    `_enrichment_url` with it rather than duplicating their logic.
+
+    THE RULE THIS FUNCTION EXISTS FOR: every source in `sources` is
+    searched, unconditionally, before anything is decided. Nothing here
+    stops at the first store that answers — doing that would make the
+    outcome depend on the order `sources` happens to list its stores in,
+    which is the same silent-ordering mistake this codebase has already
+    removed from candidate scoring (`scoring.decide`'s ambiguity refusal),
+    from artist resolution (`artist._resolve_by_evidence`'s two-supported-
+    candidates refusal), and from alias-key collisions
+    (`artist._alias_index`). A store answering nothing for this creator is
+    an ordinary, expected outcome — most stores will, most of the time —
+    and is never treated as a reason to skip the rest.
+
+    Each store's own candidates are scored and decided ENTIRELY on their
+    own — `scoring.decide` runs once per store, over that store's own
+    candidate list, never over a list pooled across stores. Pooling
+    candidates from different stores into one `decide()` call would let a
+    non-attributing store's bare title match compete on equal arithmetic
+    terms with a catalogue-resolvable store's confirmed one, which is
+    exactly the laundering `Source.catalog_resolvable` exists to prevent;
+    keeping each store's decision separate is what makes that prevention
+    possible, at the cost below.
+
+    TWO OR MORE STORES CLEARING THE THRESHOLD IS A FINDING, NOT A TIE. Most
+    often the same work published in both places; occasionally a real
+    conflict about who made it. `_choose_winner` resolves it BY CONTENT,
+    never by position: a store that cannot confirm ownership never
+    out-ranks or ties with one that can, and among whichever stores remain
+    eligible the higher SCORE wins — only a genuine tie (within
+    `scoring.AMBIGUITY_MARGIN`, the same margin `scoring.decide` uses for
+    two candidates within one store) is refused rather than picked, so the
+    common case — several stores agreeing, or one clearly ahead of the rest
+    — still produces a proposal instead of demanding a person look at every
+    ordinary republish. See `_choose_winner`'s own docstring for the full
+    rule. When a winner IS chosen despite other stores also matching, the
+    OTHER stores' winning candidates are recorded in the payload's
+    `competing_store` (see below) rather than silently dropped — the
+    cross-store counterpart to `cronicled.artist.Resolution.competing`,
+    reported the same way a reviewer already sees a folder and a filename
+    naming different creators.
+
+    ONE LOOKUP PER STORE PER CREATOR, not per file: `sources[i].search` is
+    expected to already be single-flighted across a batch — see
+    `ScanProducer.produce`, which builds one `_SingleFlight` PER STORE
+    (never one shared across stores: the same creator name against two
+    different stores is two different lookups, and collapsing them would
+    silently answer one store's file from another's catalogue).
+
+    Returns an `Outcome`, on the same three-way contract `examine`
+    documents (`mute_reason` / refused-but-not-muted / `error`), with two
+    additions when a proposal is returned: the payload's `"store"` names
+    which source the winning candidate came from, and `"competing_store"`
+    — present only when another store also matched — lists every other
+    winning store's own candidate and score, highest first.
+
+    A store's search raising is isolated to THAT store for this file: it
+    is recorded and the remaining stores are still searched and still
+    allowed to produce a proposal. Only when EVERY store either raised or
+    returned nothing does the distinction matter for the outcome itself —
+    if at least one store raised, the file cannot be muted (an error is
+    evidence about the network, not a confirmed-empty catalogue, and mute
+    is reserved for the latter); with no errors at all and every store
+    genuinely empty, the file is muted exactly as a single empty store
+    already mutes it today. Any store error is also appended to whatever
+    `reason` a file ends up with — visible in the per-file log line even
+    when the file still proposes off a different, healthy store.
+    """
+    if not sources:
+        raise ValueError(
+            "examine_sources needs at least one configured source to "
+            "search against")
+    path = _primary_path(scene)
+    name = posixpath.basename(path)
+    directory = creator_folder(path)
+
+    resolution = resolve(name, directory, aliases,
+                         owners_of=_combined_owners_of(sources))
+    if resolution.name is None:
+        return Outcome(mute_reason=MUTE_UNRESOLVED_CREATOR,
+                       reason=MUTE_UNRESOLVED_CREATOR)
+
+    per_store = []
+    store_errors = []
+    for source in sources:
+        try:
+            candidates = list(source.search(resolution.name))
+        except Exception as exc:
+            store_errors.append(
+                "%s: %s: %s" % (source.name, type(exc).__name__, exc))
+            continue
+        if not candidates:
+            continue
+        matches = [score(name, directory,
+                         decensor(c["title"], source.censorship or {}),
+                         artist=resolution.name)
+                  for c in candidates]
+        decision = decide(matches, threshold)
+        per_store.append(_StoreDecision(source, candidates, matches, decision))
+
+    def with_store_errors(reason):
+        if not store_errors:
+            return reason
+        return "%s (store errors: %s)" % (reason, "; ".join(store_errors))
+
+    winners = [sd for sd in per_store if sd.decision.match is not None]
+
+    if not winners:
+        if not per_store:
+            if store_errors:
+                combined = "; ".join(store_errors)
+                return Outcome(error=combined, reason=combined)
+            return Outcome(mute_reason=MUTE_NO_CANDIDATES,
+                           reason=MUTE_NO_CANDIDATES)
+        best = _closest_refusal(per_store)
+        reason = "%s: %s" % (best.source.name, best.decision.reason)
+        return Outcome(reason=with_store_errors(reason))
+
+    chosen, competing = _choose_winner(winners)
+    if chosen is None:
+        names = ", ".join(sorted(sd.source.name for sd in winners))
+        reason = ("ambiguous across stores: %s each matched a candidate "
+                  "above the threshold, too close to call between them"
+                  % names)
+        return Outcome(reason=with_store_errors(reason))
+
+    winner = chosen.candidates[chosen.decision.index]
+    if enrich is not None:
+        url = _enrichment_url(winner)
+        if url:
+            try:
+                enriched = enrich(url)
+            except Exception:
+                pass
+            else:
+                if enriched:
+                    winner = enriched
+
+    payload = {
+        "path": path,
+        "creator": {
+            "name": resolution.name,
+            "source": resolution.source,
+            "competing": resolution.competing,
+            "rejected_folder": resolution.rejected_folder,
+        },
+        "candidate": winner,
+        "score": chosen.decision.match.value,
+        "runners_up": _runners_up(chosen.candidates, chosen.matches,
+                                  chosen.decision.index),
+        "store": chosen.source.name,
+    }
+    summary = '%s -> "%s" by %s (score %.3f)' % (
+        name, winner["title"], resolution.name, chosen.decision.match.value)
+    if competing:
+        ordered = sorted(
+            competing, key=lambda sd: (-sd.decision.match.value, sd.source.name))
+        payload["competing_store"] = [
+            {"store": sd.source.name,
+             "candidate": sd.candidates[sd.decision.index],
+             "score": sd.decision.match.value}
+            for sd in ordered]
+        summary += " [also matched by %s]" % ", ".join(
+            sd.source.name for sd in ordered)
+
+    return Outcome(
+        proposal={
+            "folder": folder,
+            "subject_type": SUBJECT_TYPE,
+            "subject_id": str(scene["id"]),
+            "summary": summary,
+            "confidence": chosen.decision.match.value,
+            "payload": payload,
+        },
+        reason=with_store_errors(chosen.decision.reason),
+    )
+
+
 # --- Running a batch -------------------------------------------------------
 
 
@@ -627,12 +1002,23 @@ class _SingleFlight:
     One entry per distinct creator for the life of a run. That is bounded by
     the batch, not by the library, and each entry holds a catalogue the
     caller was going to hold anyway.
+
+    `calls` counts how many of those entries were actually created — a real
+    lookup issued against `search` — as opposed to a caller that arrived
+    while one was already in flight or found one already answered. That is
+    precisely "lookups actually spent" against this store for the run: the
+    number a person choosing a file limit now needs, since a scan can search
+    several stores and the limit itself still counts files, not lookups (see
+    `ScanProducer`'s own docstring). Incremented under the same lock that
+    decides `mine`, so two workers racing to create the same entry can never
+    both count it.
     """
 
     def __init__(self, search):
         self._search = search
         self._lock = threading.Lock()
         self._flights = {}
+        self.calls = 0
 
     def __call__(self, query):
         key = _query_key(query)
@@ -641,6 +1027,7 @@ class _SingleFlight:
             mine = flight is None
             if mine:
                 flight = self._flights[key] = _Flight()
+                self.calls += 1
         if mine:
             try:
                 flight.result = list(self._search(query))
@@ -676,9 +1063,17 @@ class ScanProducer:
     file 49 of 50 keeps the 48 it already found. The legacy tool computed
     everything and wrote at the end, and lost all of it on the same failure.
 
-    `search` is injected. Nothing in this package executes a query — the
-    adapter layer phrases one and reads the results — so the expensive,
-    networked half is the caller's, and no test here opens a socket.
+    `sources` is a list of `Source` — every configured store, injected.
+    Nothing in this package executes a query — the adapter layer phrases one
+    and reads the results — so the expensive, networked half is the
+    caller's, and no test here opens a socket. Every one of them is
+    searched for every file this scan examines; see `examine_sources`, the
+    per-file worker this delegates to, for why that is the whole point and
+    not merely a detail — stopping at the first store that answers would
+    make a proposal's contents depend on the order `sources` lists its
+    stores in. At least one is required: a scan with nothing configured to
+    search against is a wiring mistake to refuse here, at construction, not
+    three calls later inside `examine_sources`.
 
     `store` is injected for two reasons and no others: `select` asks it which
     subjects are muted or already proposed, and an unidentifiable file is
@@ -694,49 +1089,53 @@ class ScanProducer:
     performers, and does not write anything back. That is what makes it safe
     to run repeatedly.
 
-    `censorship` is passed straight through to `examine` on every file — see
-    its docstring. It only ever changes which candidate scores highest; it
-    can never change what a proposal's `candidate` field carries, since
-    `examine` scores off a decensored copy and proposes the candidate
-    `search` returned, unaltered.
+    Each source's own `censorship` map and `owner_of` reach `examine_sources`
+    unchanged — see `Source`'s own docstring for what each does and why they
+    stay per-store rather than becoming one map/reader for the whole run.
 
-    `owner_of` is also passed straight through, to let `examine`'s call into
-    `cronicled.artist.resolve` check a candidate name against the catalogue
-    instead of assuming the first one — see `examine`'s and `_owners_of`'s
-    docstrings. `None` (the default) keeps the creator resolved exactly as it
-    always was, with no search issued before scoring.
-
-    `enrich` is passed straight through as well, to let `examine` replace
-    the winning candidate with a fuller scrape of its own URL once `decide`
-    has picked it — see `examine`'s docstring for the full contract and for
-    why a raise from it degrades a proposal to its thin candidate rather
-    than costing the file its turn. `None` (the default) keeps a proposal's
-    candidate exactly as `search` returned it, with no second lookup issued
-    at all — today's behaviour, unchanged.
+    `enrich` is passed straight through, store-agnostic on purpose: it
+    scrapes the WINNING candidate's own URL directly, against whichever
+    scraper the media server itself matches to that URL, never asking any
+    one store's own search to identify anything further — so it stays a
+    single, run-wide collaborator rather than one per source. See
+    `examine`'s `enrich` paragraph for the full contract and for why a raise
+    from it degrades a proposal to its thin candidate rather than costing
+    the file its turn. `None` (the default) keeps a proposal's candidate
+    exactly as `search` returned it, with no second lookup issued at all —
+    today's behaviour, unchanged.
     """
 
     name = "library-scan"
-    # Every selected file drives a lookup against a scraper, which is the
-    # resource `COST_CLASS_LIMITS` rations to one job at a time.
+    # Every selected file drives at least one lookup per configured store
+    # against a scraper, which is the resource `COST_CLASS_LIMITS` rations to
+    # one job at a time — see `examine_sources` for why the multiplier is
+    # bounded per CREATOR rather than per file.
     cost = "scraping"
 
-    def __init__(self, stash, search, *, store, folder="library", limit=None,
+    def __init__(self, stash, sources, *, store, folder="library", limit=None,
                  name_filter=None, threshold=DEFAULT_THRESHOLD, aliases=None,
-                 workers=4, censorship=None, owner_of=None, enrich=None):
+                 workers=4, enrich=None):
         if workers < 1:
             # A pool of nothing would do nothing at all, forever. Refuse it
             # where the mistake was made rather than on a background thread
             # hours later. `select` owns the matching rule for `limit`.
             raise ValueError(f"workers must be at least 1, got {workers!r}")
+        if not sources:
+            # A scan with no store configured to search against would mute
+            # or refuse every single file it ever looked at, for a reason
+            # that has nothing to do with any of them — a wiring mistake,
+            # refused where it was made rather than discovered file by file
+            # on a background thread.
+            raise ValueError(
+                "ScanProducer needs at least one configured source to "
+                "search against, got %r" % (sources,))
         self._stash = stash
-        self._search = search
+        self._sources = list(sources)
         self._store = store
         self._folder = folder
         self._limit = limit
         self._name_filter = name_filter
         self._threshold = threshold
-        self._censorship = censorship or {}
-        self._owner_of = owner_of
         self._enrich = enrich
         # Indexed and checked HERE, for the same reason `workers` is checked
         # here: a duplicated or empty alias line is a wiring mistake that is
@@ -805,12 +1204,26 @@ class ScanProducer:
                 counts.muted, counts.filtered_out, counts.deferred))
         ctx.log(selection)
 
-        search = _SingleFlight(self._search)
+        # One `_SingleFlight` PER SOURCE, never one shared across sources: the
+        # same creator name against two different stores is two different
+        # lookups, and collapsing them into one cache entry would silently
+        # answer one store's file from another's catalogue. Built fresh here,
+        # inside `produce`, for the same reason the single-store version
+        # always was — the cache must not outlive the run, and a second call
+        # to `produce` (there is none in production, but nothing stops a
+        # test) must not go on answering from a previous run's entries.
+        flights = [_SingleFlight(source.search) for source in self._sources]
+        sources = [
+            Source(name=source.name, search=flight, owner_of=source.owner_of,
+                  catalog_resolvable=source.catalog_resolvable,
+                  censorship=source.censorship)
+            for source, flight in zip(self._sources, flights)
+        ]
         proposed = muted = refused = errors = 0
         pool = ThreadPoolExecutor(max_workers=self._workers,
                                   thread_name_prefix=self.name)
         try:
-            futures = {pool.submit(self._examine, scene, search): scene
+            futures = {pool.submit(self._examine, scene, sources): scene
                        for scene in selected}
             for done, future in enumerate(as_completed(futures), start=1):
                 subject_id = str(futures[future]["id"])
@@ -859,23 +1272,34 @@ class ScanProducer:
         # proposed" alone reads the same for a library nobody has decided
         # anything about and for one whose every file a reviewer has already
         # muted, and those call for opposite responses.
-        ctx.log("finished: %d proposed, %d muted, %d refused, %d errors; %s"
-                % (proposed, muted, refused, errors, selection))
+        #
+        # `lookups` is the sum of every source's own `_SingleFlight.calls` —
+        # how many REAL queries this run actually issued, after single-flight
+        # collapse, across every configured store. `select`'s file limit
+        # still means files, not lookups (see this module's own docstring for
+        # why that stays true even now) — but that limit is now a multiplier
+        # of up to `len(sources)` lookups per file, so a person choosing it
+        # deserves to see what it actually cost this run, not just how many
+        # files it was spent on.
+        lookups = sum(flight.calls for flight in flights)
+        ctx.log("finished: %d proposed, %d muted, %d refused, %d errors, "
+                "%d lookups; %s"
+                % (proposed, muted, refused, errors, lookups, selection))
 
-    def _examine(self, scene, search):
+    def _examine(self, scene, sources):
         """One file's turn, with its exceptions kept to itself.
 
-        The isolation is around `examine` as a whole, not only around the
-        lookup: a malformed scene raises there too, and one bad record must
-        not end a batch whose other files are fine. It is reported as an
-        error rather than a mute, because a mute is a verdict that the file
-        is unidentifiable and a malformed record is not evidence of that.
+        The isolation is around `examine_sources` as a whole, not only
+        around a lookup: a malformed scene raises there too, and one bad
+        record must not end a batch whose other files are fine. It is
+        reported as an error rather than a mute, because a mute is a verdict
+        that the file is unidentifiable and a malformed record is not
+        evidence of that.
         """
         try:
-            return examine(scene, search=search, folder=self._folder,
-                           threshold=self._threshold, aliases=self._aliases,
-                           censorship=self._censorship, owner_of=self._owner_of,
-                           enrich=self._enrich)
+            return examine_sources(scene, sources=sources, folder=self._folder,
+                                   threshold=self._threshold,
+                                   aliases=self._aliases, enrich=self._enrich)
         except Exception as exc:
             # Name the type as well as the message, for the same reason
             # `examine` does: `str(exc)` alone is '' for a bare raise.

@@ -78,6 +78,38 @@ class RowContent(unittest.TestCase):
         self.assertFalse(row.contested)
         self.assertIsNone(row.disagreement)
 
+    def test_another_store_matching_the_same_file_is_reported_as_contested(self):
+        """`cronicled.scan.examine_sources` records another configured
+        store's own winning candidate under `competing_store` when more than
+        one store clears the threshold for the same file (see
+        `_choose_winner`) -- reported the same way a folder/filename
+        disagreement already is, so a reviewer sees it before approving."""
+        row = to_row(_item(payload={"competing_store": [
+            {"store": "otherstore",
+             "candidate": {"id": "c-9", "title": "Morning Ritual (Alt Cut)"},
+             "score": 0.91},
+        ]}))
+        self.assertTrue(row.contested)
+        self.assertIn("otherstore", row.disagreement)
+
+    def test_two_competing_stores_are_both_named(self):
+        row = to_row(_item(payload={"competing_store": [
+            {"store": "alpha", "candidate": {"id": "c-9", "title": "X"},
+             "score": 0.91},
+            {"store": "beta", "candidate": {"id": "c-10", "title": "Y"},
+             "score": 0.85},
+        ]}))
+        self.assertIn("alpha", row.disagreement)
+        self.assertIn("beta", row.disagreement)
+
+    def test_no_competing_store_key_at_all_is_not_contested_by_itself(self):
+        """The common, single-answer case: no `competing_store` key present
+        at all (every proposal made before this ticket, and every proposal
+        with only one winning store now) must not read as contested on its
+        own."""
+        row = to_row(_item())
+        self.assertNotIn("also matched", row.disagreement or "")
+
     def test_keeps_the_runners_up_that_lost(self):
         row = to_row(_item())
         self.assertIsInstance(row.runners_up, tuple)

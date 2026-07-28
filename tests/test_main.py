@@ -213,8 +213,7 @@ class ConfigDirThreading(_Base):
         conf = os.path.join(self._dir, "conf")
         os.makedirs(conf)
         with open(os.path.join(conf, "adapters.json"), "w") as fh:
-            json.dump({"default": "invented",
-                       "adapters": [{"name": "invented",
+            json.dump({"adapters": [{"name": "invented",
                                      "display": "An Invented Store",
                                      "scraper_id": "InventedStore",
                                      "owner_source": "url_segment",
@@ -225,9 +224,11 @@ class ConfigDirThreading(_Base):
             os.environ.pop(CONFIG_DIR_ENV_VAR, None)
             with patch("cronicled.__main__.serve", captured):
                 main(["--db", self.db_path, "--config-dir", conf])
-        adapter = captured.kwargs["actions"]._adapter
-        self.assertIsNotNone(
-            adapter, "the adapter directory the flag named was not read")
+        adapters = captured.kwargs["actions"]._adapters
+        self.assertIn(
+            "invented", adapters,
+            "the adapter directory the flag named was not read")
+        adapter = adapters["invented"]
         self.assertEqual(adapter.name, "invented")
         self.assertEqual(adapter.scraper_id, "InventedStore")
 
@@ -298,7 +299,7 @@ class ScanWiring(_Base):
         # checking they are the same object.
         self.assertEqual(captured.kwargs["scan_status"], actions.scan_status)
 
-    def test_with_no_adapters_configured_the_adapter_is_none_not_a_crash(self):
+    def test_with_no_adapters_configured_the_adapters_are_empty_not_a_crash(self):
         # A fresh install (no config/adapters.json committed -- this repo's
         # own working tree has none) is a legitimate state: the app must
         # still start, with `Actions.scan` left to give its own clear
@@ -307,7 +308,7 @@ class ScanWiring(_Base):
         captured = _CapturedServe()
         with patch("cronicled.__main__.serve", captured):
             main(["--db", self.db_path])
-        self.assertIsNone(captured.kwargs["actions"]._adapter)
+        self.assertEqual(captured.kwargs["actions"]._adapters, {})
 
 
 if __name__ == "__main__":

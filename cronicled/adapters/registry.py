@@ -15,9 +15,14 @@ from cronicled.config import config_dir
 
 
 class AdapterMap(dict):
-    """Adapters by name, plus which one is the configured default. Carrying the
-    default on the mapping keeps it tied to the config it came from — module-level
-    state would let a second load silently change the answer for the first."""
+    """Adapters by name.
+
+    `default` stays as a class attribute, always `None`, for one reason
+    only: a caller that read `loaded.default` before this ticket must not
+    start raising `AttributeError` on a value that used to be a real
+    (if now meaningless) answer. It is never set from a config any more —
+    see `load_adapters`'s own docstring for why the key it used to come
+    from is refused at load time instead."""
     default = None
 
 
@@ -31,7 +36,19 @@ def load_adapters(path=None, env=None):
     config/adapters.example.json for the shape); an explicit `path` is used
     exactly as given, unaffected by `$CRONICLED_CONFIG_DIR`. `env` defaults to
     `os.environ` but is injectable so a test can supply one without mutating
-    the real environment."""
+    the real environment.
+
+    A `"default"` key at the top level is REFUSED, naming itself in the
+    message, rather than silently ignored. It used to name the one adapter
+    `--adapter` fell back to when no name was given on the command line;
+    every scan now searches every configured adapter (see
+    `cronicled.runscan.build_producer`), so the flag is gone and the key it
+    fed has nothing left to mean. A key that goes on being accepted while
+    quietly doing nothing is exactly how configuration drifts from
+    behaviour — an operator reading their own `adapters.json` a year from
+    now would have no way to tell "this orders something" from "this is
+    inert" without reading this loader's source. Raising, and naming the
+    key, turns that silent drift into one clear edit: delete the line."""
     if path is None:
         path = default_adapters_path(env)
     adapters = AdapterMap()
@@ -39,20 +56,12 @@ def load_adapters(path=None, env=None):
         return adapters
     with open(path) as fh:
         payload = json.load(fh)
+    if "default" in payload:
+        raise ValueError(
+            "adapters.json sets \"default\", which no longer means "
+            "anything: every configured adapter is searched on every scan, "
+            "and there is no single adapter left to prefer. Remove the "
+            "\"default\" key.")
     for spec in payload.get("adapters") or []:
         adapters[spec["name"]] = DeclarativeAdapter(spec)
-    adapters.default = payload.get("default")
     return adapters
-
-
-def get_adapter(name, adapters):
-    """The named adapter, or the configured default when `name` is None. Raises
-    KeyError naming what was available, so a typo is obvious."""
-    if name is None:
-        name = getattr(adapters, "default", None)
-        if name is None and len(adapters) == 1:
-            return list(adapters.values())[0]
-    if name not in adapters:
-        raise KeyError("no adapter %r configured (have: %s)"
-                       % (name, ", ".join(sorted(adapters)) or "none"))
-    return adapters[name]

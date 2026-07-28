@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 from cronicled.adapters.declarative import DeclarativeAdapter
-from cronicled.adapters.registry import load_adapters, get_adapter
+from cronicled.adapters.registry import load_adapters
 
 # owner_segment counts from the host: for
 #   https://example.test/store/velvetcrane/copper-kettle
@@ -279,7 +279,7 @@ class ExampleConfig(unittest.TestCase):
         cls.loaded = load_adapters(os.path.join("config", "adapters.example.json"))
 
     def test_example_config_loads_a_working_url_segment_adapter(self):
-        adapter = get_adapter(None, self.loaded)
+        adapter = self.loaded["examplestore"]
         self.assertEqual(adapter.name, "examplestore")
         r = {"url": "https://example.test/store/velvetcrane/copper-kettle",
              "title": "Copper Kettle"}
@@ -323,29 +323,6 @@ class Registry(unittest.TestCase):
         # a fresh install has no config yet; the app must still start
         self.assertEqual(load_adapters("/nonexistent/adapters.json"), {})
 
-    def test_unknown_adapter_name_raises(self):
-        p = self._write({"adapters": [URL_SPEC]})
-        loaded = load_adapters(p)
-        with self.assertRaises(KeyError):
-            get_adapter("nosuchsite", loaded)
-
-    def test_default_is_the_one_marked_default(self):
-        p = self._write({"default": "fieldsite", "adapters": [URL_SPEC, FIELD_SPEC]})
-        loaded = load_adapters(p)
-        self.assertEqual(get_adapter(None, loaded).name, "fieldsite")
-
-    def test_unknown_adapter_message_names_the_bad_name_and_whats_available(self):
-        p = self._write({"adapters": [URL_SPEC, FIELD_SPEC]})
-        loaded = load_adapters(p)
-        try:
-            get_adapter("nosuchsite", loaded)
-            self.fail("expected KeyError")
-        except KeyError as exc:
-            msg = str(exc)
-            self.assertIn("nosuchsite", msg)
-            self.assertIn("fieldsite", msg)
-            self.assertIn("urlsite", msg)
-
     def test_malformed_config_raises_rather_than_loading_silently(self):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, ignore_errors=True)
@@ -355,16 +332,25 @@ class Registry(unittest.TestCase):
         with self.assertRaises(ValueError):
             load_adapters(p)
 
-    def test_two_configs_with_overlapping_names_keep_their_own_default(self):
-        # Regression: a module-level "current default" would let loading config B
-        # silently change what get_adapter(None, ...) returns for config A's
-        # mapping, even though the two configs share no state of their own.
-        p_a = self._write({"default": "urlsite", "adapters": [URL_SPEC, FIELD_SPEC]})
-        p_b = self._write({"default": "fieldsite", "adapters": [URL_SPEC, FIELD_SPEC]})
-        loaded_a = load_adapters(p_a)
-        loaded_b = load_adapters(p_b)
-        self.assertEqual(get_adapter(None, loaded_a).name, "urlsite")
-        self.assertEqual(get_adapter(None, loaded_b).name, "fieldsite")
+    def test_a_default_key_is_refused_at_load_time(self):
+        """`--adapter` is gone and every configured adapter is searched on
+        every scan, so `"default"` has nothing left to mean. A config
+        written before this ticket that still sets it must fail loudly, at
+        load time, naming the key -- not be silently ignored, which is
+        exactly the "key that stops mattering but stays accepted" drift
+        this refusal exists to prevent."""
+        p = self._write({"default": "fieldsite", "adapters": [URL_SPEC, FIELD_SPEC]})
+        with self.assertRaises(ValueError) as ctx:
+            load_adapters(p)
+        self.assertIn("default", str(ctx.exception))
+
+    def test_a_config_with_no_default_key_at_all_loads_normally(self):
+        """The permissive side of the same guard: a config that never
+        mentioned `"default"` must not be caught by a check aimed only at
+        one that does."""
+        p = self._write({"adapters": [URL_SPEC, FIELD_SPEC]})
+        loaded = load_adapters(p)
+        self.assertEqual(sorted(loaded), ["fieldsite", "urlsite"])
 
 
 if __name__ == "__main__":

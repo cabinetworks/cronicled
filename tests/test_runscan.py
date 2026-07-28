@@ -111,19 +111,21 @@ class BuildProducerRequiresALimit(unittest.TestCase):
         # by passing the same `None` a caller might use elsewhere to mean
         # "no filter".
         with self.assertRaises(ValueError):
-            build_producer(_FakeStash([]), _Adapter(), self.store, limit=None)
+            build_producer(_FakeStash([]), {"store": _Adapter()}, self.store,
+                           limit=None)
 
     def test_omitting_the_argument_entirely_is_refused_too(self):
         # HARM: a signature that DEFAULTED `limit` to `None` would make this
         # call succeed silently, reachable by a caller who simply forgot the
         # flag — which is the shape of failure this whole guard exists for.
         with self.assertRaises(TypeError):
-            build_producer(_FakeStash([]), _Adapter(), self.store)
+            build_producer(_FakeStash([]), {"store": _Adapter()}, self.store)
 
     def test_limit_zero_is_accepted_as_a_deliberate_instruction(self):
         # The permissive-looking value that is nonetheless a real, honoured
         # instruction — see `scan.select`'s own docstring for `limit=0`.
-        producer = build_producer(_FakeStash([]), _Adapter(), self.store, limit=0)
+        producer = build_producer(_FakeStash([]), {"store": _Adapter()},
+                                  self.store, limit=0)
         self.assertEqual(producer._limit, 0)
 
 
@@ -147,7 +149,7 @@ class BuildProducerWiring(unittest.TestCase):
             script={("scraper-alpha", "Velvet Crane"): [candidate]})
         adapter = _Adapter(scraper_id="scraper-alpha")
 
-        producer = build_producer(stash, adapter, self.store, limit=10)
+        producer = build_producer(stash, {"store": adapter}, self.store, limit=10)
         finished = self._run_to_completion(producer)
 
         self.assertEqual(finished.state, "done")
@@ -170,7 +172,7 @@ class BuildProducerWiring(unittest.TestCase):
         wrong_adapter = _Adapter(scraper_id="scraper-beta")  # never scripted
 
         finished = self._run_to_completion(
-            build_producer(stash, wrong_adapter, self.store, limit=10))
+            build_producer(stash, {"store": wrong_adapter}, self.store, limit=10))
 
         self.assertEqual(finished.recorded, 0)
         self.assertIn(
@@ -191,7 +193,7 @@ class BuildProducerWiring(unittest.TestCase):
         adapter = _Adapter(scraper_id="scraper-alpha", censorship=CENSORSHIP)
 
         finished = self._run_to_completion(
-            build_producer(stash, adapter, self.store, limit=10))
+            build_producer(stash, {"store": adapter}, self.store, limit=10))
 
         self.assertEqual(finished.recorded, 1)
 
@@ -209,7 +211,7 @@ class BuildProducerWiring(unittest.TestCase):
         adapter = _Adapter(scraper_id="scraper-alpha")
 
         finished = self._run_to_completion(
-            build_producer(stash, adapter, self.store, limit=10))
+            build_producer(stash, {"store": adapter}, self.store, limit=10))
 
         self.assertEqual(finished.state, "done")
         for call in stash.calls:
@@ -233,13 +235,15 @@ class BuildProducerOwnerOfWiring(unittest.TestCase):
 
     def test_a_catalog_resolvable_adapter_passes_its_owner_of_through(self):
         adapter = _Adapter(catalog_resolvable=True)
-        producer = build_producer(_FakeStash([]), adapter, self.store, limit=10)
-        self.assertEqual(producer._owner_of, adapter.owner_of)
+        producer = build_producer(_FakeStash([]), {"store": adapter},
+                                  self.store, limit=10)
+        self.assertEqual(producer._sources[0].owner_of, adapter.owner_of)
 
     def test_a_non_catalog_resolvable_adapter_passes_none(self):
         adapter = _Adapter(catalog_resolvable=False)
-        producer = build_producer(_FakeStash([]), adapter, self.store, limit=10)
-        self.assertIsNone(producer._owner_of)
+        producer = build_producer(_FakeStash([]), {"store": adapter},
+                                  self.store, limit=10)
+        self.assertIsNone(producer._sources[0].owner_of)
 
 
 class BuildProducerEnrichmentWiring(unittest.TestCase):
@@ -262,7 +266,8 @@ class BuildProducerEnrichmentWiring(unittest.TestCase):
 
     def test_the_stashs_own_scrape_by_url_method_is_wired_through(self):
         stash = _FakeStash([])
-        producer = build_producer(stash, _Adapter(), self.store, limit=10)
+        producer = build_producer(stash, {"store": _Adapter()}, self.store,
+                                  limit=10)
         self.assertEqual(producer._enrich, stash.scrape_scene_url)
 
     def test_a_proposal_carries_the_fuller_scrape_of_its_own_url(self):
@@ -283,7 +288,7 @@ class BuildProducerEnrichmentWiring(unittest.TestCase):
         adapter = _Adapter(scraper_id="scraper-alpha")
 
         finished = self._run_to_completion(
-            build_producer(stash, adapter, self.store, limit=10))
+            build_producer(stash, {"store": adapter}, self.store, limit=10))
 
         self.assertEqual(finished.recorded, 1)
         item = self.store.items(folder="library")[0]
@@ -308,7 +313,7 @@ class BuildProducerEnrichmentWiring(unittest.TestCase):
         adapter = _Adapter(scraper_id="scraper-alpha")
 
         finished = self._run_to_completion(
-            build_producer(stash, adapter, self.store, limit=10))
+            build_producer(stash, {"store": adapter}, self.store, limit=10))
 
         self.assertEqual(finished.recorded, 1)
         item = self.store.items(folder="library")[0]
@@ -361,20 +366,18 @@ class MainOrchestration(unittest.TestCase):
             "cronicled.runscan",
             load_server=mock.DEFAULT,
             configured_adapters=mock.DEFAULT,
-            get_adapter=mock.DEFAULT,
             Stash=mock.DEFAULT,
             Store=mock.DEFAULT,
             JobRunner=mock.DEFAULT,
             build_producer=mock.DEFAULT,
         )
 
-    def test_it_wires_server_adapter_producer_and_runner_together(self):
+    def test_it_wires_server_adapters_producer_and_runner_together(self):
         with self._patched() as mocks:
             mocks["load_server"].return_value = {
                 "url": "http://server.example.test", "api_key": "K"}
-            mocks["configured_adapters"].return_value = {"only": _Adapter()}
-            chosen_adapter = _Adapter(name="chosen")
-            mocks["get_adapter"].return_value = chosen_adapter
+            configured = {"only": _Adapter(), "second": _Adapter(name="second")}
+            mocks["configured_adapters"].return_value = configured
             producer = mock.Mock()
             producer.name = "library-scan"
             mocks["build_producer"].return_value = producer
@@ -386,15 +389,16 @@ class MainOrchestration(unittest.TestCase):
                 error=None)
             store_instance = mocks["Store"].return_value
 
-            rc = main(["--limit", "5", "--db", "irrelevant.sqlite3",
-                      "--adapter", "chosen"])
+            rc = main(["--limit", "5", "--db", "irrelevant.sqlite3"])
 
             self.assertEqual(rc, 0)
             mocks["Stash"].assert_called_once_with(
                 "http://server.example.test", "K")
-            mocks["get_adapter"].assert_called_once_with(
-                "chosen", {"only": mocks["configured_adapters"].return_value["only"]})
-            _, kwargs = mocks["build_producer"].call_args
+            # Every configured adapter reaches `build_producer` -- there is
+            # no `--adapter` flag left to single one out, and no `get_adapter`
+            # call standing between `configured_adapters` and the producer.
+            args, kwargs = mocks["build_producer"].call_args
+            self.assertEqual(args[1], configured)
             self.assertEqual(kwargs["limit"], 5)
             runner.register.assert_called_once_with(producer)
             runner.start.assert_called_once_with("library-scan")
@@ -406,7 +410,6 @@ class MainOrchestration(unittest.TestCase):
             mocks["load_server"].return_value = {
                 "url": "http://server.example.test", "api_key": "K"}
             mocks["configured_adapters"].return_value = {"only": _Adapter()}
-            mocks["get_adapter"].return_value = _Adapter()
             producer = mock.Mock()
             producer.name = "library-scan"
             mocks["build_producer"].return_value = producer
