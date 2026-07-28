@@ -341,3 +341,65 @@ class ARevertedRowStopsOfferingUndo(unittest.TestCase):
         item = _item(state="reverted", prior_state={"title": "was"})
         self.assertTrue(item["prior_state"])
         self.assertFalse(to_row(item).undoable)
+
+
+class ContestedOnlyWhenSomethingActuallyDisagrees(unittest.TestCase):
+    """Measured against a real library: six contested warnings, one of which
+    meant anything. A warning firing on nearly every row stops being read, and
+    then the one that matters goes past unread with the rest.
+
+    The resolver still records everything it passed over; what changes is
+    which of those is worth interrupting a person about.
+    """
+
+    def _creator(self, **over):
+        c = {"name": "Nine Winters", "source": "filename",
+             "competing": None, "rejected_folder": None}
+        c.update(over)
+        return c
+
+    def test_a_folder_that_is_the_filename_repeated_is_not_a_disagreement(self):
+        # One file per folder is an ordinary layout. Such a folder was never
+        # going to name anyone -- it failed the guards for being a title, not
+        # because the filing convention is wrong -- and it says nothing the
+        # filename beside it does not already say.
+        row = to_row(_item(payload={
+            "path": "/library/Nine Winters - The Lantern Room/"
+                    "Nine Winters - The Lantern Room.mp4",
+            "creator": self._creator(
+                rejected_folder="Nine Winters - The Lantern Room")}))
+        self.assertFalse(row.contested)
+        self.assertIsNone(row.disagreement)
+
+    def test_a_folder_naming_someone_else_is_still_a_disagreement(self):
+        # The case the field exists for, and the reason the rule above is
+        # equality rather than containment: a folder genuinely naming a
+        # different creator is a mis-filing, and hiding it is the expensive
+        # mistake.
+        row = to_row(_item(payload={
+            "path": "/library/Ada Marsh/Nine Winters - The Lantern Room.mp4",
+            "creator": self._creator(rejected_folder="Ada Marsh")}))
+        self.assertTrue(row.contested)
+        self.assertIn("Ada Marsh", row.disagreement)
+
+    def test_a_competing_name_containing_the_winner_is_the_same_person(self):
+        row = to_row(_item(payload={"creator": self._creator(
+            competing="Nine Winters - The Lantern Room")}))
+        self.assertFalse(row.contested)
+
+    def test_a_competing_name_that_is_a_different_person_still_warns(self):
+        # The one real signal in the measured set: a store contending with a
+        # creator. This is what the whole field is for.
+        row = to_row(_item(payload={"creator": self._creator(
+            competing="Ada Marsh")}))
+        self.assertTrue(row.contested)
+        self.assertIn("Ada Marsh", row.disagreement)
+
+    def test_both_kinds_can_still_be_reported_together(self):
+        row = to_row(_item(payload={
+            "path": "/library/Downloads/Nine Winters - The Lantern Room.mp4",
+            "creator": self._creator(competing="Ada Marsh",
+                                     rejected_folder="Downloads")}))
+        self.assertTrue(row.contested)
+        self.assertIn("Ada Marsh", row.disagreement)
+        self.assertIn("Downloads", row.disagreement)
