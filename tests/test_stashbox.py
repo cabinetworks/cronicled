@@ -759,6 +759,30 @@ class ListingVerdict(unittest.TestCase):
         self.assertIn("competed", verdict.reason)
         self.assertNotIn("in full", verdict.reason)
 
+    def test_a_single_contender_is_not_an_absence_either(self):
+        # `if decision.contenders:` fires at contenders == 1, not only at 2
+        # or more. `decide()` itself never returns exactly one contender
+        # beside a refusal -- a lone eligible candidate always wins outright
+        # -- so nothing on the ordinary decision path exercises this
+        # boundary, and `contenders > 1` would pass every test above just as
+        # well. A future caller that hand-builds a `Decision`, or a `decide`
+        # whose shape changes, must not have this read as "nothing competed"
+        # the moment there is exactly one entry that did -- that is the
+        # loose side of the boundary, and it is the direction that
+        # fabricates an absence.
+        one_contender = Decision(
+            match=None, index=None,
+            reason="a lone candidate that still lost to an ambiguity "
+                   "elsewhere",
+            contenders=1, interrogated=True)
+
+        verdict = listing_verdict(_listing(complete=True), one_contender,
+                                  performer_id=PERFORMER)
+
+        self.assertIsNone(verdict.unlisted)
+        self.assertIsNot(verdict.unlisted, True)
+        self.assertIn("competed", verdict.reason)
+
     def test_the_kind_of_refusal_is_read_from_the_count_not_the_prose(self):
         # scan.py already states the rule: a fact worth acting on is asked of
         # the data, never inferred from a reason string, because the wording
