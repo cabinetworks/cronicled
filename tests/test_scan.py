@@ -38,9 +38,10 @@ import cronicled.artist
 from cronicled.artist import Aliases
 from cronicled.jobs import COST_CLASS_LIMITS, JobRunner
 from cronicled.scan import (
-    Counts, MAX_RUNNERS_UP, MUTE_NO_CANDIDATES, MUTE_UNRESOLVED_CREATOR,
-    Outcome, ScanProducer, Source, SUBJECT_TYPE, _SingleFlight, examine,
-    examine_sources, select,
+    Conflict, Counts, DEFAULT_THRESHOLD, FingerprintPass, IDENTIFIED_BY_FINGERPRINT, Identified,
+    MAX_RUNNERS_UP, MUTE_NO_CANDIDATES, MUTE_UNRESOLVED_CREATOR, Outcome,
+    ScanProducer, Source, SUBJECT_TYPE, _SingleFlight, examine,
+    examine_sources, fingerprint_outcome, identify_by_fingerprint, select,
 )
 from cronicled.store import Store
 from tests.fixtures.cast import CENSORSHIP
@@ -2713,3 +2714,592 @@ class ScanProducerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# -- identifying a file before searching for it ---------------------------- #
+#
+# Every fixture in this section is invented. `example.invalid` is reserved by
+# RFC 2606 and can never resolve.
+
+NORTH = {"name": "north-box", "endpoint": "https://one.example.invalid/gql"}
+SOUTH = {"name": "south-box", "endpoint": "https://two.example.invalid/gql"}
+
+
+def box_match(title, remote_site_id, **over):
+    """One `ScrapedScene` as a stash-box returns it: the fields an apply
+    writes, plus the box's own id for the scene it recognised."""
+    row = {"title": title, "code": None, "details": None, "director": None,
+           "urls": [], "url": None, "date": None, "image": None,
+           "studio": None, "tags": [], "performers": [],
+           "remote_site_id": remote_site_id}
+    row.update(over)
+    return row
+
+
+class ScriptedBoxes:
+    """The injected `lookup`: answers each box's whole batch from a script,
+    and remembers every call in the order it was made.
+
+    `script` is keyed by ENDPOINT and holds either a list of per-scene match
+    lists (returned verbatim, so a test can hand back a deliberately
+    misaligned reply) or a mapping of scene id -> matches, expanded in the
+    order the ids were asked about.
+
+    `raises` names endpoints that fail instead of answering. It matches what
+    the real collaborator can do -- `Stash.scrape_scenes_by_fingerprint`
+    raises `StashError` on a transport failure and on a reply it cannot
+    align -- rather than offering a way to fail that production has not.
+    """
+
+    def __init__(self, script=None, raises=None):
+        self._script = dict(script or {})
+        self._raises = dict(raises or {})
+        self.calls = []
+
+    def __call__(self, endpoint, scene_ids):
+        self.calls.append((endpoint, list(scene_ids)))
+        if endpoint in self._raises:
+            raise self._raises[endpoint]
+        answer = self._script.get(endpoint, {})
+        if isinstance(answer, list):
+            return answer
+        return [list(answer.get(scene_id, [])) for scene_id in scene_ids]
+
+
+class IdentifyByFingerprintTest(unittest.TestCase):
+
+    LEDGER = box_match("Winter Ledger", "r-77")
+    MORNING = box_match("Morning Ritual", "r-12")
+
+    def test_every_box_is_asked_once_for_the_whole_batch_in_order(self):
+        # One call per box, not one per file: a real installation had three
+        # boxes configured and a batch is the unit the lookup takes. The
+        # ORDER is the operator's own configured order, which is what a
+        # caller is told to try them in.
+        lookup = ScriptedBoxes()
+        identify_by_fingerprint(["1", "2"], boxes=[SOUTH, NORTH], lookup=lookup)
+
+        self.assertEqual(lookup.calls, [(SOUTH["endpoint"], ["1", "2"]),
+                                        (NORTH["endpoint"], ["1", "2"])])
+
+    def test_a_match_is_filed_against_the_scene_it_was_returned_for(self):
+        # Only some scenes match, they match DIFFERENTLY, and they sit at
+        # positions that are not mirror images of each other. A fixture where
+        # every scene matched could not tell a correct alignment from a
+        # shifted one -- and neither could a symmetric one, which survives
+        # being reversed unchanged.
+        lookup = ScriptedBoxes(
+            {NORTH["endpoint"]: [[], [self.LEDGER], [self.MORNING], []]})
+        result = identify_by_fingerprint(["1", "2", "3", "4"], boxes=[NORTH],
+                                         lookup=lookup)
+
+        self.assertEqual(sorted(result.identified), ["2", "3"])
+        self.assertEqual(result.identified["2"],
+                         Identified(box="north-box", candidate=self.LEDGER,
+                                    remote_site_id="r-77"))
+        self.assertEqual(result.identified["3"],
+                         Identified(box="north-box", candidate=self.MORNING,
+                                    remote_site_id="r-12"))
+
+    def test_a_scene_no_box_recognised_is_simply_absent(self):
+        # Absence is not evidence: 10 of 23 measured files got no hit
+        # anywhere. Such a file must fall through, not be recorded as
+        # anything.
+        lookup = ScriptedBoxes({NORTH["endpoint"]: {}})
+        result = identify_by_fingerprint(["1"], boxes=[NORTH], lookup=lookup)
+
+        self.assertEqual(result.identified, {})
+        self.assertEqual(result.errors, ())
+
+    def test_no_boxes_configured_asks_nobody_and_identifies_nothing(self):
+        lookup = ScriptedBoxes()
+        result = identify_by_fingerprint(["1"], boxes=[], lookup=lookup)
+
+        self.assertEqual(lookup.calls, [])
+        self.assertEqual(result, FingerprintPass(identified={}, errors=()))
+
+    def test_two_boxes_naming_the_same_scene_is_agreement_not_a_conflict(self):
+        same = box_match("Winter Ledger", "r-77", date="2021-03-04")
+        lookup = ScriptedBoxes({NORTH["endpoint"]: {"1": [self.LEDGER]},
+                                SOUTH["endpoint"]: {"1": [same]}})
+        result = identify_by_fingerprint(["1"], boxes=[NORTH, SOUTH],
+                                         lookup=lookup)
+
+        self.assertEqual(result.identified["1"],
+                         Identified(box="north-box", candidate=self.LEDGER,
+                                    remote_site_id="r-77",
+                                    agreeing=("south-box",)))
+
+    def test_two_boxes_naming_different_scenes_is_a_conflict_carrying_both(self):
+        # HARM: taking the first box's answer here silently settles, by
+        # config order, a question two sources that hashed the same bytes
+        # disagreed about -- and writes one of them onto the file.
+        lookup = ScriptedBoxes({NORTH["endpoint"]: {"1": [self.LEDGER]},
+                                SOUTH["endpoint"]: {"1": [self.MORNING]}})
+        result = identify_by_fingerprint(["1"], boxes=[NORTH, SOUTH],
+                                         lookup=lookup)
+
+        self.assertEqual(result.identified["1"], Conflict(claims=(
+            ("north-box", "r-77", self.LEDGER),
+            ("south-box", "r-12", self.MORNING))))
+
+    def test_two_boxes_that_named_no_scene_at_all_do_not_count_as_agreeing(self):
+        # HARM: comparing ids with a missing one treated as a value makes two
+        # boxes that each DECLINED to name a scene look like two boxes naming
+        # the same one -- a default that happens to skip the guard.
+        anonymous = box_match("Winter Ledger", None)
+        other = box_match("Morning Ritual", None)
+        lookup = ScriptedBoxes({NORTH["endpoint"]: {"1": [anonymous]},
+                                SOUTH["endpoint"]: {"1": [other]}})
+        result = identify_by_fingerprint(["1"], boxes=[NORTH, SOUTH],
+                                         lookup=lookup)
+
+        self.assertIsInstance(result.identified["1"], Conflict)
+
+    def test_one_box_naming_no_scene_still_identifies_the_file(self):
+        # A single claim has nothing to disagree with, so the missing id
+        # withholds nothing: the box recognised the file, and the id is only
+        # ever needed to compare two boxes.
+        anonymous = box_match("Winter Ledger", None)
+        lookup = ScriptedBoxes({NORTH["endpoint"]: {"1": [anonymous]}})
+        result = identify_by_fingerprint(["1"], boxes=[NORTH], lookup=lookup)
+
+        self.assertEqual(result.identified["1"],
+                         Identified(box="north-box", candidate=anonymous,
+                                    remote_site_id=None))
+
+    def test_one_box_returning_two_different_scenes_is_a_conflict_too(self):
+        lookup = ScriptedBoxes(
+            {NORTH["endpoint"]: {"1": [self.LEDGER, self.MORNING]}})
+        result = identify_by_fingerprint(["1"], boxes=[NORTH], lookup=lookup)
+
+        self.assertIsInstance(result.identified["1"], Conflict)
+
+    def test_a_box_that_raises_costs_only_its_own_answers(self):
+        # HARM: letting one box's outage end the pass takes the OTHER boxes'
+        # identifications with it, and the text fallback for every file in
+        # the batch besides.
+        lookup = ScriptedBoxes({SOUTH["endpoint"]: {"1": [self.LEDGER]}},
+                               raises={NORTH["endpoint"]: RuntimeError("down")})
+        result = identify_by_fingerprint(["1", "2"], boxes=[NORTH, SOUTH],
+                                         lookup=lookup)
+
+        self.assertEqual(result.identified["1"],
+                         Identified(box="south-box", candidate=self.LEDGER,
+                                    remote_site_id="r-77"))
+        self.assertNotIn("2", result.identified)
+        self.assertEqual(result.errors,
+                         ("north-box: RuntimeError: down",))
+
+    def test_a_box_whose_reply_cannot_be_aligned_is_discarded_whole(self):
+        # HARM: position is the only thing tying a match to its scene, so a
+        # reply of the wrong length zipped against the ids attributes one
+        # file's box metadata to a different file. `lookup` is injected and
+        # this cannot assume the client already checked.
+        lookup = ScriptedBoxes({NORTH["endpoint"]: [[self.LEDGER]],
+                                SOUTH["endpoint"]: {"2": [self.MORNING]}})
+        result = identify_by_fingerprint(["1", "2"], boxes=[NORTH, SOUTH],
+                                         lookup=lookup)
+
+        self.assertNotIn("1", result.identified)
+        self.assertEqual(result.identified["2"],
+                         Identified(box="south-box", candidate=self.MORNING,
+                                    remote_site_id="r-12"))
+        self.assertEqual(len(result.errors), 1)
+        self.assertIn("north-box", result.errors[0])
+
+    def test_a_reply_of_exactly_the_right_length_is_used(self):
+        # The permissive side of the alignment guard: a mutation tightening
+        # it into refusing every reply must fail something.
+        lookup = ScriptedBoxes({NORTH["endpoint"]: [[], [self.MORNING]]})
+        result = identify_by_fingerprint(["1", "2"], boxes=[NORTH],
+                                         lookup=lookup)
+
+        self.assertEqual(result.errors, ())
+        self.assertEqual(list(result.identified), ["2"])
+
+
+class FingerprintOutcomeTest(unittest.TestCase):
+
+    PATH = "/library/Ivy Kingsley/Winter Ledger.mp4"
+    LEDGER = box_match("Winter Ledger", "r-77")
+
+    def outcome(self, identification):
+        return fingerprint_outcome(scene(7, self.PATH), identification,
+                                   folder=FOLDER)
+
+    def test_a_hit_is_a_whole_proposal_that_records_no_score(self):
+        # Asserted as ONE whole shape, not field by field: the runner passes
+        # these straight to `record()`, which hashes the payload, so a field
+        # added here changes every fingerprint -- and a `score` or a
+        # `confidence` added here is a number nothing computed, which the row
+        # view, the threshold control and the runners-up display would every
+        # one of them read as the scorer's own output.
+        outcome = self.outcome(Identified(box="north-box",
+                                          candidate=self.LEDGER,
+                                          remote_site_id="r-77"))
+
+        self.assertEqual(outcome.proposal, {
+            "folder": FOLDER,
+            "subject_type": SUBJECT_TYPE,
+            "subject_id": "7",
+            "summary": 'Winter Ledger.mp4 -> "Winter Ledger" identified by '
+                       'fingerprint (north-box)',
+            "payload": {
+                "path": self.PATH,
+                "candidate": self.LEDGER,
+                "identified_by": IDENTIFIED_BY_FINGERPRINT,
+                "box": "north-box",
+                "remote_site_id": "r-77",
+            },
+        })
+
+    def test_an_identified_proposal_is_not_recorded_like_a_scored_one(self):
+        # The property stated on its own terms, so it survives the shape
+        # above being rewritten: nothing a scorer produces may appear on a
+        # proposal nothing scored.
+        proposal = self.outcome(
+            Identified(box="north-box", candidate=self.LEDGER,
+                       remote_site_id="r-77")).proposal
+
+        self.assertNotIn("confidence", proposal)
+        for key in ("score", "runners_up", "creator", "store"):
+            self.assertNotIn(key, proposal["payload"])
+        self.assertEqual(proposal["payload"]["identified_by"],
+                         IDENTIFIED_BY_FINGERPRINT)
+
+    def test_agreeing_boxes_are_recorded_beside_the_one_carried_forward(self):
+        outcome = self.outcome(
+            Identified(box="north-box", candidate=self.LEDGER,
+                       remote_site_id="r-77", agreeing=("south-box",)))
+
+        self.assertEqual(outcome.proposal["payload"]["agreeing_boxes"],
+                         ["south-box"])
+        self.assertIn("also identified by south-box",
+                      outcome.proposal["summary"])
+
+    def test_a_conflict_refuses_and_names_every_box_and_every_scene(self):
+        # HARM: a refusal naming only the winner would read identically to
+        # first-match-wins, which is the failure being avoided. Both sides
+        # have to be in front of the person who has to go and look.
+        outcome = self.outcome(Conflict(claims=(
+            ("north-box", "r-77", self.LEDGER),
+            ("south-box", "r-12", box_match("Morning Ritual", "r-12")))))
+
+        self.assertIsNone(outcome.proposal)
+        self.assertIsNone(outcome.mute_reason)
+        self.assertIsNone(outcome.error)
+        for fragment in ("north-box", "r-77", "south-box", "r-12"):
+            self.assertIn(fragment, outcome.reason)
+
+    def test_a_conflict_is_a_refusal_and_never_a_mute(self):
+        # Muting would hide a file forever over two boxes disagreeing, which
+        # is the one thing a person can most usefully act on.
+        outcome = self.outcome(Conflict(claims=(
+            ("north-box", "r-77", self.LEDGER),
+            ("south-box", "r-12", box_match("Morning Ritual", "r-12")))))
+
+        self.assertIsNone(outcome.mute_reason)
+
+
+class ScanProducerFingerprintTest(unittest.TestCase):
+    """The batch with a fingerprint pass in front of it.
+
+    The properties here are about ORDER and about what a file's turn COSTS.
+    A file a box recognised is already identified, so the one thing that must
+    not happen to it is a store search -- and the one thing that must still
+    happen to every other file is exactly the search it got before any of
+    this existed.
+    """
+
+    MORNING = candidate("Morning Ritual", "morning-ritual")
+    LEDGER = candidate("Winter Ledger", "winter-ledger")
+    SCRIPT = {"Velvet Crane": [MORNING], "Ivy Kingsley": [LEDGER]}
+
+    MORNING_PATH = "/library/Velvet Crane/Morning Ritual.mp4"
+    LEDGER_PATH = "/library/Ivy Kingsley/Winter Ledger.mp4"
+
+    BOX_LEDGER = box_match("Winter Ledger", "r-77")
+    BOX_MORNING = box_match("Morning Ritual", "r-12")
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+        self.ctx = FakeCtx()
+
+    def build(self, scenes, search, identify=None, **kwargs):
+        kwargs.setdefault("folder", FOLDER)
+        kwargs.setdefault("workers", 1)
+        return ScanProducer(
+            FakeStash(scenes),
+            [Source(name="store", search=search, censorship={})],
+            store=self.store, identify=identify, **kwargs)
+
+    def scan(self, scenes, search, identify=None, **kwargs):
+        return list(self.build(scenes, search, identify, **kwargs)
+                    .produce(self.ctx))
+
+    @staticmethod
+    def pass_for(**identified):
+        def identify(scene_ids):
+            return FingerprintPass(
+                identified={k: v for k, v in identified.items()
+                            if k in scene_ids})
+        return identify
+
+    # -- an identified file costs no lookup -------------------------------- #
+
+    def test_an_identified_file_is_never_searched_for_in_any_store(self):
+        # HARM: a store search here spends a rate-limited lookup re-deriving,
+        # as a scored guess, an answer already in hand -- and the guess would
+        # then be offered beside the identification. Asserted against the
+        # search callable itself, not inferred from a log line.
+        search = ScriptedSearch(self.SCRIPT)
+        proposals = self.scan(
+            [scene(7, self.LEDGER_PATH)], search,
+            self.pass_for(**{"7": Identified(box="north-box",
+                                             candidate=self.BOX_LEDGER,
+                                             remote_site_id="r-77")}))
+
+        self.assertEqual(search.queries, [])
+        self.assertEqual([p["subject_id"] for p in proposals], ["7"])
+        self.assertEqual(proposals[0]["payload"]["identified_by"],
+                         IDENTIFIED_BY_FINGERPRINT)
+
+    def test_the_boxes_are_asked_before_any_store_is_searched(self):
+        # HARM: running the text path first spends the lookup this pass
+        # exists to save, on every file a box would have identified.
+        order = []
+
+        def identify(scene_ids):
+            order.append("identify")
+            return FingerprintPass(identified={
+                "7": Identified(box="north-box", candidate=self.BOX_LEDGER,
+                                remote_site_id="r-77")})
+
+        def search(query):
+            order.append("search")
+            return list(self.SCRIPT.get(query, []))
+
+        self.scan([scene(7, self.LEDGER_PATH), scene(8, self.MORNING_PATH)],
+                  search, identify)
+
+        self.assertEqual(order, ["identify", "search"])
+
+    def test_a_file_the_boxes_disagreed_about_is_refused_and_not_searched(self):
+        # HARM: falling through to the text path would settle, by scoring a
+        # filename, a question two sources that hashed the actual bytes could
+        # not agree on -- the weaker mechanism quietly resolving what the
+        # stronger one flagged.
+        search = ScriptedSearch(self.SCRIPT)
+        conflict = Conflict(claims=(("north-box", "r-77", self.BOX_LEDGER),
+                                    ("south-box", "r-12", self.BOX_MORNING)))
+        proposals = self.scan([scene(7, self.LEDGER_PATH)], search,
+                              self.pass_for(**{"7": conflict}))
+
+        self.assertEqual(proposals, [])
+        self.assertEqual(search.queries, [])
+        refusals = self.store.refusals()
+        self.assertEqual([r["subject_id"] for r in refusals], ["7"])
+        for fragment in ("north-box", "r-77", "south-box", "r-12"):
+            self.assertIn(fragment, refusals[0]["reason"])
+        self.assertEqual(self.store.muted_subjects(), set())
+
+    # -- everything else is untouched -------------------------------------- #
+
+    def _text_path_calls(self, identify, collaborators=None):
+        """Every call the text path made, projected to what a caller can
+        compare between two runs -- the whole keyword set included, so a
+        keyword added or dropped shows up as a difference rather than as a
+        field nobody looked at.
+
+        `collaborators` is the (aliases, enrich, search) triple to build the
+        producer with. Two runs being compared MUST be handed the same three
+        objects: a freshly-built alias index or enrichment callable differs
+        between runs by identity alone, which would make every comparison
+        fail for a reason that has nothing to do with the pass.
+        """
+        calls = []
+        real = examine_sources
+
+        def spy(scene_arg, **kwargs):
+            calls.append((
+                scene_arg,
+                sorted(kwargs),
+                kwargs["folder"], kwargs["threshold"], kwargs["aliases"],
+                kwargs["enrich"],
+                [(s.name, s.owner_of, s.catalog_resolvable, s.censorship,
+                  s.search._search) for s in kwargs["sources"]],
+            ))
+            return real(scene_arg, **kwargs)
+
+        aliases, enrich, search = collaborators or (
+            Aliases({}), FakeEnrich(), ScriptedSearch(self.SCRIPT))
+        with mock.patch("cronicled.scan.examine_sources", spy):
+            self.scan([scene(7, self.LEDGER_PATH), scene(8, self.MORNING_PATH)],
+                      search, identify, aliases=aliases, enrich=enrich)
+        return calls
+
+    def test_an_unmatched_file_reaches_the_text_path_exactly_as_before(self):
+        # The whole call, not "it happened": the pass sits in front of a path
+        # whose arguments are what every downstream decision is made from.
+        # Compared against the SAME batch run with no pass at all, so the
+        # comparison is against today's behaviour rather than against a
+        # hand-written expectation that could drift with it.
+        shared = (Aliases({}), FakeEnrich(), ScriptedSearch(self.SCRIPT))
+        without = self._text_path_calls(None, shared)
+        with_pass = self._text_path_calls(
+            self.pass_for(**{"9": Identified(box="north-box",
+                                             candidate=self.BOX_LEDGER,
+                                             remote_site_id="r-77")}),
+            shared)
+
+        self.assertEqual(len(without), 2)
+        self.assertEqual(with_pass, without)
+
+    def test_the_text_path_is_handed_every_argument_it_needs_and_no_other(self):
+        # The differential test above pins that the PASS changes nothing. This
+        # pins the call itself, absolutely, so a keyword dropped or renamed on
+        # both sides at once -- which a comparison of two runs cannot see --
+        # still fails something. `enrich` most of all: dropped here, every
+        # proposal silently degrades to the thin candidate a name search
+        # returned, with no error anywhere.
+        aliases, enrich, search = (Aliases({}), FakeEnrich(),
+                                   ScriptedSearch(self.SCRIPT))
+        calls = self._text_path_calls(
+            self.pass_for(**{"7": Identified(box="north-box",
+                                             candidate=self.BOX_LEDGER,
+                                             remote_site_id="r-77")}),
+            (aliases, enrich, search))
+
+        self.assertEqual(len(calls), 1)
+        scene_arg, keywords, folder, threshold, seen_aliases, seen_enrich, \
+            seen_sources = calls[0]
+        self.assertEqual(scene_arg["id"], "8")
+        self.assertEqual(keywords,
+                         ["aliases", "enrich", "folder", "sources", "threshold"])
+        self.assertEqual(folder, FOLDER)
+        self.assertEqual(threshold, DEFAULT_THRESHOLD)
+        self.assertIs(seen_aliases, aliases)
+        self.assertIs(seen_enrich, enrich)
+        self.assertEqual(seen_sources, [("store", None, True, {}, search)])
+
+    def test_only_the_unidentified_files_reach_the_text_path(self):
+        with_hit = self._text_path_calls(
+            self.pass_for(**{"7": Identified(box="north-box",
+                                             candidate=self.BOX_LEDGER,
+                                             remote_site_id="r-77")}))
+
+        self.assertEqual([call[0]["id"] for call in with_hit], ["8"])
+
+    def test_a_batch_of_nothing_asks_the_boxes_nothing(self):
+        # A run whose narrowings suppressed every file is an ordinary
+        # outcome, and asking the server for its box list in order to
+        # identify no files is a round trip spent on a question with no
+        # subject.
+        asked = []
+
+        def identify(scene_ids):
+            asked.append(list(scene_ids))
+            return FingerprintPass()
+
+        self.scan([], ScriptedSearch(self.SCRIPT), identify)
+
+        self.assertEqual(asked, [])
+
+    def test_no_identifier_at_all_leaves_the_scan_exactly_as_it_was(self):
+        search = ScriptedSearch(self.SCRIPT)
+        proposals = self.scan([scene(7, self.LEDGER_PATH)], search)
+
+        self.assertEqual(search.queries, ["Ivy Kingsley"])
+        self.assertEqual(proposals[0]["payload"]["score"], 1.0)
+        self.assertNotIn("identified by fingerprint", self.ctx.message)
+
+    # -- a box failing costs the batch nothing ----------------------------- #
+
+    def test_a_box_error_keeps_the_other_boxes_answers_and_the_text_path(self):
+        # HARM: an outage at one box that cost the batch its other
+        # identifications AND the text fallback for every file would turn one
+        # box's bad afternoon into a whole run that decided nothing.
+        def identify(scene_ids):
+            return FingerprintPass(
+                identified={"7": Identified(box="south-box",
+                                            candidate=self.BOX_LEDGER,
+                                            remote_site_id="r-77")},
+                errors=("north-box: RuntimeError: down",))
+
+        search = ScriptedSearch(self.SCRIPT)
+        proposals = self.scan(
+            [scene(7, self.LEDGER_PATH), scene(8, self.MORNING_PATH)],
+            search, identify)
+
+        by_id = {p["subject_id"]: p for p in proposals}
+        self.assertEqual(sorted(by_id), ["7", "8"])
+        self.assertEqual(by_id["7"]["payload"]["identified_by"],
+                         IDENTIFIED_BY_FINGERPRINT)
+        self.assertEqual(by_id["8"]["payload"]["score"], 1.0)
+        self.assertEqual(search.queries, ["Velvet Crane"])
+        self.assertIn("north-box: RuntimeError: down", self.ctx.message)
+
+    def test_an_identifier_that_raises_leaves_every_file_to_the_text_path(self):
+        # The pass reads the server's own box configuration, which can fail
+        # on its own. A scan that died there would lose the text path for the
+        # whole batch over an addition that only ever saves some files a
+        # lookup.
+        def identify(scene_ids):
+            raise RuntimeError("cannot read the box configuration")
+
+        search = ScriptedSearch(self.SCRIPT)
+        proposals = self.scan([scene(7, self.LEDGER_PATH)], search, identify)
+
+        self.assertEqual([p["subject_id"] for p in proposals], ["7"])
+        self.assertEqual(proposals[0]["payload"]["score"], 1.0)
+        self.assertEqual(search.queries, ["Ivy Kingsley"])
+        self.assertIn("cannot read the box configuration", self.ctx.message)
+
+    def test_the_closing_line_says_how_many_files_the_boxes_identified(self):
+        # `JobRunner` keeps only the LAST line a producer logs, so anything a
+        # person reads off a finished job has to be in this one.
+        self.scan([scene(7, self.LEDGER_PATH), scene(8, self.MORNING_PATH)],
+                  ScriptedSearch(self.SCRIPT),
+                  self.pass_for(**{"7": Identified(box="north-box",
+                                                   candidate=self.BOX_LEDGER,
+                                                   remote_site_id="r-77")}))
+
+        self.assertIn("2 proposed", self.ctx.message)
+        self.assertIn("1 identified by fingerprint", self.ctx.message)
+        # One store lookup, for the one file the boxes did not recognise.
+        self.assertIn("1 lookups", self.ctx.message)
+
+    def test_every_file_still_gets_its_own_numbered_line(self):
+        self.scan([scene(7, self.LEDGER_PATH), scene(8, self.MORNING_PATH)],
+                  ScriptedSearch(self.SCRIPT),
+                  self.pass_for(**{"7": Identified(box="north-box",
+                                                   candidate=self.BOX_LEDGER,
+                                                   remote_site_id="r-77")}))
+
+        numbered = [m for m in self.ctx.messages if m.startswith(("1/", "2/"))]
+        self.assertEqual(len(numbered), 2)
+        self.assertTrue(numbered[0].startswith("1/2 scene 7:"), numbered)
+        self.assertTrue(numbered[1].startswith("2/2 scene 8:"), numbered)
+
+    def test_an_identified_proposal_is_recorded_by_the_real_runner(self):
+        # Through `JobRunner` and the real `Store`, because a proposal with no
+        # `confidence` key at all is a shape the recording path has never been
+        # handed before -- and `record()` is where a missing field becomes a
+        # KeyError on a background thread.
+        producer = self.build(
+            [scene(7, self.LEDGER_PATH)], ScriptedSearch(self.SCRIPT),
+            self.pass_for(**{"7": Identified(box="north-box",
+                                             candidate=self.BOX_LEDGER,
+                                             remote_site_id="r-77")}))
+        runner = JobRunner(self.store)
+        runner.register(producer)
+        job = runner.start(producer.name)
+        self.assertTrue(runner.wait(job.id, WAIT))
+
+        self.assertEqual(runner.job(job.id).state, "done")
+        items = self.store.items(folder=FOLDER)
+        self.assertEqual(len(items), 1)
+        self.assertIsNone(items[0]["confidence"])
+        self.assertEqual(items[0]["payload"]["box"], "north-box")

@@ -644,3 +644,58 @@ class ApplifiedSectionRendering(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _identified_row(**over):
+    payload = {
+        "path": "/library/x/%s.mp4" % _HOSTILE,
+        "candidate": {"id": "c-1", "title": _HOSTILE, "image": None,
+                     "performers": [], "studio": None},
+        "identified_by": "fingerprint",
+        "box": _HOSTILE,
+        "remote_site_id": "r-77",
+    }
+    item = {"fingerprint": "fp-2", "state": "new", "summary": "s",
+            "confidence": None, "payload": payload, "prior_state": None,
+            "subject_id": "1"}
+    item.update(over)
+    return to_row(item)
+
+
+class IdentifiedRowRendering(unittest.TestCase):
+    """A proposal a stash-box identified renders as an identification.
+
+    The template reads `creator` and `creator_source` off every row, and
+    Jinja renders `None` as the literal text "None" rather than raising -- so
+    without a branch the page would tell a person the file was attributed to
+    "None (from the None)" and look, at a glance, exactly like a row that had
+    been resolved.
+    """
+
+    def test_the_page_names_the_box_instead_of_a_creator(self):
+        html = render("inbox.html", rows=[_identified_row()], counts={})
+        self.assertIn("identified by fingerprint", html)
+        self.assertNotIn("from the None", html)
+        self.assertNotIn(">None<", html)
+
+    def test_a_scored_row_still_names_its_creator_and_its_source(self):
+        # The other side: the branch must not swallow the ordinary row.
+        html = render("inbox.html", rows=[_row()], counts={})
+        self.assertIn("from the folder", html)
+        self.assertNotIn("identified by fingerprint", html)
+
+    def test_the_box_name_is_escaped_like_every_other_field(self):
+        html = render("inbox.html", rows=[_identified_row()], counts={})
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+    def test_an_identified_row_renders_in_every_section_that_shows_rows(self):
+        # Dismissed and Superseded render their own copy of the attribution
+        # line rather than going through `proposal_block`. A branch added to
+        # one and not the others would leave "None (from the None)" on a row
+        # that had merely been dismissed.
+        for section in ("dismissed", "superseded"):
+            html = render("inbox.html", rows=[], counts={},
+                          **{section: [_identified_row()]})
+            self.assertIn("identified by fingerprint", html, section)
+            self.assertNotIn("from the None", html, section)

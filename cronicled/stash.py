@@ -644,6 +644,110 @@ class Stash:
         data = self.gql(q, {"url": url})
         return data.get("scrapeSceneURL")
 
+    # The one field the fingerprint lookup selects that
+    # `_SCRAPED_SCENE_SELECTION` does not: the BOX's own id for the scene it
+    # recognised. It is deliberately NOT folded into the shared constant.
+    #
+    # The shared constant's own comment explains the drift it exists to
+    # prevent: `scrape_scenes_by_query` and `scrape_scene_url` feed the SAME
+    # consumer — `scan.examine`'s enrichment replaces a thin candidate from
+    # the first with a fuller record of the same object from the second — so
+    # a field present on one and absent on the other silently changes a
+    # candidate's field surface depending on which call answered. The
+    # fingerprint lookup is not in that pair: nothing ever replaces one of
+    # its results with a text-scraped one, or the reverse, so it cannot
+    # produce that drift.
+    #
+    # What adding `remote_site_id` to the shared constant WOULD do is put a
+    # `remote_site_id: None` key on every candidate a text scrape returns —
+    # a site scraper has no box id to give — which changes every proposal's
+    # payload, hence its fingerprint, hence re-proposes every file in the
+    # library once. A superset here costs nothing and is read by exactly the
+    # one caller that has a use for it.
+    _REMOTE_SITE_ID = "remote_site_id"
+
+    def stash_boxes(self):
+        """Every stash-box this server is configured against, as a list of
+        `{"name", "endpoint"}` dicts, in the order the SERVER lists them —
+        which is the operator's own configured order, and the order a caller
+        should try them in.
+
+        An install with none configured answers `[]`. That is an ordinary
+        state, not a failure: identifying a file by its fingerprints is an
+        addition to the text path, never a replacement for it, so a caller
+        with no box to ask simply has nothing to ask and falls through.
+
+        `StashBox` also carries `api_key` and `max_requests_per_minute`.
+        Neither is selected: the api key is a secret this client has no use
+        for (the server holds it and uses it on our behalf when we name the
+        endpoint), and the rate limit is the server's own business for the
+        same reason. Selecting a secret in order to throw it away would put
+        it in a response body, and in whatever ever logs one.
+        """
+        q = """
+        query{ configuration{ general{ stashBoxes{ name endpoint } } } }"""
+        general = self.gql(q)["configuration"]["general"]
+        return list(general["stashBoxes"] or [])
+
+    def scrape_scenes_by_fingerprint(self, endpoint, scene_ids):
+        """Ask ONE stash-box to identify a batch of scenes by their own
+        fingerprints, and return what it recognised for each — a list of
+        match lists, ONE PER REQUESTED SCENE, IN THE ORDER REQUESTED.
+
+        This is identity, not similarity. The server computes each scene's
+        hashes from the file itself and asks the box which scene those
+        belong to; nothing here searches for text and nothing here is
+        scored. An empty inner list is the box saying "I have never seen
+        this file", which is an ordinary answer — most files, most boxes.
+
+        `endpoint` is a configured box's own address (see `stash_boxes`),
+        passed as `ScraperSourceInput.stash_box_endpoint`. That is the same
+        source argument the text-scraping queries take, with the box half
+        supplied instead of the `scraper_id` half — which is exactly what
+        points the scene-scraping machinery at a box rather than at a site
+        scraper.
+
+        THE ORDER IS THE ONLY THING TYING A MATCH TO ITS SCENE. The reply
+        carries no scene id of its own: entry `i` is the answer for
+        `scene_ids[i]` and there is no other way to associate the two. So
+        the reply is checked to be exactly as long as the request and the
+        call FAILS if it is not, rather than being zipped against the ids
+        (which would silently truncate) or padded (which would silently
+        shift). A misalignment here writes one file's box metadata onto a
+        different file, which is the most expensive silent failure this
+        method can produce and the one thing it cannot detect after the
+        fact.
+
+        An empty `scene_ids` issues no request at all and answers `[]`: a
+        batch of nothing is not a question worth asking a box, and the
+        length check above would otherwise be comparing two empties.
+
+        The selection set is `_SCRAPED_SCENE_SELECTION` — the same fields a
+        text scrape returns, so a match can be carried into a proposal's
+        payload and applied by exactly the same code — plus
+        `remote_site_id`, the box's own id for the scene it recognised. See
+        `_REMOTE_SITE_ID` for why that one field is a superset here rather
+        than an addition to the shared constant.
+        """
+        ids = [str(scene_id) for scene_id in scene_ids]
+        if not ids:
+            return []
+        q = """
+        query($source: ScraperSourceInput!, $input: ScrapeMultiScenesInput!){
+          scrapeMultiScenes(source:$source, input:$input){%s %s}
+        }""" % (self._SCRAPED_SCENE_SELECTION, self._REMOTE_SITE_ID)
+        data = self.gql(q, {"source": {"stash_box_endpoint": endpoint},
+                            "input": {"scene_ids": ids}})
+        per_scene = data["scrapeMultiScenes"]
+        if per_scene is None or len(per_scene) != len(ids):
+            raise StashError(
+                "asked %s to identify %d scenes and it answered with %s match "
+                "lists; the reply carries no scene ids, so nothing can be "
+                "matched to the scene it belongs to"
+                % (endpoint, len(ids),
+                   "no list at all" if per_scene is None else len(per_scene)))
+        return [list(matches or []) for matches in per_scene]
+
     def scene_scrapers(self):
         """The configured scrapers that can scrape a scene, as a list of
         `{"id", "name"}` dicts — enough for a caller to tell an operator
