@@ -1,7 +1,14 @@
 name: ci
 on:
   push:
-    branches: [main]
+    # Every branch, not just the default one: a feature branch pushed to
+    # the public remote is public the moment it lands there, and a pull
+    # request is not guaranteed to exist yet to bring it through the guard.
+    # The jobs below that must stay confined to the default branch (the
+    # docs deploy, the image publish) already gate themselves on
+    # `github.ref == 'refs/heads/main'` explicitly, so widening the trigger
+    # here does not widen what they do.
+    branches: ["**"]
     # Release tags publish a version-tagged image as well as the SHA-tagged
     # one. The publish job checks the tag against the declared version rather
     # than trusting the tag name.
