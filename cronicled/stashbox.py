@@ -227,9 +227,18 @@ def listing_verdict(listing, decision, *, performer_id, attribution_certain=True
     fix.
     `attribution_certain` says whether the performer whose listing was read is
     agreed to be this file's creator — a caller working from
-    `cronicled.artist.resolve` computes it as `resolution.competing is None`,
-    the resolver's own report that the folder and the filename did not name
-    different people.
+    `cronicled.artist.resolve` computes it as `resolution.competing is None
+    and resolution.rejected_folder is None`. `competing` is the resolver's
+    report that the folder and the filename did not name different people;
+    `rejected_folder` is its report that the folder's own text never
+    competed at all because a guard threw it out first. That second signal
+    matters here for the same reason the first one does: `_is_name`'s guards
+    are heuristics tuned against real filing conventions, not a proof that
+    the rejected text names nobody, so an attribution resting on the
+    filename after the folder was thrown out is not the same as the folder
+    and the filename having been checked and found to agree. Reading only
+    `competing` treats the two as the same thing and calls the weaker one
+    settled.
 
     The strongest thing obtainable here is *this source does not list it*. It
     is worth obtaining: a scorer must always pick a winner from what it is
@@ -379,10 +388,14 @@ def check(box, performer_id, name, folder, resolution, *,
     `resolution` is the `cronicled.artist.Resolution` that named
     `performer_id`'s creator. Its `name` is subtracted from the evidence the
     same way `cronicled.scan.examine` subtracts it before scoring (see
-    `scoring.score`'s `artist` argument), and its `competing` is read exactly
-    the way `listing_verdict` documents: `None` means the attribution is
-    settled, anything else means the folder and the filename named different
-    people and the listing being enumerated may not even be this file's
+    `scoring.score`'s `artist` argument), and its `competing` and
+    `rejected_folder` are read together exactly the way `listing_verdict`
+    documents: both `None` means the attribution is settled; a `competing`
+    name means the folder and the filename named different people; a
+    `rejected_folder` means the folder had text at all but a guard -- not a
+    check against evidence -- is why it did not win, which is not the same
+    as the folder having agreed. Either one downgrades the claim, because in
+    either case the listing being enumerated may not even be this file's
     creator's.
 
     Returns a `Verdict` -- see `listing_verdict` for the whole of what
@@ -410,7 +423,13 @@ def check(box, performer_id, name, folder, resolution, *,
                      artist=resolution.name)
                for scene in listing.scenes]
     decision = decide(matches, threshold)
-    attribution_certain = resolution.competing is None
+    # Both signals, not just the one a competing NAME sets: a folder whose
+    # text a guard threw out never competed either, and the guard is a
+    # heuristic, not a check against evidence -- see `listing_verdict`'s own
+    # docstring for why treating that as settled is the same mistake as
+    # ignoring `competing` outright.
+    attribution_certain = (resolution.competing is None
+                           and resolution.rejected_folder is None)
     return listing_verdict(listing, decision, performer_id=performer_id,
                            attribution_certain=attribution_certain)
 

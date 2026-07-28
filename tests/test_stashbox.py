@@ -1099,6 +1099,28 @@ class Check(unittest.TestCase):
 
         self.assertIs(verdict.unlisted, True)
 
+    def test_a_rejected_folder_can_never_be_used_as_though_settled(self):
+        # `competing` is only set when the folder WON and a differing
+        # filename candidate existed. It stays None when the folder's own
+        # text never competed at all -- thrown out by a guard, not checked
+        # against evidence -- and the filename resolved on its own. A guard
+        # is a heuristic tuned against real filing conventions, not a proof
+        # that the rejected text names nobody, so this is not the same as
+        # the folder and the filename having been compared and agreeing.
+        # Reading only `competing` would call this settled.
+        t = _transport([_page(1, [{"id": "s1", "title": "A Totally Different Scene"}])])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        verdict = check(box, "pf-performer", "Velvet Crane - Morning Ritual.mp4",
+                        "2023 September 11",
+                        Resolution(name="Velvet Crane", source="filename",
+                                  competing=None,
+                                  rejected_folder="2023 September 11"))
+
+        self.assertIsNone(verdict.unlisted)
+        self.assertIsNot(verdict.unlisted, True)
+        self.assertIn("different creators", verdict.reason)
+
     def test_the_resolved_name_is_subtracted_as_artist_evidence(self):
         # A file named after nobody but its own creator must not read as a
         # match on the creator's name alone -- the same zero-evidence rule
