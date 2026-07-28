@@ -131,6 +131,71 @@ class Scoring(unittest.TestCase):
         m = score("clip01.mp4", "Morning Ritual", "Morning Ritual")
         self.assertGreater(m.value, 0.8)
 
+    def test_a_folder_naming_only_the_artist_is_not_scored_as_a_view(self):
+        # A folder that says nothing but the creator's name is the same
+        # fact `_evidence` already treats as no evidence at all -- every file
+        # of theirs carries it. Scored as a raw string it is not: "Velvet
+        # Crane" resembles a title that happens to mention Velvet Crane
+        # (studios routinely credit the performer in the title) regardless
+        # of which file is asked, which is exactly ticket #96's bug. The
+        # fix must make an artist-only folder score IDENTICALLY to no
+        # folder at all, not merely differently from before.
+        artist = "Velvet Crane"
+        title = "Garden Sessions"
+        name = "clip04.mp4"
+        artist_only_folder = score(name, "Velvet Crane", title, artist=artist)
+        no_folder = score(name, "", title, artist=artist)
+        self.assertEqual(artist_only_folder, no_folder)
+
+    def test_a_folder_with_real_evidence_still_contributes(self):
+        # The other half: a folder is not always noise. One naming a real
+        # collection adds tokens the filename does not have, and that is
+        # evidence in its own right -- dropping the folder view outright
+        # (rather than only when it reduces to the artist's name) would
+        # throw this away too.
+        artist = "Velvet Crane"
+        title = "Garden Sessions"
+        name = "clip04.mp4"
+        with_collection = score(name, "Velvet Crane - Garden Sessions", title,
+                                artist=artist)
+        artist_only_folder = score(name, "Velvet Crane", title, artist=artist)
+        self.assertGreater(with_collection.value, artist_only_folder.value)
+        self.assertGreater(with_collection.value, 0.5)
+
+    def test_a_folder_of_nothing_but_stopwords_is_not_scored_as_a_view(self):
+        # A folder can reduce to nothing without being empty: "The Of And"
+        # is a non-empty string but every token in it is a stopword, so it
+        # carries the same amount of real evidence an empty folder does --
+        # none. It must be barred from standalone scoring for the same
+        # reason an artist-only folder is, and checked separately because a
+        # fix keyed only off "the folder has no tokens at all" (an empty
+        # string) would still let a pure-stopword folder through: `tokens()`
+        # drops stopwords, but `clean_folder` does not, so the raw string
+        # scored here is not empty even though it says nothing.
+        name = "clip.mp4"
+        folder = "The Of And"
+        title = "The Of And Backyard Evening"
+        with_folder = score(name, folder, title)
+        no_folder = score(name, "", title)
+        self.assertEqual(with_folder, no_folder)
+
+    def test_two_files_in_one_creators_folder_no_longer_score_identically(self):
+        # The bug itself: `max([stripped_name, cleaned_folder])` let a folder
+        # that is just the creator's name outscore every filename in it,
+        # identically, whenever a candidate title happened to mention that
+        # creator. Two DIFFERENT files, same folder, same candidate: the
+        # scores must differ, and neither may land anywhere near what the
+        # folder alone used to hand out (0.86 here, verified against the
+        # pre-fix arithmetic).
+        artist = "Velvet Crane"
+        folder = "Velvet Crane"
+        title = "Velvet Crane Presents A Night Out"
+        a = score("Morning Song.mp4", folder, title, artist=artist)
+        b = score("River Talk.mp4", folder, title, artist=artist)
+        self.assertNotEqual(a.value, b.value)
+        self.assertLess(a.value, 0.5)
+        self.assertLess(b.value, 0.5)
+
     def test_containment_is_reported(self):
         m = score("Morning Ritual.mp4", "", "Morning Ritual At Dawn")
         self.assertTrue(m.contained)
