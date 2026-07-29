@@ -1202,11 +1202,20 @@ class Identified:
     `ScrapedScene` it returned, the same shape a text scrape produces, so it
     can be carried into a payload and applied by the same code.
 
+    `endpoint` is that same box's URL, and it is REQUIRED — no default, on
+    the same terms every other field here that a write depends on. `box` is
+    a name a person reads; a `stash_ids` link is `{endpoint, stash_id}`, so
+    the endpoint is the only half of the box's identity the link can be made
+    from. It was in hand at lookup time and dropped, and the whole of the
+    link was lost with it.
+
     `remote_site_id` is that box's own id for the scene, kept because it is
     the only thing that makes two boxes' answers COMPARABLE — see
-    `_resolve_claims`. It may be `None`: a box that recognised the file but
-    named no id has still identified it, and nothing downstream needs the id
-    to record or apply the match.
+    `_resolve_claims` — and because it is the other half of the link. It may
+    be `None`: a box that recognised the file but named no id has still
+    identified it, and nothing downstream needs the id to record or apply the
+    match. What such an identification must NOT produce is a link to
+    nothing; see `catalogue_link`.
 
     `agreeing` names the other boxes that returned the SAME
     `remote_site_id`. Agreement is not a disagreement to report, but it is
@@ -1214,6 +1223,7 @@ class Identified:
     """
     box: str
     candidate: dict
+    endpoint: str
     remote_site_id: str = None
     agreeing: tuple = ()
 
@@ -1255,7 +1265,7 @@ class FingerprintPass:
 
 
 def _resolve_claims(claims):
-    """What a file's collected `(box_name, match)` claims amount to.
+    """What a file's collected `(box_name, endpoint, match)` claims amount to.
 
     `None` when nothing recognised it, an `Identified` when the claims all
     name one scene, a `Conflict` when they do not.
@@ -1281,19 +1291,20 @@ def _resolve_claims(claims):
     """
     if not claims:
         return None
-    first_box, first_match = claims[0]
-    ids = [match.get("remote_site_id") for _, match in claims]
+    first_box, first_endpoint, first_match = claims[0]
+    ids = [match.get("remote_site_id") for _, _, match in claims]
     if len(claims) == 1:
         return Identified(box=first_box, candidate=first_match,
-                          remote_site_id=ids[0])
+                          endpoint=first_endpoint, remote_site_id=ids[0])
     if None in ids or len(set(ids)) != 1:
         return Conflict(claims=tuple(
             (box, match.get("remote_site_id"), match)
-            for box, match in claims))
-    agreeing = tuple(dict.fromkeys(box for box, _ in claims[1:]
+            for box, _, match in claims))
+    agreeing = tuple(dict.fromkeys(box for box, _, _ in claims[1:]
                                    if box != first_box))
     return Identified(box=first_box, candidate=first_match,
-                      remote_site_id=ids[0], agreeing=agreeing)
+                      endpoint=first_endpoint, remote_site_id=ids[0],
+                      agreeing=agreeing)
 
 
 def identify_by_fingerprint(scene_ids, *, boxes, lookup):
@@ -1330,8 +1341,9 @@ def identify_by_fingerprint(scene_ids, *, boxes, lookup):
     errors = []
     for box in boxes:
         name = box["name"]
+        endpoint = box["endpoint"]
         try:
-            per_scene = lookup(box["endpoint"], scene_ids)
+            per_scene = lookup(endpoint, scene_ids)
         except Exception as exc:
             errors.append("%s: %s: %s" % (name, type(exc).__name__, exc))
             continue
@@ -1343,7 +1355,12 @@ def identify_by_fingerprint(scene_ids, *, boxes, lookup):
             continue
         for scene_id, matches in zip(scene_ids, per_scene):
             for match in matches:
-                claims[scene_id].append((name, match))
+                # The endpoint is kept beside the name, not instead of it:
+                # the name is what a person reads on the row, and the
+                # endpoint is the half of the box's identity a
+                # `stash_ids` link is made of. Keeping only the name is
+                # how the link came to be dropped.
+                claims[scene_id].append((name, endpoint, match))
 
     identified = {}
     for scene_id in scene_ids:
@@ -1402,6 +1419,11 @@ def fingerprint_outcome(scene, identification, *, folder):
         "candidate": candidate,
         "identified_by": IDENTIFIED_BY_FINGERPRINT,
         "box": identification.box,
+        # Beside the name, never instead of it. The name is what the row
+        # shows a person; the endpoint is what `catalogue_link` needs to
+        # make the `{endpoint, stash_id}` pair an apply writes. A payload
+        # carrying only the name can be read but cannot be linked.
+        "endpoint": identification.endpoint,
         "remote_site_id": identification.remote_site_id,
     }
     summary = '%s -> "%s" identified by fingerprint (%s)' % (
@@ -1425,6 +1447,38 @@ def fingerprint_outcome(scene, identification, *, folder):
         },
         reason=summary,
     )
+
+
+def catalogue_link(payload):
+    """The `{endpoint, stash_id}` pair a proposal's payload stands for, or
+    `None` when it names no link to make.
+
+    This is the one case where the link between a file and a catalogue can
+    be written with certainty rather than inferred: a box hashed the actual
+    bytes and answered with its own id for them, so the pair is (the box we
+    asked, the id it returned) — not something read back out of a scrape and
+    hoped to be about the same scene.
+
+    BOTH halves are required and both are read with `.get`, because three
+    different payloads legitimately reach here:
+
+    - a scored, text-matched proposal, which has neither key. A site scraper
+      is not a catalogue endpoint and returns no such id, so there is
+      nothing to link and `None` is the whole answer.
+    - a fingerprint-identified proposal whose box named no id. That box has
+      still identified the file, and the proposal is still worth applying —
+      but a link to nothing is not a weaker link, it is a wrong one, and
+      uncertainty here may withhold evidence and never supply it.
+    - a fingerprint-identified proposal recorded BEFORE the endpoint was
+      kept, which names an id and no endpoint at all. There is no endpoint
+      to guess from the box's name (nothing maps one to the other after the
+      fact), and half a link is not a link.
+    """
+    endpoint = payload.get("endpoint")
+    stash_id = payload.get("remote_site_id")
+    if not endpoint or not stash_id:
+        return None
+    return {"endpoint": endpoint, "stash_id": stash_id}
 
 
 # --- Running a batch -------------------------------------------------------

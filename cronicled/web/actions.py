@@ -9,6 +9,7 @@ job runner directly and grow another kind of write nobody reviewed.
 from cronicled import tags
 from cronicled.descriptions import SUBJECT_TYPE as DESCRIPTION_SUBJECT
 from cronicled.runscan import build_producer
+from cronicled.scan import catalogue_link
 from cronicled.web.rows import carries_cover
 
 
@@ -40,6 +41,30 @@ _NO_STASH = ("no media server is configured -- start cronicled with "
 _COVER_NOT_RESTORED = ("reverted -- except the cover image, which cannot be "
                        "restored (Stash.apply_scene's undo snapshot has no "
                        "way to represent a scene's prior cover)")
+
+
+def _match_to_apply(payload):
+    """The scene metadata to write, which is the proposal's candidate plus
+    the catalogue link the payload stands for.
+
+    Built HERE, at apply time, out of the two fields the payload already
+    carries for a person to read (`endpoint` and `remote_site_id`) rather
+    than stored a third time when the proposal was made. One fact, one
+    representation: a stored copy of the pair could disagree with the fields
+    beside it, and nothing would ever notice which of them was right.
+
+    A link the candidate ALREADY carries is kept and the new one appended,
+    never replaced. A site scraper does not return one today (see
+    `scan.catalogue_link`), but if one ever does, dropping it here would
+    silently discard a link the proposal was made with. `apply_scene` is the
+    single authority on what happens when two entries name one endpoint.
+    """
+    candidate = payload["candidate"]
+    link = catalogue_link(payload)
+    if link is None:
+        return candidate
+    return dict(candidate,
+                stash_ids=list(candidate.get("stash_ids") or ()) + [link])
 
 
 class Actions:
@@ -107,7 +132,7 @@ class Actions:
                     expected=payload["original"])
             else:
                 result = self._stash.apply_scene(
-                    subject_id, item["payload"]["candidate"])
+                    subject_id, _match_to_apply(item["payload"]))
         except Exception as exc:
             # Recorded as failed, never as applied: an applied row offers an
             # undo, and an undo of a write that never happened would restore

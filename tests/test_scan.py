@@ -43,7 +43,7 @@ from cronicled.jobs import COST_CLASS_LIMITS, JobRunner
 from cronicled.scan import (
     Conflict, Counts, DEFAULT_THRESHOLD, FingerprintPass, IDENTIFIED_BY_FINGERPRINT, Identified,
     MAX_RUNNERS_UP, MUTE_NO_CANDIDATES, MUTE_UNRESOLVED_CREATOR, Outcome,
-    ScanProducer, Source, SUBJECT_TYPE, _SingleFlight, examine,
+    ScanProducer, Source, SUBJECT_TYPE, _SingleFlight, catalogue_link, examine,
     examine_sources, fingerprint_outcome, identify_by_fingerprint, select,
 )
 from cronicled.scoring import title_view
@@ -3324,6 +3324,24 @@ def box_match(title, remote_site_id, **over):
     return row
 
 
+BOXES_BY_NAME = {box["name"]: box for box in (NORTH, SOUTH)}
+
+
+def identified(box, **over):
+    """An `Identified` as `identify_by_fingerprint` builds one: the box's
+    NAME and that same box's ENDPOINT, never one without the other.
+
+    Written as a helper rather than repeated at every call site because the
+    endpoint is not optional -- `Identified` has no default for it, so an
+    identification that cannot say which endpoint recognised the file cannot
+    be constructed at all, here or in production. The endpoint is looked up
+    from the box fixture BY NAME, so an expectation always names the endpoint
+    belonging to the box it names: a production path carrying some OTHER
+    box's endpoint forward would differ from it.
+    """
+    return Identified(box=box, endpoint=BOXES_BY_NAME[box]["endpoint"], **over)
+
+
 class ScriptedBoxes:
     """The injected `lookup`: answers each box's whole batch from a script,
     and remembers every call in the order it was made.
@@ -3383,10 +3401,10 @@ class IdentifyByFingerprintTest(unittest.TestCase):
 
         self.assertEqual(sorted(result.identified), ["2", "3"])
         self.assertEqual(result.identified["2"],
-                         Identified(box="north-box", candidate=self.LEDGER,
+                         identified(box="north-box", candidate=self.LEDGER,
                                     remote_site_id="r-77"))
         self.assertEqual(result.identified["3"],
-                         Identified(box="north-box", candidate=self.MORNING,
+                         identified(box="north-box", candidate=self.MORNING,
                                     remote_site_id="r-12"))
 
     def test_a_scene_no_box_recognised_is_simply_absent(self):
@@ -3398,6 +3416,36 @@ class IdentifyByFingerprintTest(unittest.TestCase):
 
         self.assertEqual(result.identified, {})
         self.assertEqual(result.errors, ())
+
+    def test_each_identification_carries_the_endpoint_of_the_box_that_answered(self):
+        # HARM: the endpoint is the only half of a box's identity a
+        # `stash_ids` link can be made from, so carrying the wrong one links
+        # the file to a catalogue that never saw it -- and that link is
+        # written with the confidence of a hash match.
+        #
+        # The two boxes answer for DIFFERENT files, so an implementation that
+        # reached for the configured list rather than for the box that
+        # actually answered would give scene 2 north's endpoint.
+        lookup = ScriptedBoxes({NORTH["endpoint"]: {"1": [self.LEDGER]},
+                                SOUTH["endpoint"]: {"2": [self.MORNING]}})
+        result = identify_by_fingerprint(["1", "2"], boxes=[NORTH, SOUTH],
+                                         lookup=lookup)
+
+        self.assertNotEqual(NORTH["endpoint"], SOUTH["endpoint"])
+        self.assertEqual(result.identified["1"].endpoint, NORTH["endpoint"])
+        self.assertEqual(result.identified["2"].endpoint, SOUTH["endpoint"])
+
+    def test_an_identification_names_the_box_and_its_own_endpoint_together(self):
+        # The name and the endpoint have to describe ONE box: the name is
+        # what a person reads on the row and the endpoint is what the link is
+        # made from, so a pairing that crossed them would show a reviewer one
+        # catalogue and write the link to another.
+        lookup = ScriptedBoxes({SOUTH["endpoint"]: {"1": [self.LEDGER]}})
+        result = identify_by_fingerprint(["1"], boxes=[NORTH, SOUTH],
+                                         lookup=lookup)
+
+        self.assertEqual(result.identified["1"].box, SOUTH["name"])
+        self.assertEqual(result.identified["1"].endpoint, SOUTH["endpoint"])
 
     def test_no_boxes_configured_asks_nobody_and_identifies_nothing(self):
         lookup = ScriptedBoxes()
@@ -3414,7 +3462,7 @@ class IdentifyByFingerprintTest(unittest.TestCase):
                                          lookup=lookup)
 
         self.assertEqual(result.identified["1"],
-                         Identified(box="north-box", candidate=self.LEDGER,
+                         identified(box="north-box", candidate=self.LEDGER,
                                     remote_site_id="r-77",
                                     agreeing=("south-box",)))
 
@@ -3453,7 +3501,7 @@ class IdentifyByFingerprintTest(unittest.TestCase):
         result = identify_by_fingerprint(["1"], boxes=[NORTH], lookup=lookup)
 
         self.assertEqual(result.identified["1"],
-                         Identified(box="north-box", candidate=anonymous,
+                         identified(box="north-box", candidate=anonymous,
                                     remote_site_id=None))
 
     def test_one_box_returning_two_different_scenes_is_a_conflict_too(self):
@@ -3473,7 +3521,7 @@ class IdentifyByFingerprintTest(unittest.TestCase):
                                          lookup=lookup)
 
         self.assertEqual(result.identified["1"],
-                         Identified(box="south-box", candidate=self.LEDGER,
+                         identified(box="south-box", candidate=self.LEDGER,
                                     remote_site_id="r-77"))
         self.assertNotIn("2", result.identified)
         self.assertEqual(result.errors,
@@ -3491,7 +3539,7 @@ class IdentifyByFingerprintTest(unittest.TestCase):
 
         self.assertNotIn("1", result.identified)
         self.assertEqual(result.identified["2"],
-                         Identified(box="south-box", candidate=self.MORNING,
+                         identified(box="south-box", candidate=self.MORNING,
                                     remote_site_id="r-12"))
         self.assertEqual(len(result.errors), 1)
         self.assertIn("north-box", result.errors[0])
@@ -3523,7 +3571,7 @@ class FingerprintOutcomeTest(unittest.TestCase):
         # `confidence` added here is a number nothing computed, which the row
         # view, the threshold control and the runners-up display would every
         # one of them read as the scorer's own output.
-        outcome = self.outcome(Identified(box="north-box",
+        outcome = self.outcome(identified(box="north-box",
                                           candidate=self.LEDGER,
                                           remote_site_id="r-77"))
 
@@ -3538,6 +3586,7 @@ class FingerprintOutcomeTest(unittest.TestCase):
                 "candidate": self.LEDGER,
                 "identified_by": IDENTIFIED_BY_FINGERPRINT,
                 "box": "north-box",
+                "endpoint": NORTH["endpoint"],
                 "remote_site_id": "r-77",
             },
         })
@@ -3547,7 +3596,7 @@ class FingerprintOutcomeTest(unittest.TestCase):
         # above being rewritten: nothing a scorer produces may appear on a
         # proposal nothing scored.
         proposal = self.outcome(
-            Identified(box="north-box", candidate=self.LEDGER,
+            identified(box="north-box", candidate=self.LEDGER,
                        remote_site_id="r-77")).proposal
 
         self.assertNotIn("confidence", proposal)
@@ -3558,7 +3607,7 @@ class FingerprintOutcomeTest(unittest.TestCase):
 
     def test_agreeing_boxes_are_recorded_beside_the_one_carried_forward(self):
         outcome = self.outcome(
-            Identified(box="north-box", candidate=self.LEDGER,
+            identified(box="north-box", candidate=self.LEDGER,
                        remote_site_id="r-77", agreeing=("south-box",)))
 
         self.assertEqual(outcome.proposal["payload"]["agreeing_boxes"],
@@ -3588,6 +3637,68 @@ class FingerprintOutcomeTest(unittest.TestCase):
             ("south-box", "r-12", box_match("Morning Ritual", "r-12")))))
 
         self.assertIsNone(outcome.mute_reason)
+
+
+class CatalogueLinkTest(unittest.TestCase):
+    """The `{endpoint, stash_id}` pair a payload stands for.
+
+    Every payload here is built by `fingerprint_outcome` rather than written
+    out by hand, except where the point IS a payload of another shape. The
+    producer and the reader have to agree about which keys carry the endpoint
+    and the id, and a hand-written payload could only ever show that this
+    function agrees with itself.
+    """
+
+    PATH = "/library/Ivy Kingsley/Winter Ledger.mp4"
+
+    def payload_for(self, remote_site_id, box="north-box"):
+        return fingerprint_outcome(
+            scene(7, self.PATH),
+            identified(box=box,
+                       candidate=box_match("Winter Ledger", remote_site_id),
+                       remote_site_id=remote_site_id),
+            folder=FOLDER).proposal["payload"]
+
+    def test_the_pair_is_the_box_asked_and_the_id_it_returned(self):
+        # This is the one link that can be written with certainty rather than
+        # inferred: the box hashed the actual bytes and answered with its own
+        # id for them.
+        self.assertEqual(catalogue_link(self.payload_for("r-77")),
+                         {"endpoint": NORTH["endpoint"], "stash_id": "r-77"})
+
+    def test_the_pair_names_the_endpoint_of_the_box_that_identified_it(self):
+        # Two boxes, one payload each: a link built from a fixed endpoint,
+        # or from the first configured box, would be identical for both.
+        self.assertEqual(catalogue_link(self.payload_for("r-77", "south-box")),
+                         {"endpoint": SOUTH["endpoint"], "stash_id": "r-77"})
+
+    def test_a_box_that_named_no_id_stands_for_no_link_at_all(self):
+        # HARM: a box that recognised the file but named no id has still
+        # identified it, and the proposal is still worth applying -- but an
+        # entry with a null id is not a weaker link, it is a wrong one.
+        # Uncertainty may withhold evidence and never supply it.
+        self.assertIsNone(catalogue_link(self.payload_for(None)))
+
+    def test_a_payload_that_names_no_endpoint_stands_for_no_link(self):
+        # Every proposal recorded before the endpoint was kept carries the
+        # box's NAME and its id and no endpoint at all. Nothing maps a name
+        # back to an endpoint after the fact, and half a link is not a link.
+        payload = dict(self.payload_for("r-77"))
+        del payload["endpoint"]
+
+        self.assertIsNone(catalogue_link(payload))
+
+    def test_a_text_scored_payload_stands_for_no_link(self):
+        # A site scraper is not a catalogue endpoint and returns no such id,
+        # so a scored proposal carries neither key. Its payload is the one
+        # here that is NOT built by `fingerprint_outcome`, because the point
+        # is precisely that it came from the other producer. Indexing rather
+        # than `.get` here would raise on every scored proposal in the inbox,
+        # which is most of them.
+        self.assertIsNone(catalogue_link(
+            {"path": self.PATH, "creator": {"name": "Ivy Kingsley"},
+             "candidate": {"title": "Winter Ledger"}, "score": 0.9,
+             "runners_up": []}))
 
 
 class ScanProducerFingerprintTest(unittest.TestCase):
@@ -3645,7 +3756,7 @@ class ScanProducerFingerprintTest(unittest.TestCase):
         search = ScriptedSearch(self.SCRIPT)
         proposals = self.scan(
             [scene(7, self.LEDGER_PATH)], search,
-            self.pass_for(**{"7": Identified(box="north-box",
+            self.pass_for(**{"7": identified(box="north-box",
                                              candidate=self.BOX_LEDGER,
                                              remote_site_id="r-77")}))
 
@@ -3662,7 +3773,7 @@ class ScanProducerFingerprintTest(unittest.TestCase):
         def identify(scene_ids):
             order.append("identify")
             return FingerprintPass(identified={
-                "7": Identified(box="north-box", candidate=self.BOX_LEDGER,
+                "7": identified(box="north-box", candidate=self.BOX_LEDGER,
                                 remote_site_id="r-77")})
 
         def search(query):
@@ -3737,7 +3848,7 @@ class ScanProducerFingerprintTest(unittest.TestCase):
         shared = (Aliases({}), FakeEnrich(), ScriptedSearch(self.SCRIPT))
         without = self._text_path_calls(None, shared)
         with_pass = self._text_path_calls(
-            self.pass_for(**{"9": Identified(box="north-box",
+            self.pass_for(**{"9": identified(box="north-box",
                                              candidate=self.BOX_LEDGER,
                                              remote_site_id="r-77")}),
             shared)
@@ -3755,7 +3866,7 @@ class ScanProducerFingerprintTest(unittest.TestCase):
         aliases, enrich, search = (Aliases({}), FakeEnrich(),
                                    ScriptedSearch(self.SCRIPT))
         calls = self._text_path_calls(
-            self.pass_for(**{"7": Identified(box="north-box",
+            self.pass_for(**{"7": identified(box="north-box",
                                              candidate=self.BOX_LEDGER,
                                              remote_site_id="r-77")}),
             (aliases, enrich, search))
@@ -3774,7 +3885,7 @@ class ScanProducerFingerprintTest(unittest.TestCase):
 
     def test_only_the_unidentified_files_reach_the_text_path(self):
         with_hit = self._text_path_calls(
-            self.pass_for(**{"7": Identified(box="north-box",
+            self.pass_for(**{"7": identified(box="north-box",
                                              candidate=self.BOX_LEDGER,
                                              remote_site_id="r-77")}))
 
@@ -3811,7 +3922,7 @@ class ScanProducerFingerprintTest(unittest.TestCase):
         # box's bad afternoon into a whole run that decided nothing.
         def identify(scene_ids):
             return FingerprintPass(
-                identified={"7": Identified(box="south-box",
+                identified={"7": identified(box="south-box",
                                             candidate=self.BOX_LEDGER,
                                             remote_site_id="r-77")},
                 errors=("north-box: RuntimeError: down",))
@@ -3850,7 +3961,7 @@ class ScanProducerFingerprintTest(unittest.TestCase):
         # person reads off a finished job has to be in this one.
         self.scan([scene(7, self.LEDGER_PATH), scene(8, self.MORNING_PATH)],
                   ScriptedSearch(self.SCRIPT),
-                  self.pass_for(**{"7": Identified(box="north-box",
+                  self.pass_for(**{"7": identified(box="north-box",
                                                    candidate=self.BOX_LEDGER,
                                                    remote_site_id="r-77")}))
 
@@ -3862,7 +3973,7 @@ class ScanProducerFingerprintTest(unittest.TestCase):
     def test_every_file_still_gets_its_own_numbered_line(self):
         self.scan([scene(7, self.LEDGER_PATH), scene(8, self.MORNING_PATH)],
                   ScriptedSearch(self.SCRIPT),
-                  self.pass_for(**{"7": Identified(box="north-box",
+                  self.pass_for(**{"7": identified(box="north-box",
                                                    candidate=self.BOX_LEDGER,
                                                    remote_site_id="r-77")}))
 
@@ -3878,7 +3989,7 @@ class ScanProducerFingerprintTest(unittest.TestCase):
         # KeyError on a background thread.
         producer = self.build(
             [scene(7, self.LEDGER_PATH)], ScriptedSearch(self.SCRIPT),
-            self.pass_for(**{"7": Identified(box="north-box",
+            self.pass_for(**{"7": identified(box="north-box",
                                              candidate=self.BOX_LEDGER,
                                              remote_site_id="r-77")}))
         runner = JobRunner(self.store)

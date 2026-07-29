@@ -330,6 +330,12 @@ class _SceneTransport:
         self.found = found or {}
         self.create = create or {}
         self.scene_update_input = None
+        # Every query body sent, in order. `scene_update_input` records only
+        # the final write, so it cannot tell "nothing was written" from
+        # "nothing was written AND nothing was created on the way there" --
+        # and an entity created for an apply that then refused is rubbish
+        # left on the server for a proposal nobody approved.
+        self.queries = []
         # the variables of every findScene read, in order: the apply's merge
         # and its undo snapshot both come from that read, so WHICH scene it
         # asked about is part of what a test needs to be able to see
@@ -337,6 +343,7 @@ class _SceneTransport:
 
     def __call__(self, body, timeout):
         q = body["query"]
+        self.queries.append(q)
         if "findScene(" in q:
             self.scene_read_variables.append(body["variables"])
             return {"data": {"findScene": self.existing}}
@@ -679,6 +686,189 @@ class SkipOrRaiseTurnsOnTheFlag(unittest.TestCase):
         self.assertTrue(ctx.exception.transient)
         self.assertIsNone(trans_t.scene_update_input,
                           "a transient failure must write nothing at all")
+
+
+# -- catalogue links ------------------------------------------------------- #
+#
+# Invented endpoints. `.invalid` is reserved by RFC 2606 and can never
+# resolve, so nothing here can reach a real catalogue even by accident.
+
+CATALOGUE = "https://one.example.invalid/graphql"
+OTHER_CATALOGUE = "https://two.example.invalid/graphql"
+
+LINK = {"endpoint": CATALOGUE, "stash_id": "r-77"}
+OTHER_LINK = {"endpoint": OTHER_CATALOGUE, "stash_id": "r-31"}
+# The same catalogue naming a DIFFERENT scene -- the disagreement, not a
+# second link.
+CLASHING_LINK = {"endpoint": CATALOGUE, "stash_id": "r-99"}
+
+
+def _linkable_scene(stash_ids):
+    return {"id": "1", "studio": None, "performers": [], "tags": [],
+            "stash_ids": list(stash_ids)}
+
+
+class CatalogueLinkWrite(unittest.TestCase):
+    """What `apply_scene` sends when the match carries a `{endpoint,
+    stash_id}` link, and what it refuses to send."""
+
+    def apply(self, existing_links, match, create=None):
+        t = _SceneTransport(_linkable_scene(existing_links), create=create)
+        Stash("http://example.test", "k", transport=t).apply_scene("1", match)
+        return t
+
+    def test_the_link_is_written_and_the_whole_update_input_is_this(self):
+        # Asserted as ONE whole dict, never key by key. A field slipped into
+        # a scene update past a green suite has already happened on this
+        # project once, and `rating100` unlisted here would blank the rating
+        # on every scene an apply touches.
+        t = self.apply([], {"title": "Winter Ledger", "stash_ids": [LINK]})
+
+        self.assertEqual(t.scene_update_input,
+                         {"id": "1", "organized": True,
+                          "title": "Winter Ledger", "stash_ids": [LINK]})
+
+    def test_a_match_with_no_link_writes_no_stash_ids_key_at_all(self):
+        # The whole input again: "no link" has to mean the key is absent, not
+        # present and empty. An empty list is a WRITE -- sceneUpdate replaces
+        # the list it is sent -- so writing one would delete whatever links
+        # the scene already had, on every apply that had none to add.
+        t = self.apply([OTHER_LINK], {"title": "Winter Ledger"})
+
+        self.assertEqual(t.scene_update_input,
+                         {"id": "1", "organized": True,
+                          "title": "Winter Ledger"})
+
+    def test_a_link_from_another_catalogue_survives_the_write(self):
+        # HARM: sceneUpdate REPLACES the whole list, so sending only the new
+        # pair deletes every link this tool did not make -- silently, and on
+        # a scene the row says was merely enriched. A fixture starting from a
+        # scene with no links could not tell a merge from a replace at all.
+        t = self.apply([OTHER_LINK], {"stash_ids": [LINK]})
+
+        self.assertEqual(t.scene_update_input,
+                         {"id": "1", "organized": True,
+                          "stash_ids": [OTHER_LINK, LINK]})
+
+    def test_the_same_link_already_present_is_written_back_once(self):
+        # The permissive side of the guard, which a refusal-only test leaves
+        # open: the same catalogue naming the SAME scene is agreement, and
+        # re-applying a proposal must not start refusing because the link it
+        # writes is already there. Nor may it duplicate the entry.
+        t = self.apply([LINK], {"stash_ids": [LINK]})
+
+        self.assertEqual(t.scene_update_input,
+                         {"id": "1", "organized": True, "stash_ids": [LINK]})
+
+    def test_the_same_catalogue_naming_a_different_scene_is_refused(self):
+        # HARM: overwriting here settles, by whoever wrote last, a
+        # disagreement between the media server and the catalogue about which
+        # scene this file IS -- and a wrong link is the corrupted record
+        # nobody notices, because the row reads as applied and the scene
+        # reads as catalogued. Both ids have to reach the person who has to
+        # go and look at the two.
+        t = _SceneTransport(_linkable_scene([CLASHING_LINK]))
+        with self.assertRaises(StashError) as ctx:
+            Stash("http://example.test", "k", transport=t).apply_scene(
+                "1", {"title": "Winter Ledger", "stash_ids": [LINK]})
+
+        for fragment in (CATALOGUE, "r-99", "r-77"):
+            self.assertIn(fragment, str(ctx.exception))
+        self.assertFalse(ctx.exception.transient,
+                         "a retry cannot make the two sources agree")
+        self.assertIsNone(t.scene_update_input,
+                          "the title must not land either -- nothing is "
+                          "written when the link is in dispute")
+
+    def test_a_link_in_dispute_costs_the_server_no_created_entity(self):
+        # The refusal is knowable from the scene read alone, so it happens
+        # before any find-or-create. Creating a studio, performer or tag on
+        # the way to a write that was never going to happen leaves rubbish on
+        # the server for a proposal that was refused.
+        #
+        # Asserted on the MUTATIONS SENT, not on the raise: this fake resolves
+        # an unknown performer by creating it, and `apply_scene` turns a
+        # refused name into a `skipped` entry rather than an error, so a
+        # bare `assertRaises(StashError)` here is satisfied by the
+        # disagreement raise whether the create happened first or not.
+        t = _SceneTransport(_linkable_scene([CLASHING_LINK]))
+        with self.assertRaises(StashError) as ctx:
+            Stash("http://example.test", "k", transport=t).apply_scene(
+                "1", {"stash_ids": [LINK],
+                      "performers": [{"name": "Velvet Crane"}]})
+
+        self.assertIn("disagree", str(ctx.exception))  # this raise, not another
+        self.assertEqual([q for q in t.queries if "mutation" in q], [],
+                         "nothing may be created for a write that was "
+                         "refused before it could begin")
+
+    def test_a_match_naming_one_catalogue_twice_over_is_refused(self):
+        # HARM: two entries for one endpoint is not a merge under any
+        # reading -- it is the match disagreeing with ITSELF about which
+        # scene this is, and appending both leaves the scene claiming two
+        # different records at one catalogue for good.
+        #
+        # This is the case that decides whether the comparison is against
+        # what is being BUILT or only against what the scene already held:
+        # here the scene holds nothing, so a check that consulted only the
+        # existing list would find no disagreement and write both.
+        t = _SceneTransport(_linkable_scene([]))
+        with self.assertRaises(StashError) as ctx:
+            Stash("http://example.test", "k", transport=t).apply_scene(
+                "1", {"stash_ids": [LINK, CLASHING_LINK]})
+
+        self.assertIn("disagree", str(ctx.exception))
+        for fragment in (CATALOGUE, "r-77", "r-99"):
+            self.assertIn(fragment, str(ctx.exception))
+        self.assertIsNone(t.scene_update_input)
+
+    def test_a_link_for_a_third_catalogue_joins_the_other_two(self):
+        # Merging by ENDPOINT, not by position or by count: two links held,
+        # one added, and the one added belongs to neither of them.
+        t = self.apply([OTHER_LINK, {"endpoint": "https://three.example.invalid/graphql",
+                                     "stash_id": "r-5"}],
+                       {"stash_ids": [LINK]})
+
+        self.assertEqual(t.scene_update_input["stash_ids"],
+                         [OTHER_LINK,
+                          {"endpoint": "https://three.example.invalid/graphql",
+                           "stash_id": "r-5"},
+                          LINK])
+
+
+class CatalogueLinkUndo(unittest.TestCase):
+    """A link written and not reverted is a change the operator cannot take
+    back, so the round trip is asserted against a server that really holds
+    the state rather than against the snapshot the client returned."""
+
+    def test_undo_restores_a_scene_that_carried_no_links(self):
+        # The empty case is the one an apply is most likely to hit, and the
+        # one a snapshot is most likely to lose: `[]` and "absent" look alike
+        # everywhere except in the restore input.
+        server = _mutable_scene(stash_ids=[])
+        stash = Stash("http://example.test", "k", transport=server.transport)
+        before = server.snapshot()
+
+        info = stash.apply_scene("s1", {"stash_ids": [LINK]})
+        self.assertEqual(server.snapshot()["stash_ids"], [LINK])
+
+        stash.revert_scene("s1", info["prior"])
+        self.assertEqual(server.snapshot(), before)
+
+    def test_undo_restores_the_links_that_were_there_before(self):
+        # A scene that already carried a link from elsewhere: the undo has to
+        # put back exactly that list -- not an empty one, and not the merged
+        # one the apply wrote.
+        server = _mutable_scene(stash_ids=[OTHER_LINK])
+        stash = Stash("http://example.test", "k", transport=server.transport)
+        before = server.snapshot()
+
+        info = stash.apply_scene("s1", {"stash_ids": [LINK]})
+        self.assertEqual(server.snapshot()["stash_ids"], [OTHER_LINK, LINK])
+
+        stash.revert_scene("s1", info["prior"])
+        self.assertEqual(server.snapshot(), before)
+        self.assertEqual(server.snapshot()["stash_ids"], [OTHER_LINK])
 
 
 class PriorStateSnapshot(unittest.TestCase):

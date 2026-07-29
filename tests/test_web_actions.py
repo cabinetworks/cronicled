@@ -3,10 +3,13 @@ import unittest
 
 from cronicled.adapters.base import SiteAdapter
 from cronicled.jobs import JobRejected, JobRunner
+from cronicled.scan import Identified, fingerprint_outcome
+from cronicled.stash import Stash
 from cronicled.store import Store
 from cronicled.tags import cluster_tags
 from cronicled.tags import proposal as tag_proposal
 from cronicled.web.actions import Actions, ApplyFailed, UnknownProposal
+from tests.test_stash import CATALOGUE, LINK, OTHER_LINK, _MutableScene
 
 WAIT = 10
 
@@ -916,3 +919,133 @@ class DismissAndMuteAMerge(unittest.TestCase):
         self.assertEqual(store.calls,
                          [("muted", "tag-cluster", "velvetcrane",
                            "muted from the inbox")])
+
+
+# -- the catalogue link, from the recorded payload to the server ----------- #
+#
+# Driven end to end, through a real `Stash` over a fake server that actually
+# holds scene state, because the two ends of this live in different modules:
+# the scan records which box identified the file and that box's endpoint, and
+# only the update the server receives says whether anything was linked. A
+# double for `Stash` here could only ever show that `Actions` called it.
+#
+# `example.invalid` is reserved by RFC 2606 and can never resolve.
+
+BOX_PATH = "/library/Ivy Kingsley/Winter Ledger.mp4"
+BOX_CANDIDATE = {"title": "Winter Ledger", "image": None}
+
+
+def _fingerprint_payload(remote_site_id="r-77", candidate=None):
+    """The payload a fingerprint-identified proposal is recorded with, built
+    by the producer that really builds it.
+
+    Written out by hand it would prove nothing: the producer and the applier
+    have to agree about which keys carry the box's endpoint and its id, and
+    an invented payload can only ever agree with whichever of them it was
+    copied from.
+    """
+    return fingerprint_outcome(
+        {"id": "s1", "files": [{"path": BOX_PATH}]},
+        Identified(box="north-box", endpoint=CATALOGUE,
+                   candidate=BOX_CANDIDATE if candidate is None else candidate,
+                   remote_site_id=remote_site_id),
+        folder="library").proposal["payload"]
+
+
+class CatalogueLinkOnApprove(unittest.TestCase):
+
+    def _approve(self, payload, stash_ids=()):
+        server = _MutableScene(stash_ids=list(stash_ids))
+        stash = Stash("http://example.test", "k", transport=server.transport)
+        item = _item(payload=payload, subject_id="s1")
+        store = _FakeStore(item)
+        Actions(store, stash).approve("fp-1")
+        return server, store, item
+
+    def test_the_scene_after_approving_an_identified_proposal_is_exactly_this(self):
+        # The WHOLE scene, not the one field this ticket adds. A field
+        # slipped into a scene update past a green suite has happened here
+        # before, and an unlisted `rating100` would blank the rating on every
+        # scene an apply touches.
+        server, _, _ = self._approve(_fingerprint_payload())
+
+        self.assertEqual(server.snapshot(), {
+            "title": "Winter Ledger", "details": None, "date": None,
+            "urls": [], "organized": True, "rating100": None, "code": None,
+            "director": None, "stash_ids": [LINK], "studio_id": None,
+            "performer_ids": [], "tag_ids": []})
+
+    def test_the_link_names_the_endpoint_the_payload_carries(self):
+        # Stated on its own terms so it survives the shape above being
+        # rewritten: this is the pair the box's answer stands for, and it is
+        # the whole point of the ticket.
+        payload = _fingerprint_payload()
+        server, _, _ = self._approve(payload)
+
+        self.assertEqual(server.snapshot()["stash_ids"],
+                         [{"endpoint": payload["endpoint"],
+                           "stash_id": payload["remote_site_id"]}])
+
+    def test_a_box_that_named_no_id_links_the_scene_to_nothing(self):
+        # HARM: such a box has still identified the file and the proposal is
+        # still applied -- but an entry with a null id claims a catalogue
+        # record that does not exist, and a later re-scrape would start from
+        # it. No id means no link, never a link to nothing.
+        server, _, _ = self._approve(_fingerprint_payload(remote_site_id=None))
+
+        self.assertEqual(server.snapshot()["stash_ids"], [])
+
+    def test_a_scored_proposal_leaves_the_scenes_own_links_alone(self):
+        # A site scraper is not a catalogue endpoint, so a text-matched
+        # proposal has nothing to link -- and must not write an empty list
+        # over the links the scene already had.
+        server, _, _ = self._approve(_item()["payload"],
+                                     stash_ids=[OTHER_LINK])
+
+        self.assertEqual(server.snapshot()["stash_ids"], [OTHER_LINK])
+
+    def test_a_link_the_candidate_itself_carried_is_kept_beside_the_new_one(self):
+        # Nothing produces such a candidate today. If a scraper ever does,
+        # replacing its link with this one would discard a link the proposal
+        # was made with, which is the failure the merge exists to prevent.
+        server, _, _ = self._approve(_fingerprint_payload(
+            candidate=dict(BOX_CANDIDATE, stash_ids=[OTHER_LINK])))
+
+        self.assertEqual(server.snapshot()["stash_ids"], [OTHER_LINK, LINK])
+
+    def test_undo_takes_the_link_back_off_the_scene(self):
+        # A link written and not reverted is a change the operator cannot
+        # take back. Driven through the snapshot the STORE was handed, not
+        # the one the apply returned, because that is the only one an undo
+        # days later has.
+        server = _MutableScene(stash_ids=[OTHER_LINK])
+        stash = Stash("http://example.test", "k", transport=server.transport)
+        item = _item(payload=_fingerprint_payload(), subject_id="s1")
+        store = _FakeStore(item)
+        actions = Actions(store, stash)
+        before = server.snapshot()
+
+        actions.approve("fp-1")
+        self.assertEqual(server.snapshot()["stash_ids"], [OTHER_LINK, LINK])
+        item["state"], item["prior_state"] = "applied", store.calls[-1][2]
+
+        self.assertEqual(actions.undo("fp-1"), "reverted")
+        self.assertEqual(server.snapshot(), before)
+
+    def test_undo_restores_a_scene_that_had_carried_no_links(self):
+        # The empty case: `[]` and "absent" look alike everywhere except in
+        # the restore input, so an undo that dropped the field would leave
+        # the link in place and still report success.
+        server = _MutableScene(stash_ids=[])
+        stash = Stash("http://example.test", "k", transport=server.transport)
+        item = _item(payload=_fingerprint_payload(), subject_id="s1")
+        store = _FakeStore(item)
+        actions = Actions(store, stash)
+        before = server.snapshot()
+
+        actions.approve("fp-1")
+        self.assertEqual(server.snapshot()["stash_ids"], [LINK])
+        item["state"], item["prior_state"] = "applied", store.calls[-1][2]
+
+        actions.undo("fp-1")
+        self.assertEqual(server.snapshot(), before)

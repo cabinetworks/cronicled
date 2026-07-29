@@ -367,6 +367,51 @@ class Stash:
             return None
         return self._find_first(kind, name) or self._create(kind, name)
 
+    @staticmethod
+    def _merge_stash_ids(scene_id, existing, incoming):
+        """The scene's catalogue links with `incoming` merged in BY ENDPOINT.
+
+        sceneUpdate replaces the whole `stash_ids` list, so writing only the
+        incoming pair would delete every link this tool did not make — a
+        second catalogue, or one somebody entered by hand — and delete it
+        silently. That is the same failure the performer/tag union exists to
+        prevent, and the merge is by endpoint for the same reason it is by
+        id there: an endpoint is what makes two entries the same link.
+
+        An existing entry for the SAME endpoint carrying a DIFFERENT id is
+        not a merge and is not resolved here. It is the media server and the
+        catalogue disagreeing about which scene this file is, which is the
+        most useful thing a reviewer could be told about it — so it is
+        refused with both ids named, and nothing at all is written. This
+        project reports every other two-source disagreement rather than
+        letting whoever wrote last decide it, and a wrong link is precisely
+        the corrupted record nobody notices: the row reads as applied, the
+        scene reads as catalogued, and a later re-scrape pulls the other
+        scene's metadata onto this file.
+
+        Comparison is against every held id for that endpoint, not against
+        one picked out of the list. A scene carrying two entries for one
+        endpoint is already malformed, and choosing which of them to compare
+        with would be an iteration order deciding an attribution.
+        """
+        merged = [dict(entry) for entry in existing]
+        for entry in incoming:
+            endpoint, stash_id = entry["endpoint"], entry["stash_id"]
+            held = [held_entry["stash_id"] for held_entry in merged
+                    if held_entry["endpoint"] == endpoint]
+            if not held:
+                merged.append({"endpoint": endpoint, "stash_id": stash_id})
+                continue
+            disagreeing = sorted(set(held) - {stash_id})
+            if disagreeing:
+                raise StashError(
+                    "scene %s is already linked to %s as %s, but this "
+                    "proposal identifies it there as %s -- the media server "
+                    "and the catalogue disagree about which scene this file "
+                    "is, so nothing was written"
+                    % (scene_id, endpoint, ", ".join(disagreeing), stash_id))
+        return merged
+
     def apply_scene(self, scene_id, match, overwrite_studio=False, drop_tag_ids=()):
         """Write resolved metadata onto a scene. The server's sceneUpdate
         REPLACES the performer/tag arrays, so we read the scene's current
@@ -414,6 +459,14 @@ class Stash:
             "performer_ids": existing_pids,
             "tag_ids": existing_tids,
         }
+
+        # Resolved from the read alone, and BEFORE any find-or-create runs:
+        # a disagreement between the scene's own links and this proposal's is
+        # knowable without asking the server anything else, and refusing here
+        # costs it no studio, performer or tag created on the way to a write
+        # that was never going to happen.
+        merged_stash_ids = self._merge_stash_ids(
+            scene_id, prior["stash_ids"], match.get("stash_ids") or ())
 
         skipped = []
 
@@ -467,7 +520,7 @@ class Stash:
         if urls:
             inp["urls"] = urls
         if match.get("stash_ids"):  # canonical external id link(s), if supplied
-            inp["stash_ids"] = match["stash_ids"]
+            inp["stash_ids"] = merged_stash_ids
         # studio: only claim an unset slot unless explicitly told to overwrite
         write_studio = studio_id if (studio_id and (overwrite_studio or not existing_studio_id)) else None
         if write_studio:
