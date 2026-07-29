@@ -4,8 +4,8 @@ import tempfile
 import unittest
 
 from cronicled.config import (
-    config_dir, default_server_path, default_stashbox_path, load_server,
-    load_stashbox)
+    config_dir, default_schedule_path, default_server_path,
+    default_stashbox_path, load_schedule, load_server, load_stashbox)
 from cronicled.adapters.registry import default_adapters_path, load_adapters
 
 
@@ -168,6 +168,71 @@ class LoadAdaptersConfigDir(unittest.TestCase):
             env = {"CRONICLED_CONFIG_DIR": configured}
             loaded = load_adapters(p, env=env)
             self.assertEqual(sorted(loaded), ["explicit"])
+
+
+class LoadSchedule(unittest.TestCase):
+    """Schedule overrides fall on `load_adapters`'s side of the rule in
+    `cronicled/config.py`'s module docstring: every producer already declares
+    its own cadence, so an operator who is happy with it configures nothing
+    and the file is simply absent.
+
+    What it deliberately does NOT do is validate the overrides. That belongs
+    to `cronicled.schedule.resolve`, which refuses an unknown producer name, an
+    unknown key, a cadence that is not a positive number and a non-boolean
+    `enabled` — and refuses them at the moment the schedule is wired up, which
+    is the same moment this file is read. A second validator here would be a
+    second place for the two to disagree, and the one reading the file is the
+    one that would go stale.
+    """
+
+    def test_it_is_found_under_the_config_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(default_schedule_path({"CRONICLED_CONFIG_DIR": d}),
+                             os.path.join(d, "schedule.json"))
+
+    def test_an_absent_file_is_a_legitimate_state_not_an_error(self):
+        with tempfile.TemporaryDirectory() as empty:
+            self.assertEqual(load_schedule(env={"CRONICLED_CONFIG_DIR": empty}),
+                             {})
+
+    def test_what_the_file_says_is_handed_on_whole(self):
+        # Whole-shape equality, and two producers with different keys: a
+        # loader that returned only the first entry, or dropped `enabled` in
+        # favour of `every`, would leave an operator's explicit "do not run
+        # this" doing nothing with nothing raised.
+        overrides = {"nightly-library-scan": {"every": 3600},
+                     "some-other-producer": {"enabled": False}}
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "schedule.json"), "w") as fh:
+                json.dump(overrides, fh)
+            self.assertEqual(load_schedule(env={"CRONICLED_CONFIG_DIR": d}),
+                             overrides)
+
+    def test_an_explicit_path_overrides_the_config_directory(self):
+        with tempfile.TemporaryDirectory() as configured, \
+             tempfile.TemporaryDirectory() as explicit:
+            with open(os.path.join(configured, "schedule.json"), "w") as fh:
+                json.dump({"from-the-config-dir": {"every": 60}}, fh)
+            p = os.path.join(explicit, "schedule.json")
+            with open(p, "w") as fh:
+                json.dump({"from-the-explicit-path": {"every": 60}}, fh)
+            self.assertEqual(
+                load_schedule(p, env={"CRONICLED_CONFIG_DIR": configured}),
+                {"from-the-explicit-path": {"every": 60}})
+
+    def test_a_top_level_value_that_is_not_an_object_is_refused_by_name(self):
+        # `resolve` receives this as `dict(overrides)`. A JSON list of names
+        # would raise there as a `ValueError` about a dictionary update
+        # sequence, and a bare string as a set of one-letter producer names
+        # nobody wrote. Neither message mentions the file, and the file is
+        # the only thing the operator can edit.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "schedule.json")
+            with open(p, "w") as fh:
+                json.dump(["nightly-library-scan"], fh)
+            with self.assertRaises(ValueError) as ctx:
+                load_schedule(env={"CRONICLED_CONFIG_DIR": d})
+            self.assertIn(p, str(ctx.exception))
 
 
 class MissingConfigRule(unittest.TestCase):

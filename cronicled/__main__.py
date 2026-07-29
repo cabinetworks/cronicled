@@ -1,12 +1,23 @@
-"""Start the inbox.
+"""Start the inbox, and the schedule that runs a scan without being asked.
 
-The one entry point this package has. It constructs no scheduler and starts
-no timer: no scan runs on its own here, and no proposal is produced without a
-person asking for one. A person CAN ask for one, from the page itself — the
-`Scan` control posts to `/scan`, which starts a `JobRunner` job through
-`web.actions.Actions.scan`, built from the same `cronicled.runscan.build_producer`
-the CLI uses. That is the one place a scan starts; nothing decides on its own
-that one is due.
+The one entry point this package has. Two things start a scan here, and they
+are deliberately separate registrations:
+
+- a person pressing `Scan` on the page, which posts to `/scan` and goes
+  through `web.actions.Actions.scan`. That builds a producer with the limit
+  they typed and `reregister`s it, per click, under `ScanProducer.name`;
+- `cronicled.schedule.Scheduler`, ticking in the background, which starts
+  `runscan.SCHEDULED_SCAN_NAME` — its own registration, its own declared
+  cadence, and no file limit.
+
+They share the `scraping` cost class, so the runner serialises them: an
+unattended scan and a manual one never scrape the media server at once, and
+whichever asks second is refused with a reason the page shows. Nothing either
+of them starts writes to the media server; a scan reads and proposes, and
+every proposal still waits for a person to approve it.
+
+The ordering in `build_scheduler` below is load-bearing and is the one part
+of this file that fails silently when it is wrong. Read it there.
 
 `--server` names a media server; it has no default because there is no safe
 guess for it. Without one, the inbox still starts: a person can browse what a
@@ -30,14 +41,68 @@ other two.
 import argparse
 import os
 
-from .config import CONFIG_DIR_ENV_VAR, config_dir
+from .config import CONFIG_DIR_ENV_VAR, config_dir, load_schedule
 from .jobs import JobRunner
-from .runscan import configured_adapters
+from .runscan import build_scheduled_producer, configured_adapters
+from .schedule import Scheduler
 from .store import Store
 from .stash import Stash
 from .web.actions import Actions
 from .web.app import DEFAULT_HOST, DEFAULT_PORT, serve
 from .web.rows import to_mute_rows, to_refusal_rows, to_rows
+
+# How long shutdown waits for the loop to come out of a tick. Bounded rather
+# than `None`: a tick wedged in the store or the media server would otherwise
+# hold the process open forever, and a shutdown that never finishes is one
+# somebody replaces with a kill signal. `close` returns whether it made it,
+# and that answer is printed rather than dropped.
+SCHEDULER_SHUTDOWN_TIMEOUT = 10.0
+
+
+def build_scheduler(runner, store, stash, adapters, env=None):
+    """Register the unattended scan, then resolve a schedule over it.
+
+    **The order of the two statements below is the whole of this function.**
+    `Scheduler.__init__` resolves the schedule ONCE, from the producers the
+    runner holds at that instant. Built first, it resolves an empty registry:
+    it schedules nothing, raises nothing, ticks on time forever and starts
+    nothing — a nightly scan that never runs, with no exception, no log line
+    and no symptom but an inbox that stays empty. Register first, and the
+    same wiring mistake cannot happen; register LATER still and
+    `Scheduler.start` refuses out loud, which is the last moment anything can
+    say so.
+
+    Returns `None`, having said why, when there is nothing to schedule: a
+    scan needs a media server to read the library from and at least one
+    configured adapter to search against, exactly as `Actions.scan` needs
+    both before a person's click can do anything. Printed rather than
+    silently skipped, because "no scan is scheduled" and "a scan is scheduled
+    and has not run yet" look identical from the outside otherwise.
+
+    The producer a person's `Scan` button builds is deliberately NOT in this
+    schedule. It is registered later, under a different name, with the limit
+    they typed (see `web.actions.Actions.scan`); it exists to be started by
+    hand, and a schedule that also ran it would run somebody's 25-file
+    request on a cadence.
+    """
+    if stash is None or not adapters:
+        missing = []
+        if stash is None:
+            missing.append("no media server (--server)")
+        if not adapters:
+            missing.append("no configured site adapter (adapters.json)")
+        print("no scan is scheduled: %s. The inbox still works, and Scan "
+              "still refuses with the same reason." % "; and ".join(missing))
+        return None
+    producer = build_scheduled_producer(stash, adapters, store)
+    # First. See this function's docstring for what building the scheduler
+    # ahead of this line costs, and why nothing would report it.
+    runner.register(producer)
+    # Second, so `resolve` can see the producer above and read its declared
+    # cadence off it. Overrides come from the operator's own config and are
+    # validated by `resolve`, at this line, where a typo is a start-up stack
+    # trace rather than a producer that quietly never runs.
+    return Scheduler(runner, store, overrides=load_schedule(env=env))
 
 
 def main(argv=None):
@@ -119,18 +184,36 @@ def main(argv=None):
         return to_rows([item for item in store.items()
                         if item["state"] != "applied"], base_url=base_url)
 
-    serve(rows=_inbox_rows,
-          muted=lambda: to_mute_rows(store.mutes(), base_url=base_url),
-          dismissed=lambda: to_rows(store.items(state="dismissed"),
-                                    base_url=base_url),
-          refused=lambda: to_refusal_rows(store.refusals(),
-                                          base_url=base_url),
-          superseded=lambda: to_rows(store.items(state="superseded"),
-                                     base_url=base_url),
-          applied=lambda: to_rows(store.items(state="applied"),
-                                  base_url=base_url),
-          actions=actions, scan_status=actions.scan_status,
-          host=args.host, port=args.port)
+    scheduler = build_scheduler(runner, store, stash, adapters, env=env)
+    if scheduler is not None:
+        scheduler.start()
+
+    try:
+        serve(rows=_inbox_rows,
+              muted=lambda: to_mute_rows(store.mutes(), base_url=base_url),
+              dismissed=lambda: to_rows(store.items(state="dismissed"),
+                                        base_url=base_url),
+              refused=lambda: to_refusal_rows(store.refusals(),
+                                              base_url=base_url),
+              superseded=lambda: to_rows(store.items(state="superseded"),
+                                         base_url=base_url),
+              applied=lambda: to_rows(store.items(state="applied"),
+                                      base_url=base_url),
+              actions=actions, scan_status=actions.scan_status,
+              # `None` when nothing is scheduled, which the page says out
+              # loud rather than drawing as a healthy idle schedule.
+              schedule_status=(None if scheduler is None
+                               else scheduler.status),
+              host=args.host, port=args.port)
+    finally:
+        # In a `finally`, so a `serve` that raises still stops the loop
+        # rather than leaving a daemon thread scraping the media server on
+        # the way out of a failed start-up.
+        if scheduler is not None and not scheduler.close(
+                SCHEDULER_SHUTDOWN_TIMEOUT):
+            print("WARNING: the schedule's loop was still in a tick after "
+                  "%gs; a job it started keeps running until this process "
+                  "exits." % SCHEDULER_SHUTDOWN_TIMEOUT)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,3 @@
+{
+  "nightly-library-scan": {"every": 86400, "enabled": true}
+}

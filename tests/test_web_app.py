@@ -7,6 +7,7 @@ from http.server import HTTPServer
 from unittest.mock import patch
 
 from cronicled.jobs import JobRejected
+from cronicled.schedule import LoopStatus, TickResult
 from cronicled.web.actions import ApplyFailed, UnknownProposal
 from cronicled.web.app import build_handler, serve, DEFAULT_HOST
 
@@ -290,6 +291,31 @@ class MutedDismissedRefusedRendering(unittest.TestCase):
              "filename": "clip.mp4", "proposed_title": "T", "creator": "N",
              "creator_source": "folder", "score_text": "0.900"}])
         self.assertIn('<details class="section" open', html)
+
+    def test_the_schedule_status_callable_reaches_the_page(self):
+        # The seam between a running `Scheduler` and the panel that reports
+        # it. A `build_handler` that accepted the callable and never called
+        # it would render the "nothing is scheduled" branch on an install
+        # that HAS a schedule -- indistinguishable, to someone reading the
+        # page, from one where nothing was ever wired up.
+        html = self._get(schedule_status=lambda: LoopStatus(
+            running=True, closed=False, ticks=4, failures=0,
+            consecutive_failures=0, last_tick_at="2026-07-27T03:00:00+00:00",
+            last_error=None, last_error_at=None, last_traceback=None,
+            failing_to_start={},
+            last_result=TickResult(at="2026-07-27T03:00:00+00:00",
+                                   due=["nightly-library-scan"], started={},
+                                   skipped={"nightly-library-scan":
+                                            "disabled by override"},
+                                   failed_to_start={})))
+        self.assertIn("did not run: disabled by override", html)
+        self.assertNotIn("Nothing is scheduled", html)
+
+    def test_omitting_it_says_nothing_is_scheduled(self):
+        # The other side, and the default every existing double here relies
+        # on: no schedule wired up must read as "no schedule", never as a
+        # healthy loop that has simply not been due yet.
+        self.assertIn("Nothing is scheduled", self._get())
 
     def test_no_applied_query_param_leaves_every_section_collapsed(self):
         html = self._get(applied=lambda: [

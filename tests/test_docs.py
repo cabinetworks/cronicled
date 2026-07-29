@@ -142,23 +142,31 @@ class ThePlannedServiceIsMarkedAsPlanned(unittest.TestCase):
             self.assertNotIn("approval", fence.lower())
 
 
-class NothingCallsTheSchedulerUnattended(unittest.TestCase):
-    """The claim this class protects narrowed rather than disappeared.
+class TheEntryPointRunsTheSchedulerUnattended(unittest.TestCase):
+    """The claim this class protects INVERTED, and that is the maintenance it
+    exists for.
 
-    `cronicled/__main__.py` now exists — `python -m cronicled` serves the
-    inbox — so "no entry point that starts any of this" is no longer true,
-    and the fourth diagram now draws the entry point, the inbox and the
-    approval gate as BUILT rather than PLANNED. What survives, and what this
-    class now exists to protect, is the narrower half: nothing constructs a
-    `Scheduler`, so a scan is never run without a person asking for one.
+    It used to assert that no module constructs a `Scheduler`, and said in its
+    own failure message that if this project ever ran producers unattended,
+    the README's claim and the fourth diagram's remaining PLANNED node would
+    both be wrong and need changing with it. That happened: the entry point
+    now registers a scheduled scan, builds a scheduler over it and starts it.
+    So all three moved together, which is the only way a claim like this stays
+    true.
+
+    What it protects now is the narrower thing that replaced it: exactly one
+    module constructs a `Scheduler`, and it is the entry point. A second
+    constructor somewhere else would be a second loop over one registry,
+    doubling every producer's rate — and the README, which now describes one,
+    would be describing half of what runs.
 
     The honesty test on `ThePlannedServiceIsMarkedAsPlanned` above covers the
     diagram's labelling mechanism. This is the entry point's counterpart: a
     claim about what the CODE does, which no diagram assertion can make.
     """
 
-    def test_no_module_in_the_package_constructs_a_scheduler(self):
-        offenders = []
+    def _modules_constructing_a_scheduler(self):
+        found = []
         for root, _dirs, names in os.walk("cronicled"):
             if "__pycache__" in root:
                 continue
@@ -167,13 +175,20 @@ class NothingCallsTheSchedulerUnattended(unittest.TestCase):
                     continue
                 path = os.path.join(root, name)
                 if "Scheduler(" in _read(path):
-                    offenders.append(path)
+                    found.append(path)
+        return sorted(found)
+
+    def test_the_entry_point_is_the_one_module_that_constructs_a_scheduler(self):
+        # Asserted as the WHOLE list, not as "the entry point is in it": a
+        # second module building its own scheduler over the same runner is
+        # two loops against one schedule, which doubles every producer's
+        # cadence and is invisible in anything but the job history.
         self.assertEqual(
-            offenders, [],
-            "%s constructs a Scheduler. If this project now runs producers "
-            "unattended, the README's 'nothing constructs a scheduler' claim "
-            "and the fourth diagram's one remaining PLANNED node are both "
-            "wrong and need changing with it." % ", ".join(offenders))
+            self._modules_constructing_a_scheduler(),
+            [os.path.join("cronicled", "__main__.py")],
+            "exactly one module builds a Scheduler, and it is the entry "
+            "point. If that moved, the README and the fourth diagram both "
+            "describe something that is no longer where they say it is.")
 
     def test_the_entry_point_exists_and_declares_no_console_script(self):
         # `cronicled/__main__.py` is what makes `python -m cronicled`
@@ -188,13 +203,16 @@ class NothingCallsTheSchedulerUnattended(unittest.TestCase):
             "cronicled/__main__.py is missing - the README documents "
             "`python -m cronicled` as this project's entry point")
 
-    def test_the_readme_states_the_narrowed_claim(self):
-        # Both halves asserted, and separately, because only one of them is
-        # still true. Collapsed to whitespace so a wrapped line cannot decide
-        # the result.
+    def test_the_readme_no_longer_claims_nothing_runs_this(self):
+        # The claim that was true until the entry point started a scheduler,
+        # asserted as ABSENT. A sentence that keeps saying nothing runs this
+        # unattended, in a project that now does, is the single most
+        # misleading line the README could carry -- and a reader believes a
+        # README's "not yet built" section over anything else in it.
+        # Collapsed to whitespace so a wrapped line cannot decide the result.
         prose = " ".join(_read(README).split())
-        self.assertIn("nothing constructs a scheduler", prose,
-                      "the narrower claim that survives must still be made")
+        self.assertNotIn("nothing constructs a scheduler", prose)
+        self.assertNotIn("nothing runs this unattended", prose)
         self.assertIn("python -m cronicled", prose,
                       "the README must document the entry point that now "
                       "exists, not continue to claim nothing starts this "

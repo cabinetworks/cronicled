@@ -266,9 +266,15 @@ class Actions:
 
         `JobRunner.jobs()` documents its own order as oldest-start-first, so
         the last element is the most recently started job without this
-        needing to re-derive "most recent" from `started_at` itself -- and
-        every job this runner ever holds is one this same control started;
-        `cronicled.__main__` wires no scheduler that could add another kind.
+        needing to re-derive "most recent" from `started_at` itself.
+
+        It is NOT necessarily a scan this control started. `cronicled.__main__`
+        registers a scheduled scan of its own and a background loop starts it
+        on a cadence, so the most recent job may be that one -- which is the
+        right answer to "what is the scan doing", and the reason this reports
+        the job rather than filtering by which control began it. The job
+        carries its own `producer` name, so the two are told apart by
+        whatever reads this rather than by hiding one of them.
         """
         if self._runner is None:
             return None

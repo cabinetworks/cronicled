@@ -22,13 +22,16 @@ import unittest
 from unittest import mock
 
 from cronicled.adapters.base import SiteAdapter
-from cronicled.jobs import JobRunner
+from cronicled.jobs import COST_CLASS_LIMITS, JobRunner
 from cronicled.scan import IDENTIFIED_BY_FINGERPRINT
-from cronicled.runscan import build_producer, configured_adapters, main
+from cronicled.runscan import (EVERY_FILE, build_producer,
+                               build_scheduled_producer, configured_adapters,
+                               main)
 from cronicled.store import Store
 from tests.fixtures.cast import CENSORSHIP
 
 WAIT = 10
+HOUR = 3600
 
 
 class _Adapter(SiteAdapter):
@@ -156,6 +159,101 @@ class BuildProducerRequiresALimit(unittest.TestCase):
         producer = build_producer(_FakeStash([]), {"store": _Adapter()},
                                   self.store, limit=0)
         self.assertEqual(producer._limit, 0)
+
+    def test_every_file_is_the_one_way_to_ask_for_no_limit(self):
+        # The deliberate unbounded caller — an unattended pass over the whole
+        # unorganized set. It reaches `select` as the same `None` the check
+        # above refuses, and that is the point: the value is not the guard,
+        # having to name it at the call site is. A caller who simply forgot
+        # the argument still cannot get here.
+        producer = build_producer(_FakeStash([]), {"store": _Adapter()},
+                                  self.store, limit=EVERY_FILE)
+        self.assertIsNone(producer._limit)
+
+
+class TheScheduledScanIsNotTheManualOne(unittest.TestCase):
+    """Two scans, and every difference between them is a way this wiring
+    would otherwise fail without saying anything.
+
+    `web.actions.Actions.scan` builds a producer per click and `reregister`s
+    it, because a scan's limit can only be fixed at construction. `reregister`
+    REPLACES whatever holds the name. So a scheduled scan that shared the
+    name would be silently reconfigured by somebody typing 25 into the box —
+    and the next unattended run, hours later with nobody watching, would scan
+    25 files instead of the library.
+    """
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+        self.stash = _FakeStash([])
+        self.adapters = {"store": _Adapter()}
+
+    def _both(self, **kwargs):
+        manual = build_producer(self.stash, self.adapters, self.store,
+                                limit=25)
+        scheduled = build_scheduled_producer(self.stash, self.adapters,
+                                             self.store, **kwargs)
+        return manual, scheduled
+
+    def test_the_two_are_registered_under_different_names(self):
+        # Asserted as a DIFFERENCE rather than against the name constant the
+        # code itself uses: what matters is that one cannot replace the
+        # other, and a test comparing the constant to itself would hold for
+        # any rename including one back onto the manual scan's name.
+        manual, scheduled = self._both()
+        self.assertNotEqual(scheduled.name, manual.name)
+
+    def test_the_scheduled_scan_is_built_with_no_file_limit(self):
+        # The limit the producer was BUILT with, not "a scan ran": a
+        # scheduled run that quietly inherited the manual scan's 25 would
+        # start, finish, and record a run exactly as a whole-library pass
+        # does.
+        manual, scheduled = self._both()
+        self.assertIsNone(scheduled._limit)
+        self.assertEqual(manual._limit, 25)
+
+    def test_the_scheduled_scan_declares_a_daily_cadence(self):
+        # 86400 seconds spelled out, not read back from the constant the
+        # producer was built from — that comparison holds whatever the
+        # constant becomes, including a cadence of one second against a
+        # rate-limited scraper.
+        _manual, scheduled = self._both()
+        self.assertEqual(scheduled.every, 86400)
+
+    def test_the_manual_scan_declares_no_cadence_at_all(self):
+        # The other side, and the reason the two are separate registrations:
+        # `schedule.resolve` refuses an enabled producer with no cadence, so
+        # a manual scan that declared one would be schedulable by accident
+        # and one that is in the registry at start-up would take the whole
+        # start-up down.
+        manual, _scheduled = self._both()
+        self.assertIsNone(manual.every)
+
+    def test_the_cadence_is_overridable_but_has_no_permissive_default(self):
+        _manual, scheduled = self._both(every=HOUR)
+        self.assertEqual(scheduled.every, HOUR)
+
+    def test_it_shares_the_scraping_cost_class_so_the_two_serialise(self):
+        # Not a detail: an unattended scan and a manual one both drive the
+        # media server's headless browser, and two at once thrash it. The
+        # runner rations that class to one job, so sharing it is what makes
+        # a nightly run and somebody's click take turns instead of colliding.
+        manual, scheduled = self._both()
+        self.assertEqual(scheduled.cost, manual.cost)
+        self.assertEqual(COST_CLASS_LIMITS[scheduled.cost], 1)
+
+    def test_it_is_wired_through_build_producer_not_around_it(self):
+        # A scheduled scan assembled separately would be a second copy of the
+        # wiring, free to lose the enrichment pass or a store, and every test
+        # of `build_producer` above would go on passing while the unattended
+        # run — the one nobody watches — searched fewer places.
+        manual, scheduled = self._both()
+        self.assertEqual([source.name for source in scheduled._sources],
+                         [source.name for source in manual._sources])
+        self.assertEqual(scheduled._enrich, manual._enrich)
+        self.assertIs(scheduled._store, self.store)
+        self.assertIsNotNone(scheduled._identify)
 
 
 class BuildProducerWiring(unittest.TestCase):

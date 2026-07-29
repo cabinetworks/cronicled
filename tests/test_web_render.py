@@ -2,6 +2,7 @@ import re
 import unittest
 
 from cronicled.jobs import Job
+from cronicled.schedule import LoopStatus, TickResult
 from cronicled.web.render import environment, render
 from cronicled.web.rows import to_row
 
@@ -749,3 +750,103 @@ class IdentifiedRowRendering(unittest.TestCase):
                           **{section: [_identified_row()]})
             self.assertIn("identified by fingerprint", html, section)
             self.assertNotIn("from the None", html, section)
+
+
+def _loop_status(**over):
+    """A `LoopStatus` the way the scheduler hands one out.
+
+    Built from the real dataclass rather than a stand-in dict, so a field
+    renamed on it fails here instead of rendering blank -- and so the
+    defaults this fixture leaves alone are the ones production actually
+    carries.
+    """
+    fields = dict(running=True, closed=False, ticks=7, failures=0,
+                  consecutive_failures=0,
+                  last_tick_at="2026-07-27T03:00:00+00:00",
+                  last_error=None, last_error_at=None, last_traceback=None,
+                  failing_to_start={}, last_result=None)
+    fields.update(over)
+    return LoopStatus(**fields)
+
+
+def _tick_result(**over):
+    fields = dict(at="2026-07-27T03:00:00+00:00", due=[], started={},
+                  skipped={}, failed_to_start={})
+    fields.update(over)
+    return TickResult(**fields)
+
+
+class TheSchedulePanel(unittest.TestCase):
+    """What an operator asks the page when the inbox has stopped filling.
+
+    Three questions, and the page has to answer all three: is the loop alive,
+    when did it last look, and why has the thing they are waiting for not
+    run. A panel that reported only what STARTED would answer the first two
+    and leave the third -- the reason `due` returns reasons at all -- with
+    nowhere to be seen.
+    """
+
+    def test_it_says_why_a_due_producer_did_not_run(self):
+        status = _loop_status(last_result=_tick_result(
+            due=["nightly-library-scan"],
+            skipped={"nightly-library-scan":
+                     "cost class saturated: scraping is already running "
+                     "library-scan"}))
+        html = render("inbox.html", rows=[], counts={}, schedule=status)
+        self.assertIn("nightly-library-scan &mdash; did not run: cost class "
+                      "saturated: scraping is already running library-scan",
+                      html)
+
+    def test_a_refusal_it_cannot_retry_is_shown_apart_from_a_skip(self):
+        # A skip is a "not now" the next tick may resolve on its own; a
+        # failure to start is the runner refusing in a way repeating will not
+        # fix. Collapsing them would send somebody to wait out a condition
+        # that is never going to clear.
+        status = _loop_status(last_result=_tick_result(
+            due=["nightly-library-scan"],
+            skipped={"other-producer": "disabled by override"},
+            failed_to_start={"nightly-library-scan":
+                             "RunnerClosed: the runner is closed"}))
+        html = render("inbox.html", rows=[], counts={}, schedule=status)
+        self.assertIn("did not run: disabled by override", html)
+        self.assertIn("could not start: RunnerClosed: the runner is closed",
+                      html)
+
+    def test_it_says_what_started_and_when_the_loop_last_looked(self):
+        status = _loop_status(last_result=_tick_result(
+            due=["nightly-library-scan"],
+            started={"nightly-library-scan": "job-77"}))
+        html = render("inbox.html", rows=[], counts={}, schedule=status)
+        self.assertIn("started as job job-77", html)
+        self.assertIn("2026-07-27T03:00:00+00:00", html)
+        self.assertIn("due at that tick: nightly-library-scan", html)
+
+    def test_a_loop_that_died_is_not_drawn_as_one_that_was_stopped(self):
+        # The whole reason `running` and `closed` are two fields. Not running
+        # and closed is a clean shutdown; not running and NOT closed is a
+        # loop that died, and the only symptom otherwise is an inbox that
+        # stopped filling.
+        died = render("inbox.html", rows=[], counts={},
+                      schedule=_loop_status(running=False, closed=False,
+                                            failures=3))
+        self.assertIn("NOT RUNNING", died)
+        stopped = render("inbox.html", rows=[], counts={},
+                         schedule=_loop_status(running=False, closed=True))
+        self.assertNotIn("NOT RUNNING", stopped)
+        self.assertIn("stopped", stopped)
+
+    def test_nothing_scheduled_says_so_rather_than_drawing_an_idle_loop(self):
+        # An install with no media server or no adapter schedules nothing.
+        # Rendered as an empty panel it is indistinguishable from a healthy
+        # schedule that has simply not been due yet, which is the one reading
+        # that would leave somebody waiting for a scan that is never coming.
+        html = render("inbox.html", rows=[], counts={}, schedule=None)
+        self.assertIn("Nothing is scheduled", html)
+        self.assertNotIn("last tick", html)
+
+    def test_a_reason_from_the_schedule_is_escaped_like_every_other_field(self):
+        status = _loop_status(last_result=_tick_result(
+            due=[_HOSTILE], skipped={_HOSTILE: _HOSTILE}))
+        html = render("inbox.html", rows=[], counts={}, schedule=status)
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
