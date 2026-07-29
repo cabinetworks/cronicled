@@ -42,9 +42,11 @@ from cronicled.artist import Aliases
 from cronicled.jobs import COST_CLASS_LIMITS, JobRunner
 from cronicled.scan import (
     Conflict, Counts, DEFAULT_THRESHOLD, FingerprintPass, IDENTIFIED_BY_FINGERPRINT, Identified,
-    MAX_RUNNERS_UP, MUTE_NO_CANDIDATES, MUTE_UNRESOLVED_CREATOR, Outcome,
+    MAX_RUNNERS_UP, MUTE_NO_CANDIDATES, Outcome, REFUSED_REJECTED_FOLDER,
+    REFUSED_UNRESOLVED_CREATOR, RETIRED_MUTE_UNRESOLVED_CREATOR,
     ScanProducer, Source, SUBJECT_TYPE, _SingleFlight, catalogue_link, examine,
-    examine_sources, fingerprint_outcome, identify_by_fingerprint, select,
+    examine_sources, fingerprint_outcome, identify_by_fingerprint,
+    release_auto_mutes, select,
 )
 from cronicled.scoring import title_view
 from cronicled.store import Store
@@ -776,43 +778,73 @@ class ExamineTest(unittest.TestCase):
             proposal=None, mute_reason=MUTE_NO_CANDIDATES, error=None,
             reason=MUTE_NO_CANDIDATES))
 
-    def test_an_unresolved_creator_mutes_and_buys_no_lookup(self):
+    def test_an_unresolved_creator_refuses_and_buys_no_lookup(self):
         """Nothing names a creator, so there is no query to phrase — and the
-        budget this whole module rations must not be spent finding that out."""
+        budget this whole module rations must not be spent finding that out.
+
+        A REFUSAL, not a mute, and the whole `Outcome` is asserted so that
+        `mute_reason` staying `None` is pinned rather than assumed: a mute is
+        never revisited and no later scan re-examines the file, so an alias
+        written to fix exactly this file would change nothing anywhere. The
+        reason is spelled out here rather than read from the constant the
+        code formats — assert the code against itself and the two move
+        together.
+        """
         outcome, search = self.run_examine("/lib/2020-05-04/clip one.mp4",
                                            results=[self.MORNING])
 
         self.assertEqual(search.queries, [])
         self.assertEqual(outcome, Outcome(
-            proposal=None, mute_reason=MUTE_UNRESOLVED_CREATOR, error=None,
-            reason=MUTE_UNRESOLVED_CREATOR))
+            proposal=None, mute_reason=None, error=None,
+            reason="creator unresolved: the folder text '2020-05-04' was not "
+                   "accepted as a name, and the filename yielded none either"))
 
-    def test_the_two_mute_reasons_are_different_text(self):
-        """They mean different things to whoever reads them later — one says
-        the catalogue has nothing, the other says the library's own layout
-        names nobody — and only one of them is fixed by an alias. A single
-        catch-all reason would satisfy both tests above and lose that."""
-        self.assertNotEqual(MUTE_NO_CANDIDATES, MUTE_UNRESOLVED_CREATOR)
+    def test_a_file_with_no_folder_text_refuses_differently(self):
+        """The same filename, one directory level shallower, so the ONLY
+        thing that differs from the test above is whether there was folder
+        text for a guard to turn down.
 
-    def test_each_mute_reason_says_which_of_the_two_it_is(self):
-        """Which constant carries which sentence, pinned as a property of the
-        sentence rather than as the constant compared to itself.
+        There was not, so there is nothing to quote — and the reason must say
+        that as itself rather than quote an empty string or borrow the other
+        sentence. Collapsed into one catch-all reason, both tests above would
+        still pass while the Refused section stopped naming the text an alias
+        would be written against, which is the actionable half of the whole
+        row.
+        """
+        outcome, search = self.run_examine("/clip one.mp4",
+                                           results=[self.MORNING])
 
-        The tests above spell the expected reason `MUTE_NO_CANDIDATES` and
-        `MUTE_UNRESOLVED_CREATOR`, which is the same name the code returns:
-        exchange the two strings at their definitions and both sides move
-        together, both tests still pass, and `assertNotEqual` above still
-        holds because they are still two different strings. Confirmed by
-        mutation — the swap survives the whole suite.
+        self.assertEqual(search.queries, [])
+        self.assertEqual(outcome, Outcome(
+            proposal=None, mute_reason=None, error=None,
+            reason="creator unresolved: neither the folder nor the filename "
+                   "yielded a creator this run could accept"))
 
-        What the swap costs is the one thing these two reasons exist to
-        separate. The stored reason is what a reviewer reads months later,
-        and only ONE of the two is fixed by adding an alias. Swapped, every
-        file the catalogue had nothing for tells them to go write an alias
-        that will never fire, and every file whose layout named nobody tells
-        them the catalogue is empty for a creator that was never identified.
+    def test_only_the_rejected_folder_refusal_quotes_the_folder(self):
+        """The property that separates the two sentences, pinned on the
+        sentences rather than on one being compared to itself.
 
-        Each sentence is pinned by what it names AND by what it does not: a
+        Both tests above spell their expected reason out, so exchanging the
+        two constants at their definitions fails them — but a reader still
+        needs the rule stated: one of these two carries a `%r` slot for the
+        rejected text and the other must not, because a sentence with a slot
+        and nothing to put in it is how "no folder at all" comes to read as
+        `''`.
+        """
+        self.assertIn("%r", REFUSED_REJECTED_FOLDER)
+        self.assertNotIn("%", REFUSED_UNRESOLVED_CREATOR)
+        self.assertNotEqual(REFUSED_REJECTED_FOLDER,
+                            REFUSED_UNRESOLVED_CREATOR)
+
+    def test_the_mute_reason_is_not_reused_for_a_refusal(self):
+        """`MUTE_NO_CANDIDATES` is the one reason a scan still mutes for, and
+        it says the catalogue had nothing for a creator that WAS identified.
+        Neither refusal above may read like it: a person seeing "the
+        catalogue offered nothing" goes looking at a catalogue for a creator
+        nothing ever named, and the alias that would actually fix the file is
+        never written.
+
+        Each sentence pinned by what it names AND by what it does not — a
         single catch-all mentioning the catalogue, the folder and the
         filename at once would satisfy the positive halves alone.
         """
@@ -821,10 +853,12 @@ class ExamineTest(unittest.TestCase):
         self.assertNotIn("folder", MUTE_NO_CANDIDATES)
         self.assertNotIn("filename", MUTE_NO_CANDIDATES)
 
-        self.assertIn("folder", MUTE_UNRESOLVED_CREATOR)
-        self.assertIn("filename", MUTE_UNRESOLVED_CREATOR)
-        self.assertNotIn("candidates", MUTE_UNRESOLVED_CREATOR)
-        self.assertNotIn("catalogue", MUTE_UNRESOLVED_CREATOR)
+        for refusal in (REFUSED_REJECTED_FOLDER, REFUSED_UNRESOLVED_CREATOR):
+            self.assertIn("folder", refusal)
+            self.assertIn("filename", refusal)
+            self.assertNotIn("candidates", refusal)
+            self.assertNotIn("catalogue", refusal)
+            self.assertNotEqual(refusal, MUTE_NO_CANDIDATES)
 
     # -- the second kind: a human should look ----------------------------- #
 
@@ -948,7 +982,10 @@ class ExamineTest(unittest.TestCase):
             path, results=[self.MORNING], aliases={"VC": "Velvet Crane"})
 
         self.assertEqual(no_search.queries, [])
-        self.assertEqual(without.mute_reason, MUTE_UNRESOLVED_CREATOR)
+        self.assertIsNone(without.proposal)
+        # And the refusal names the text the operator has to declare, which
+        # is the whole reason an alias is writable at all.
+        self.assertIn("'VC'", without.reason)
         self.assertEqual(search.queries, ["Velvet Crane"])
         self.assertEqual(with_alias.proposal["payload"]["creator"], {
             "name": "Velvet Crane", "source": "alias",
@@ -1838,7 +1875,16 @@ class ExamineSourcesTest(unittest.TestCase):
             scene(1, "/library/Amberlight/Wren Ashcombe - Morning Ritual.mp4"),
             sources=sources, folder=FOLDER, threshold=0.5)
 
-        self.assertEqual(outcome.mute_reason, MUTE_UNRESOLVED_CREATOR)
+        # Refused, not muted — and refused with the sentence that claims
+        # nothing about the folder. "Amberlight" IS a plausible name; it was
+        # the evidence check that declined it, not a name guard, so there is
+        # no rejected text to quote and a reason saying the folder was empty
+        # would be false.
+        self.assertIsNone(outcome.mute_reason)
+        self.assertEqual(
+            outcome.reason,
+            "creator unresolved: neither the folder nor the filename yielded "
+            "a creator this run could accept")
 
     # -- malformed input ----------------------------------------------------- #
 
@@ -2232,14 +2278,20 @@ class MuteSpy:
     called `mute` with the reason Task 2 chose AND that the real store now
     refuses proposals for that subject. A fake store could pass the first
     check while the mute never landed.
+
+    Named `mute_calls`, not `mutes`: `Store.mutes()` is a real method, and an
+    attribute of that name here shadowed it through `__getattr__` — so a
+    producer that called `store.mutes()` got a list where the real store
+    hands back rows. A double must not have a different shape from the thing
+    it stands in for.
     """
 
     def __init__(self, store):
         self._store = store
-        self.mutes = []
+        self.mute_calls = []
 
     def mute(self, subject_type, subject_id, reason=None):
-        self.mutes.append((subject_type, subject_id, reason))
+        self.mute_calls.append((subject_type, subject_id, reason))
         return self._store.mute(subject_type, subject_id, reason=reason)
 
     def __getattr__(self, name):
@@ -2427,6 +2479,120 @@ class SingleFlightTest(unittest.TestCase):
         self.assertEqual(sorted(raised), ["first", "second"])
         self.assertIs(raised["first"], raised["second"])
         self.assertIsInstance(raised["second"], KeyboardInterrupt)
+
+
+class ReleaseAutoMutesTest(unittest.TestCase):
+    """Releasing the mutes the retired unresolved-creator rule left behind.
+
+    This runs against an operator's live database, so the failure that
+    matters is not "a row stayed hidden" — it is a hand-made mute, a standing
+    decision nothing else records, deleted by a repair that was aimed at
+    something else. Every test here therefore keeps a manual mute in the
+    table and asserts it is still standing afterwards: a release that emptied
+    the table would satisfy every "the auto-mute is gone" check on its own.
+
+    THE HISTORICAL TEXT IS SPELLED OUT, not imported. What has to be
+    recognised is the exact sentence sitting in databases written by the old
+    code; reading it from the constant the code matches on would move both
+    sides together, and a reworded constant would silently stop matching
+    anything while every test here went on passing.
+    """
+
+    # Byte for byte what the retired rule wrote. Never re-derived.
+    RETIRED = "creator unresolved: neither the folder nor the filename names one"
+    BY_HAND = "muted from the inbox"
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+
+    def mute_table(self):
+        """The mute table as `(subject_id, reason)`, whole rows, so a manual
+        mute that survived with its reason rewritten is not mistaken for one
+        that survived intact."""
+        return sorted((m["subject_id"], m["reason"]) for m in self.store.mutes())
+
+    def test_it_releases_the_auto_mutes_and_leaves_a_hand_made_one_standing(self):
+        self.store.mute(SUBJECT_TYPE, "1", reason=self.RETIRED)
+        self.store.mute(SUBJECT_TYPE, "2", reason=self.BY_HAND)
+        self.store.mute(SUBJECT_TYPE, "3", reason=self.RETIRED)
+        # The other auto-mute, deliberately still a mute and out of scope.
+        self.store.mute(SUBJECT_TYPE, "4", reason=MUTE_NO_CANDIDATES)
+        # A mute made with no reason at all, which `Store.mute` allows.
+        self.store.mute(SUBJECT_TYPE, "5")
+
+        released = release_auto_mutes(self.store)
+
+        self.assertEqual(sorted(released),
+                         [(SUBJECT_TYPE, "1"), (SUBJECT_TYPE, "3")])
+        self.assertEqual(self.mute_table(),
+                         [("2", self.BY_HAND), ("4", MUTE_NO_CANDIDATES),
+                          ("5", None)])
+
+    def test_a_reason_that_merely_resembles_the_retired_one_is_left_alone(self):
+        """Matched whole, not by prefix or substring. A person's own note
+        that happens to quote the sentence — or to be quoted by it — is a
+        standing decision, and releasing it on a resemblance would destroy
+        one on evidence that was never there.
+        """
+        self.store.mute(SUBJECT_TYPE, "1", reason=self.RETIRED + " (mine)")
+        self.store.mute(SUBJECT_TYPE, "2", reason="creator unresolved")
+        self.store.mute(SUBJECT_TYPE, "3", reason=self.RETIRED.upper())
+
+        self.assertEqual(release_auto_mutes(self.store), [])
+        self.assertEqual(self.mute_table(),
+                         [("1", self.RETIRED + " (mine)"),
+                          ("2", "creator unresolved"),
+                          ("3", self.RETIRED.upper())])
+
+    def test_it_is_safe_to_run_twice(self):
+        self.store.mute(SUBJECT_TYPE, "1", reason=self.RETIRED)
+        self.store.mute(SUBJECT_TYPE, "2", reason=self.BY_HAND)
+
+        release_auto_mutes(self.store)
+        second = release_auto_mutes(self.store)
+
+        self.assertEqual(second, [])
+        self.assertEqual(self.mute_table(), [("2", self.BY_HAND)])
+
+    def test_a_database_the_rule_never_touched_is_left_exactly_as_it_was(self):
+        self.store.mute(SUBJECT_TYPE, "2", reason=self.BY_HAND)
+
+        self.assertEqual(release_auto_mutes(self.store), [])
+        self.assertEqual(self.mute_table(), [("2", self.BY_HAND)])
+
+    def test_a_released_subject_comes_back_to_the_inbox_it_was_hidden_from(self):
+        """Deleting the mute row is not the same as undoing the mute.
+
+        `Store.mute` moves the subject's `item` row into `state = 'muted'`,
+        and `items()` filters that state out — so a release that only removed
+        the standing block would leave the proposal invisible behind a mute
+        that no longer exists, with nothing on any screen to say why.
+        """
+        fp = self.store.record(folder=FOLDER, subject_type=SUBJECT_TYPE,
+                               subject_id="1", summary="a proposal",
+                               payload={"title": "something"},
+                               producer="earlier")
+        self.store.mute(SUBJECT_TYPE, "1", reason=self.RETIRED)
+        self.assertEqual(self.store.items(), [])
+
+        release_auto_mutes(self.store)
+
+        self.assertEqual([(i["fingerprint"], i["state"])
+                          for i in self.store.items()], [(fp, "new")])
+
+    def test_the_retired_reason_is_kept_apart_from_the_wording_in_use(self):
+        """The release matches one exact sentence. Folded into whichever
+        refusal reads closest to it, a later reword of that refusal would
+        stop the release matching anything — and the rows it should have
+        freed would stay hidden, which is the failure this whole change
+        exists to end.
+        """
+        self.assertEqual(RETIRED_MUTE_UNRESOLVED_CREATOR, self.RETIRED)
+        self.assertNotEqual(RETIRED_MUTE_UNRESOLVED_CREATOR,
+                            REFUSED_UNRESOLVED_CREATOR)
+        self.assertNotEqual(RETIRED_MUTE_UNRESOLVED_CREATOR,
+                            REFUSED_REJECTED_FOLDER)
 
 
 class ScanProducerTest(unittest.TestCase):
@@ -2756,6 +2922,48 @@ class ScanProducerTest(unittest.TestCase):
         self.assertEqual(proposals, [])
         self.assertEqual(search.queries, [])
 
+    def test_a_scan_releases_the_retired_auto_mutes_and_works_them_at_once(self):
+        """The release has to happen before the batch is chosen, or the file
+        it freed waits for a run that nobody scheduled.
+
+        Being absent from the mute table is not the same as being selectable.
+        What is asserted here is that the released file was actually LOOKED
+        UP and proposed by this same scan — the thing an operator wanted when
+        they added the alias — not merely that a row disappeared.
+
+        Scene 2 is muted by hand in the same batch and must come through
+        untouched: it buys no lookup, produces no proposal, and its mute is
+        still standing at the end. A release that emptied the mute table
+        would pass every assertion about scene 1 on its own.
+        """
+        retired = ("creator unresolved: neither the folder nor the filename "
+                   "names one")
+        self.store.mute(SUBJECT_TYPE, "1", reason=retired)
+        self.store.mute(SUBJECT_TYPE, "2", reason="muted from the inbox")
+        search = ScriptedSearch(self.SCRIPT)
+
+        proposals = self.scan([scene(1, self.MORNING_PATH),
+                               scene(2, self.LEDGER_PATH)], search)
+
+        self.assertEqual(self.ids(proposals), ["1"])
+        self.assertEqual(search.queries, ["Velvet Crane"])
+        self.assertEqual([(m["subject_id"], m["reason"])
+                          for m in self.store.mutes()],
+                         [("2", "muted from the inbox")])
+        self.assertTrue(any("released 1 file(s)" in m
+                            for m in self.ctx.messages), self.ctx.messages)
+
+    def test_a_scan_with_nothing_to_release_says_nothing_about_it(self):
+        """An absent line has to mean "the retired rule left nothing here",
+        so it must not be printed unconditionally — the opening line a person
+        reads is the selection breakdown."""
+        self.store.mute(SUBJECT_TYPE, "2", reason="muted from the inbox")
+        self.scan([scene(1, self.MORNING_PATH)], ScriptedSearch(self.SCRIPT))
+
+        self.assertNotIn("released", self.ctx.messages[0])
+        self.assertFalse([m for m in self.ctx.messages if "released" in m],
+                         self.ctx.messages)
+
     def test_an_already_proposed_file_buys_no_lookup(self):
         self.store.record(folder=FOLDER, subject_type=SUBJECT_TYPE,
                           subject_id="1", summary="a proposal",
@@ -2769,10 +2977,13 @@ class ScanProducerTest(unittest.TestCase):
     # -- what happens to the files that do not become proposals ------------ #
 
     def test_an_unidentifiable_file_is_muted_through_the_store_with_a_reason(self):
-        """The skiplist is a mute. The two reasons stay distinct, because one
-        says the catalogue had nothing for a creator we did identify and the
-        other says the library's own layout named nobody — and only the second
-        is fixed by an alias."""
+        """The skiplist is a mute, and exactly one verdict still reaches it:
+        the creator was identified and the catalogue had nothing for them.
+
+        The unresolved-creator file in the same batch is the contrast, and it
+        is the point of running both together — a mute that fired for either
+        would satisfy a test that only looked at the first.
+        """
         spy = MuteSpy(self.store)
         proposals = self.scan(
             [scene(1, "/library/Velvet Crane/Harbour Lights.mp4"),
@@ -2780,12 +2991,39 @@ class ScanProducerTest(unittest.TestCase):
             ScriptedSearch({"Velvet Crane": []}), store=spy)
 
         self.assertEqual(proposals, [])
-        self.assertEqual(sorted(spy.mutes), sorted([
-            (SUBJECT_TYPE, "1", MUTE_NO_CANDIDATES),
-            (SUBJECT_TYPE, "2", MUTE_UNRESOLVED_CREATOR),
-        ]))
-        self.assertEqual(self.store.muted_subjects(),
-                         {(SUBJECT_TYPE, "1"), (SUBJECT_TYPE, "2")})
+        self.assertEqual(spy.mute_calls,
+                         [(SUBJECT_TYPE, "1", MUTE_NO_CANDIDATES)])
+        self.assertEqual(self.store.muted_subjects(), {(SUBJECT_TYPE, "1")})
+
+    def test_an_unresolved_creator_is_refused_through_the_store_not_muted(self):
+        """The whole recorded refusal, as one shape.
+
+        A field-by-field check cannot notice a field that was added or one
+        that quietly went missing, and this row is all a person gets: the
+        Refused section shows the filename, the reason and nothing else. The
+        reason is what carries the rejected folder text — "2020-05-04", the
+        date-shaped directory a name guard turned down — and that text is the
+        only thing on the row an operator can act on.
+
+        Muted instead, the same file leaves a row showing a bare id, is never
+        re-examined, and is re-muted by the next run for good measure.
+        """
+        proposals = self.scan([scene(2, self.UNNAMED_PATH)],
+                              ScriptedSearch({}))
+
+        self.assertEqual(proposals, [])
+        self.assertEqual(self.store.muted_subjects(), set())
+        refusals = self.store.refusals()
+        self.assertEqual(len(refusals), 1)
+        self.assertEqual(
+            {k: v for k, v in refusals[0].items() if k != "at"},
+            {"subject_type": SUBJECT_TYPE, "subject_id": "2",
+             "path": self.UNNAMED_PATH,
+             "reason": "creator unresolved: the folder text '2020-05-04' was "
+                       "not accepted as a name, and the filename yielded none "
+                       "either"})
+        self.assertEqual(set(refusals[0]), {"subject_type", "subject_id",
+                                            "path", "reason", "at"})
 
     def test_the_mute_names_the_file_that_was_unidentifiable(self):
         """The mute is bound to the scene that produced it, not to the place
@@ -2820,7 +3058,7 @@ class ScanProducerTest(unittest.TestCase):
         release.set()
         self.assertEqual(list(stream), [])
 
-        self.assertEqual(spy.mutes, [(SUBJECT_TYPE, "1", MUTE_NO_CANDIDATES)])
+        self.assertEqual(spy.mute_calls, [(SUBJECT_TYPE, "1", MUTE_NO_CANDIDATES)])
         self.assertEqual(self.store.muted_subjects(), {(SUBJECT_TYPE, "1")})
         # The same binding as the log sees it: the file that finished first
         # is named first, and each line names the file it is about.
