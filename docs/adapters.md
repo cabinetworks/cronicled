@@ -176,13 +176,30 @@ declare, and there is no way to tell one from a title word without guessing.
 a word says nothing about what any other store does. `aliases` does not:
 a file's creator is resolved once, from the file's own folder, before any
 store is searched, so every configured adapter's map is pooled into the one
-map a scan resolves against. A folder name that two adapters both declare an
-alias for is refused, naming both, rather than resolved by whichever loaded
-last — declare it in exactly one adapter.
+map a scan resolves against.
+
+Two adapters declaring the same folder is therefore ordinary and not an
+error, as long as they name the same creator — an adapter block is usually
+written by copying another and changing the store-specific fields, and the
+shared alias map comes along with the copy. The entry is pooled once and the
+scan runs. The folder name is compared the way a lookup compares it, so
+`V Crane` and `vcrane` are one entry rather than two.
+
+Two adapters naming *different* creators for one folder is refused, and the
+app will not start: there is one answer to give for that folder, and picking
+between them by whichever adapter loaded last would file somebody's work
+under another person's name with nothing anywhere saying so. The refusal
+names both adapters and both names, so the line to correct is in the message.
+The names are compared exactly — `Velvet Crane` and `velvet crane` are a
+disagreement about the spelling every proposal from that scan would carry,
+and making the two lines identical is the fix.
 
 Both maps are optional and default to empty. A malformed `aliases` map — two
 keys that normalise alike, a key that normalises to nothing, a value that is
 not a name — fails when `adapters.json` loads, not part-way through a scan.
+That includes one adapter declaring the same folder twice, which stays a
+refusal whether or not the two lines agree: within one map the rule is one
+entry per folder name.
 
 ## Where adapters come from
 

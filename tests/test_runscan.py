@@ -625,12 +625,22 @@ def alias_spec(name="store", aliases=None, scraper_id="scraper-alpha"):
     """A real `DeclarativeAdapter` spec -- the shape an `adapters.json` entry
     actually has. The alias tests below go through the real class rather than
     the `_Adapter` double above, because the whole question is whether what an
-    operator writes in that file reaches the resolver."""
-    return {"name": name, "display": name, "scraper_id": scraper_id,
-            "owner_source": "url_segment", "owner_segment": 2,
-            "catalog_resolvable": True,
-            "title_match_counts_as_ownership": True,
-            "aliases": dict(aliases or {})}
+    operator writes in that file reaches the resolver.
+
+    Round-tripped through JSON because that is where a spec comes from, and
+    because the difference is load-bearing here. Two adapters that name the
+    same creator hold two EQUAL strings; the compiler folds two identical
+    literals written in one test method into ONE object, so a fixture built
+    from literals hands the code an identity `json.load` never produces --
+    and an agreement check written as `is` would pass every test while
+    refusing every real config. A fixture must not be more capable than the
+    thing it stands in for."""
+    return json.loads(json.dumps(
+        {"name": name, "display": name, "scraper_id": scraper_id,
+         "owner_source": "url_segment", "owner_segment": 2,
+         "catalog_resolvable": True,
+         "title_match_counts_as_ownership": True,
+         "aliases": dict(aliases or {})}))
 
 
 class TheConfiguredAliasesAreOneMapForTheWholeScan(unittest.TestCase):
@@ -681,25 +691,69 @@ class TheConfiguredAliasesAreOneMapForTheWholeScan(unittest.TestCase):
         self.assertIn("beta", message)
         self.assertIn("vcrane", message)
 
-    def test_a_duplicate_the_two_adapters_agree_on_is_refused_too(self):
-        # Not an ambiguity -- a rule. `Aliases` already refuses two keys that
-        # normalise alike within one map even when they agree, because the
-        # rule an operator can hold in their head is one entry per folder
-        # name; splitting it across adapters does not make it two rules.
-        # Spelled differently in the two adapters on purpose: the collision
-        # is on the NORMALISED form, which is what a lookup uses, so the
-        # refusal has to name both adapters here too -- left to the plain-key
-        # check these two are simply different entries, and the operator
-        # would be told two keys normalise alike with no way to tell which
-        # files they are in.
+    def test_the_refusal_names_the_two_names_that_actually_disagree(self):
+        # The two KEYS are identical by construction -- they are what
+        # collided -- so a message built from them prints one folder name
+        # twice and leaves the operator to open both files and diff them by
+        # eye. The names are the whole of the disagreement and the only part
+        # they can act on. Asserted as two distinct strings: a catch-all
+        # phrase, or one name printed twice, satisfies neither assertion.
         adapters = self._adapters(
             alias_spec("alpha", {"vcrane": "Velvet Crane"}),
-            alias_spec("beta", {"V Crane": "Velvet Crane"}))
+            alias_spec("beta", {"vcrane": "Vera Crane"}))
         with self.assertRaises(ValueError) as ctx:
             configured_aliases(adapters)
         message = str(ctx.exception)
-        self.assertIn("alpha", message)
-        self.assertIn("beta", message)
+        self.assertIn("Velvet Crane", message)
+        self.assertIn("Vera Crane", message)
+
+    def test_two_adapters_declaring_the_same_entry_agree_and_it_is_pooled(self):
+        # HARM, observed live: three adapters carrying identical alias maps
+        # crash-looped the container, so the refusal arrived as a service
+        # that would not start rather than as a page anybody could read it
+        # on. Copying an adapter block and changing the store-specific
+        # fields is the ordinary way one gets written, and the shared map
+        # comes along with the copy -- two adapters saying the same thing
+        # about the same folder AGREE, and agreement is not ambiguity.
+        # Whole map asserted, not just its length: pooling that dropped the
+        # entry entirely would also leave one adapter's worth of nothing.
+        adapters = self._adapters(
+            alias_spec("alpha", {"vcrane": "Velvet Crane"}),
+            alias_spec("beta", {"vcrane": "Velvet Crane"}),
+            alias_spec("gamma", {"vcrane": "Velvet Crane"}))
+        self.assertEqual(configured_aliases(adapters),
+                         Aliases({"vcrane": "Velvet Crane"}))
+
+    def test_agreement_is_read_off_the_normalised_key_the_lookup_uses(self):
+        # "V Crane" and "vcrane" are one lookup, not two -- `full_name`
+        # matches on the spaceless form. So two adapters that spell the same
+        # folder differently and name the same creator agree just as plainly
+        # as two that spell it alike, and the pooled map holds ONE entry.
+        adapters = self._adapters(
+            alias_spec("alpha", {"vcrane": "Velvet Crane"}),
+            alias_spec("beta", {"V Crane": "Velvet Crane"}))
+        pooled = configured_aliases(adapters)
+        self.assertEqual(pooled, Aliases({"vcrane": "Velvet Crane"}))
+        self.assertEqual(pooled.full_name("V-Crane"), "Velvet Crane")
+
+    def test_two_spellings_of_one_name_are_a_disagreement_not_agreement(self):
+        # Pins what "the same value" MEANS: the name as written, compared
+        # exactly. Normalising it first would make these two agree -- and
+        # then the one name pooled, which is the name every proposal from
+        # this run is attributed to, would be whichever adapter sorted
+        # first. That is the iteration-order attribution this function
+        # exists to refuse, reintroduced one level down where nothing looks
+        # at it. Two adapters that disagree about the spelling have not
+        # agreed about the name; an operator makes them identical, which is
+        # a one-line edit against a message that shows both.
+        adapters = self._adapters(
+            alias_spec("alpha", {"vcrane": "Velvet Crane"}),
+            alias_spec("beta", {"vcrane": "velvet crane"}))
+        with self.assertRaises(ValueError) as ctx:
+            configured_aliases(adapters)
+        message = str(ctx.exception)
+        self.assertIn("Velvet Crane", message)
+        self.assertIn("velvet crane", message)
 
     def test_the_refusal_reads_the_same_whatever_order_the_file_lists_them_in(self):
         # `load_adapters` builds its mapping in the order `adapters.json`
@@ -741,6 +795,24 @@ class TheConfiguredAliasesAreOneMapForTheWholeScan(unittest.TestCase):
         # this adapter twice and tell the operator to declare the alias in
         # exactly one adapter -- advice that cannot be followed, because they
         # already have.
+        message = str(ctx.exception)
+        self.assertIn("normalise", message)
+        self.assertNotIn("adapters", message)
+
+    def test_one_adapter_declaring_a_folder_twice_is_still_refused(self):
+        # Two adapters AGREEING is the thing this ticket stopped refusing.
+        # One adapter writing the same folder twice is a different mistake
+        # and is not covered by that: it is a duplicated line in a single
+        # hand-edited map, refused by `Aliases` even when the two lines
+        # agree, because the rule an operator can hold in their head is one
+        # entry per folder name. Same value in both lines on purpose -- an
+        # agreement test that let this through would look exactly like the
+        # fix above.
+        adapters = {"alpha": _Adapter()}
+        adapters["alpha"].aliases = {"vcrane": "Velvet Crane",
+                                     "v crane": "Velvet Crane"}
+        with self.assertRaises(ValueError) as ctx:
+            build_producer(_FakeStash([]), adapters, self.store, limit=10)
         message = str(ctx.exception)
         self.assertIn("normalise", message)
         self.assertNotIn("adapters", message)

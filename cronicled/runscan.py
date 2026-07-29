@@ -80,15 +80,43 @@ def configured_aliases(adapters):
     once per FILE, off that file's own folder, before any store has been
     searched. There is one answer per file to give, so there is one map.
 
-    That makes a key declared by two adapters ambiguous rather than
-    redundant, and it is REFUSED, naming both adapters. Pooling by
-    `dict.update` would hand the answer to whichever adapter sorted last —
+    Two adapters declaring the same folder are therefore checked against
+    each other before either is pooled — but what decides it is whether they
+    NAME THE SAME CREATOR, not whether they both spoke. Two adapters that
+    agree agree; refusing that took the service down at start-up, before
+    there was a page to read the refusal on, over a configuration shape that
+    is the ordinary one: an adapter block gets written by copying another
+    and changing the store-specific fields, so a shared alias map comes
+    along with the copy. An entry two adapters agree on is pooled once and
+    the run starts.
+
+    Two adapters that name DIFFERENT creators for one folder is the real
+    ambiguity, and it is still refused — at start-up, deliberately. Pooling
+    by `dict.update` would hand the answer to whichever adapter sorted last,
     the iteration-order attribution this project has already removed from
-    three other places — and refusing even when the two agree keeps the rule
-    an operator can hold in their head the same one `Aliases` states for a
-    single map: one entry per normalised folder name, declared once.
-    Adapters are visited in name order so the refusal names the same pair
-    whatever order the config file happens to list them in.
+    three other places, and a wrong attribution is written into proposals
+    where nothing later re-checks it. The refusal names both adapters AND
+    both names: the keys are identical by construction — they are what
+    collided — so a message built from them prints one folder name twice and
+    leaves the operator to diff two files by eye. Adapters are visited in
+    name order, so the same pair of lines produces the same message whatever
+    order the config file happens to list them in.
+
+    "The same creator" means the name as WRITTEN, compared exactly. The
+    normalised forms are deliberately not compared: agreement is what lets a
+    single value be pooled, and if two spellings of one name counted as
+    agreement then the spelling pooled — which is the name every proposal
+    from this run carries — would be whichever adapter sorted first. That is
+    the same iteration-order attribution one level down, where nothing looks
+    at it. Exact equality is the only reading under which the pooled map
+    cannot depend on adapter order. The cost is a refusal an operator clears
+    by making two lines identical, against a message showing both.
+
+    The KEYS, in contrast, are compared normalised, because that is what a
+    lookup matches on: "V Crane" and "vcrane" are one entry, not two, so two
+    adapters spelling one folder differently and naming one creator agree.
+    Which of the two spellings is pooled is unobservable — `Aliases` keys its
+    index on the normalised form, so both build the identical map.
 
     Returns an `Aliases`, built here and passed whole to the run, which is
     where the remaining malformed-map refusals (a duplicated key, a key that
@@ -96,7 +124,19 @@ def configured_aliases(adapters):
     `DeclarativeAdapter` has already applied those to its own map as it
     loaded; this catches the cross-adapter cases that check cannot see, and
     stands as the backstop for a hand-written adapter that never went
-    through it.
+    through it. One adapter declaring the same folder twice stays that
+    refusal's business, agreeing values or not — the pairwise check below
+    skips an adapter against itself, so both spellings reach the pooled map
+    and `Aliases` refuses them there, describing the mistake that was
+    actually made rather than telling an operator to declare in one adapter
+    what they already did.
+
+    One residual, stated rather than claimed away: an adapter that declares
+    one folder twice AND shares that folder with another adapter every one of
+    them names the same creator for has its internal duplicate absorbed by
+    the agreement above, and is not refused. Every line agrees, so nothing
+    about the attribution is decided by order; what is lost is the tidiness
+    complaint, not a guard.
     """
     pooled = {}
     declared_by = {}
@@ -105,13 +145,21 @@ def configured_aliases(adapters):
             slug = spaceless(key)
             first = declared_by.get(slug)
             if first is not None and first[0] != adapter_name:
-                raise ValueError(
-                    "adapters %r and %r both declare an alias for %r "
-                    "(as %r and %r); an alias names a creator, not a store, "
-                    "and one map is built for the whole scan, so declare it "
-                    "in exactly one adapter"
-                    % (first[0], adapter_name, slug, first[1], key))
-            declared_by[slug] = (adapter_name, key)
+                first_adapter, first_full = first
+                if full != first_full:
+                    raise ValueError(
+                        "adapters %r and %r disagree about the alias for "
+                        "%r: %r names %r, %r names %r. An alias names a "
+                        "creator, not a store, and one map is built for the "
+                        "whole scan, so there is one answer to give for that "
+                        "folder — correct whichever line is wrong, or leave "
+                        "the entry in exactly one adapter"
+                        % (first_adapter, adapter_name, slug,
+                           first_adapter, first_full, adapter_name, full))
+                # The two agree: already pooled, under the equal name the
+                # earlier adapter wrote.
+                continue
+            declared_by[slug] = (adapter_name, full)
             pooled[key] = full
     return Aliases(pooled)
 
