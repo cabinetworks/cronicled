@@ -132,6 +132,71 @@ def load_schedule(path=None, env=None):
     return overrides
 
 
+def default_scan_path(env=None):
+    return os.path.join(config_dir(env), "scan.json")
+
+
+MARKER_TAG_KEY = "marker_tag"
+
+
+def load_marker_tag(path=None, env=None):
+    """The name of the tag that marks a scene as ORGANIZED PROVISIONALLY, or
+    `None` when the operator has not named one.
+
+    A library can carry a tag an earlier tool left behind, recording that a
+    scene's metadata was guessed — a date, a filename, sometimes a creator —
+    and never checked against a catalogue. Such a scene is usually marked
+    organized too, so a scan that pools only the unorganized set never looks
+    at it again. Naming that tag here is what puts those files back in a
+    scan's reach; see `cronicled.scan.ScanProducer` for what it then does
+    with them, and for why the tag is read and never written.
+
+    Absence is a legitimate state — most libraries carry no such tag, and a
+    scan with none configured pools exactly what it always did — so this
+    follows `load_adapters`'s half of the rule in this module's docstring and
+    returns `None` rather than raising: an absent file, and a file that names
+    no `marker_tag`, are both "nothing configured". A file that IS a config
+    file for something else this scan may one day carry is not malformed for
+    lacking this key.
+
+    A key that is PRESENT and unusable raises, naming the file. That is the
+    other half of the rule, and the distinction it draws is the whole reason
+    this is not one `or None`: an empty string, a blank one, or a number is
+    an operator who meant to name a tag, and it is falsy — folded into
+    absence it would silently restore today's behaviour, which is the exact
+    state the operator was trying to change and the one they cannot tell
+    apart from success. The tag NAME is not otherwise inspected here; whether
+    the server actually holds such a tag is a question only the server can
+    answer, and it is asked at scan time (see `ScanProducer._pool`).
+
+    `$CRONICLED_CONFIG_DIR` is honoured through `config_dir`, and `env` is
+    injectable, exactly as every loader above.
+    """
+    if path is None:
+        path = default_scan_path(env)
+    if not os.path.exists(path):
+        return None
+    with open(path) as fh:
+        payload = json.load(fh)
+    if not isinstance(payload, dict):
+        raise ValueError(
+            "%s must hold a JSON object, for example {\"%s\": \"needs "
+            "review\"}, but it holds %s"
+            % (path, MARKER_TAG_KEY, type(payload).__name__))
+    if MARKER_TAG_KEY not in payload:
+        return None
+    marker = payload[MARKER_TAG_KEY]
+    if not isinstance(marker, str) or not marker.strip():
+        raise ValueError(
+            "%s sets %r to %r, which names no tag. Give it the exact name of "
+            "the tag your library marks provisionally-organized scenes with, "
+            "or remove the key — removing it is how a scan is told there is "
+            "no such tag, and an empty one would quietly mean the same thing "
+            "while looking like a setting."
+            % (path, MARKER_TAG_KEY, marker))
+    return marker
+
+
 def default_stashbox_path(env=None):
     return os.path.join(config_dir(env), "stashbox.json")
 

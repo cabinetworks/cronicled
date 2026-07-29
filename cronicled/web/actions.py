@@ -68,7 +68,8 @@ def _match_to_apply(payload):
 
 
 class Actions:
-    def __init__(self, store, stash, runner=None, adapters=None):
+    def __init__(self, store, stash, runner=None, adapters=None,
+                 marker=None):
         self._store = store
         # `stash` is None when the entry point was started without a
         # configured media server -- see cronicled/__main__.py. Every method
@@ -89,6 +90,18 @@ class Actions:
         # them rather than one chosen adapter.
         self._runner = runner
         self._adapters = adapters
+        # The provisionally-organized marker tag's NAME, read from this
+        # install's own config by the entry point (see
+        # `cronicled.config.load_marker_tag`) and handed on to every scan this
+        # control starts. Carried rather than re-read here for the same
+        # reason `adapters` is: `--config-dir` means only the entry point
+        # knows which directory the config was loaded from, and a loader
+        # called from this far in would read a different one, find nothing,
+        # and leave a configured marker doing nothing at all on the one path
+        # a person actually presses. That is not hypothetical -- an alias map
+        # was configured and ignored on exactly this path, because this
+        # method did not pass it either.
+        self._marker = marker
 
     def _find(self, fp):
         # A single call, not one per state: `items(state=None)` already
@@ -339,6 +352,12 @@ class Actions:
         that forgot to supply one gets the same refusal the CLI's `--limit`
         gives, not a silent unlimited scan.
 
+        The configured marker tag travels with this control (see
+        `__init__`), so a scan a person presses Scan for pools the
+        provisionally-organized files a scheduled scan pools -- the two
+        differ in their limit and their registration, never in what they can
+        see.
+
         Raises when there is nothing to scan against, on the same terms
         `approve`/`undo` already refuse a missing `stash`: no adapter
         configured (a fresh install with `adapters.json` never set up), or
@@ -356,7 +375,7 @@ class Actions:
         if self._stash is None:
             raise RuntimeError(_NO_STASH)
         producer = build_producer(self._stash, self._adapters, self._store,
-                                  limit=limit)
+                                  limit=limit, marker=self._marker)
         # A fresh `ScanProducer` is built above for every call, because
         # `limit` has to be enforced at construction (see `build_producer`'s
         # own docstring) -- there is no later point to hand it in. `register`

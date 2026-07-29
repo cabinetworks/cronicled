@@ -526,6 +526,61 @@ class ConfigDirThreading(_Base):
         self.assertEqual(adapter.name, "invented")
         self.assertEqual(adapter.scraper_id, "InventedStore")
 
+    def test_config_dir_also_reaches_the_marker_tag(self):
+        # The same seam as the adapters above, for the value that decides
+        # whether a scan can see provisionally-organized files at all. A
+        # loader called on the ambient environment instead of the same `env`
+        # finds no scan.json, answers "no marker configured" -- a legitimate
+        # state, so nothing raises -- and every scan this process starts goes
+        # on pooling only the unorganized set while the operator's config
+        # sits in the directory they named.
+        conf = os.path.join(self._dir, "conf")
+        os.makedirs(conf)
+        with open(os.path.join(conf, "scan.json"), "w") as fh:
+            json.dump({"marker_tag": "inferred-metadata"}, fh)
+        captured = _CapturedServe()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(CONFIG_DIR_ENV_VAR, None)
+            with patch("cronicled.__main__.serve", captured):
+                main(["--db", self.db_path, "--config-dir", conf])
+
+        self.assertEqual(captured.kwargs["actions"]._marker,
+                         "inferred-metadata")
+
+    def test_no_marker_configured_leaves_the_actions_without_one(self):
+        # The other half of the rule the loader states: an absent scan.json
+        # is a legitimate install, not a start-up failure, and it must reach
+        # the page as "no marker" rather than as something invented here.
+        conf = os.path.join(self._dir, "empty-conf")
+        os.makedirs(conf)
+        captured = _CapturedServe()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(CONFIG_DIR_ENV_VAR, None)
+            with patch("cronicled.__main__.serve", captured):
+                main(["--db", self.db_path, "--config-dir", conf])
+
+        self.assertIsNone(captured.kwargs["actions"]._marker)
+
+    def test_the_marker_read_here_also_reaches_the_scheduled_scan(self):
+        # `main` hands the marker to two places -- the page's control and the
+        # unattended schedule -- and one of them silently not getting it is
+        # the shape this project has already shipped once. The `Actions` half
+        # is asserted above; this is the other half, at the call `main` makes.
+        conf = os.path.join(self._dir, "conf-scheduled")
+        os.makedirs(conf)
+        with open(os.path.join(conf, "scan.json"), "w") as fh:
+            json.dump({"marker_tag": "inferred-metadata"}, fh)
+        captured = _CapturedServe()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(CONFIG_DIR_ENV_VAR, None)
+            with patch("cronicled.__main__.serve", captured):
+                with patch("cronicled.__main__.build_scheduler") as scheduler:
+                    scheduler.return_value = None
+                    main(["--db", self.db_path, "--config-dir", conf])
+
+        self.assertEqual(scheduler.call_args.kwargs["marker"],
+                         "inferred-metadata")
+
     def test_config_dir_flag_does_not_mutate_os_environ(self):
         # Deliberately NOT run through `self._run`'s `patch.dict`: that
         # context manager restores `os.environ` to its pre-call snapshot on
@@ -821,10 +876,12 @@ class ScheduledScanWiring(_Base):
         # value a test passes on purpose here -- an install with no media
         # server -- and a helper reading it as "not supplied" would hand back
         # the configured one and quietly test the opposite of what was asked.
-        args = {"stash": self.stash, "adapters": self.adapters}
+        args = {"stash": self.stash, "adapters": self.adapters,
+                "marker": None}
         args.update(over)
         return build_scheduler(self.runner, self.store, args["stash"],
-                               args["adapters"], env=self.env)
+                               args["adapters"], env=self.env,
+                               marker=args["marker"])
 
     def test_the_nightly_scan_is_in_the_schedule_the_first_tick_reads(self):
         # THE silent one. `Scheduler.__init__` resolves the schedule once,
@@ -866,6 +923,19 @@ class ScheduledScanWiring(_Base):
         # And the run was recorded against the moment the tick decided, so
         # the next one is counted from it.
         self.assertEqual(self.store.last_run(SCHEDULED_SCAN_NAME), result.at)
+
+    def test_the_configured_marker_tag_reaches_the_scheduled_scan(self):
+        # A SEPARATE call site from the page's Scan button, and so a separate
+        # test, for the same reason the aliases below have one: the run
+        # nobody watches is the one where a value quietly not arriving costs
+        # the most. Without the marker here the nightly pass keeps skipping
+        # every provisionally-organized file in the library, and the only
+        # symptom is an inbox that stays smaller than it should.
+        self._build(marker="inferred-metadata")
+
+        nightly = {p.name: p for p in self.runner.producers()}[
+            SCHEDULED_SCAN_NAME]
+        self.assertEqual(nightly._marker, "inferred-metadata")
 
     def test_the_configured_aliases_reach_the_scheduled_scan(self):
         # A SEPARATE call site from the page's Scan button, and so a separate
