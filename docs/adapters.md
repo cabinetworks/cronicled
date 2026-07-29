@@ -133,3 +133,15 @@ See [Container](container.md) for how that is mounted in the image.
 A fresh install has no config at all. `load_adapters` returns an empty mapping
 rather than raising, so the app can start and say what needs configuring
 instead of failing to import.
+
+An `adapters.json` that is present and cannot be loaded is the opposite case,
+and the app refuses to start: a syntax error, a retired key, a spec missing a
+required field. Each raises with a message naming what is wrong, and the entry
+point reports it — naming the file — rather than substituting the empty mapping
+above. The two states are not interchangeable: "you have not configured a store
+yet" and "the store you configured has a trailing comma on line 4" call for
+different next moves from whoever reads the message.
+
+The start-up line names the config directory, the database, and which adapters
+actually loaded. It is printed after the load, so it cannot report a directory
+in good health for a config that never parsed.

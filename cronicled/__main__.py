@@ -42,10 +42,11 @@ import argparse
 import os
 
 from . import tags
+from .adapters.registry import default_adapters_path, load_adapters
 from .config import CONFIG_DIR_ENV_VAR, config_dir, load_schedule
 from .descriptions import DescriptionProducer
 from .jobs import JobRunner
-from .runscan import DAILY, build_scheduled_producer, configured_adapters
+from .runscan import DAILY, build_scheduled_producer
 from .schedule import Scheduler
 from .store import Store
 from .stash import Stash
@@ -174,7 +175,70 @@ def main(argv=None):
     env = dict(os.environ)
     if args.config_dir is not None:
         env[CONFIG_DIR_ENV_VAR] = args.config_dir
-    print("config directory: %s" % config_dir(env=env))
+
+    # FIRST, before the start-up line below and before anything is opened,
+    # because a config that cannot be understood is a start-up failure and
+    # every line printed before it would be describing an install that does
+    # not exist.
+    #
+    # `load_adapters` draws the one distinction that matters here, and it
+    # draws it deliberately (see `cronicled.adapters.registry`'s module
+    # docstring, and the rule in `cronicled.config`'s):
+    #
+    #     absent adapters.json  -> an empty mapping, a legitimate fresh
+    #                              install, nothing said
+    #     present but unloadable -> raises, naming what is wrong
+    #
+    # This calls it and swallows NOTHING. A caller that turned the second
+    # answer into the first -- as this one used to, catching ValueError,
+    # RuntimeError and KeyError alike and substituting `{}` -- reports a
+    # syntax error, a retired key and a missing required field all as "no
+    # adapters are configured", which sends the operator to check that a
+    # file they already have exists. Observed three times, from three
+    # different causes.
+    #
+    # `configured_adapters` is deliberately NOT what is called here: it adds
+    # "and a scan needs at least one" on top of the loader, which is a
+    # refusal that belongs to a caller about to run a scan, not to the app
+    # starting. An install with no adapters still starts, still browses,
+    # still dismisses and mutes, and `Actions.scan` gives its own clear
+    # refusal once somebody presses Scan.
+    #
+    # `env=env` and not the ambient environment: this is the seam where
+    # --config-dir either reaches the adapters or silently does not.
+    # Omitting it leaves the flag half-working -- the directory printed
+    # below would be the one asked for, while the adapters came from
+    # somewhere else -- and nothing would raise to say so.
+    #
+    # The WHOLE mapping, every configured adapter -- there is no single
+    # "the" adapter any more (see `cronicled.runscan.build_producer`): a
+    # scan searches every one of them.
+    try:
+        adapters = load_adapters(env=env)
+    except Exception as exc:
+        # Nothing is swallowed: every path out of this block either binds
+        # `adapters` or raises. The wrapper exists only to name the FILE,
+        # which none of the loader's own messages carry -- a JSON syntax
+        # error names a line and a column and no file at all -- and it
+        # carries the original message through verbatim, chained to the
+        # original traceback rather than replacing it.
+        raise RuntimeError(
+            "the adapter config at %s could not be loaded: %s. An ABSENT "
+            "adapters.json is a legitimate fresh install and starts "
+            "silently with no adapters; this one is present and cannot be "
+            "read, which is not the same state and must not be reported as "
+            "it." % (default_adapters_path(env), exc)) from exc
+
+    # AFTER the load, and reporting what the load produced. Printed before
+    # it, this line announced a config directory in good health on every one
+    # of the malformed configs above -- the log read as though everything was
+    # found while nothing worked.
+    print("config directory: %s (adapters: %s)"
+          % (config_dir(env=env), ", ".join(sorted(adapters)) or "none"))
+    # The other path this process writes to and the operator cannot see from
+    # the outside. Two files, both named, so "which database is this reading"
+    # is answered by the start-up line rather than by guessing at the flag.
+    print("database: %s" % args.db)
 
     store = Store(args.db)
     if args.server:
@@ -185,24 +249,6 @@ def main(argv=None):
               "muting still work; Approve and Undo will refuse until a "
               "media server is set (--server / --api-key, or "
               "$CRONICLED_SERVER / $CRONICLED_API_KEY).")
-    try:
-        # A fresh install with no adapters.json configured is a legitimate
-        # state, not an error -- see cronicled.adapters.registry's module
-        # docstring -- so this stays silent the same way `load_adapters`
-        # itself does. `Actions.scan` gives the loud, specific refusal, and
-        # only once someone actually presses Scan.
-        # `env=env` and not the ambient environment: this is the seam where
-        # --config-dir either reaches the adapters or silently does not.
-        # Omitting it leaves the flag half-working -- the directory printed
-        # above would be the one asked for, while the adapters came from
-        # somewhere else -- and nothing would raise to say so.
-        #
-        # The WHOLE mapping, every configured adapter -- there is no single
-        # "the" adapter any more (see `cronicled.runscan.build_producer`): a
-        # scan searches every one of them.
-        adapters = configured_adapters(env=env)
-    except (ValueError, RuntimeError, KeyError):
-        adapters = {}
     runner = JobRunner(store)
     actions = Actions(store, stash, runner=runner, adapters=adapters)
     # The same address already resolved for `stash` above (or `None`,
