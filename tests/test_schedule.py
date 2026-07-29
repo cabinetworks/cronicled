@@ -1330,5 +1330,91 @@ class AProducerThatNeverStarts(SchedulerCase):
         self.assertEqual(scheduler.status().failing_to_start, {})
 
 
+class FailsAfterTheFirstTick(WatchedStore):
+    """The real store for one tick, and a store that cannot be read for every
+    tick after it.
+
+    It exists to make "the last tick that FINISHED" a different tick from
+    "the last tick", which is the only way to tell a status that keeps the
+    last real answer from one that keeps whatever happened most recently.
+    """
+
+    def runs(self):
+        answer = super().runs()
+        if self.ticks > 1:
+            raise gone_away()
+        return answer
+
+
+class TheStatusCarriesTheLastTicksAnswers(SchedulerCase):
+    """`LoopStatus` counts ticks, and a count cannot answer "why has the
+    nightly scan not run?".
+
+    The reasons exist for exactly that question — `due` returns them and a
+    `TickResult` carries them — but until they reach `status()` they end with
+    the tick that produced them, because nothing else keeps them and nothing
+    logs them. A status reporting only what STARTED answers a different
+    question from the one anybody asks of it.
+    """
+
+    def test_a_scheduler_that_has_never_ticked_has_no_last_result(self):
+        scheduler = self.scheduler(RunnableProducer("nightly"))
+        self.assertIsNone(scheduler.status().last_result)
+
+    def test_the_reason_a_due_producer_was_left_alone_reaches_status(self):
+        # Recorded as having just run, so every tick has a cadence to explain
+        # rather than work to do — and so the reason is the cadence one
+        # rather than "already running", which would depend on how quickly a
+        # job the loop started happened to finish.
+        self.store.record_run("nightly", NOW_ISO)
+        watched = WatchedStore(self.store)
+        scheduler = self.scheduler(RunnableProducer("nightly"), store=watched,
+                                   interval=0, clock=lambda: NOW)
+
+        self.looping(scheduler)
+        self.assertTrue(watched.reached(2).wait(5))
+        self.assertTrue(scheduler.close(5))
+
+        result = scheduler.status().last_result
+        # Whole shapes, not sampled keys: a tick with nothing due and a tick
+        # with work it could not begin both read as "nothing started", and
+        # telling those apart is the whole of what this field is for.
+        self.assertEqual(result.due, [])
+        self.assertEqual(result.started, {})
+        self.assertEqual(result.failed_to_start, {})
+        self.assertEqual(list(result.skipped), ["nightly"])
+        self.assertIn("next due at", result.skipped["nightly"])
+        self.assertEqual(result.at, NOW_ISO)
+        # Nothing ran, which is what the reason above says: a status that
+        # reported a reason while the producer had in fact started would be
+        # worse than one that reported nothing.
+        self.assertEqual(self.runner.jobs(), [])
+
+    def test_the_answer_it_keeps_is_the_last_tick_that_FINISHED(self):
+        # Both halves in one fixture, because they are the same rule: what
+        # `status()` holds is the last tick that decided something, so the
+        # started side is pinned as well as the reason side, and a tick that
+        # RAISED leaves the last real answer standing rather than blanking it
+        # at the moment there is most to explain.
+        watched = FailsAfterTheFirstTick(self.store)
+        scheduler = self.scheduler(RunnableProducer("nightly",
+                                                    gate=self.gate()),
+                                   store=watched, interval=0,
+                                   clock=lambda: NOW)
+
+        self.looping(scheduler)
+        self.assertTrue(watched.reached(3).wait(5))
+        self.assertTrue(scheduler.close(5))
+
+        status = scheduler.status()
+        self.assertGreaterEqual(status.failures, 2)
+        result = status.last_result
+        self.assertEqual(result.due, ["nightly"])
+        self.assertEqual(list(result.started), ["nightly"])
+        self.assertEqual(result.skipped, {})
+        self.assertEqual(result.failed_to_start, {})
+        self.assertEqual(result.at, NOW_ISO)
+
+
 if __name__ == "__main__":
     unittest.main()

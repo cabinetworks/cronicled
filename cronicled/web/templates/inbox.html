@@ -322,3 +322,44 @@
 <form method="post" action="/scan"><label>Files to look at <input type="number" name="limit" value="{{ scan_default_limit }}" min="0"></label> <button>Scan</button></form>
 <p class="note">Each file spends one lookup against the configured scraper. Files already proposed or muted don't count against this.</p>
 </div>
+
+{# The three questions an operator has about an unattended run, in the order
+   they ask them: is the loop alive, when did it last look, and -- the one a
+   started set alone can never answer -- why did the thing they are waiting
+   for not run. `skipped` is a "not now" the next tick may resolve on its
+   own; `failed_to_start` is the runner refusing in a way repeating will not
+   fix, and the two are shown apart because they send a person to different
+   places. #}
+<h2>Schedule</h2>
+<div class="scan">
+{% if schedule %}
+  {% if schedule.running %}
+<p>Loop: <b>ticking</b> &mdash; {{ schedule.ticks }} ticks, {{ schedule.failures }} failed</p>
+  {% elif schedule.closed %}
+<p>Loop: <b>stopped</b> &mdash; {{ schedule.ticks }} ticks, {{ schedule.failures }} failed</p>
+  {% else %}
+<p>Loop: <b>NOT RUNNING</b>, and not stopped either &mdash; it died after {{ schedule.ticks }} ticks</p>
+  {% endif %}
+<p class="note">last tick {{ schedule.last_tick_at or "never" }}</p>
+  {% if schedule.last_error %}
+<p class="note">last error {{ schedule.last_error_at }}: {{ schedule.last_error }}</p>
+  {% endif %}
+  {% if schedule.last_result %}
+<p class="note">due at that tick: {{ schedule.last_result.due|join(", ") or "nothing" }}</p>
+    {% for name, job_id in schedule.last_result.started.items() %}
+<p class="note">{{ name }} &mdash; started as job {{ job_id }}</p>
+    {% endfor %}
+    {% for name, reason in schedule.last_result.skipped.items() %}
+<p class="note">{{ name }} &mdash; did not run: {{ reason }}</p>
+    {% endfor %}
+    {% for name, reason in schedule.last_result.failed_to_start.items() %}
+<p class="note">{{ name }} &mdash; could not start: {{ reason }}</p>
+    {% endfor %}
+  {% endif %}
+  {% for name, ticks in schedule.failing_to_start.items() %}
+<p class="note">{{ name }} has failed to start on the last {{ ticks }} tick(s)</p>
+  {% endfor %}
+{% else %}
+<p class="note">Nothing is scheduled here. A scan runs only when someone presses Scan above.</p>
+{% endif %}
+</div>

@@ -56,7 +56,8 @@ def _origin_matches_host(origin, host_header):
 
 
 def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
-                  refused=None, superseded=None, applied=None):
+                  refused=None, superseded=None, applied=None,
+                  schedule_status=None):
     # A separate callable rather than always reaching through `actions`:
     # every existing action-path test builds its own recording double for
     # `actions` and none of them implement `scan_status`, so defaulting it
@@ -73,6 +74,12 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
     _refused = refused or (lambda: [])
     _superseded = superseded or (lambda: [])
     _applied = applied or (lambda: [])
+    # `None` here is not "no information": it is the answer for an install
+    # where nothing is scheduled at all, which is a state the page has to be
+    # able to say out loud rather than render as an empty section that looks
+    # like a healthy idle one. Ordinarily `cronicled.schedule.Scheduler.status`
+    # itself -- see `cronicled.__main__`.
+    _schedule_status = schedule_status or (lambda: None)
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, status, body=b"", headers=()):
@@ -113,6 +120,7 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                          refused=_refused(),
                          superseded=_superseded(),
                          applied=_applied(),
+                         schedule=_schedule_status(),
                          just_applied=just_applied).encode()
             self._send(200, body,
                        [("Content-Type", "text/html; charset=utf-8")])
@@ -248,8 +256,8 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
 
 
 def serve(rows, actions, scan_status=None, muted=None, dismissed=None,
-         refused=None, superseded=None, applied=None, host=DEFAULT_HOST,
-         port=DEFAULT_PORT):
+         refused=None, superseded=None, applied=None, schedule_status=None,
+         host=DEFAULT_HOST, port=DEFAULT_PORT):
     # `HTTPServer` is single-threaded: one connection wedged on a slow read
     # or a slow downstream call (a media server taking its whole configured
     # timeout to answer an Approve, say) stalls every other request -- an
@@ -294,6 +302,7 @@ def serve(rows, actions, scan_status=None, muted=None, dismissed=None,
               % (host, DEFAULT_HOST, port, port, port, port))
     httpd = HTTPServer((host, port), build_handler(
         rows, actions, scan_status, muted=muted, dismissed=dismissed,
-        refused=refused, superseded=superseded, applied=applied))
+        refused=refused, superseded=superseded, applied=applied,
+        schedule_status=schedule_status))
     print("inbox on http://%s:%d/" % (host, port))
     httpd.serve_forever()

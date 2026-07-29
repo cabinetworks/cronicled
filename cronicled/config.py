@@ -93,6 +93,45 @@ def load_server(path=None, env=None):
     return {"url": url, "api_key": api_key}
 
 
+def default_schedule_path(env=None):
+    return os.path.join(config_dir(env), "schedule.json")
+
+
+def load_schedule(path=None, env=None):
+    """Schedule overrides, as `{producer_name: {"every": …, "enabled": …}}`.
+
+    Absence is a legitimate state — every producer already declares its own
+    cadence, and an operator who is happy with it configures nothing — so
+    this follows `load_adapters`'s half of the rule above and returns an
+    empty mapping rather than raising.
+
+    It validates almost nothing on purpose. `cronicled.schedule.resolve`
+    already refuses an override naming a producer that does not exist, an
+    unknown key, a cadence that is not a positive number and an `enabled`
+    that is not a boolean, and it refuses them at the moment the schedule is
+    wired up, which is the same moment this is read. A second validator here
+    would be a second place for the two to disagree, and the one that reads
+    the file is the one that would go stale.
+
+    What it does refuse is a top-level value that is not an object, because
+    `resolve` receives that as `dict(overrides)` and a JSON list or string
+    would fail there as a `TypeError` or a name nobody wrote — a message
+    about this file, naming this file, is what an operator can act on.
+    """
+    if path is None:
+        path = default_schedule_path(env)
+    if not os.path.exists(path):
+        return {}
+    with open(path) as fh:
+        overrides = json.load(fh)
+    if not isinstance(overrides, dict):
+        raise ValueError(
+            "%s must hold a JSON object keyed by producer name, for example "
+            '{"nightly-library-scan": {"every": 3600}}, but it holds %s'
+            % (path, type(overrides).__name__))
+    return overrides
+
+
 def default_stashbox_path(env=None):
     return os.path.join(config_dir(env), "stashbox.json")
 

@@ -10,11 +10,18 @@ files into proposals, a scheduler that decides when each producer is due, an
 inbox that shows a proposal and takes approve/dismiss/mute/undo, an entry point
 that serves it, and a leak guard for the repo itself.
 
-**Not yet built:** nothing runs this unattended. `python -m cronicled` serves
-the inbox and answers a person's clicks; it constructs no scheduler and starts
-no timer. The scheduler knows what is due and can run it, but nothing calls it
-on its own — a scan still has to be started by something outside this package.
-Until that exists, "always-on" describes the design, not what is running.
+**Running unattended:** `python -m cronicled` now builds a scheduler and starts
+it. A library scan is registered at start-up with a cadence of its own and no
+file limit, and the scheduler starts it when it is due — so proposals arrive
+without anyone pressing anything. Nothing it starts writes to the media
+server: a scan reads and proposes, and every proposal still waits for a person
+to approve it.
+
+**Not yet built:** wall-clock scheduling. A cadence is an interval measured
+from the last recorded run, so a daily scan drifts to a different hour across
+restarts. Times of day bring a machine that was off across the appointed hour,
+and daylight-saving transitions where an hour repeats or does not exist, and
+neither is decided yet.
 
 One runtime dependency: Jinja2, for autoescaped HTML. Everything else is the
 Python standard library. The inbox renders text the project did not write —
@@ -32,15 +39,16 @@ image writes one the media server never exposes in a form its own undo
 snapshot can restore, so that one field stays as the approve left it. The
 inbox warns before an approve that would do this, and undo reports the same
 residual afterward, rather than either one reading as a clean, full
-reversal. What is still missing is the part that would make any of this
-unattended: nothing constructs a scheduler, so no proposal is ever produced
-without a person starting a scan themselves.
+reversal. The unattended half is real too: the entry point registers a scan
+with a declared cadence, builds a scheduler over it and starts it, and the
+page reports what the loop last did — when it ticked, what was due, and why
+anything due was left alone.
 
-The distinction worth keeping in mind: a scheduler that is never started is a
-component, not a service. What is missing is the process that would construct
-one and start it on a schedule. That gap has its own diagram, kept separate
-from the ones describing what is built, on the
-[architecture](docs/index.md#the-service-that-does-not-exist-yet) page.
+The distinction worth keeping in mind: the cadence is an INTERVAL, not a time
+of day, so "nightly" means "a day since the last run" and drifts across
+restarts. That remaining gap has its own diagram, kept separate from the ones
+describing what is built, on the
+[architecture](docs/index.md#what-is-not-decided-yet) page.
 
 ## Quickstart
 
@@ -70,6 +78,16 @@ environment variable of the matching name (`$CRONICLED_DB`,
 form the container image relies on, since a `docker run` argument list and an
 `-e` list are both just ways of setting the same thing. The flag wins if both
 are set.
+
+That command also registers a library scan with a cadence of its own and no
+file limit, and starts the loop that runs it when it is due. To change how
+often it runs, or to turn it off, put a `schedule.json` in the config
+directory — see `config/schedule.example.json` for the shape. A cadence that
+is not a positive number of seconds, a key that is not `every`/`enabled`, or
+a producer name that is not registered are all refused at start-up rather
+than leaving a producer running on a cadence nobody chose. Without a media
+server or a configured site adapter there is nothing to scan, so nothing is
+scheduled and the entry point says so.
 
 It binds to loopback only (`127.0.0.1:8571` by default) — there is no
 authentication, so the binding is the only thing standing between the page's

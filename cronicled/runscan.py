@@ -8,11 +8,15 @@ and registered it with `cronicled.jobs.JobRunner`. This module is that
 construction, and `python -m cronicled.runscan` is the command that runs it
 once, on request.
 
-This is deliberately NOT a UI trigger. `python -m cronicled` (see
-`cronicled/__main__.py`) still constructs no scheduler and starts no scan on
-its own; adding a button to the inbox that starts one is a separate task.
-And this module itself constructs no `cronicled.schedule.Scheduler` either —
-running this command is still a person asking for one scan, not a process
+Two scans are built here, and the difference between them is the point of
+`build_scheduled_producer` existing at all. `build_producer` builds the one a
+person asks for, with the limit they chose. `build_scheduled_producer` builds
+the one `cronicled/__main__.py` registers at start-up for
+`cronicled.schedule.Scheduler` to run unattended: its own name, its own
+declared cadence, and no file limit.
+
+This module still constructs no `Scheduler` itself — running
+`python -m cronicled.runscan` is a person asking for one scan, not a process
 that decides scans are due on its own.
 """
 import argparse
@@ -29,9 +33,42 @@ from cronicled.stash import Stash
 from cronicled.store import Store
 
 
+# The name the scan a schedule runs is registered under — deliberately NOT
+# `ScanProducer.name`, which is what `web.actions.Actions.scan` reregisters on
+# every click. Sharing one name would make a manual scan of 25 files replace
+# the scheduled producer, so the next unattended run would quietly scan 25
+# files instead of the whole set. See `build_scheduled_producer`.
+SCHEDULED_SCAN_NAME = "nightly-library-scan"
+
+# How often the scheduled scan declares itself due, in seconds. An INTERVAL,
+# not a time of day: `cronicled.schedule` measures from the last recorded run,
+# so a daily scan drifts to a different hour across restarts. That is accepted
+# — wall-clock scheduling brings a machine that was off across the appointed
+# hour, and daylight-saving transitions where an hour repeats or does not
+# exist, and neither is decided here.
+DAILY = 86400
+
+
+class _EveryFile:
+    """The one value `build_producer` accepts as "no file limit".
+
+    `limit=None` stays refused, because a caller who forgot the argument and
+    a caller who wants the whole library must not be able to write the same
+    thing. This is a sentinel nobody produces by accident: it has to be
+    imported and named at the call site, where it reads as the deliberate
+    instruction it is rather than as an omission.
+    """
+
+    def __repr__(self):
+        return "EVERY_FILE"
+
+
+EVERY_FILE = _EveryFile()
+
+
 def build_producer(stash, adapters, store, *, limit, folder="library",
                    name_filter=None, threshold=DEFAULT_THRESHOLD,
-                   aliases=None, workers=4):
+                   aliases=None, workers=4, producer_name=None, every=None):
     """The `ScanProducer` that scans EVERY one of `adapters` through `stash`,
     recording through `store`.
 
@@ -48,7 +85,9 @@ def build_producer(stash, adapters, store, *, limit, folder="library",
 
     `limit` is REQUIRED and has no permissive default — it does not even
     accept the keyword unless the caller supplies it, and `None` is refused
-    rather than treated as "unlimited". `scan.select` treats `limit=None` as
+    rather than treated as "unlimited"; `EVERY_FILE` is the one way to ask
+    for no limit, and it has to be named to be got. `scan.select` treats
+    `limit=None` as
     "take every survivor of narrowing", and every one it takes spends a
     lookup against a rate-limited third party (the configured scraper) FOR
     EVERY CONFIGURED STORE. A first run against a whole library must not be
@@ -102,8 +141,26 @@ def build_producer(stash, adapters, store, *, limit, folder="library",
     twice does not hold a stale list. An install with no box configured
     answers `[]`, the closure asks nobody, and every file takes the text
     path exactly as it does today.
+
+    `producer_name` and `every` are what make a producer schedulable and are
+    deliberately separate from each other. `producer_name` overrides
+    `ScanProducer.name` so a scan started on a cadence is its own
+    registration rather than sharing the one a manual scan replaces on every
+    click (it is spelled differently from the `name` bound inside the
+    `sources` comprehension below, which is an ADAPTER's name). `every` is
+    the cadence the producer DECLARES, which
+    `cronicled.schedule.resolve` reads off it; left `None` — the default, and
+    what a manual scan keeps — the producer declares none, and `resolve`
+    refuses to schedule it rather than inventing an interval.
     """
-    if limit is None:
+    if limit is EVERY_FILE:
+        # The deliberate unbounded caller, spelled out at its own call site.
+        # `select` reads `None` as "take every survivor of narrowing", which
+        # is exactly what was asked for here — and is exactly what must not
+        # be reachable by forgetting an argument, which is why the refusal
+        # below is untouched.
+        limit = None
+    elif limit is None:
         raise ValueError(
             "limit is required to build a scan: scan.select treats "
             "limit=None as \"take every survivor of narrowing\", and every "
@@ -128,7 +185,43 @@ def build_producer(stash, adapters, store, *, limit, folder="library",
     return ScanProducer(
         stash, sources, store=store, folder=folder, limit=limit,
         name_filter=name_filter, threshold=threshold, aliases=aliases,
-        workers=workers, enrich=stash.scrape_scene_url, identify=identify)
+        workers=workers, enrich=stash.scrape_scene_url, identify=identify,
+        name=producer_name, every=every)
+
+
+def build_scheduled_producer(stash, adapters, store, *, every=DAILY, **kwargs):
+    """The scan a `cronicled.schedule.Scheduler` runs unattended.
+
+    Three things separate it from the scan a person presses a button for, and
+    each of them is a way this wiring would otherwise fail quietly:
+
+    - **Its own name**, `SCHEDULED_SCAN_NAME`. `web.actions.Actions.scan`
+      builds a fresh producer per click and `reregister`s it, because a
+      scan's `limit` can only be fixed at construction. Under a shared name
+      that replaces this one, so a manual scan of 25 files would silently
+      become what the next unattended run scans, with nothing anywhere saying
+      so. Two producers in the same `scraping` cost class SERIALISE rather
+      than collide, which is the behaviour actually wanted: an unattended
+      scan and a manual one must not scrape the media server at once, and
+      `jobs.COST_CLASS_LIMITS` already enforces that.
+
+    - **No file limit.** The whole unorganized set, every run, spelled
+      `EVERY_FILE` at this call site so nobody later reads it as a forgotten
+      argument. The cost is bounded by what a scan actually spends: lookups
+      collapse per CREATOR rather than per file, the per-title fallback is
+      one search per (file, store), and a fingerprint pass is one batched
+      call per box. It also shrinks every night, because each run's proposals
+      take their files out of the next run's selection.
+
+    - **A declared cadence**, so `resolve` has an interval to schedule it on.
+      `every` is overridable here for the same reason the schedule accepts
+      overrides at all, but it has a value rather than a `None` default: a
+      producer with no cadence is what `resolve` refuses, and defaulting to
+      the refusal would make forgetting the argument look like a decision.
+    """
+    return build_producer(stash, adapters, store, limit=EVERY_FILE,
+                          producer_name=SCHEDULED_SCAN_NAME, every=every,
+                          **kwargs)
 
 
 def configured_adapters(env=None):

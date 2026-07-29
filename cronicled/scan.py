@@ -1599,6 +1599,10 @@ class ScanProducer:
     and this class behaves precisely as it always has.
     """
 
+    # The default a manually-started scan runs under. `__init__`'s `name`
+    # overrides it per instance, which is how a scan started on a cadence
+    # keeps its own registration instead of sharing this one — see the
+    # comment beside that assignment.
     name = "library-scan"
     # Every selected file drives at least one lookup per configured store
     # against a scraper, which is the resource `COST_CLASS_LIMITS` rations to
@@ -1610,7 +1614,7 @@ class ScanProducer:
 
     def __init__(self, stash, sources, *, store, folder="library", limit=None,
                  name_filter=None, threshold=DEFAULT_THRESHOLD, aliases=None,
-                 workers=4, enrich=None, identify=None):
+                 workers=4, enrich=None, identify=None, name=None, every=None):
         if workers < 1:
             # A pool of nothing would do nothing at all, forever. Refuse it
             # where the mistake was made rather than on a background thread
@@ -1648,6 +1652,24 @@ class ScanProducer:
         # that cannot have changed.
         self._aliases = aliases if isinstance(aliases, Aliases) else Aliases(aliases)
         self._workers = workers
+        # A name of this instance's own, shadowing the class attribute above.
+        # `JobRunner` keys its registry by name and `JobRunner.reregister`
+        # REPLACES whatever is registered under one, so two producers that
+        # share a name are one registration: a manual scan built with a limit
+        # of 25 would silently become whatever a scheduled, unbounded scan
+        # runs next. A scan that something else starts on a cadence therefore
+        # takes a name of its own rather than the shared class default; see
+        # `cronicled.runscan.build_scheduled_producer`.
+        if name is not None:
+            self.name = name
+        # The cadence this producer DECLARES, in seconds, read off the object
+        # by `cronicled.schedule.resolve`. `None` — the default, and what a
+        # manually-started scan keeps — means it declares none, which
+        # `resolve` refuses for an enabled producer rather than inventing an
+        # interval for it. Set unconditionally so a producer's cadence is a
+        # value that was decided, never an attribute that happens to be
+        # missing.
+        self.every = every
 
     def produce(self, ctx):
         """Yield one proposal per file the scan could decide.

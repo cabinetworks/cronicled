@@ -360,6 +360,17 @@ class LoopStatus:
       in which the runner refused to start it. A tick can only see its own
       refusal; it takes the loop to notice the same one on every tick since
       the process began.
+    - `last_result` is the whole `TickResult` of the last tick that FINISHED,
+      or `None` before there has been one. The counts above say whether the
+      loop is alive; this says what it decided, and it is the only place the
+      reasons survive — `due` returns them, a tick carries them, and without
+      this they end with the tick that produced them. An operator asking "why
+      has the nightly scan not run?" is asking for `last_result.skipped`, and
+      a status that could only answer "the loop is fine, 400 ticks" would be
+      telling them nothing they asked about. A tick that RAISED leaves this
+      holding the last good one: a tick that did not finish decided nothing,
+      and blanking the last real answer would lose the record at the moment
+      there is most to explain.
     """
 
     running: bool
@@ -372,6 +383,7 @@ class LoopStatus:
     last_error_at: Optional[str]
     last_traceback: Optional[str]
     failing_to_start: dict = field(default_factory=dict)
+    last_result: Optional[TickResult] = None
 
 
 class Scheduler:
@@ -453,6 +465,7 @@ class Scheduler:
         self._last_error_at = None
         self._last_traceback = None
         self._failing_to_start = {}
+        self._last_result = None
 
     def tick(self, now=None):
         """Start everything due, once, and return a `TickResult`.
@@ -675,6 +688,10 @@ class Scheduler:
                 # A copy: a caller holding the answer must not be able to
                 # edit the loop's own counts by mutating it.
                 failing_to_start=dict(self._failing_to_start),
+                # Not copied, and does not need to be: `TickResult` is
+                # frozen, and nothing writes to the dicts it carries after
+                # the tick that built them returned.
+                last_result=self._last_result,
             )
 
     def _loop(self):
@@ -731,6 +748,11 @@ class Scheduler:
         with self._lock:
             self._ticks += 1
             self._last_tick_at = result.at
+            # The whole result, not a summary of it: `status()` is the only
+            # way anybody sees why a due producer was left alone, and a
+            # summary would have to decide in advance which of those reasons
+            # was worth keeping. See `LoopStatus.last_result`.
+            self._last_result = result
             self._consecutive_failures = 0
             self._failing_to_start = {
                 name: self._failing_to_start.get(name, 0) + 1

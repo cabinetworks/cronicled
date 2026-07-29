@@ -243,7 +243,7 @@ cancellation — nothing interrupts a producer, and a job still running when the
 timeout expires keeps running on its daemon thread, which the process exit will
 kill wherever it has got to.
 
-## The service that does not exist yet
+## What is not decided yet
 
 Only one node below is **planned**. Everything else in this diagram now has
 code behind it — it is drawn separately from the three above only because it
@@ -253,15 +253,16 @@ does.
 
 ```mermaid
 flowchart TD
-    entry["BUILT: `python -m cronicled`<br/>serves the inbox; constructs no scheduler"]
+    entry["BUILT: `python -m cronicled`<br/>registers the scheduled scan, then builds and starts the scheduler"]
     sched["BUILT: Scheduler decides what is due,<br/>runs it, and records the run"]
-    unattended{"PLANNED: something calls the scheduler on its own"}
+    wallclock{"PLANNED: a cadence written as a time of day"}
     built["BUILT: JobRunner drives the producer,<br/>Store records each proposal as it is yielded"]
     inbox["BUILT: the inbox — a person sees what was proposed"]
     gate{"BUILT: approval<br/>no write happens without one"}
     apply["BUILT: Actions.approve calls Stash.apply_scene;<br/>Actions.undo calls Stash.revert_scene"]
 
-    unattended -. "would start a job when a producer is due" .-> sched
+    entry -- "starts the loop, and closes it on shutdown" --> sched
+    wallclock -. "would replace the interval with an appointed hour" .-> sched
     sched --> built
     built -- "the store now holds a proposal" --> inbox
     entry --> inbox
@@ -271,24 +272,33 @@ flowchart TD
 
     classDef planned stroke-dasharray:6 4
     classDef built stroke-width:3px
-    class unattended planned
+    class wallclock planned
     class entry,sched,built,inbox,gate,apply built
 ```
 
-One node in that diagram is dashed, and it is the only one that does not exist:
-whatever would call the scheduler without a person asking. Everything else —
-the entry point, the inbox, the approval gate, and the caller that applies or
-reverts a scene — is built and tested.
+One node in that diagram is dashed, and it is the only one that does not
+exist: a cadence written as a time of day. Everything else — the entry point,
+the scheduler it now starts, the inbox, the approval gate, and the caller that
+applies or reverts a scene — is built and tested.
 
-The scheduler being solid is worth reading carefully, because it predates this
-diagram's rewrite. It decides what is due and starts it, and it is tested doing
-so — but the arrow *into* it is still planned, which is the whole point:
-nothing constructs a scheduler, so nothing ever calls the code that would run
-producers unattended. `python -m cronicled` does not close that gap; it serves
-the inbox and answers a person's clicks, and starts no timer of its own.
+What replaced the dashed arrow *into* the scheduler is worth reading
+carefully, because the ordering it depends on fails silently. A scheduler
+resolves its schedule once, in its constructor, from whatever producers the
+runner holds at that instant, so the entry point registers the scheduled scan
+BEFORE it builds the scheduler. Built the other way round it resolves an empty
+registry: it schedules nothing, raises nothing, and ticks on time forever
+without ever starting anything.
 
-The store already keeps the record an inbox reads — proposals, their states,
-dismissals and mutes — and the inbox now reads it: a person sees each
-proposal, approves, dismisses, mutes or undoes it, and nothing is written to
-the media server except through that approval. What is missing is only the
-part that would decide *when* to run a scan without someone asking first.
+The scan it starts is a registration of its own, with no file limit — the
+whole unorganized set each run. The scan a person presses the button for keeps
+the name it always had and the limit they typed, and the two never replace
+each other; they share the `scraping` cost class instead, so the runner
+serialises them rather than letting both scrape at once.
+
+The remaining gap is narrower than it was, and it is about WHEN rather than
+whether. A cadence is an interval measured from the last recorded run, so a
+daily scan drifts to a different hour across restarts, and a machine that was
+off for a week runs once when it comes back rather than seven times. Times of
+day would bring the two cases that break a naive implementation — a machine
+off across the appointed hour, and daylight-saving transitions where an hour
+repeats or does not exist — and neither is decided here.
