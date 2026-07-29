@@ -6,6 +6,7 @@ Separated from request handling so the write paths can be tested without a
 socket, and so the handler cannot reach the store, the media server, or the
 job runner directly and grow another kind of write nobody reviewed.
 """
+from cronicled import tags
 from cronicled.descriptions import SUBJECT_TYPE as DESCRIPTION_SUBJECT
 from cronicled.runscan import build_producer
 from cronicled.web.rows import carries_cover
@@ -77,6 +78,8 @@ class Actions:
 
     def approve(self, fp):
         item = self._find(fp)
+        if item["subject_type"] == tags.SUBJECT_TYPE:
+            return self._approve_merge(fp, item)
         subject_id = item["subject_id"]
         if self._stash is None:
             # Recorded as failed for the same reason a real apply failure is:
@@ -117,6 +120,57 @@ class Actions:
         self._store.mark_applied(fp, prior_state=result.get("prior"))
         return "applied"
 
+    def _approve_merge(self, fp, item):
+        """Perform one tag merge: move every item off the losing spellings
+        onto the surviving one and delete them.
+
+        Refuses an UNDECIDED cluster outright, and does so before touching
+        the store or the media server. A cluster of three spellings, or of
+        two that carry no evidence about which was meant, is a finding: there
+        is no canonical name in the payload, so there is nothing to merge
+        into and nothing to invent one from. The row never offers Approve for
+        such a proposal (`MergeRow.appliable`), so reaching here means a
+        request that did not come from the page -- refused with a reason
+        rather than resolved by picking a member.
+
+        Nothing is recorded for that refusal, unlike the `_NO_STASH` case
+        below. A missing media server is a real attempt at a write that
+        failed, and an applied-or-failed row is the honest record of it; an
+        undecided cluster was never a write that could be attempted, and
+        marking it `failed` would put a resolution on a proposal that is
+        still exactly as open as it was.
+
+        `Stash.merge_tags` is called WITHOUT `aliases`. Its `aliases`
+        argument replaces the destination's whole alias list, and the only
+        list available here is whatever the proposal captured when it was
+        made -- days ago, potentially -- so passing it would silently delete
+        any alias added since. See `cronicled.tags`'s module docstring.
+
+        `mark_applied` is called with NO `prior_state`, and that is where
+        this module enforces the irreversibility decision rather than merely
+        describing it: there is no snapshot, so the store holds none, so no
+        row can ever claim an undo it cannot perform.
+        """
+        payload = item["payload"]
+        canonical = payload["canonical"]
+        if canonical is None:
+            raise ValueError(
+                "cannot merge %s: this cluster has no agreed surviving "
+                "spelling (%s). Nothing here may pick one for you."
+                % (payload["key"], payload["undecided"]))
+        if self._stash is None:
+            self._store.mark_failed(fp, _NO_STASH)
+            raise ApplyFailed("could not apply: %s" % _NO_STASH)
+        sources = [m["id"] for m in payload["members"]
+                   if m["id"] != canonical["id"]]
+        try:
+            self._stash.merge_tags(canonical["id"], sources)
+        except Exception as exc:
+            self._store.mark_failed(fp, "%s: %s" % (type(exc).__name__, exc))
+            raise ApplyFailed("could not apply: %s" % exc) from exc
+        self._store.mark_applied(fp)
+        return "merged"
+
     def undo(self, fp):
         """Revert one applied proposal to the state its stored snapshot
         describes, and report the outcome.
@@ -133,6 +187,17 @@ class Actions:
         cover either way, which is exactly the gap being reported.
         """
         item = self._find(fp)
+        if item["subject_type"] == tags.SUBJECT_TYPE:
+            # Refused with the REASON, not with the generic "no snapshot was
+            # stored" the check below would otherwise give. A merge has no
+            # snapshot because none can exist (see
+            # `cronicled.tags.MERGE_IS_IRREVERSIBLE`), and "no snapshot was
+            # stored for it" reads as an omission somebody could go and fix.
+            # The page never offers Undo on a merge row -- `MergeRow` has no
+            # `undoable` field at all -- so this answers a request that did
+            # not come from the page.
+            raise ValueError(
+                "cannot undo %s: %s" % (fp, tags.MERGE_IS_IRREVERSIBLE))
         if self._stash is None:
             raise RuntimeError("cannot undo %s: %s" % (fp, _NO_STASH))
         prior = item.get("prior_state")

@@ -9,6 +9,7 @@ import os
 from dataclasses import dataclass
 
 from cronicled.descriptions import SUBJECT_TYPE as DESCRIPTION_SUBJECT
+from cronicled.tags import MERGE_IS_IRREVERSIBLE
 from cronicled.text import slug_match, spaceless
 
 # What a row says it IS, so the page can pick a shape for it without
@@ -445,6 +446,117 @@ def to_rows(items, base_url=None):
             if i["subject_type"] == DESCRIPTION_SUBJECT
             else to_row(i, base_url=base_url)
             for i in items]
+
+
+@dataclass(frozen=True)
+class MergeRow:
+    """One tag-merge proposal -> what the Merges section shows for it.
+
+    A merge row is deliberately NOT a `Row`. A scene proposal's fields --
+    filename, proposed title, creator, score, cover warning, runners-up --
+    describe one file's metadata; a merge describes a decision about the
+    library's whole vocabulary, and forcing it through `Row` would have cost
+    it exactly the two things that make it judgeable: the per-spelling item
+    counts, and the warning that the write cannot be taken back.
+
+    **There is no `undoable` field, and that is the design.** `Row` has one
+    because a scene apply snapshots what it replaced. A merge cannot be
+    reversed (see `cronicled.tags.MERGE_IS_IRREVERSIBLE` for the four
+    separate reasons), so there is no state in which this row may offer an
+    Undo -- and the cheapest way to guarantee that is for the template to
+    have nothing to read.
+
+    `warning` is carried on every row in every state, not only before the
+    approve. After the merge the sources are gone, and a page that stopped
+    saying so would leave a person looking for the Undo that is not there.
+    """
+    fingerprint: str
+    state: str
+    subject_type: str
+    subject_id: str
+    # The normalised form every spelling in this cluster reduces to.
+    key: str
+    # Every spelling, as `{"id", "name", "scene_count"}`, in the order the
+    # payload carries them (`cronicled.tags.cluster_tags` sorts by name).
+    members: tuple
+    # The spelling that survives, or `None` when this cluster is a FINDING
+    # rather than a merge -- three or more spellings, or two that carry no
+    # evidence about which was meant. `undecided` says which, and is `None`
+    # exactly when `canonical` is set.
+    canonical: str | None
+    # The spellings the merge would delete. Empty when `canonical` is `None`:
+    # nothing is losing, because nothing has been decided.
+    losing: tuple
+    undecided: str | None
+    # The blast radius, the number that decides whether this merge is safe.
+    # `counts_cover` says what it counts, because it is not everything a tag
+    # holds -- see `cronicled.tags.COUNTS_COVER`.
+    total_scenes: int
+    counts_cover: str
+    warning: str
+    # Whether Approve is offered. An undecided cluster never offers it: there
+    # is no canonical name to merge into, and offering the button would ask a
+    # person to authorise a write nothing has specified.
+    appliable: bool
+    # Whether Dismiss/Mute are offered -- "not closed", stated as the absence
+    # of a closed state rather than as a list of open ones, so a state added
+    # later inherits its controls instead of silently losing them.
+    actionable: bool
+    undismissable: bool
+    unmutable: bool
+    error: str | None
+
+
+# States in which a merge proposal has no decision left in it, each for its
+# own reason: `applied` is done and cannot be undone, `dismissed` and `muted`
+# are a person's own standing rejections (each with its own reversal control
+# instead), and `superseded` has been retired. Everything else -- `new`,
+# `seen`, `failed` -- still has a decision left in it.
+_CLOSED_MERGE_STATES = ("applied", "dismissed", "muted", "superseded")
+
+
+def to_merge_row(item):
+    """One tag-merge `item` (the store's dict shape) -> its `MergeRow`.
+
+    Everything is INDEXED, never `.get`: every field read here is written by
+    `cronicled.tags.proposal` on every proposal it makes, so an absent one is
+    a malformed payload rather than an ordinary "nothing to say". The
+    expensive direction is specific -- a missing `scene_count` read back as 0
+    would tell a reviewer this merge moves nothing, which is precisely the
+    reading that gets a large, irreversible write approved without a second
+    thought.
+    """
+    payload = item["payload"]
+    members = tuple(dict(m) for m in payload["members"])
+    canonical = payload["canonical"]
+    canonical_name = canonical["name"] if canonical else None
+    losing = (tuple(m["name"] for m in members
+                    if m["id"] != canonical["id"]) if canonical else ())
+    state = item["state"]
+    open_state = state not in _CLOSED_MERGE_STATES
+    return MergeRow(
+        fingerprint=item["fingerprint"],
+        state=state,
+        subject_type=item["subject_type"],
+        subject_id=item["subject_id"],
+        key=payload["key"],
+        members=members,
+        canonical=canonical_name,
+        losing=losing,
+        undecided=payload["undecided"],
+        total_scenes=sum(m["scene_count"] for m in members),
+        counts_cover=payload["counts_cover"],
+        warning=MERGE_IS_IRREVERSIBLE,
+        appliable=open_state and canonical is not None,
+        actionable=open_state,
+        undismissable=state == "dismissed",
+        unmutable=state == "muted",
+        error=item.get("error"),
+    )
+
+
+def to_merge_rows(items):
+    return [to_merge_row(i) for i in items]
 
 
 def to_refusal_row(entry, base_url=None):

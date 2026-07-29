@@ -79,15 +79,30 @@ form the container image relies on, since a `docker run` argument list and an
 `-e` list are both just ways of setting the same thing. The flag wins if both
 are set.
 
-That command also registers a library scan with a cadence of its own and no
-file limit, and starts the loop that runs it when it is due. To change how
-often it runs, or to turn it off, put a `schedule.json` in the config
-directory — see `config/schedule.example.json` for the shape. A cadence that
+That command also registers three unattended passes, each with a cadence of
+its own, and starts the loop that runs them when they are due: a library scan
+with no file limit, a pass over performer descriptions that proposes cleaned
+text for any carrying markup, and a tag pass that looks for one tag written
+under more than one spelling and proposes a merge. To change how often any of
+them runs, or to turn one off, put a `schedule.json` in the config directory —
+see `config/schedule.example.json` for the shape. A cadence that
 is not a positive number of seconds, a key that is not `every`/`enabled`, or
 a producer name that is not registered are all refused at start-up rather
 than leaving a producer running on a cadence nobody chose. Without a media
-server or a configured site adapter there is nothing to scan, so nothing is
-scheduled and the entry point says so.
+server nothing is scheduled at all and the entry point says so; without a
+configured site adapter there is nothing to scan, so the scan alone is left
+out — the description and tag passes read the media server's own text and
+vocabulary and need no store to search.
+
+A proposed merge is judged in its own section of the inbox, not among the
+scene proposals, because it is a different weight of decision: it names every
+spelling and how many scenes each carries, and it says plainly that approving
+it cannot be undone. A merge moves every item off the losing spellings and
+deletes them; nothing records which items came from which tag, so there is no
+snapshot to restore and no Undo is offered. Where three spellings share one
+form, or two carry no evidence about which was meant, the cluster is reported
+without a survivor and no Merge button at all — which one wins is a person's
+call, not something to settle by picking the most popular.
 
 It binds to loopback only (`127.0.0.1:8571` by default) — there is no
 authentication, so the binding is the only thing standing between the page's
