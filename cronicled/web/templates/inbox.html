@@ -121,6 +121,24 @@
      lives in -- a visible marker so undoing it is still a glance away, not
      a search through the whole section's history. */
   details.section .proposal.just-applied { border-left: 3px solid var(--warn-line); }
+
+  /* A description rewrite is reviewed by reading two paragraphs against each
+     other, so both get equal room and identical typography -- anything that
+     styled one more prominently than the other would tilt the judgement the
+     reviewer is being asked to make. `pre-wrap` because the whole question
+     includes the whitespace: a cleanup that flattened the paragraphs would
+     be invisible in a view that collapsed them. */
+  .diff { border-top: 1px solid var(--line); display: grid;
+          grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); }
+  .diff > div { background: var(--panel); padding: 0.55rem 0.9rem; }
+  .diff h3 { margin: 0 0 0.3rem; font-size: 0.75rem; font-weight: 600;
+             letter-spacing: 0.04em; text-transform: uppercase;
+             color: var(--muted); }
+  .diff .text { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere;
+                font-size: 0.9rem; }
+  /* One column on a narrow screen: side by side would shrink each to a few
+     words per line, which is worse than reading them in order. */
+  @media (max-width: 42rem) { .diff { grid-template-columns: 1fr; } }
 </style>
 
 {# `identifier` and `proposal_block` are shared by the live inbox list and
@@ -202,6 +220,64 @@
 </div>
 {% endmacro %}
 
+{# A proposed description rewrite. The two texts side by side ARE the review:
+   the reviewer is being asked whether the right-hand text is the left-hand
+   one with its markup taken out, and a block showing only the cleaned
+   version would be asking them to approve a write to a field whose previous
+   contents they cannot see. Both are rendered with the same type and the
+   same width for the same reason. #}
+{% macro description_block(row, highlight=False) %}
+<div class="proposal{% if highlight %} just-applied{% endif %}">
+  <div class="head">
+    <div class="what">
+      <p class="file">{{ identifier("performer " ~ row.subject_id, row.performer_url) }}</p>
+      <p class="title">{{ row.name }}</p>
+      <div class="meta">description contains <b>{% for f in row.faults %}{{ f }}{% if not loop.last %} and {% endif %}{% endfor %}</b></div>
+    </div>
+    <div class="acts">
+      {% if row.undoable %}
+      <form method="post" action="/undo"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Undo</button></form>
+      {% elif row.actionable %}
+      <form method="post" action="/approve"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>{% if row.error %}Try again{% else %}Approve{% endif %}</button></form>
+      <form method="post" action="/dismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Dismiss</button></form>
+      <form method="post" action="/mute"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Mute</button></form>
+      {% endif %}
+      <form method="post" action="/refresh"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Refresh</button></form>
+    </div>
+  </div>
+  {% if row.error %}
+  <div class="warn">The last attempt to apply this failed, and nothing was written: {{ row.error }}</div>
+  {% endif %}
+  <div class="diff">
+    <div><h3>Now</h3><p class="text">{{ row.original }}</p></div>
+    <div><h3>Proposed</h3><p class="text">{{ row.cleaned }}</p></div>
+  </div>
+</div>
+{% endmacro %}
+
+{# One entry point for "draw whatever kind of row this is", so every place a
+   list of proposals is rendered picks the same way. Branching on `row.kind`
+   rather than on whether some field exists: Jinja renders an undefined
+   attribute as empty text instead of raising, so a shape test written that
+   way fails by drawing a blank block rather than by saying anything. #}
+{% macro row_block(row, highlight=False) %}{% if row.kind == 'performer-description' %}{{ description_block(row, highlight) }}{% else %}{{ proposal_block(row, highlight) }}{% endif %}{% endmacro %}
+
+{# The compact identifying line these two closed sections show for a row.
+   Branched on `row.kind` for the same reason `row_block` is: a description
+   proposal has no filename, no candidate title and no score, so the scene
+   shape would draw three blank fields here rather than say anything. #}
+{% macro compact_identity(row) %}{% if row.kind == 'performer-description' %}
+        <p class="file">{{ identifier("performer " ~ row.subject_id, row.performer_url) }}</p>
+        <p class="title">{{ row.name }}</p>
+        <div class="meta">description contains <b>{% for f in row.faults %}{{ f }}{% if not loop.last %} and {% endif %}{% endfor %}</b></div>
+{% else %}
+        <p class="file">{{ identifier(row.filename, row.scene_url) }}</p>
+        <p class="title">{{ row.proposed_title }}</p>
+        <div class="meta">{{ attribution(row) }}</div>
+{% endif %}{% endmacro %}
+
+{% macro compact_score(row) %}{% if row.kind != 'performer-description' %}<div class="score">{{ row.score_text }}</div>{% endif %}{% endmacro %}
+
 {% macro section(name, entries, empty_text, open=False) %}
 <details class="section"{% if open %} open{% endif %}>
   <summary>{{ name }} ({{ entries | length }})</summary>
@@ -221,7 +297,7 @@
 {% endif %}
 
 {% for row in rows %}
-{{ proposal_block(row) }}
+{{ row_block(row) }}
 {% endfor %}
 
 {% set muted = muted | default([]) %}
@@ -243,7 +319,7 @@
 
 {% call section("Applied", applied, "Nothing applied yet.", open=(just_applied_rows | length > 0)) %}
   {% for row in applied %}
-  {{ proposal_block(row, highlight=(row.fingerprint == just_applied)) }}
+  {{ row_block(row, highlight=(row.fingerprint == just_applied)) }}
   {% endfor %}
 {% endcall %}
 
@@ -252,10 +328,10 @@
   <div class="proposal">
     <div class="head">
       <div class="what">
-        {% if m.filename %}
-        <p class="file">{{ identifier(m.filename, m.scene_url) }}</p>
+        {% if m.subject_label %}
+        <p class="file">{{ identifier(m.subject_label, m.subject_url) }}</p>
         {% else %}
-        <p class="file subject-unknown">{{ identifier("scene " ~ m.subject_id, m.scene_url) }} <span class="note">(muted before any proposal was ever recorded -- only the id is known)</span></p>
+        <p class="file subject-unknown">{{ identifier(m.subject_type ~ " " ~ m.subject_id, m.subject_url) }} <span class="note">(muted before any proposal was ever recorded -- only the id is known)</span></p>
         {% endif %}
         <div class="meta">{{ m.reason }} &middot; muted {{ m.at }}</div>
       </div>
@@ -272,11 +348,8 @@
   <div class="proposal">
     <div class="head">
       <div class="what">
-        <p class="file">{{ identifier(row.filename, row.scene_url) }}</p>
-        <p class="title">{{ row.proposed_title }}</p>
-        <div class="meta">{{ attribution(row) }}</div>
-      </div>
-      <div class="score">{{ row.score_text }}</div>
+{{ compact_identity(row) }}      </div>
+      {{ compact_score(row) }}
       <div class="acts">
         <form method="post" action="/undismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Undismiss</button></form>
       </div>
@@ -290,11 +363,8 @@
   <div class="proposal">
     <div class="head">
       <div class="what">
-        <p class="file">{{ identifier(row.filename, row.scene_url) }}</p>
-        <p class="title">{{ row.proposed_title }}</p>
-        <div class="meta">{{ attribution(row) }}</div>
-      </div>
-      <div class="score">{{ row.score_text }}</div>
+{{ compact_identity(row) }}      </div>
+      {{ compact_score(row) }}
     </div>
   </div>
   {% endfor %}

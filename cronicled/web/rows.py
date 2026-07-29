@@ -8,7 +8,19 @@ proposal without opening anything else. That is worth testing on its own.
 import os
 from dataclasses import dataclass
 
+from cronicled.descriptions import SUBJECT_TYPE as DESCRIPTION_SUBJECT
 from cronicled.text import slug_match, spaceless
+
+# What a row says it IS, so the page can pick a shape for it without
+# inspecting its fields. A scene proposal and a description proposal are not
+# the same row with some fields blank: one is judged by a filename, a
+# candidate title and a score, the other by two versions of a paragraph. The
+# template branches on this rather than on `row.original is defined`, because
+# an undefined attribute renders as empty text in Jinja rather than raising --
+# so a mis-typed field name there is a silently blank block, which on a page
+# whose buttons write to a library is the failure mode to design out.
+KIND_SCENE = "scene"
+KIND_DESCRIPTION = "performer-description"
 
 
 @dataclass(frozen=True)
@@ -83,6 +95,49 @@ class Row:
     # silently fall through every branch and take the controls away again --
     # which is exactly how a failed row became a dead end.
     actionable: bool
+    # Last, with a default, so this stays the row every existing caller
+    # already builds. See KIND_SCENE.
+    kind: str = KIND_SCENE
+
+
+@dataclass(frozen=True)
+class DescriptionRow:
+    """What the inbox shows for a proposed description rewrite.
+
+    BOTH texts, always. That is the entire review: the reviewer is being
+    asked whether the second is the first with its markup taken out, and a
+    row showing only the cleaned version gives them nothing to judge it
+    against -- they would be approving a write to a field whose previous
+    contents they cannot see, which is precisely the "plausible-looking
+    proposal that silently removed text" this producer exists to avoid
+    making in the first place.
+
+    `faults` names what was found (`markup`, `entity`, or both) rather than
+    leaving a reviewer to spot the difference themselves between two
+    paragraphs that may differ by four characters.
+
+    No score. Nothing scored this -- a description either carries markup or
+    it does not -- and any number would be one this page invented and then
+    showed in the same column, in the same type, as numbers the scorer really
+    produced. The same reasoning `Row.score` documents for a
+    fingerprint-identified proposal, taken one step further: there is no
+    column at all here.
+    """
+
+    kind: str
+    fingerprint: str
+    state: str
+    subject_id: str
+    name: str
+    # The media server's own page for this performer, or `None` when no
+    # server is configured -- see `performer_url`.
+    performer_url: str | None
+    faults: tuple
+    original: str
+    cleaned: str
+    undoable: bool
+    actionable: bool
+    error: str | None
 
 
 def scene_url(base_url, subject_id):
@@ -109,6 +164,22 @@ def scene_url(base_url, subject_id):
     if not base_url:
         return None
     return "%s/scenes/%s" % (base_url.rstrip("/"), subject_id)
+
+
+def performer_url(base_url, subject_id):
+    """The media server's own page for a performer, or `None` when
+    `base_url` is falsy.
+
+    The sibling of `scene_url` and deliberately a second function rather than
+    one taking a path segment: the two are the only two subject kinds this
+    page knows, and a shared helper parameterised by `"scenes"`/`"performers"`
+    would let a caller pass a segment that names neither and get a link to
+    nowhere. Same `base_url`, resolved once in `cronicled.__main__`, used for
+    both.
+    """
+    if not base_url:
+        return None
+    return "%s/performers/%s" % (base_url.rstrip("/"), subject_id)
 
 
 def _runner_up_view(entry):
@@ -327,8 +398,53 @@ def to_row(item, base_url=None):
     )
 
 
+def to_description_row(item, base_url=None):
+    """One stored description proposal -> what the inbox shows for it.
+
+    Every payload field is INDEXED, not `.get`: `cronicled.descriptions
+    .proposal` writes all five on every proposal it makes, so a payload
+    missing one is malformed rather than a description with (say) no
+    original text. Reading a missing `original` back as an empty string
+    would draw a review panel whose "before" is blank -- which reads as "this
+    field was empty and is being filled in", the one interpretation that
+    would get a destructive rewrite approved without a second look.
+    """
+    payload = item["payload"]
+    return DescriptionRow(
+        kind=KIND_DESCRIPTION,
+        fingerprint=item["fingerprint"],
+        state=item["state"],
+        subject_id=item["subject_id"],
+        name=payload["name"],
+        performer_url=performer_url(base_url, item["subject_id"]),
+        faults=tuple(payload["faults"]),
+        original=payload["original"],
+        cleaned=payload["cleaned"],
+        # An applied row with no snapshot cannot be reverted --
+        # `revert_performer_description` raises on an empty one. The same
+        # rule `to_row` applies, for the same reason: offering the button
+        # would promise an undo the code cannot perform.
+        undoable=(item["state"] == "applied"
+                  and bool(item.get("prior_state"))),
+        actionable=item["state"] != "applied",
+        error=item.get("error"),
+    )
+
+
 def to_rows(items, base_url=None):
-    return [to_row(i, base_url=base_url) for i in items]
+    """Every stored proposal as the row its own kind of subject needs.
+
+    Dispatched on `subject_type`, the field the store itself keys a mute and
+    a refusal by -- never on what a payload happens to contain. A description
+    proposal put through `to_row` raises on the very first line
+    (`payload["path"]`), which is at least loud; the reverse mistake, a
+    payload-shape guess that silently picked the wrong builder, would draw a
+    row with the wrong controls on it.
+    """
+    return [to_description_row(i, base_url=base_url)
+            if i["subject_type"] == DESCRIPTION_SUBJECT
+            else to_row(i, base_url=base_url)
+            for i in items]
 
 
 def to_refusal_row(entry, base_url=None):
@@ -366,23 +482,40 @@ def to_mute_row(entry, base_url=None):
     `entry["payload"]` is `Store.mutes()`'s own recovery of the most
     recently seen proposal ever made for this subject, or `None` when none
     ever was -- the genuine exception ticket 97 names: a subject muted
-    ahead of any scan finding it. `filename` follows the same "honest
+    ahead of any scan finding it. `subject_label` follows the same "honest
     exception, not a blended-in normal case" split the ticket asks for:
     recovered from the payload the same way `to_row`'s own `filename` is
     (indexed, not `.get`, for the same reason -- a payload that exists but
-    has no `path` is malformed, not "no filename"), or `None` when there is
+    cannot answer is malformed, not "no label"), or `None` when there is
     no payload at all to read one from. The template is where that `None`
     becomes visibly the exception, not this function's job.
+
+    WHAT identifies a subject depends on which kind it is, which is why this
+    is `subject_label` and `subject_url` rather than `filename` and
+    `scene_url`. A mute is keyed by `(subject_type, subject_id)` and can be
+    placed on ANY subject a producer proposes about, so one click on a
+    description proposal's Mute button puts a performer in this list -- and
+    a performer has no path to read a filename out of. Reading one anyway
+    raised a `KeyError` that took out the whole Muted section, and with it
+    the only control that could lift the mute again.
     """
     payload = entry["payload"]
-    filename = os.path.basename(payload["path"]) if payload is not None else None
+    performer = entry["subject_type"] == DESCRIPTION_SUBJECT
+    if payload is None:
+        label = None
+    elif performer:
+        label = payload["name"]
+    else:
+        label = os.path.basename(payload["path"])
+    url = (performer_url(base_url, entry["subject_id"]) if performer
+           else scene_url(base_url, entry["subject_id"]))
     return {
         "subject_type": entry["subject_type"],
         "subject_id": entry["subject_id"],
         "reason": entry["reason"],
         "at": entry["at"],
-        "filename": filename,
-        "scene_url": scene_url(base_url, entry["subject_id"]),
+        "subject_label": label,
+        "subject_url": url,
     }
 
 

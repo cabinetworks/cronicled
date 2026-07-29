@@ -42,8 +42,9 @@ import argparse
 import os
 
 from .config import CONFIG_DIR_ENV_VAR, config_dir, load_schedule
+from .descriptions import DescriptionProducer
 from .jobs import JobRunner
-from .runscan import build_scheduled_producer, configured_adapters
+from .runscan import DAILY, build_scheduled_producer, configured_adapters
 from .schedule import Scheduler
 from .store import Store
 from .stash import Stash
@@ -60,7 +61,7 @@ SCHEDULER_SHUTDOWN_TIMEOUT = 10.0
 
 
 def build_scheduler(runner, store, stash, adapters, env=None):
-    """Register the unattended scan, then resolve a schedule over it.
+    """Register the unattended producers, then resolve a schedule over them.
 
     **The order of the two statements below is the whole of this function.**
     `Scheduler.__init__` resolves the schedule ONCE, from the producers the
@@ -72,12 +73,22 @@ def build_scheduler(runner, store, stash, adapters, env=None):
     `Scheduler.start` refuses out loud, which is the last moment anything can
     say so.
 
-    Returns `None`, having said why, when there is nothing to schedule: a
-    scan needs a media server to read the library from and at least one
-    configured adapter to search against, exactly as `Actions.scan` needs
-    both before a person's click can do anything. Printed rather than
-    silently skipped, because "no scan is scheduled" and "a scan is scheduled
-    and has not run yet" look identical from the outside otherwise.
+    TWO producers are registered here, and what each one needs is different.
+    The scan needs a media server to read the library from AND at least one
+    configured adapter to search against, exactly as `Actions.scan` needs both
+    before a person's click can do anything. The description pass needs only
+    the media server: the fault it looks for is in the text the server already
+    holds, so there is nothing for it to search against and no adapter for it
+    to want. So an install with a server and no `adapters.json` schedules the
+    description pass and says the scan is not scheduled -- rather than the two
+    being one all-or-nothing decision, which would have left a producer with a
+    perfectly good reason to run silently unregistered.
+
+    Returns `None`, having said why, only when there is nothing to schedule at
+    all, which is an install with no media server. Printed rather than
+    silently skipped in either case, because "no scan is scheduled" and "a
+    scan is scheduled and has not run yet" look identical from the outside
+    otherwise.
 
     The producer a person's `Scan` button builds is deliberately NOT in this
     schedule. It is registered later, under a different name, with the limit
@@ -93,15 +104,26 @@ def build_scheduler(runner, store, stash, adapters, env=None):
             missing.append("no configured site adapter (adapters.json)")
         print("no scan is scheduled: %s. The inbox still works, and Scan "
               "still refuses with the same reason." % "; and ".join(missing))
-        return None
-    producer = build_scheduled_producer(stash, adapters, store)
-    # First. See this function's docstring for what building the scheduler
-    # ahead of this line costs, and why nothing would report it.
-    runner.register(producer)
-    # Second, so `resolve` can see the producer above and read its declared
-    # cadence off it. Overrides come from the operator's own config and are
-    # validated by `resolve`, at this line, where a typo is a start-up stack
-    # trace rather than a producer that quietly never runs.
+        if stash is None:
+            # Nothing else here can run either: every producer below reads
+            # the library from the media server.
+            return None
+    else:
+        # First. See this function's docstring for what building the scheduler
+        # ahead of this line costs, and why nothing would report it.
+        runner.register(build_scheduled_producer(stash, adapters, store))
+    # The description pass, which wants nothing but the server. Its cadence is
+    # passed HERE rather than defaulted inside the producer, for the reason
+    # `build_scheduled_producer` passes the scan's: a producer with no cadence
+    # is what `resolve` refuses, and defaulting to the refusal would make
+    # forgetting the argument look like a decision. Daily, the same interval
+    # the scan runs on -- there is no reason for a whole-library text pass
+    # that issues one query to run more rarely than the scan beside it.
+    runner.register(DescriptionProducer(stash, every=DAILY))
+    # Last, so `resolve` can see the producers above and read each one's
+    # declared cadence off it. Overrides come from the operator's own config
+    # and are validated by `resolve`, at this line, where a typo is a start-up
+    # stack trace rather than a producer that quietly never runs.
     return Scheduler(runner, store, overrides=load_schedule(env=env))
 
 

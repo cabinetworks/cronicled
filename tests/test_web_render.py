@@ -4,7 +4,7 @@ import unittest
 from cronicled.jobs import Job
 from cronicled.schedule import LoopStatus, TickResult
 from cronicled.web.render import environment, render
-from cronicled.web.rows import to_row
+from cronicled.web.rows import to_description_row, to_row
 
 _HOSTILE = '<script>alert("x")</script>'
 
@@ -582,7 +582,8 @@ class MutedSubjectFilename(unittest.TestCase):
         html = render("inbox.html", rows=[], counts={},
                       muted=[{"subject_type": "scene", "subject_id": "12962",
                              "reason": "never identifiable", "at": "t",
-                             "filename": "reel.mp4", "scene_url": None}],
+                             "subject_label": "reel.mp4",
+                             "subject_url": None}],
                       dismissed=[], refused=[])
         start = html.index("Muted (")
         section = html[start:html.index("</details>", start)]
@@ -598,7 +599,7 @@ class MutedSubjectFilename(unittest.TestCase):
         html = render("inbox.html", rows=[], counts={},
                       muted=[{"subject_type": "scene", "subject_id": "12962",
                              "reason": "never identifiable", "at": "t",
-                             "filename": None, "scene_url": None}],
+                             "subject_label": None, "subject_url": None}],
                       dismissed=[], refused=[])
         start = html.index("Muted (")
         section = html[start:html.index("</details>", start)]
@@ -608,8 +609,9 @@ class MutedSubjectFilename(unittest.TestCase):
     def test_a_muted_entrys_scene_url_is_a_link(self):
         html = render("inbox.html", rows=[], counts={},
                       muted=[{"subject_type": "scene", "subject_id": "7",
-                             "reason": "r", "at": "t", "filename": "reel.mp4",
-                             "scene_url": "http://media.example/scenes/7"}],
+                             "reason": "r", "at": "t",
+                             "subject_label": "reel.mp4",
+                             "subject_url": "http://media.example/scenes/7"}],
                       dismissed=[], refused=[])
         self.assertIn('<a href="http://media.example/scenes/7"', html)
 
@@ -850,3 +852,84 @@ class TheSchedulePanel(unittest.TestCase):
         html = render("inbox.html", rows=[], counts={}, schedule=status)
         self.assertNotIn("<script>", html)
         self.assertIn("&lt;script&gt;", html)
+
+
+# -- description proposals ------------------------------------------------- #
+
+
+def _description_row(**over):
+    item = {"fingerprint": "fp-d", "state": "new",
+            "subject_type": "performer", "subject_id": "7",
+            "summary": "s", "confidence": None, "prior_state": None,
+            "payload": {"name": "Wren Alderly", "field": "details",
+                        "faults": ["markup", "entity"],
+                        "original": "<p>Marsh &amp; Holloway.</p>\n\nSecond.",
+                        "cleaned": "Marsh & Holloway.\n\nSecond."}}
+    item.update(over)
+    return to_description_row(item, base_url=over.pop("base_url", None))
+
+
+class DescriptionBlock(unittest.TestCase):
+    _FORM_RE = re.compile(
+        r'<form method="post" action="(?P<action>[^"]+)">'
+        r'<input type="hidden" name="fp" value="(?P<fp>[^"]*)">'
+        r'<button>(?P<label>[^<]+)</button></form>')
+
+    def _html(self, row, **kwargs):
+        return render("inbox.html", rows=[row], counts={}, **kwargs)
+
+    def test_the_page_shows_the_text_now_and_the_text_proposed(self):
+        # THE review. A page showing only the proposed value asks somebody to
+        # approve a write to a field whose previous contents are not on the
+        # screen -- so both are asserted present, escaped, and in full.
+        html = self._html(_description_row())
+
+        self.assertIn("&lt;p&gt;Marsh &amp;amp; Holloway.&lt;/p&gt;", html)
+        self.assertIn("Marsh &amp; Holloway.", html)
+        self.assertIn("Now", html)
+        self.assertIn("Proposed", html)
+
+    def test_the_faults_it_found_are_named_on_the_row(self):
+        html = self._html(_description_row())
+        self.assertIn("markup", html)
+        self.assertIn("entity", html)
+
+    def test_the_performer_is_named_and_linked(self):
+        html = self._html(_description_row(base_url="http://media.example"))
+        self.assertIn("Wren Alderly", html)
+        self.assertIn("http://media.example/performers/7", html)
+
+    def test_a_new_row_offers_exactly_approve_dismiss_mute_refresh(self):
+        html = self._html(_description_row(state="new"))
+        self.assertEqual(
+            [(m.group("action"), m.group("label"), m.group("fp"))
+             for m in self._FORM_RE.finditer(html)],
+            [("/approve", "Approve", "fp-d"),
+             ("/dismiss", "Dismiss", "fp-d"),
+             ("/mute", "Mute", "fp-d"),
+             ("/refresh", "Refresh", "fp-d")])
+
+    def test_an_applied_row_with_a_snapshot_offers_undo_and_refresh(self):
+        html = self._html(_description_row(
+            state="applied", prior_state={"details": "<p>x</p>"}))
+        self.assertEqual(
+            [(m.group("action"), m.group("label"))
+             for m in self._FORM_RE.finditer(html)],
+            [("/undo", "Undo"), ("/refresh", "Refresh")])
+
+    def test_the_two_kinds_of_proposal_render_side_by_side_on_one_page(self):
+        # HARM: the page draws one list. A dispatcher that only ever picked
+        # one shape would render every row of the other kind as a block with
+        # its identifying fields blank -- which Jinja does silently, because
+        # an undefined attribute is empty text rather than an error.
+        html = render("inbox.html", counts={},
+                      rows=[_row(), _description_row()])
+
+        self.assertIn("Wren Alderly", html)
+        self.assertIn("0.812", html)
+
+    def test_a_description_row_carries_no_invented_score(self):
+        # Nothing scored it. Any number would sit in the same column, in the
+        # same type, as numbers the scorer really produced.
+        html = self._html(_description_row())
+        self.assertNotIn('<div class="score">', html)
