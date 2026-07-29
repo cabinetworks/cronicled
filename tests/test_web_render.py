@@ -3,8 +3,10 @@ import unittest
 
 from cronicled.jobs import Job
 from cronicled.schedule import LoopStatus, TickResult
+from cronicled.tags import cluster_tags
+from cronicled.tags import proposal as tag_proposal
 from cronicled.web.render import environment, render
-from cronicled.web.rows import to_description_row, to_row
+from cronicled.web.rows import to_description_row, to_merge_row, to_row
 
 _HOSTILE = '<script>alert("x")</script>'
 
@@ -933,3 +935,142 @@ class DescriptionBlock(unittest.TestCase):
         # same type, as numbers the scorer really produced.
         html = self._html(_description_row())
         self.assertNotIn('<div class="score">', html)
+
+
+# -- tag-merge proposals ---------------------------------------------------- #
+
+
+def _merge_row(tags=None, **over):
+    """One `MergeRow`, built through the real producer and the real row
+    builder rather than hand-assembled, for the reason `_row` above is: a
+    hand-written payload can carry a shape the producer never emits, and
+    Jinja renders a missing attribute as empty text instead of raising.
+    """
+    if tags is None:
+        tags = [{"id": "1", "name": "Velvet Crane", "aliases": [],
+                 "scene_count": 12},
+                {"id": "9", "name": "VelvetCrane", "aliases": [],
+                 "scene_count": 4}]
+    built = tag_proposal(cluster_tags(tags)[0], "library")
+    item = {"fingerprint": "fp-m", "state": "new",
+            "subject_type": built["subject_type"],
+            "subject_id": built["subject_id"], "summary": built["summary"],
+            "confidence": None, "payload": built["payload"],
+            "prior_state": None}
+    item.update(over)
+    return to_merge_row(item)
+
+
+_THREE_SPELLINGS = [
+    {"id": "1", "name": "IvyMayKingsley", "aliases": [], "scene_count": 1},
+    {"id": "2", "name": "Ivy MayKingsley", "aliases": [], "scene_count": 2},
+    {"id": "3", "name": "Ivy May Kingsley", "aliases": [], "scene_count": 3},
+]
+
+
+class TagMergeSection(unittest.TestCase):
+    """The section a merge is judged in. It is not the scene block, and the
+    two things it has that the scene block cannot carry -- per-spelling item
+    counts, and a warning about a write that cannot be taken back -- are what
+    every test here is about.
+    """
+
+    _MERGE_FORM_RE = re.compile(
+        r'<form method="post" action="/approve">'
+        r'<input type="hidden" name="fp" value="(?P<fp>[^"]*)">'
+        r'<button>Merge</button></form>')
+    _UNDO_FORM_RE = re.compile(r'action="/undo"')
+
+    def _render(self, merges, **over):
+        kwargs = dict(rows=[], counts={}, muted=[], dismissed=[], refused=[],
+                      superseded=[], applied=[], merges=merges)
+        kwargs.update(over)
+        return render("inbox.html", **kwargs)
+
+    def test_the_section_carries_its_count_while_collapsed(self):
+        self.assertIn("Tag merges (1)", self._render([_merge_row()]))
+        self.assertIn("Tag merges (0)", self._render([]))
+
+    def test_every_spelling_and_its_own_count_are_on_the_page(self):
+        # The blast radius is the number that decides whether a merge is
+        # safe, and it has to be in front of the reviewer rather than
+        # something they go and look up.
+        html = self._render([_merge_row()])
+
+        self.assertIn("Velvet Crane", html)
+        self.assertIn("12 scenes", html)
+        self.assertIn("VelvetCrane", html)
+        self.assertIn("4 scenes", html)
+
+    def test_the_total_sits_where_a_score_would_and_says_what_it_counts(self):
+        # An unlabelled number in that slot reads as a score, and the two
+        # could hardly mean more different things: one is how sure the tool
+        # is, the other is how much a person is about to move.
+        html = self._render([_merge_row()])
+
+        self.assertIn('<div class="score">16<div class="note">scenes</div>',
+                      html)
+
+    def test_the_irreversibility_warning_is_on_a_new_merge(self):
+        # Before the write, when it can still change the answer. Rendered as
+        # a warning, not as plain text beside it: the sentence that says
+        # "this cannot be taken back" must not read like the list a reviewer
+        # can skim past.
+        html = self._render([_merge_row()])
+
+        self.assertIn("cannot be undone", html)
+        self.assertRegex(html, r'<div class="warn">[^<]*cannot be undone')
+
+    def test_the_irreversibility_warning_is_still_there_after_the_merge(self):
+        # The sources are gone by now. A page that stopped saying so would
+        # leave a person hunting for the Undo that is not there.
+        html = self._render([_merge_row(state="applied")])
+
+        self.assertIn("cannot be undone", html)
+
+    def test_no_merge_row_ever_offers_an_undo(self):
+        for state in ("new", "seen", "applied", "failed"):
+            with self.subTest(state=state):
+                html = self._render([_merge_row(state=state)])
+                self.assertEqual(self._UNDO_FORM_RE.findall(html), [], state)
+
+    def test_a_decided_cluster_offers_exactly_one_merge_control(self):
+        html = self._render([_merge_row()])
+
+        self.assertEqual(self._MERGE_FORM_RE.findall(html), ["fp-m"])
+        self.assertIn("Merge into <b>Velvet Crane</b>", html)
+        self.assertIn("Deletes: VelvetCrane", html)
+
+    def test_an_undecided_cluster_offers_no_merge_control_and_says_why(self):
+        # Three spellings do not say which is canonical. Offering the button
+        # would ask a person to authorise a write nothing has specified.
+        html = self._render([_merge_row(tags=_THREE_SPELLINGS)])
+
+        self.assertEqual(self._MERGE_FORM_RE.findall(html), [])
+        self.assertIn("3 spellings of one tag", html)
+        self.assertIn("three or more spellings share this form", html)
+
+    def test_two_merges_each_get_their_own_control_not_a_bulk_one(self):
+        rows = [_merge_row(fingerprint="a"), _merge_row(fingerprint="b")]
+
+        self.assertEqual(self._MERGE_FORM_RE.findall(self._render(rows)),
+                         ["a", "b"])
+
+    def test_a_muted_cluster_offers_its_unmute_with_the_subject_pair(self):
+        # A mute is keyed by (subject_type, subject_id), not by fingerprint,
+        # so this control posts the pair -- and a tag cluster's subject is
+        # the CLUSTER, never one of its tags.
+        html = self._render([_merge_row(state="muted")])
+
+        self.assertIn('name="subject_type" value="tag-cluster"', html)
+        self.assertIn('name="subject_id" value="velvetcrane"', html)
+        self.assertIn("<button>Unmute</button>", html)
+
+    def test_a_hostile_tag_name_is_escaped(self):
+        rows = [_merge_row(tags=[
+            {"id": "1", "name": _HOSTILE + " x", "aliases": [],
+             "scene_count": 1},
+            {"id": "2", "name": _HOSTILE + "x", "aliases": [],
+             "scene_count": 2}])]
+
+        self.assertNotIn("<script>", self._render(rows))

@@ -1,3 +1,5 @@
 {
-  "nightly-library-scan": {"every": 86400, "enabled": true}
+  "nightly-library-scan": {"every": 86400, "enabled": true},
+  "performer-descriptions": {"every": 86400, "enabled": true},
+  "tag-merge": {"every": 86400, "enabled": true}
 }

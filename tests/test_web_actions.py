@@ -4,6 +4,8 @@ import unittest
 from cronicled.adapters.base import SiteAdapter
 from cronicled.jobs import JobRejected, JobRunner
 from cronicled.store import Store
+from cronicled.tags import cluster_tags
+from cronicled.tags import proposal as tag_proposal
 from cronicled.web.actions import Actions, ApplyFailed, UnknownProposal
 
 WAIT = 10
@@ -668,6 +670,50 @@ def _description_item(**over):
     return item
 
 
+# -- tag-merge proposals ---------------------------------------------------- #
+
+
+class _MergingStash(_FakeStash):
+    """Adds the one write a tag merge makes, and keeps the real client's
+    limitations while doing it.
+
+    `Stash.merge_tags` takes `(destination_id, source_ids, aliases=None)` and
+    coerces every id to a string on the way out. Recording the call verbatim
+    is what lets a test assert the WHOLE argument set -- an `aliases` value
+    slipped in would replace the destination's entire alias list on a real
+    server, and a check of only the ids could not see it arrive.
+    """
+
+    def __init__(self, fail=False):
+        _FakeStash.__init__(self)
+        self._fail_merge = fail
+        self.merges = []
+
+    def merge_tags(self, destination_id, source_ids, aliases=None):
+        self.merges.append((destination_id, list(source_ids), aliases))
+        if self._fail_merge:
+            raise RuntimeError("server said no")
+        return {"id": destination_id, "name": "x", "aliases": []}
+
+
+def _merge_item(tags=None, **over):
+    """One tag-merge item, built through `cronicled.tags`' own producer path
+    rather than hand-written, so it cannot describe a payload shape nothing
+    ever emits."""
+    if tags is None:
+        tags = [{"id": "1", "name": "Velvet Crane", "aliases": [],
+                 "scene_count": 12},
+                {"id": "9", "name": "VelvetCrane", "aliases": [],
+                 "scene_count": 4}]
+    built = tag_proposal(cluster_tags(tags)[0], "library")
+    item = {"fingerprint": "fp-m", "state": "new",
+            "subject_type": built["subject_type"],
+            "subject_id": built["subject_id"], "prior_state": None,
+            "payload": built["payload"]}
+    item.update(over)
+    return item
+
+
 class ApproveADescription(unittest.TestCase):
     def test_it_writes_the_cleaned_text_through_the_description_path(self):
         store, stash = _FakeStore(_description_item()), _FakeDescriptionStash()
@@ -748,3 +794,125 @@ class UndoADescription(unittest.TestCase):
             Actions(store, stash).undo("fp-d")
 
         self.assertEqual(stash.calls, [])
+
+
+_THREE_SPELLINGS = [
+    {"id": "1", "name": "IvyMayKingsley", "aliases": [], "scene_count": 1},
+    {"id": "2", "name": "Ivy MayKingsley", "aliases": [], "scene_count": 2},
+    {"id": "3", "name": "Ivy May Kingsley", "aliases": [], "scene_count": 3},
+]
+
+
+class ApproveAMerge(unittest.TestCase):
+    def test_it_merges_the_losing_spellings_into_the_survivor(self):
+        # The WHOLE call, `aliases` included. `Stash.merge_tags`'s `aliases`
+        # REPLACES the destination's alias list, and the only list this could
+        # pass is whatever the proposal captured when it was made -- days ago
+        # -- so passing one would silently delete every alias added since.
+        # An assertion on the ids alone could not see one appear.
+        store, stash = _FakeStore(_merge_item()), _MergingStash()
+
+        self.assertEqual(Actions(store, stash).approve("fp-m"), "merged")
+
+        self.assertEqual(stash.merges, [("1", ["9"], None)])
+
+    def test_it_records_no_undo_snapshot(self):
+        # THE enforcement of the irreversibility decision, not a description
+        # of it: with no `prior_state` in the store, no row anywhere can ever
+        # offer an undo it cannot perform.
+        store, stash = _FakeStore(_merge_item()), _MergingStash()
+
+        Actions(store, stash).approve("fp-m")
+
+        self.assertEqual(store.calls, [("applied", "fp-m", None)])
+
+    def test_it_never_touches_the_scene_apply_path(self):
+        # A merge routed through `apply_scene` would send a cluster key where
+        # a scene id belongs, and the payload has no `candidate` for it to
+        # read. Asserted as "no scene call was made" rather than as an
+        # absence of an exception.
+        store, stash = _FakeStore(_merge_item()), _MergingStash()
+
+        Actions(store, stash).approve("fp-m")
+
+        self.assertEqual(stash.calls, [])
+
+    def test_an_undecided_cluster_is_refused_and_nothing_is_written(self):
+        # Three spellings do not say which survives. Picking one here would
+        # be the silent resolution the whole clustering rule refuses, done at
+        # the moment it is most expensive.
+        store = _FakeStore(_merge_item(tags=_THREE_SPELLINGS))
+        stash = _MergingStash()
+
+        with self.assertRaisesRegex(ValueError, "no agreed surviving"):
+            Actions(store, stash).approve("fp-m")
+
+        self.assertEqual(stash.merges, [])
+        # Not recorded as failed either: nothing was attempted, so the
+        # proposal is still exactly as open as it was.
+        self.assertEqual(store.calls, [])
+
+    def test_a_failed_merge_is_recorded_as_failed_not_applied(self):
+        store, stash = _FakeStore(_merge_item()), _MergingStash(fail=True)
+
+        with self.assertRaises(ApplyFailed):
+            Actions(store, stash).approve("fp-m")
+
+        self.assertEqual([c[0] for c in store.calls], ["failed"])
+
+    def test_it_refuses_without_a_configured_media_server(self):
+        store = _FakeStore(_merge_item())
+
+        with self.assertRaises(ApplyFailed):
+            Actions(store, None).approve("fp-m")
+
+        self.assertEqual([c[0] for c in store.calls], ["failed"])
+
+
+class UndoAMerge(unittest.TestCase):
+    def test_it_refuses_and_says_the_merge_cannot_be_reversed(self):
+        # Refused with the REASON. "No snapshot was stored for it" -- the
+        # generic answer below this branch -- reads as an omission somebody
+        # could go and fix, and there is nothing to fix: a merge destroys the
+        # record an undo would need.
+        item = _merge_item(state="applied")
+        store, stash = _FakeStore(item), _MergingStash()
+
+        with self.assertRaises(ValueError) as caught:
+            Actions(store, stash).undo("fp-m")
+
+        self.assertIn("cannot be undone", str(caught.exception))
+        self.assertEqual(store.calls, [])
+        self.assertEqual(stash.calls, [])
+
+    def test_a_merge_that_somehow_carried_a_snapshot_is_still_refused(self):
+        # The subject type decides, not the presence of a snapshot. A merge
+        # whose row had acquired a `prior_state` from anywhere would
+        # otherwise be replayed through `revert_scene` against a cluster key.
+        item = _merge_item(state="applied", prior_state={"title": "was"})
+        store, stash = _FakeStore(item), _MergingStash()
+
+        with self.assertRaises(ValueError):
+            Actions(store, stash).undo("fp-m")
+
+        self.assertEqual(stash.calls, [])
+
+
+class DismissAndMuteAMerge(unittest.TestCase):
+    """The two store-only decisions, which need no special case at all --
+    asserted so a later "merges are different" refactor cannot quietly take
+    a person's ability to reject one."""
+
+    def test_a_merge_can_be_dismissed(self):
+        store = _FakeStore(_merge_item())
+        self.assertEqual(Actions(store, None).dismiss("fp-m"), "dismissed")
+        self.assertEqual([c[0] for c in store.calls], ["dismissed"])
+
+    def test_muting_a_merge_keys_on_the_cluster_not_on_a_tag(self):
+        store = _FakeStore(_merge_item())
+
+        Actions(store, None).mute("fp-m")
+
+        self.assertEqual(store.calls,
+                         [("muted", "tag-cluster", "velvetcrane",
+                           "muted from the inbox")])

@@ -41,6 +41,7 @@ other two.
 import argparse
 import os
 
+from . import tags
 from .config import CONFIG_DIR_ENV_VAR, config_dir, load_schedule
 from .descriptions import DescriptionProducer
 from .jobs import JobRunner
@@ -48,9 +49,10 @@ from .runscan import DAILY, build_scheduled_producer, configured_adapters
 from .schedule import Scheduler
 from .store import Store
 from .stash import Stash
+from .tags import TagMergeProducer
 from .web.actions import Actions
 from .web.app import DEFAULT_HOST, DEFAULT_PORT, serve
-from .web.rows import to_mute_rows, to_refusal_rows, to_rows
+from .web.rows import to_merge_rows, to_mute_rows, to_refusal_rows, to_rows
 
 # How long shutdown waits for the loop to come out of a tick. Bounded rather
 # than `None`: a tick wedged in the store or the media server would otherwise
@@ -58,6 +60,15 @@ from .web.rows import to_mute_rows, to_refusal_rows, to_rows
 # somebody replaces with a kill signal. `close` returns whether it made it,
 # and that answer is printed rather than dropped.
 SCHEDULER_SHUTDOWN_TIMEOUT = 10.0
+
+# How often the unattended tag-merge pass declares itself due, in seconds.
+# An INTERVAL measured from its last recorded run, exactly like the scan's
+# own cadence (see `cronicled.runscan.DAILY`) and with the same accepted
+# drift. Daily rather than more often because the thing it looks for -- two
+# spellings of one tag -- appears when somebody adds a tag by hand, which is
+# not an hourly event; and because a person has to approve every merge
+# anyway, so finding one sooner buys nothing.
+TAG_MERGE_EVERY = 86400
 
 
 def build_scheduler(runner, store, stash, adapters, env=None):
@@ -73,22 +84,27 @@ def build_scheduler(runner, store, stash, adapters, env=None):
     `Scheduler.start` refuses out loud, which is the last moment anything can
     say so.
 
-    TWO producers are registered here, and what each one needs is different.
+    THREE producers are registered here, and what each one needs is different.
     The scan needs a media server to read the library from AND at least one
     configured adapter to search against, exactly as `Actions.scan` needs both
     before a person's click can do anything. The description pass needs only
     the media server: the fault it looks for is in the text the server already
     holds, so there is nothing for it to search against and no adapter for it
-    to want. So an install with a server and no `adapters.json` schedules the
-    description pass and says the scan is not scheduled -- rather than the two
-    being one all-or-nothing decision, which would have left a producer with a
-    perfectly good reason to run silently unregistered.
+    to want. The tag-merge pass needs only the media server for the same kind
+    of reason: tags are the server's own vocabulary and exist whether or not
+    any store is configured.
+
+    So an install with a server and no `adapters.json` schedules the
+    description and tag-merge passes and says, separately, that the scan is
+    the thing not scheduled -- rather than the three being one all-or-nothing
+    decision, which would have left two producers with a perfectly good reason
+    to run silently unregistered.
 
     Returns `None`, having said why, only when there is nothing to schedule at
-    all, which is an install with no media server. Printed rather than
-    silently skipped in either case, because "no scan is scheduled" and "a
-    scan is scheduled and has not run yet" look identical from the outside
-    otherwise.
+    all, which is an install with no media server: every producer here reads
+    something from one. Printed rather than silently skipped in either case,
+    because "no scan is scheduled" and "a scan is scheduled and has not run
+    yet" look identical from the outside otherwise.
 
     The producer a person's `Scan` button builds is deliberately NOT in this
     schedule. It is registered later, under a different name, with the limit
@@ -120,6 +136,10 @@ def build_scheduler(runner, store, stash, adapters, env=None):
     # the scan runs on -- there is no reason for a whole-library text pass
     # that issues one query to run more rarely than the scan beside it.
     runner.register(DescriptionProducer(stash, every=DAILY))
+    # The tag-merge pass, which wants nothing but the server either, and for
+    # the same reason carries its cadence in from here.
+    runner.register(TagMergeProducer(stash, store=store,
+                                     every=TAG_MERGE_EVERY))
     # Last, so `resolve` can see the producers above and read each one's
     # declared cadence off it. Overrides come from the operator's own config
     # and are validated by `resolve`, at this line, where a typo is a start-up
@@ -203,23 +223,70 @@ def main(argv=None):
         # itself is left untouched: `undo` still needs `items(state=None)`
         # to include an applied row, and this filtering happens here, not
         # by narrowing what `items()` returns.
+        # Tag-merge proposals are excluded here and rendered by
+        # `_merge_rows` below instead. Not tidiness: `to_row` INDEXES
+        # `payload["path"]` and `payload["candidate"]`, which a merge payload
+        # has neither of, so a single tag cluster in the store would take the
+        # whole page down with a KeyError rather than render oddly.
         return to_rows([item for item in store.items()
-                        if item["state"] != "applied"], base_url=base_url)
+                        if item["state"] != "applied"
+                        and item["subject_type"] != tags.SUBJECT_TYPE],
+                       base_url=base_url)
+
+    def _scene_items(state):
+        return [item for item in store.items(state=state)
+                if item["subject_type"] != tags.SUBJECT_TYPE]
+
+    def _merge_rows():
+        """Every tag-merge proposal that still has something to show, in
+        every state that carries a control.
+
+        Three reads rather than one because `items()`'s default view hides a
+        person's own rejections: a dismissed cluster needs its Undismiss and
+        a muted one its Unmute, and both are only reachable if the row is on
+        the page. `superseded` is deliberately absent -- a merge row offers
+        no Refresh, so nothing puts one there.
+
+        Muted clusters come from `items(state="muted")`, not from
+        `store.mutes()`: that is what keeps `to_mute_row` -- which knows how
+        to label exactly two subject kinds, a performer by `name` and
+        anything else by `path` -- from ever being handed a merge payload,
+        which answers to neither. It also shows the spellings and their
+        counts rather than a bare subject id. A cluster muted with no row
+        of its own at all would be
+        invisible to this, which is unreachable today: Mute is offered only
+        on a row that already exists.
+        """
+        seen = []
+        for state in (None, "dismissed", "muted"):
+            seen.extend(item for item in store.items(state=state)
+                        if item["subject_type"] == tags.SUBJECT_TYPE)
+        return to_merge_rows(seen)
 
     scheduler = build_scheduler(runner, store, stash, adapters, env=env)
     if scheduler is not None:
         scheduler.start()
 
     try:
+        # Every section but Merges filters tag clusters out for the reason
+        # `_inbox_rows` states: `to_rows` dispatches between a scene and a
+        # performer-description row and has no third branch, and `to_mute_row`
+        # labels a performer by `name` and everything else by `path`. A merge
+        # payload answers to none of those, so one cluster in the wrong list
+        # is a KeyError that takes the whole page down.
         serve(rows=_inbox_rows,
-              muted=lambda: to_mute_rows(store.mutes(), base_url=base_url),
-              dismissed=lambda: to_rows(store.items(state="dismissed"),
+              merges=_merge_rows,
+              muted=lambda: to_mute_rows(
+                  [m for m in store.mutes()
+                   if m["subject_type"] != tags.SUBJECT_TYPE],
+                  base_url=base_url),
+              dismissed=lambda: to_rows(_scene_items("dismissed"),
                                         base_url=base_url),
               refused=lambda: to_refusal_rows(store.refusals(),
                                               base_url=base_url),
-              superseded=lambda: to_rows(store.items(state="superseded"),
+              superseded=lambda: to_rows(_scene_items("superseded"),
                                          base_url=base_url),
-              applied=lambda: to_rows(store.items(state="applied"),
+              applied=lambda: to_rows(_scene_items("applied"),
                                       base_url=base_url),
               actions=actions, scan_status=actions.scan_status,
               # `None` when nothing is scheduled, which the page says out

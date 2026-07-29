@@ -1,11 +1,14 @@
 import unittest
+from dataclasses import asdict
 
 from cronicled.scan import _runners_up
 from cronicled.scoring import Match
+from cronicled.tags import MERGE_IS_IRREVERSIBLE, UNDECIDED_MANY, cluster_tags
+from cronicled.tags import proposal as tag_proposal
 from cronicled.web.rows import (
     IDENTIFIED_SCORE_TEXT, KIND_DESCRIPTION, KIND_SCENE, Row, scene_url,
-    to_description_row, to_mute_row, to_mute_rows, to_refusal_row,
-    to_refusal_rows, to_row, to_rows,
+    to_description_row, to_merge_row, to_merge_rows, to_mute_row,
+    to_mute_rows, to_refusal_row, to_refusal_rows, to_row, to_rows,
 )
 
 
@@ -732,6 +735,32 @@ def _description_item(**over):
     return item
 
 
+# -- tag-merge proposals ---------------------------------------------------- #
+
+
+def _merge_item(**over):
+    """One tag-merge item, shaped as `cronicled.tags.proposal` really builds
+    it -- via that function on a real cluster, never hand-written.
+
+    A hand-written payload literal is how a row builder comes to read a shape
+    the producer does not emit, and nothing raises: the field is simply
+    missing. Building the fixture through the producer's own function means
+    this cannot drift from what `to_merge_row` will actually be handed.
+    """
+    tags = over.pop("tags", [
+        {"id": "1", "name": "Velvet Crane", "aliases": [], "scene_count": 12},
+        {"id": "9", "name": "VelvetCrane", "aliases": [], "scene_count": 4},
+    ])
+    built = tag_proposal(cluster_tags(tags)[0], "library")
+    item = {"fingerprint": "fp-m", "state": "new",
+            "subject_type": built["subject_type"],
+            "subject_id": built["subject_id"], "summary": built["summary"],
+            "confidence": None, "payload": built["payload"],
+            "prior_state": None}
+    item.update(over)
+    return item
+
+
 class ToDescriptionRowTest(unittest.TestCase):
     def test_it_carries_both_texts_so_there_is_something_to_judge_against(self):
         # THE row's reason for existing. A row carrying only the cleaned value
@@ -810,3 +839,114 @@ class ToRowsDispatch(unittest.TestCase):
         # every scene row -- which Jinja renders as empty text rather than
         # raising, so it would take the description branch's `else` by luck.
         self.assertEqual(to_row(_item()).kind, KIND_SCENE)
+
+
+_THREE_SPELLINGS = [
+    {"id": "1", "name": "IvyMayKingsley", "aliases": [], "scene_count": 1},
+    {"id": "2", "name": "Ivy MayKingsley", "aliases": [], "scene_count": 2},
+    {"id": "3", "name": "Ivy May Kingsley", "aliases": [], "scene_count": 3},
+]
+
+
+class MergeRowShape(unittest.TestCase):
+    """A merge row is not a scene row, and the differences are the point."""
+
+    def test_the_whole_row_for_a_decided_cluster(self):
+        # The WHOLE dataclass, not sampled fields. A field added here without
+        # anyone deciding to add it -- an `undoable`, most of all -- is
+        # exactly what a field-by-field check cannot see.
+        self.assertEqual(asdict(to_merge_row(_merge_item())), {
+            "fingerprint": "fp-m",
+            "state": "new",
+            "subject_type": "tag-cluster",
+            "subject_id": "velvetcrane",
+            "key": "velvetcrane",
+            "members": (
+                {"id": "1", "name": "Velvet Crane", "scene_count": 12},
+                {"id": "9", "name": "VelvetCrane", "scene_count": 4},
+            ),
+            "canonical": "Velvet Crane",
+            "losing": ("VelvetCrane",),
+            "undecided": None,
+            "total_scenes": 16,
+            "counts_cover": "scenes",
+            "warning": MERGE_IS_IRREVERSIBLE,
+            "appliable": True,
+            "actionable": True,
+            "undismissable": False,
+            "unmutable": False,
+            "error": None,
+        })
+
+    def test_the_whole_row_for_an_undecided_cluster(self):
+        row = asdict(to_merge_row(_merge_item(tags=_THREE_SPELLINGS)))
+
+        self.assertEqual(row["canonical"], None)
+        self.assertEqual(row["undecided"], UNDECIDED_MANY)
+        # Nothing is losing, because nothing has been decided.
+        self.assertEqual(row["losing"], ())
+        self.assertEqual(row["total_scenes"], 6)
+        # And no Merge control: there is no surviving spelling to merge into,
+        # so offering the button would ask a person to authorise a write
+        # nothing has specified.
+        self.assertFalse(row["appliable"])
+        # Dismiss and Mute are still theirs to press.
+        self.assertTrue(row["actionable"])
+
+    def test_a_merge_row_has_no_undoable_field_at_all(self):
+        # Not "undoable is False": the FIELD is absent, so no template can
+        # read one and no future edit can set one to True by accident. A
+        # merge cannot be reversed (see `tags.MERGE_IS_IRREVERSIBLE`), and
+        # the cheapest guarantee is that there is nothing there to read.
+        self.assertNotIn("undoable", asdict(to_merge_row(_merge_item())))
+        self.assertFalse(hasattr(to_merge_row(_merge_item()), "undoable"))
+
+    def test_the_warning_says_the_write_cannot_be_undone(self):
+        # A property of the text, not a comparison with the constant the code
+        # built the row from -- both sides of that move together.
+        self.assertIn("cannot be undone", to_merge_row(_merge_item()).warning)
+
+    def test_the_warning_is_carried_after_the_merge_too(self):
+        # The sources are gone by then, and a page that stopped saying so
+        # would leave a person hunting for the Undo that is not there.
+        row = to_merge_row(_merge_item(state="applied"))
+        self.assertIn("cannot be undone", row.warning)
+
+    def test_an_applied_merge_offers_no_controls(self):
+        row = to_merge_row(_merge_item(state="applied"))
+        self.assertFalse(row.appliable)
+        self.assertFalse(row.actionable)
+        self.assertFalse(row.undismissable)
+        self.assertFalse(row.unmutable)
+
+    def test_a_dismissed_merge_offers_only_its_reversal(self):
+        row = to_merge_row(_merge_item(state="dismissed"))
+        self.assertTrue(row.undismissable)
+        self.assertFalse(row.actionable)
+        self.assertFalse(row.unmutable)
+
+    def test_a_muted_merge_offers_only_its_reversal(self):
+        row = to_merge_row(_merge_item(state="muted"))
+        self.assertTrue(row.unmutable)
+        self.assertFalse(row.actionable)
+        self.assertFalse(row.undismissable)
+
+    def test_a_failed_merge_still_has_a_decision_left_in_it(self):
+        # Stated as "not closed" rather than as a list of open states, so a
+        # state added later inherits its controls instead of silently losing
+        # them -- which is how a failed scene row became a dead end once.
+        row = to_merge_row(_merge_item(state="failed", error="server said no"))
+        self.assertTrue(row.actionable)
+        self.assertTrue(row.appliable)
+        self.assertEqual(row.error, "server said no")
+
+    def test_a_payload_missing_a_scene_count_raises(self):
+        item = _merge_item()
+        del item["payload"]["members"][0]["scene_count"]
+        with self.assertRaises(KeyError):
+            to_merge_row(item)
+
+    def test_to_merge_rows_converts_every_item_and_keeps_their_order(self):
+        rows = to_merge_rows([_merge_item(fingerprint="a"),
+                              _merge_item(fingerprint="b")])
+        self.assertEqual([r.fingerprint for r in rows], ["a", "b"])

@@ -16,8 +16,11 @@ from cronicled.descriptions import PRODUCER_NAME as DESCRIPTION_PRODUCER_NAME
 from cronicled.jobs import JobRunner
 from cronicled.runscan import SCHEDULED_SCAN_NAME, build_producer
 from cronicled.scan import ScanProducer
+from cronicled.schedule import Entry, resolve
 from cronicled.stash import Stash
 from cronicled.store import Store
+from cronicled.tags import TagMergeProducer, cluster_tags
+from cronicled.tags import proposal as tag_proposal
 from cronicled.web.actions import Actions
 
 WAIT = 10
@@ -28,7 +31,13 @@ NOW = datetime(2026, 7, 27, 3, 0, 0, tzinfo=timezone.utc)
 # `schedule.due` sorts its answer. Imported from the modules that name them
 # rather than copied, so renaming one cannot leave a test asserting the old
 # name against a schedule that no longer has it.
-BOTH_PRODUCERS = sorted([SCHEDULED_SCAN_NAME, DESCRIPTION_PRODUCER_NAME])
+#
+# THREE, and named as a whole set rather than as "the scan and whatever else":
+# every assertion below compares against this entire list, so a producer
+# dropped from the registry -- or one added and never scheduled -- fails here
+# rather than passing an `assertIn` that only ever looked for the scan.
+ALL_PRODUCERS = sorted([SCHEDULED_SCAN_NAME, DESCRIPTION_PRODUCER_NAME,
+                        TagMergeProducer.name])
 
 # A store that exists nowhere. Every field is invented; `.invalid` is the
 # reserved TLD that cannot resolve, so nothing here can reach anything even
@@ -79,6 +88,15 @@ class _ReadOnlyStash:
         # SCHEDULING wiring, and a producer that found something to propose
         # would only add store writes to what they have to assert about.
         self.calls.append(("performers_with_descriptions",))
+        return []
+
+    def all_tags(self):
+        # The THIRD unattended producer's one read. An empty library holds no
+        # tags, so it holds no duplicate spellings either -- the same "empty
+        # library" answer `unorganized_scenes` gives above, present so the
+        # tag-merge pass this wiring registers alongside the scan runs to a
+        # real finish instead of falling through to `__getattr__`'s refusal.
+        self.calls.append(("all_tags",))
         return []
 
     def scrape_scene_url(self, url):
@@ -136,6 +154,99 @@ class _Base(unittest.TestCase):
                      "score": 0.9, "runners_up": []},
             producer="test-producer", confidence=0.9)
         store.close()
+
+
+    def _seed_merge(self, state=None):
+        """A real tag-merge proposal, built through `cronicled.tags`' own
+        producer path, in whichever `state` a person's decision would leave
+        it. Opened and closed before `main()` runs its own `Store`."""
+        store = Store(self.db_path)
+        built = tag_proposal(cluster_tags([
+            {"id": "1", "name": "Velvet Crane", "aliases": [],
+             "scene_count": 12},
+            {"id": "9", "name": "VelvetCrane", "aliases": [],
+             "scene_count": 4}])[0], "library")
+        fp = store.record(folder=built["folder"],
+                          subject_type=built["subject_type"],
+                          subject_id=built["subject_id"],
+                          summary=built["summary"], payload=built["payload"],
+                          producer="tag-merge")
+        if state == "dismissed":
+            store.dismiss(fp)
+        elif state == "muted":
+            store.mute(built["subject_type"], built["subject_id"])
+        elif state == "applied":
+            store.mark_applied(fp)
+        store.close()
+        return fp
+
+
+class MergeSectionWiring(_Base):
+    """Where a tag-merge proposal is rendered, and -- just as much -- where
+    it must NOT be.
+
+    `to_row` INDEXES `payload["path"]` and `payload["candidate"]`; a merge
+    payload has neither. So a merge item reaching any scene list is not an
+    odd-looking row, it is a `KeyError` that takes the whole page down. Every
+    assertion here calls the section's callable, which is the only way to see
+    that: `serve` receives functions, and a wiring mistake is invisible until
+    one is invoked.
+    """
+
+    def _served(self):
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path])
+        return captured.kwargs
+
+    def test_a_merge_reaches_the_merges_section_and_no_other(self):
+        self._seed()            # one ordinary scene proposal
+        self._seed_merge()
+        kwargs = self._served()
+
+        merges = kwargs["merges"]()
+        self.assertEqual([r.key for r in merges], ["velvetcrane"])
+        self.assertEqual([r.filename for r in kwargs["rows"]()], ["reel.mp4"])
+
+    def test_every_scene_section_survives_a_merge_in_the_store(self):
+        # Each of these would raise rather than render if the merge item
+        # reached it, and the failure would be a blank page rather than a
+        # misplaced row.
+        for state in ("dismissed", "muted", "applied"):
+            with self.subTest(state=state):
+                self.setUp()
+                self._seed_merge(state=state)
+                kwargs = self._served()
+                for section in ("rows", "muted", "dismissed", "superseded",
+                                "applied"):
+                    self.assertEqual(kwargs[section](), [], section)
+
+    def test_a_dismissed_merge_keeps_its_reversal_on_the_page(self):
+        # `items()`'s default view hides a person's own rejections, so a
+        # dismissed cluster is only reachable if this section reads for it
+        # explicitly -- and without the row there is no Undismiss control.
+        self._seed_merge(state="dismissed")
+
+        rows = self._served()["merges"]()
+
+        self.assertEqual([r.state for r in rows], ["dismissed"])
+        self.assertTrue(rows[0].undismissable)
+
+    def test_a_muted_merge_keeps_its_reversal_on_the_page(self):
+        self._seed_merge(state="muted")
+
+        rows = self._served()["merges"]()
+
+        self.assertEqual([r.state for r in rows], ["muted"])
+        self.assertTrue(rows[0].unmutable)
+
+    def test_an_applied_merge_stays_visible_with_its_warning(self):
+        self._seed_merge(state="applied")
+
+        rows = self._served()["merges"]()
+
+        self.assertEqual([r.state for r in rows], ["applied"])
+        self.assertIn("cannot be undone", rows[0].warning)
 
 
 class NoServerConfigured(_Base):
@@ -553,16 +664,18 @@ class ScheduledScanWiring(_Base):
 
         result = scheduler.tick(NOW)
 
-        # Both start-up producers, and the whole set of them: the scan and the
-        # description pass are separate registrations with separate cadences,
-        # and asserting only that the scan is there would pass with the second
-        # one silently unscheduled.
-        self.assertEqual(result.due, BOTH_PRODUCERS)
-        self.assertEqual(sorted(result.started), BOTH_PRODUCERS)
+        # ALL the start-up producers, and the whole set of them: the scan, the
+        # description pass and the tag-merge pass are separate registrations
+        # with separate cadences, and asserting only that the scan is there
+        # would pass with either of the others silently unscheduled.
+        self.assertEqual(result.due, ALL_PRODUCERS)
+        self.assertEqual(sorted(result.started), ALL_PRODUCERS)
         self.assertEqual(result.skipped, {})
         self.assertEqual(result.failed_to_start, {})
         self.assertTrue(self.runner.wait(
             result.started[DESCRIPTION_PRODUCER_NAME], WAIT))
+        self.assertTrue(self.runner.wait(
+            result.started[TagMergeProducer.name], WAIT))
         # It started for real, through the runner, and ran to completion --
         # not merely "a name came back from the schedule".
         job_id = result.started[SCHEDULED_SCAN_NAME]
@@ -590,7 +703,7 @@ class ScheduledScanWiring(_Base):
         # unbounded, still on its own cadence.
         scheduler = self._build()
         before = {p.name: p for p in self.runner.producers()}
-        self.assertEqual(sorted(before), BOTH_PRODUCERS)
+        self.assertEqual(sorted(before), ALL_PRODUCERS)
         actions = Actions(self.store, self.stash, runner=self.runner,
                           adapters=self.adapters)
 
@@ -599,7 +712,7 @@ class ScheduledScanWiring(_Base):
 
         after = {p.name: p for p in self.runner.producers()}
         self.assertEqual(sorted(after),
-                         sorted([ScanProducer.name] + BOTH_PRODUCERS))
+                         sorted([ScanProducer.name] + ALL_PRODUCERS))
         nightly = after[SCHEDULED_SCAN_NAME]
         self.assertIs(nightly, before[SCHEDULED_SCAN_NAME])
         self.assertIsNone(nightly._limit)
@@ -607,9 +720,11 @@ class ScheduledScanWiring(_Base):
         self.assertEqual(after[ScanProducer.name]._limit, 25)
         # And the schedule still starts the unbounded one afterwards.
         result = scheduler.tick(NOW)
-        self.assertEqual(sorted(result.started), BOTH_PRODUCERS)
+        self.assertEqual(sorted(result.started), ALL_PRODUCERS)
         self.assertTrue(self.runner.wait(
             result.started[DESCRIPTION_PRODUCER_NAME], WAIT))
+        self.assertTrue(self.runner.wait(
+            result.started[TagMergeProducer.name], WAIT))
 
     def test_the_scheduled_and_manual_scans_never_scrape_at_once(self):
         # Asserted on the runner's own accounting, never on timing: the
@@ -625,17 +740,27 @@ class ScheduledScanWiring(_Base):
 
         result = scheduler.tick(NOW)
 
-        self.assertEqual(result.due, BOTH_PRODUCERS)
+        self.assertEqual(result.due, ALL_PRODUCERS)
         # The scan is held off by the busy cost class; the description pass
-        # is NOT, and that is the point of it being `local` rather than
-        # `scraping` -- it drives no scraper, so queueing it behind a
-        # twenty-minute scrape would be a limit protecting nothing.
-        self.assertEqual(list(result.started), [DESCRIPTION_PRODUCER_NAME])
+        # and the tag-merge pass are NOT, and that is the point of both being
+        # `local` rather than `scraping` -- neither drives a scraper, so
+        # queueing either behind a twenty-minute scrape would be a limit
+        # protecting nothing. Asserted as the whole started set, so a producer
+        # mis-filed into `scraping` shows up here as a missing name rather
+        # than passing an `assertIn` on the one that was filed correctly.
+        self.assertEqual(sorted(result.started),
+                         sorted([DESCRIPTION_PRODUCER_NAME,
+                                 TagMergeProducer.name]))
         self.assertEqual(result.failed_to_start, {})
         self.assertEqual(list(result.skipped), [SCHEDULED_SCAN_NAME])
         self.assertIn("cost class", result.skipped[SCHEDULED_SCAN_NAME])
+        # Both local jobs are waited out BEFORE `running` is read below: a
+        # job still finishing would appear in that accounting and make this
+        # test about timing rather than about the scraping limit.
         self.assertTrue(self.runner.wait(
             result.started[DESCRIPTION_PRODUCER_NAME], WAIT))
+        self.assertTrue(self.runner.wait(
+            result.started[TagMergeProducer.name], WAIT))
         running = [job.producer for job in self.runner.jobs()
                    if job.state == "running"]
         self.assertEqual(running, [ScanProducer.name])
@@ -660,10 +785,15 @@ class ScheduledScanWiring(_Base):
 
     def test_the_cadence_is_overridable_through_the_existing_mechanism(self):
         self.store.record_run(SCHEDULED_SCAN_NAME, _ago(hours=2))
-        self._schedule_file({SCHEDULED_SCAN_NAME: {"every": 3600}})
-        # Held off so this test says something about the scan's cadence and
-        # nothing about the description pass, which has never run and is
-        # therefore due whatever the override says.
+        # The tag-merge pass is disabled throughout this pair so both tests
+        # stay about the SCAN's cadence: it has never run, so it would be due
+        # on every tick here and would drown the one answer being read.
+        self._schedule_file({SCHEDULED_SCAN_NAME: {"every": 3600},
+                             TagMergeProducer.name: {"enabled": False}})
+        # The description pass is held off the same way, and for the same
+        # reason -- by a recorded run rather than a disable, because either
+        # keeps it out of `due` and the two mechanisms between them show the
+        # override reaching `resolve` at all.
         self.store.record_run(DESCRIPTION_PRODUCER_NAME, _ago(hours=2))
         scheduler = self._build()
 
@@ -674,21 +804,25 @@ class ScheduledScanWiring(_Base):
     def test_the_same_fixture_is_not_due_without_that_override(self):
         # The discriminating half. Without it the test above passes on a
         # fixture that was due anyway, and would go on passing with the
-        # overrides never reaching `resolve` at all.
+        # overrides never reaching `resolve` at all. The scan's own `every`
+        # is the override left out; the tag-merge disable is the same in both.
         self.store.record_run(SCHEDULED_SCAN_NAME, _ago(hours=2))
         self.store.record_run(DESCRIPTION_PRODUCER_NAME, _ago(hours=2))
+        self._schedule_file({TagMergeProducer.name: {"enabled": False}})
         scheduler = self._build()
 
         result = scheduler.tick(NOW)
 
         self.assertEqual(result.due, [])
         self.assertEqual(result.started, {})
-        self.assertEqual(sorted(result.skipped), BOTH_PRODUCERS)
+        self.assertEqual(sorted(result.skipped), ALL_PRODUCERS)
         self.assertIn("next due at", result.skipped[SCHEDULED_SCAN_NAME])
+        self.assertIn("disabled", result.skipped[TagMergeProducer.name])
 
     def test_the_scheduled_scan_can_be_disabled_through_the_same_file(self):
         self._schedule_file({SCHEDULED_SCAN_NAME: {"enabled": False},
-                             DESCRIPTION_PRODUCER_NAME: {"enabled": False}})
+                             DESCRIPTION_PRODUCER_NAME: {"enabled": False},
+                             TagMergeProducer.name: {"enabled": False}})
         scheduler = self._build()
 
         result = scheduler.tick(NOW)
@@ -696,9 +830,10 @@ class ScheduledScanWiring(_Base):
         self.assertEqual(result.due, [])
         self.assertEqual(result.started, {})
         self.assertEqual(result.failed_to_start, {})
-        self.assertEqual(sorted(result.skipped), BOTH_PRODUCERS)
+        self.assertEqual(sorted(result.skipped), ALL_PRODUCERS)
         self.assertIn("disabled", result.skipped[SCHEDULED_SCAN_NAME])
         self.assertIn("disabled", result.skipped[DESCRIPTION_PRODUCER_NAME])
+        self.assertIn("disabled", result.skipped[TagMergeProducer.name])
         self.assertEqual(self.runner.jobs(), [])
 
     def test_an_override_naming_a_producer_that_does_not_exist_is_refused(self):
@@ -722,27 +857,82 @@ class ScheduledScanWiring(_Base):
         self.assertIn("no scan is scheduled", out.getvalue())
         self.assertIn("--server", out.getvalue())
 
-    def test_no_configured_adapter_schedules_the_description_pass_only(self):
-        # The two producers need different things, so an install missing one
-        # of them must not be an all-or-nothing decision: a scan needs a store
-        # to search against, while a description pass reads a field the server
-        # already holds. Folding them together would leave a producer with a
-        # perfectly good reason to run silently unregistered.
+    def test_no_configured_adapter_schedules_the_other_two_passes(self):
+        # The three producers need different things, so an install missing one
+        # of those things must not be an all-or-nothing decision: a scan needs
+        # a store to search against, while a description pass reads a field
+        # the server already holds and a tag merge reads the server's own
+        # vocabulary. Neither of the latter two wants an adapter at all.
+        # Folding the three requirements together would leave two producers
+        # with a perfectly good reason to run silently unregistered -- so the
+        # scan is the thing not scheduled, it says so, and the passes that CAN
+        # run still do.
+        #
+        # The registry is asserted as a WHOLE list. `assertIn` on either name
+        # would pass with the other one dropped, which is the exact failure
+        # this covers.
         out = io.StringIO()
         with redirect_stdout(out):
             scheduler = self._build(adapters={})
         self.assertIsNotNone(scheduler)
-        self.assertEqual([p.name for p in self.runner.producers()],
-                         [DESCRIPTION_PRODUCER_NAME])
+        self.assertEqual(sorted(p.name for p in self.runner.producers()),
+                         sorted([DESCRIPTION_PRODUCER_NAME,
+                                 TagMergeProducer.name]))
         self.assertIn("no scan is scheduled", out.getvalue())
         self.assertIn("adapters.json", out.getvalue())
 
         result = scheduler.tick(NOW)
 
-        self.assertEqual(result.due, [DESCRIPTION_PRODUCER_NAME])
-        self.assertEqual(list(result.started), [DESCRIPTION_PRODUCER_NAME])
+        self.assertEqual(sorted(result.due),
+                         sorted([DESCRIPTION_PRODUCER_NAME,
+                                 TagMergeProducer.name]))
+        self.assertEqual(sorted(result.started),
+                         sorted([DESCRIPTION_PRODUCER_NAME,
+                                 TagMergeProducer.name]))
         self.assertTrue(self.runner.wait(
             result.started[DESCRIPTION_PRODUCER_NAME], WAIT))
+        self.assertTrue(self.runner.wait(
+            result.started[TagMergeProducer.name], WAIT))
+
+    def test_the_tag_merge_pass_is_in_the_schedule_and_declares_a_cadence(self):
+        # The same silent failure the nightly scan's own wiring test names:
+        # a producer registered after `Scheduler.__init__` resolves is
+        # scheduled by nothing, raises nothing, and simply never runs. So
+        # this reads what the first tick actually decided, and then that the
+        # job it started reached the media server and finished.
+        scheduler = self._build()
+
+        result = scheduler.tick(NOW)
+
+        self.assertIn(TagMergeProducer.name, result.started)
+        job_id = result.started[TagMergeProducer.name]
+        self.assertTrue(self.runner.wait(job_id, WAIT))
+        job = self.runner.job(job_id)
+        self.assertEqual(job.state, "done", job.traceback)
+        self.assertEqual(job.cost, "local")
+        self.assertIn(("all_tags",), self.stash.calls)
+        self.assertEqual(self.store.last_run(TagMergeProducer.name), result.at)
+
+    def test_the_tag_merge_pass_declares_a_cadence_the_schedule_can_read(self):
+        # `resolve` refuses an ENABLED producer that declares no cadence, and
+        # it refuses it at start-up. So the cadence is asserted through the
+        # entry it produced, not by reading `.every` off the object: a value
+        # the schedule never consulted would satisfy the attribute and still
+        # take the process down here.
+        producers = {p.name: p for p in
+                     [TagMergeProducer(self.stash, store=self.store,
+                                       every=86400)]}
+        entries = resolve(producers.values())
+        self.assertEqual(entries[TagMergeProducer.name],
+                         Entry(producer=TagMergeProducer.name, every=86400,
+                               enabled=True))
+
+    def test_a_tag_merge_pass_with_no_cadence_is_refused_at_startup(self):
+        # The discriminating half of the pair above. Without it, the entry
+        # test passes on a producer whose cadence came from anywhere at all,
+        # including a default `resolve` might have invented.
+        with self.assertRaisesRegex(ValueError, "cadence"):
+            resolve([TagMergeProducer(self.stash, store=self.store)])
 
 
 class SchedulerLifecycleInMain(_Base):
@@ -790,8 +980,8 @@ class SchedulerLifecycleInMain(_Base):
         captured = self._run_main()
 
         result = captured.kwargs["schedule_status"]().last_result
-        self.assertEqual(result.due, BOTH_PRODUCERS)
-        self.assertEqual(sorted(result.started), BOTH_PRODUCERS)
+        self.assertEqual(result.due, ALL_PRODUCERS)
+        self.assertEqual(sorted(result.started), ALL_PRODUCERS)
         self.assertEqual(result.skipped, {})
         self.assertEqual(result.failed_to_start, {})
 

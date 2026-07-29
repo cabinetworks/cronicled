@@ -278,6 +278,66 @@
 
 {% macro compact_score(row) %}{% if row.kind != 'performer-description' %}<div class="score">{{ row.score_text }}</div>{% endif %}{% endmacro %}
 
+{# A tag merge is not a scene proposal and deliberately does not render
+   through `proposal_block`. It has no filename, no score and no candidate;
+   what it has instead is a per-spelling item count (the number that decides
+   whether the merge is safe) and a warning that the write cannot be taken
+   back. Forcing it through the scene shape would have cost it both.
+
+   The warning is rendered UNCONDITIONALLY, in every state -- before the
+   approve because that is when it can still change the answer, and after it
+   because the sources are gone by then and a page that stopped saying so
+   would leave a person hunting for the Undo that is not there. There is no
+   Undo control anywhere in this macro, and `MergeRow` carries no `undoable`
+   field for one to read. #}
+{% macro merge_block(row) %}
+<div class="proposal">
+  <div class="head">
+    <div class="what">
+      <p class="file">{{ row.key }}</p>
+      {% if row.canonical %}
+      <p class="title">Merge into <b>{{ row.canonical }}</b></p>
+      {% else %}
+      <p class="title">{{ row.members | length }} spellings of one tag</p>
+      {% endif %}
+      <div class="meta">
+        {% for m in row.members %}<b>{{ m.name }}</b> ({{ m.scene_count }} {{ row.counts_cover }}){% if not loop.last %} &middot; {% endif %}{% endfor %}
+      </div>
+    </div>
+    {# The blast radius sits where a scene row's score sits, and it is
+       LABELLED. A bare number in that slot reads as a score, and the two
+       could hardly mean more different things -- one is how sure the tool
+       is, the other is how much a person is about to move. #}
+    <div class="score">{{ row.total_scenes }}<div class="note">{{ row.counts_cover }}</div></div>
+    <div class="acts">
+      {% if row.appliable %}
+      <form method="post" action="/approve"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Merge</button></form>
+      {% endif %}
+      {% if row.actionable %}
+      <form method="post" action="/dismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Dismiss</button></form>
+      <form method="post" action="/mute"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Mute</button></form>
+      {% endif %}
+      {% if row.undismissable %}
+      <form method="post" action="/undismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Undismiss</button></form>
+      {% endif %}
+      {% if row.unmutable %}
+      <form method="post" action="/unmute"><input type="hidden" name="subject_type" value="{{ row.subject_type }}"><input type="hidden" name="subject_id" value="{{ row.subject_id }}"><button>Unmute</button></form>
+      {% endif %}
+    </div>
+  </div>
+  {% if row.error %}
+  <div class="warn">The last attempt to apply this failed, and nothing was written: {{ row.error }}</div>
+  {% endif %}
+  {% if row.undecided %}
+  <div class="warn">Nothing here can say which spelling wins: {{ row.undecided }}</div>
+  {% endif %}
+  <div class="warn">{{ row.warning }}</div>
+  {% if row.losing %}
+  <div class="runners">Deletes: {% for name in row.losing %}{{ name }}{% if not loop.last %}, {% endif %}{% endfor %}</div>
+  {% endif %}
+</div>
+{% endmacro %}
+
 {% macro section(name, entries, empty_text, open=False) %}
 <details class="section"{% if open %} open{% endif %}>
   <summary>{{ name }} ({{ entries | length }})</summary>
@@ -299,6 +359,13 @@
 {% for row in rows %}
 {{ row_block(row) }}
 {% endfor %}
+
+{% set merges = merges | default([]) %}
+{% call section("Tag merges", merges, "No duplicate tag spellings found.") %}
+  {% for row in merges %}
+  {{ merge_block(row) }}
+  {% endfor %}
+{% endcall %}
 
 {% set muted = muted | default([]) %}
 {% set dismissed = dismissed | default([]) %}
