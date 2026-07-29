@@ -13,7 +13,9 @@
       "catalog_resolvable": true,
       "title_match_counts_as_ownership": true,
       "censorship": {},
-      "aliases": {}
+      "aliases": {
+        "vcrane": "Velvet Crane"
+      }
     },
     {
       "name": "examplestore-fields",

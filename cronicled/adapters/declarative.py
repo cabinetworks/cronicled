@@ -29,8 +29,52 @@ candidate ends up admitted as a creator's own work on evidence the store
 cannot support. A config written before this field existed will need one
 line added, not a swap for a worse behaviour.
 """
+from cronicled.artist import Aliases
 from cronicled.text import spaceless, strip_html
 from cronicled.adapters.base import SiteAdapter
+
+
+def _checked_aliases(name, aliases):
+    """`aliases` as written, once it has been proved to be an alias map.
+
+    Checked HERE, as the spec loads, rather than left to the scan that
+    eventually reads it. `cronicled.artist.Aliases` already refuses a
+    duplicated, empty or non-name entry, and refuses it at the moment a map
+    is built for a run -- but the mistake was made in `adapters.json`, and
+    the entry point reports a load failure by naming that file (see
+    `cronicled/__main__.py`). Building one here and throwing it away costs a
+    normalisation pass over a map an operator typed by hand, and moves every
+    one of those refusals from "the scan you just started failed" to "the
+    config you just edited will not load". The scan builds its own -- see
+    `cronicled.runscan.configured_aliases` -- and this returns the plain
+    mapping it pools from.
+
+    One mistake is refused here and nowhere else, because this is the only
+    place both maps are in hand: an entry whose value is a LIST is a
+    `censorship` entry, whose value shape is `[substituted_form, ...]`, filed
+    under the wrong key. `Aliases` would refuse it too, but only as "not a
+    non-empty name" -- true, unhelpful, and silent about the map next door
+    the operator was actually reaching for. Nothing else is diagnosed that
+    way: a string value that happens to be a title word is indistinguishable
+    from a short creator name, and guessing which would refuse names that
+    are somebody's to declare.
+    """
+    for key, value in aliases.items():
+        if isinstance(value, (list, tuple)):
+            raise ValueError(
+                "adapter %r: alias %r maps to %r, which is the shape of a "
+                "censorship entry ({canonical: [substituted_form, ...]}), "
+                "not of an alias. The two maps do different jobs: "
+                "\"aliases\" maps a folder name as filed on disk to the "
+                "creator's full name, for artist resolution; "
+                "\"censorship\" maps a canonical title word to the forms "
+                "this store substitutes for it. Move this line to "
+                "\"censorship\"." % (name, key, value))
+    try:
+        Aliases(aliases)
+    except ValueError as exc:
+        raise ValueError("adapter %r: %s" % (name, exc)) from exc
+    return aliases
 
 
 class DeclarativeAdapter(SiteAdapter):
@@ -40,7 +84,7 @@ class DeclarativeAdapter(SiteAdapter):
         self.scraper_id = spec.get("scraper_id") or ""
         self.catalog_resolvable = bool(spec.get("catalog_resolvable", True))
         self.censorship = spec.get("censorship") or {}
-        self.aliases = spec.get("aliases") or {}
+        self.aliases = _checked_aliases(self.name, spec.get("aliases") or {})
         self._owner_source = spec.get("owner_source") or "none"
         self._owner_segment = spec.get("owner_segment")
         self._owner_field = spec.get("owner_field") or []

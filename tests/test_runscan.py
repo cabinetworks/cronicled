@@ -22,11 +22,13 @@ import unittest
 from unittest import mock
 
 from cronicled.adapters.base import SiteAdapter
+from cronicled.adapters.declarative import DeclarativeAdapter
+from cronicled.artist import Aliases
 from cronicled.jobs import COST_CLASS_LIMITS, JobRunner
 from cronicled.scan import IDENTIFIED_BY_FINGERPRINT
 from cronicled.runscan import (EVERY_FILE, build_producer,
                                build_scheduled_producer, configured_adapters,
-                               main)
+                               configured_aliases, main)
 from cronicled.store import Store
 from tests.fixtures.cast import CENSORSHIP
 
@@ -617,6 +619,176 @@ class MainOrchestration(unittest.TestCase):
             mocks["Stash"].assert_not_called()
             mocks["Store"].assert_not_called()
             mocks["build_producer"].assert_not_called()
+
+
+def alias_spec(name="store", aliases=None, scraper_id="scraper-alpha"):
+    """A real `DeclarativeAdapter` spec -- the shape an `adapters.json` entry
+    actually has. The alias tests below go through the real class rather than
+    the `_Adapter` double above, because the whole question is whether what an
+    operator writes in that file reaches the resolver."""
+    return {"name": name, "display": name, "scraper_id": scraper_id,
+            "owner_source": "url_segment", "owner_segment": 2,
+            "catalog_resolvable": True,
+            "title_match_counts_as_ownership": True,
+            "aliases": dict(aliases or {})}
+
+
+class TheConfiguredAliasesAreOneMapForTheWholeScan(unittest.TestCase):
+    """An alias is declared per adapter, because `adapters.json` is the only
+    configuration a store has -- but it cannot be APPLIED per adapter: the
+    creator is resolved once per file, off that file's own folder, before any
+    store has been searched. So every configured adapter's map is pooled into
+    the one map the run resolves against.
+    """
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+
+    def _adapters(self, *specs):
+        return {spec["name"]: DeclarativeAdapter(spec) for spec in specs}
+
+    def test_every_adapters_map_reaches_the_producer_whole(self):
+        # HARM: an entry silently dropped on the way in is an alias an
+        # operator wrote, can see in their own config, and that no scan will
+        # ever apply -- the exact failure this ticket exists for, one adapter
+        # further down. Asserted as the WHOLE resolved map: a pooling that
+        # kept only the last adapter's entries, or that quietly added one,
+        # would satisfy any per-key check.
+        adapters = self._adapters(
+            alias_spec("alpha", {"vcrane": "Velvet Crane"}),
+            alias_spec("beta", {"i m k": "Ivy May Kingsley",
+                                "wrenm": "Wren Marchcroft"}))
+        producer = build_producer(_FakeStash([]), adapters, self.store,
+                                  limit=10)
+        self.assertEqual(
+            producer._aliases,
+            Aliases({"vcrane": "Velvet Crane",
+                     "i m k": "Ivy May Kingsley",
+                     "wrenm": "Wren Marchcroft"}))
+
+    def test_a_folder_two_adapters_disagree_about_is_refused(self):
+        # HARM: pooled with `dict.update`, the answer would be whichever
+        # adapter sorted last -- a person's work filed under somebody else's
+        # name, decided by a config file's key order and visible nowhere.
+        adapters = self._adapters(
+            alias_spec("alpha", {"vcrane": "Velvet Crane"}),
+            alias_spec("beta", {"vcrane": "Vera Crane"}))
+        with self.assertRaises(ValueError) as ctx:
+            configured_aliases(adapters)
+        message = str(ctx.exception)
+        self.assertIn("alpha", message)
+        self.assertIn("beta", message)
+        self.assertIn("vcrane", message)
+
+    def test_a_duplicate_the_two_adapters_agree_on_is_refused_too(self):
+        # Not an ambiguity -- a rule. `Aliases` already refuses two keys that
+        # normalise alike within one map even when they agree, because the
+        # rule an operator can hold in their head is one entry per folder
+        # name; splitting it across adapters does not make it two rules.
+        # Spelled differently in the two adapters on purpose: the collision
+        # is on the NORMALISED form, which is what a lookup uses, so the
+        # refusal has to name both adapters here too -- left to the plain-key
+        # check these two are simply different entries, and the operator
+        # would be told two keys normalise alike with no way to tell which
+        # files they are in.
+        adapters = self._adapters(
+            alias_spec("alpha", {"vcrane": "Velvet Crane"}),
+            alias_spec("beta", {"V Crane": "Velvet Crane"}))
+        with self.assertRaises(ValueError) as ctx:
+            configured_aliases(adapters)
+        message = str(ctx.exception)
+        self.assertIn("alpha", message)
+        self.assertIn("beta", message)
+
+    def test_the_refusal_reads_the_same_whatever_order_the_file_lists_them_in(self):
+        # `load_adapters` builds its mapping in the order `adapters.json`
+        # lists the entries, so left to that order the same two lines produce
+        # two different messages depending on which store the operator happened
+        # to write down first. The refusal is the whole of what they have to
+        # act on; it must not depend on that.
+        alpha = alias_spec("alpha", {"vcrane": "Velvet Crane"})
+        beta = alias_spec("beta", {"vcrane": "Vera Crane"})
+        messages = []
+        for first, second in ((alpha, beta), (beta, alpha)):
+            ordered = {}
+            ordered[first["name"]] = DeclarativeAdapter(first)
+            ordered[second["name"]] = DeclarativeAdapter(second)
+            with self.assertRaises(ValueError) as ctx:
+                configured_aliases(ordered)
+            messages.append(str(ctx.exception))
+        self.assertEqual(messages[0], messages[1])
+
+    def test_an_adapter_declaring_none_contributes_nothing_and_is_not_an_error(self):
+        # The ordinary install: aliases are optional, and an operator who has
+        # registered none has a valid empty map, not a broken config.
+        adapters = self._adapters(alias_spec("alpha"), alias_spec("beta"))
+        self.assertEqual(configured_aliases(adapters), Aliases({}))
+
+    def test_a_malformed_map_still_fails_where_the_scan_is_built(self):
+        # `DeclarativeAdapter` refuses this as `adapters.json` loads, which is
+        # earlier and better. This is the backstop for an adapter that never
+        # went through it, and it must stay at BUILD time: raised inside
+        # `produce` instead, it surfaces on a background thread as that run
+        # failing rather than as a line needing an edit.
+        adapters = {"alpha": _Adapter()}
+        adapters["alpha"].aliases = {"vcrane": "Velvet Crane",
+                                     "v crane": "Vera Crane"}
+        with self.assertRaises(ValueError) as ctx:
+            build_producer(_FakeStash([]), adapters, self.store, limit=10)
+        # And it describes the mistake that was actually made: two keys in
+        # ONE map that normalise alike. The cross-adapter refusal would name
+        # this adapter twice and tell the operator to declare the alias in
+        # exactly one adapter -- advice that cannot be followed, because they
+        # already have.
+        message = str(ctx.exception)
+        self.assertIn("normalise", message)
+        self.assertNotIn("adapters", message)
+
+
+class TheAliasesReachTheResolver(unittest.TestCase):
+    """End to end, through the whole wiring, because every cheaper assertion
+    already passed while the feature did nothing.
+
+    The scene below is filed under an abbreviation. Only the resolver reading
+    the configured alias can turn that folder into the creator's full name,
+    and the only way to see what the resolver answered is the query the scan
+    then spends: a per-creator search is issued under the name it resolved.
+    """
+
+    PATH = "/library/VCrane/Morning Ritual.mp4"
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+
+    def _queries(self, stash):
+        return [call for call in stash.calls
+                if call[0] == "scrape_scenes_by_query"]
+
+    def test_the_scan_searches_under_the_aliased_name_and_proposes(self):
+        candidate = row("Morning Ritual", "https://example.invalid/clip/x")
+        stash = _FakeStash(
+            [scene(1, self.PATH)],
+            script={("scraper-alpha", "Velvet Crane"): [candidate]})
+        adapters = {"store": DeclarativeAdapter(
+            alias_spec("store", {"vcrane": "Velvet Crane"}))}
+
+        producer = build_producer(stash, adapters, self.store, limit=10)
+        runner = JobRunner(self.store)
+        self.addCleanup(runner.close)
+        runner.register(producer)
+        job = runner.start(producer.name)
+        self.assertTrue(runner.wait(job.id, WAIT))
+
+        # The whole set of queries the run spent, not one sampled from it:
+        # the folder's own spelling must never have been searched for, and a
+        # second query under it would mean the alias only half-applied.
+        self.assertEqual(self._queries(stash),
+                         [("scrape_scenes_by_query", "scraper-alpha",
+                           "Velvet Crane")])
+        item = self.store.items(folder="library")[0]
+        self.assertEqual(item["payload"]["score"], 1.0)
 
 
 if __name__ == "__main__":

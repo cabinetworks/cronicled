@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from cronicled.__main__ import build_scheduler, main
 from cronicled.adapters.declarative import DeclarativeAdapter
+from cronicled.artist import Aliases
 from cronicled.config import CONFIG_DIR_ENV_VAR
 from cronicled.descriptions import PRODUCER_NAME as DESCRIPTION_PRODUCER_NAME
 from cronicled.jobs import JobRunner
@@ -865,6 +866,33 @@ class ScheduledScanWiring(_Base):
         # And the run was recorded against the moment the tick decided, so
         # the next one is counted from it.
         self.assertEqual(self.store.last_run(SCHEDULED_SCAN_NAME), result.at)
+
+    def test_the_configured_aliases_reach_the_scheduled_scan(self):
+        # A SEPARATE call site from the page's Scan button, and so a separate
+        # test: `build_scheduler` builds the unattended producer here, and a
+        # fix that reached only the manual path would repeat the whole defect
+        # on the run nobody is watching -- every night, silently.
+        #
+        # Asserted as the whole resolved map, pooled from both configured
+        # adapters: the index `ScanProducer` hands to `resolve` for every file
+        # it examines (see `tests/test_scan.py`'s own
+        # `test_the_aliases_reach_the_resolver`, which pins that half). One
+        # adapter's entries silently missing here is an alias an operator
+        # wrote that the nightly scan will never apply.
+        adapters = {
+            "invented": DeclarativeAdapter(
+                dict(_ADAPTER_SPEC, aliases={"vcrane": "Velvet Crane"})),
+            "second": DeclarativeAdapter(
+                dict(_ADAPTER_SPEC, name="second",
+                     aliases={"i m k": "Ivy May Kingsley"}))}
+
+        self._build(adapters=adapters)
+
+        nightly = {p.name: p for p in self.runner.producers()}[
+            SCHEDULED_SCAN_NAME]
+        self.assertEqual(nightly._aliases,
+                         Aliases({"vcrane": "Velvet Crane",
+                                  "i m k": "Ivy May Kingsley"}))
 
     def test_a_manual_scan_leaves_the_scheduled_producer_untouched(self):
         # `Actions.scan` builds a producer per click and `reregister`s it,

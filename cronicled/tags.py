@@ -36,13 +36,15 @@ NEITHER is the right shape for this, so no third one is built here:
 * `cronicled.artist.Aliases` maps an as-filed FOLDER name to the creator's
   full name. It is about attributing a file to a person, is consulted only by
   the resolver, and has nothing to say about a tag.
-* `SiteAdapter.aliases` (`config/adapters.example.json`) is documented as
-  `{abbreviation_slug: real_store_slug}` and is scoped to ONE configured
-  store. Tags are a library-wide vocabulary that exists whether or not any
-  store is configured, so a per-store map is the wrong key. It is also read
-  by nothing at all today -- `DeclarativeAdapter.__init__` stores it and no
-  code path consults it -- so extending it would mean reviving inert config
-  to carry a second meaning.
+* `SiteAdapter.aliases` (`config/adapters.example.json`) is the SAME
+  folder-to-creator map, declared per store because `adapters.json` is the
+  only configuration a store has;
+  `cronicled.runscan.configured_aliases` pools every configured adapter's
+  into the one `Aliases` a scan resolves against. It is therefore about
+  attributing a file to a person too, and says nothing about a tag. Tags are
+  a library-wide vocabulary that exists whether or not any store is
+  configured, so extending a map keyed on a creator's folder would mean
+  giving an existing key a second, unrelated meaning.
 
 Building a third, library-wide tag-synonym map was considered and refused on
 the measurement: zero of the seven real clusters needed one. A synonym map is
