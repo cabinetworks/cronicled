@@ -566,6 +566,183 @@ class ConfigDirThreading(_Base):
             os.environ.pop(CONFIG_DIR_ENV_VAR, None)
             output = self._run(["--db", self.db_path])
         self.assertIn("config directory: config", output)
+
+
+class AdapterConfigThatCannotLoad(_Base):
+    """An adapters.json that is present and unreadable is a start-up
+    failure; an ABSENT one is a fresh install and starts silently.
+
+    `load_adapters` draws exactly that line -- absent returns empty, broken
+    raises -- and `main()` used to undo it, catching ValueError, RuntimeError
+    and KeyError alike and substituting an empty mapping. A syntax error, a
+    retired key and a missing required field then all came out as "no site
+    adapter is configured", which tells the operator to create a file they
+    already have. Both halves are pinned here: the broken configs below each
+    surface their OWN message, and the two loadable ones (absent, and present
+    with no adapters in it) still start with nothing said.
+
+    Every fixture is invented. No test here supplies `--server`, so nothing
+    builds a media-server client and no scheduler loop is started.
+    """
+
+    def _conf(self):
+        conf = os.path.join(self._dir, "conf")
+        os.makedirs(conf, exist_ok=True)
+        return conf
+
+    def _adapters_path(self, conf):
+        return os.path.join(conf, "adapters.json")
+
+    def _write(self, text):
+        conf = self._conf()
+        with open(self._adapters_path(conf), "w") as fh:
+            fh.write(text)
+        return conf
+
+    def _start(self, conf):
+        """`main()` over `conf`, returning what it handed `serve` and what it
+        printed."""
+        captured = _CapturedServe()
+        out = io.StringIO()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(CONFIG_DIR_ENV_VAR, None)
+            with patch("cronicled.__main__.serve", captured):
+                with redirect_stdout(out):
+                    main(["--db", self.db_path, "--config-dir", conf])
+        return captured, out.getvalue()
+
+    def _refuse(self, conf):
+        """`main()` over a `conf` that must not start, returning the message
+        the operator gets and whatever was printed before it stopped."""
+        out = io.StringIO()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(CONFIG_DIR_ENV_VAR, None)
+            with patch("cronicled.__main__.serve", _CapturedServe()):
+                with redirect_stdout(out):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        main(["--db", self.db_path, "--config-dir", conf])
+        return str(ctx.exception), out.getvalue()
+
+    def test_a_syntax_error_reaches_the_operator_with_its_own_line_number(self):
+        # A trailing comma left by a hand edit -- one of the three real
+        # causes. The parse error names line 3, and that number is the whole
+        # value of surfacing it: it is what an operator opens the file to.
+        conf = self._write('{\n  "adapters": [],\n}\n')
+        message, _ = self._refuse(conf)
+        self.assertIn(self._adapters_path(conf), message)
+        self.assertIn("line 3", message)
+
+    def test_the_parse_error_itself_is_kept_as_the_cause(self):
+        # Chained rather than replaced, so the traceback still reaches the
+        # decoder that actually objected.
+        conf = self._write('{\n  "adapters": [],\n}\n')
+        out = io.StringIO()
+        with patch("cronicled.__main__.serve", _CapturedServe()):
+            with redirect_stdout(out):
+                with self.assertRaises(RuntimeError) as ctx:
+                    main(["--db", self.db_path, "--config-dir", conf])
+        self.assertIsInstance(ctx.exception.__cause__, ValueError)
+        self.assertIn("line 3", str(ctx.exception.__cause__))
+
+    def test_the_retired_default_key_reaches_the_operator_with_its_own_message(self):
+        # The second real cause. `load_adapters` already says what to do
+        # about it -- delete the line -- and that instruction is what was
+        # being thrown away.
+        conf = self._write(json.dumps({"default": "invented",
+                                       "adapters": [_ADAPTER_SPEC]}))
+        message, _ = self._refuse(conf)
+        self.assertIn(self._adapters_path(conf), message)
+        self.assertIn('"default"', message)
+        self.assertIn("Remove", message)
+
+    def test_a_missing_required_field_reaches_the_operator_by_name(self):
+        # The third. `DeclarativeAdapter` names the field AND the adapter it
+        # is missing from; a config with several adapters is unactionable
+        # without the second half.
+        spec = dict(_ADAPTER_SPEC)
+        del spec["title_match_counts_as_ownership"]
+        conf = self._write(json.dumps({"adapters": [spec]}))
+        message, _ = self._refuse(conf)
+        self.assertIn(self._adapters_path(conf), message)
+        self.assertIn("title_match_counts_as_ownership", message)
+        self.assertIn("invented", message)
+
+    def test_an_adapter_with_no_name_is_a_startup_failure_too(self):
+        # This one raises KeyError, not ValueError, and `KeyError('name')`
+        # says nothing on its own -- which is exactly why the file has to be
+        # named around it. A catch narrowed to ValueError drops it back to a
+        # bare KeyError with no file in it.
+        spec = dict(_ADAPTER_SPEC)
+        del spec["name"]
+        conf = self._write(json.dumps({"adapters": [spec]}))
+        message, _ = self._refuse(conf)
+        self.assertIn(self._adapters_path(conf), message)
+        self.assertIn("'name'", message)
+
+    def test_a_config_that_did_not_load_reports_no_config_directory(self):
+        # The line that made the log look healthy through all three
+        # failures. It reports what the load produced, so it cannot be
+        # printed before the load, and a config that never loaded has
+        # nothing for it to report.
+        conf = self._write('{\n  "adapters": [],\n}\n')
+        _, printed = self._refuse(conf)
+        self.assertNotIn("config directory", printed)
+        self.assertEqual(printed, "")
+
+    def test_a_config_that_did_not_load_leaves_no_database_behind(self):
+        # Nothing else starts first: the failure lands before a `Store` is
+        # opened, so a mistyped config does not leave a database file at
+        # whatever path the flag happened to name.
+        conf = self._write('{\n  "adapters": [],\n}\n')
+        self._refuse(conf)
+        self.assertFalse(os.path.exists(self.db_path))
+
+    def test_an_absent_config_still_starts_with_no_adapters(self):
+        # The permissive half, and the case the old catch was protecting.
+        # Genuinely ABSENT: the config directory exists and holds no
+        # adapters.json at all. Deliberately not an empty one -- see the
+        # test below, which is a different file on a different code path,
+        # and a fixture conflating the two could not tell "a missing file is
+        # fine" from "an empty list is fine".
+        conf = self._conf()
+        self.assertFalse(os.path.exists(self._adapters_path(conf)))
+        captured, printed = self._start(conf)
+        self.assertEqual(captured.kwargs["actions"]._adapters, {})
+        self.assertNotIn("could not be loaded", printed)
+
+    def test_a_config_present_but_holding_no_adapters_starts_too(self):
+        # The neighbouring loadable case: a file that exists, parses, and
+        # configures nothing. Also empty, also silent -- an operator who has
+        # emptied the list has not broken anything.
+        conf = self._write(json.dumps({"adapters": []}))
+        self.assertTrue(os.path.exists(self._adapters_path(conf)))
+        captured, printed = self._start(conf)
+        self.assertEqual(captured.kwargs["actions"]._adapters, {})
+        self.assertNotIn("could not be loaded", printed)
+
+    def test_the_startup_line_says_no_adapters_loaded_when_none_did(self):
+        # Whole first two lines, not a substring of one: the start-up report
+        # is two facts in a fixed order, and an assertion sampling one of
+        # them cannot see the other going missing.
+        conf = self._conf()
+        _, printed = self._start(conf)
+        self.assertEqual(printed.splitlines()[:2],
+                         ["config directory: %s (adapters: none)" % conf,
+                          "database: %s" % self.db_path])
+
+    def test_the_startup_line_names_the_adapters_that_did_load(self):
+        # The other side of the same line: it reflects what loaded, so a
+        # healthy-looking directory and a working config are no longer the
+        # same sentence.
+        conf = self._write(json.dumps({"adapters": [_ADAPTER_SPEC]}))
+        captured, printed = self._start(conf)
+        self.assertEqual(printed.splitlines()[:2],
+                         ["config directory: %s (adapters: invented)" % conf,
+                          "database: %s" % self.db_path])
+        self.assertEqual(sorted(captured.kwargs["actions"]._adapters),
+                         ["invented"])
+
+
 class ScanWiring(_Base):
     # The runner a request's `/scan` starts a job on has to outlive that
     # request -- so it must be something `main()` builds once and hands to
