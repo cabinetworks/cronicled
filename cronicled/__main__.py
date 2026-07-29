@@ -43,7 +43,8 @@ import os
 
 from . import tags
 from .adapters.registry import default_adapters_path, load_adapters
-from .config import CONFIG_DIR_ENV_VAR, config_dir, load_schedule
+from .config import (CONFIG_DIR_ENV_VAR, config_dir, load_marker_tag,
+                     load_schedule)
 from .descriptions import DescriptionProducer
 from .jobs import JobRunner
 from .runscan import DAILY, build_scheduled_producer
@@ -72,7 +73,7 @@ SCHEDULER_SHUTDOWN_TIMEOUT = 10.0
 TAG_MERGE_EVERY = 86400
 
 
-def build_scheduler(runner, store, stash, adapters, env=None):
+def build_scheduler(runner, store, stash, adapters, env=None, marker=None):
     """Register the unattended producers, then resolve a schedule over them.
 
     **The order of the two statements below is the whole of this function.**
@@ -107,6 +108,14 @@ def build_scheduler(runner, store, stash, adapters, env=None):
     because "no scan is scheduled" and "a scan is scheduled and has not run
     yet" look identical from the outside otherwise.
 
+    `marker` is the provisionally-organized marker tag's name, read from the
+    config directory this process was started with and passed straight to the
+    scheduled scan -- see `cronicled.scan.ScanProducer`. It reaches the scan a
+    person presses Scan for by a separate route, through `Actions`, and both
+    routes carry the same value from the same read: a marker that only one of
+    the two honoured would make an unattended run and a manual one look at
+    different halves of the library, with nothing saying which was which.
+
     The producer a person's `Scan` button builds is deliberately NOT in this
     schedule. It is registered later, under a different name, with the limit
     they typed (see `web.actions.Actions.scan`); it exists to be started by
@@ -128,7 +137,8 @@ def build_scheduler(runner, store, stash, adapters, env=None):
     else:
         # First. See this function's docstring for what building the scheduler
         # ahead of this line costs, and why nothing would report it.
-        runner.register(build_scheduled_producer(stash, adapters, store))
+        runner.register(build_scheduled_producer(stash, adapters, store,
+                                                 marker=marker))
     # The description pass, which wants nothing but the server. Its cadence is
     # passed HERE rather than defaulted inside the producer, for the reason
     # `build_scheduled_producer` passes the scan's: a producer with no cadence
@@ -229,12 +239,31 @@ def main(argv=None):
             "read, which is not the same state and must not be reported as "
             "it." % (default_adapters_path(env), exc)) from exc
 
+    # Read with the SAME `env`, at the same point and for the same reason as
+    # the adapters above: this is the seam where --config-dir either reaches
+    # the marker or silently does not, and a marker that silently does not
+    # arrive is indistinguishable from an install that never configured one.
+    # Absent -- no scan.json, or one that names no tag -- is `None` and a
+    # legitimate state; a file that names something unusable raises here,
+    # naming itself, which is the same start-up failure a malformed
+    # adapters.json is.
+    marker = load_marker_tag(env=env)
+
     # AFTER the load, and reporting what the load produced. Printed before
     # it, this line announced a config directory in good health on every one
     # of the malformed configs above -- the log read as though everything was
     # found while nothing worked.
     print("config directory: %s (adapters: %s)"
           % (config_dir(env=env), ", ".join(sorted(adapters)) or "none"))
+    # Printed only when one is configured, so an absent line means "no marker
+    # tag is configured" rather than "one is configured and matched nothing".
+    # A scan pools organized scenes carrying this tag as well as the
+    # unorganized set, which is a materially larger night's work than the
+    # default -- worth one line at start-up rather than a surprise in a job
+    # log.
+    if marker is not None:
+        print("marker tag: %r (organized scenes carrying it are scanned too)"
+              % (marker,))
     # The other path this process writes to and the operator cannot see from
     # the outside. Two files, both named, so "which database is this reading"
     # is answered by the start-up line rather than by guessing at the flag.
@@ -250,7 +279,8 @@ def main(argv=None):
               "media server is set (--server / --api-key, or "
               "$CRONICLED_SERVER / $CRONICLED_API_KEY).")
     runner = JobRunner(store)
-    actions = Actions(store, stash, runner=runner, adapters=adapters)
+    actions = Actions(store, stash, runner=runner, adapters=adapters,
+                      marker=marker)
     # The same address already resolved for `stash` above (or `None`,
     # unconfigured) -- reused here for every row's own link to the media
     # server (ticket 97). Never re-derived from `stash.url`, which has
@@ -309,7 +339,8 @@ def main(argv=None):
                         if item["subject_type"] == tags.SUBJECT_TYPE)
         return to_merge_rows(seen)
 
-    scheduler = build_scheduler(runner, store, stash, adapters, env=env)
+    scheduler = build_scheduler(runner, store, stash, adapters, env=env,
+                                marker=marker)
     if scheduler is not None:
         scheduler.start()
 

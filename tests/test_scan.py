@@ -60,11 +60,19 @@ FOLDER = "library"
 WAIT = 10
 
 
-def scene(scene_id, *paths):
+def scene(scene_id, *paths, tags=()):
     """A scene as the media server returns it, trimmed to what selection reads.
 
     The extra keys are kept so the fixtures look like the real payload rather
     than like the two fields this module happens to use.
+
+    `tags` is the scene's own tag list, `{"id": ..., "name": ...}` per entry —
+    what `Stash._find_scenes` really selects. There is deliberately NO
+    `organized` key: the server's query FILTERS on that column and does not
+    SELECT it, so a real scene dict does not carry it, and a fixture that
+    supplied one would let code read a field production never sends. Which
+    scenes are organized is the fake client's own bookkeeping, exactly as it
+    is the server's — see `FakeStash`.
     """
     return {
         "id": str(scene_id),
@@ -73,7 +81,7 @@ def scene(scene_id, *paths):
         "files": [{"basename": p.rsplit("/", 1)[-1], "path": p} for p in paths],
         "studio": None,
         "performers": [],
-        "tags": [],
+        "tags": [dict(tag) for tag in tags],
     }
 
 
@@ -555,6 +563,80 @@ class SelectTest(unittest.TestCase):
         self.assertEqual(counts, Counts(
             total=1, already_proposed=0, muted=0, filtered_out=0, selected=1,
             deferred=0))
+
+    # -- what the marker tag added, counted apart from the rest ------------ #
+
+    def test_the_files_a_marker_added_are_counted_apart_from_the_total(self):
+        """The count the whole cost argument rests on. A pool that grew
+        nine-fold with nothing saying which files were the growth is a cost
+        read off a slow night; `marked` is what says so in the run itself.
+
+        `total` is asserted in the same shape, so a `marked` that simply
+        reported the total — the mutation this exists to catch — fails here
+        rather than reading as a plausible number.
+        """
+        scenes = [scene(1, "/library/one.mp4"), scene(2, "/library/two.mp4"),
+                  scene(3, "/library/three.mp4")]
+
+        selected, counts = select(scenes, store=self.store, folder=FOLDER,
+                                  marked={"2"})
+
+        self.assertEqual([s["id"] for s in selected], ["1", "2", "3"])
+        self.assertEqual(counts, Counts(
+            total=3, already_proposed=0, muted=0, filtered_out=0, selected=3,
+            deferred=0, marked=1))
+
+    def test_a_marked_file_is_selected_on_the_same_terms_as_any_other(self):
+        """The marker adds files to the pool and decides nothing else. A
+        marked file the reviewer muted stays dropped, and a marked file the
+        filter excludes stays excluded — otherwise the marker would be a way
+        to smuggle a file past a decision somebody already made.
+        """
+        self.store.mute(SUBJECT_TYPE, "2")
+        scenes = [scene(1, "/library/one.mp4"), scene(2, "/library/two.mp4"),
+                  scene(3, "/elsewhere/three.mp4")]
+
+        selected, counts = select(scenes, store=self.store, folder=FOLDER,
+                                  name_filter="/library/", marked={"2", "3"})
+
+        self.assertEqual([s["id"] for s in selected], ["1"])
+        self.assertEqual(counts, Counts(
+            total=3, already_proposed=0, muted=1, filtered_out=1, selected=1,
+            deferred=0, marked=2))
+        # The identity `deferred` exists to hold, with marked files in the
+        # pool: `marked` is a second reading of the same files, never a sixth
+        # bucket, so adding it here would be double-counting.
+        self.assertEqual(
+            counts.total,
+            counts.already_proposed + counts.muted + counts.filtered_out
+            + counts.selected + counts.deferred)
+
+    def test_an_id_no_scene_in_the_pool_carries_counts_nothing(self):
+        """`marked` counts files this selection was actually OFFERED, not
+        entries in the set it was handed. A count taken off the set's own
+        length would report files that are not in this batch at all — and
+        with a name filter or a second producer narrowing the pool, that is
+        not a hypothetical difference."""
+        selected, counts = select([scene(1, "/library/one.mp4")],
+                                  store=self.store, folder=FOLDER,
+                                  marked={"1", "404"})
+
+        self.assertEqual([s["id"] for s in selected], ["1"])
+        self.assertEqual(counts, Counts(
+            total=1, already_proposed=0, muted=0, filtered_out=0, selected=1,
+            deferred=0, marked=1))
+
+    def test_no_marker_leaves_every_count_exactly_as_it_was(self):
+        """Absent configuration behaves as today, asserted as one whole shape
+        rather than field by field: `marked` reads 0 and nothing else moves."""
+        selected, counts = select([scene(1, "/library/one.mp4"),
+                                   scene(2, "/library/two.mp4")],
+                                  store=self.store, folder=FOLDER, limit=1)
+
+        self.assertEqual([s["id"] for s in selected], ["1"])
+        self.assertEqual(counts, Counts(
+            total=2, already_proposed=0, muted=0, filtered_out=0, selected=1,
+            deferred=1, marked=0))
 
     def test_a_scene_without_an_id_raises(self):
         with self.assertRaises(KeyError):
@@ -2473,16 +2555,54 @@ class FakeStash:
     checked only "no writes" could not notice a read that was added, and the
     argument this scan passes is itself load-bearing: fetching with the scan's
     `limit` would apply the limit at the SOURCE, before any narrowing.
+
+    `scenes` is the whole library this server holds, and `organized` names
+    which of those ids carry the flag. Both reads below filter that one table
+    the way the server's own `scene_filter` does, rather than each returning
+    whatever a test handed it: an ORGANIZED scene is invisible to
+    `unorganized_scenes` here exactly as it is there, which is the entire
+    reason a marker is needed at all. A double that answered
+    `unorganized_scenes` with everything it was given could not tell a scan
+    that reaches marked files from one that pools the whole library.
+
+    The `organized` flag is kept HERE and never on the scene dicts handed
+    back, because the server's query filters on that column without selecting
+    it — see `scene`.
     """
 
-    def __init__(self, scenes):
+    def __init__(self, scenes, organized=(), tag_ids=None):
         self._scenes = list(scenes)
+        self._organized = {str(scene_id) for scene_id in organized}
+        # Tag name -> this installation's own id for it. Empty by default:
+        # a server holding no tags answers `None` for every name, which is
+        # what `Stash.tag_id_by_name` does and what a mistyped marker meets.
+        self._tag_ids = dict(tag_ids or {})
         self.calls = []
+
+    def _page(self, scenes, limit):
+        return len(scenes), list(scenes if limit is None else scenes[:limit])
 
     def unorganized_scenes(self, limit):
         self.calls.append(("unorganized_scenes", (limit,), {}))
-        scenes = self._scenes if limit is None else self._scenes[:limit]
-        return len(self._scenes), list(scenes)
+        return self._page([s for s in self._scenes
+                           if s["id"] not in self._organized], limit)
+
+    def tagged_scenes(self, tag_id, limit):
+        """Every scene carrying `tag_id`, organized or not — the same
+        contract `Stash.tagged_scenes` documents. `organized` is deliberately
+        not consulted: a scene an earlier tool organized on a guess is exactly
+        what this read exists to reach."""
+        self.calls.append(("tagged_scenes", (tag_id, limit), {}))
+        return self._page(
+            [s for s in self._scenes
+             if any(tag["id"] == tag_id for tag in s["tags"])], limit)
+
+    def tag_id_by_name(self, name):
+        """This installation's id for a tag name, or `None` — ids are
+        installation-specific, and a name no tag has is a normal answer here
+        rather than an error, exactly as in `Stash.tag_id_by_name`."""
+        self.calls.append(("tag_id_by_name", (name,), {}))
+        return self._tag_ids.get(name)
 
     def __getattr__(self, name):
         def refuse(*args, **kwargs):
@@ -2906,6 +3026,18 @@ class ScanProducerTest(unittest.TestCase):
     LEDGER_PATH = "/library/Ivy Kingsley/Winter Ledger.mp4"
     UNNAMED_PATH = "/lib/2020-05-04/clip one.mp4"
 
+    # An invented marker tag, and an invented id for it: ids are
+    # installation-specific, so the name an operator configures and the id a
+    # filter is built from are deliberately different strings here — a test
+    # using one value for both cannot tell a scan that resolved the name from
+    # one that passed it straight to a tag filter.
+    MARKER = "inferred-metadata"
+    MARKER_TAG = {"id": "t-7", "name": MARKER}
+    MARKER_TAG_IDS = {MARKER: "t-7"}
+    # A second tag no marker names, so "carries a tag" and "carries THE
+    # marker" cannot be satisfied by the same fixture.
+    OTHER_TAG = {"id": "t-3", "name": "shortlist"}
+
     def setUp(self):
         self.store = Store(":memory:")
         self.addCleanup(self.store.close)
@@ -2914,14 +3046,19 @@ class ScanProducerTest(unittest.TestCase):
 
     def build(self, scenes, search, store=None, censorship=None, owner_of=None,
              catalog_resolvable=True, source_name="store", sources=None,
-             **kwargs):
+             organized=(), tag_ids=None, **kwargs):
         """Build a `ScanProducer` against ONE store, named `source_name`,
         wrapping `search` (and this store's own `censorship`/`owner_of`) in
         a single-element `sources` list — the shape every pre-existing test
         in this class exercises, now expressed through the same `sources`
         list a real multi-store scan uses. Pass `sources` explicitly (a list
-        of `Source`) instead of `search` to exercise more than one store."""
-        self.stash = FakeStash(scenes)
+        of `Source`) instead of `search` to exercise more than one store.
+
+        `organized` and `tag_ids` describe the LIBRARY the fake client holds —
+        which of `scenes` carry the organized flag, and what this
+        installation's tag ids are — rather than anything about the producer;
+        see `FakeStash`."""
+        self.stash = FakeStash(scenes, organized=organized, tag_ids=tag_ids)
         kwargs.setdefault("folder", FOLDER)
         if sources is None:
             sources = [Source(name=source_name, search=search,
@@ -3193,6 +3330,193 @@ class ScanProducerTest(unittest.TestCase):
         self.assertEqual(self.stash.calls,
                          [("unorganized_scenes", (None,), {})])
         self.assertEqual(self.ids(proposals), ["2"])
+
+    # -- organized files a marker tag puts back in reach -------------------- #
+    #
+    # The population this exists for: files an earlier tool identified by
+    # guesswork and marked organized, which no scan pools because a scan pools
+    # the unorganized set. The marker names them; nothing else does. Both
+    # directions are pinned below — an organized file WITH the marker is
+    # scanned, one WITHOUT it is not — because a change that pooled every
+    # organized file would satisfy the first alone while putting a whole
+    # library into a nightly pass.
+
+    def test_an_organized_file_carrying_the_marker_is_scanned(self):
+        """The defect, fixed: 2390 organized-and-marked files in the measured
+        library, none of which any scan looked at.
+
+        The third scene is organized and carries a DIFFERENT tag, so passing
+        this test cannot be done by pooling everything organized, or
+        everything tagged."""
+        proposals = self.scan(
+            [scene(1, self.LEDGER_PATH),
+             scene(2, self.MORNING_PATH, tags=[self.MARKER_TAG]),
+             scene(3, self.EVENING_PATH, tags=[self.OTHER_TAG])],
+            ScriptedSearch(self.SCRIPT),
+            organized=("2", "3"), tag_ids=self.MARKER_TAG_IDS,
+            marker=self.MARKER)
+
+        self.assertEqual(self.ids(proposals), ["1", "2"])
+
+    def test_an_organized_file_without_the_marker_stays_out_of_the_pool(self):
+        """The guard, on its own fixture: a marker is configured and resolves,
+        and the organized file that does not carry it is still never offered.
+        Without this, pooling all 6275 files in the measured library passes
+        every other test in this section."""
+        search = ScriptedSearch(self.SCRIPT)
+        proposals = self.scan(
+            [scene(1, self.LEDGER_PATH), scene(2, self.MORNING_PATH)],
+            search, organized=("2",), tag_ids=self.MARKER_TAG_IDS,
+            marker=self.MARKER)
+
+        self.assertEqual(self.ids(proposals), ["1"])
+        # The lookups, too: an unmarked organized file must not even be
+        # searched for, which is the cost the guard is protecting.
+        self.assertEqual(search.queries, ["Ivy Kingsley"])
+        self.assertEqual(
+            self.ctx.messages[0],
+            "selected 1 of 1 files (0 already proposed, 0 already muted, "
+            "0 outside the filter, 0 deferred); 0 of the 1 offered only "
+            "because they carry the marker tag 'inferred-metadata'")
+
+    def test_with_no_marker_configured_nothing_about_the_pool_changes(self):
+        """Absent configuration is a legitimate state and behaves exactly as
+        it did: the marked organized file below is invisible, the client is
+        asked one question, and the accounting line is the one this scan has
+        always logged."""
+        proposals = self.scan(
+            [scene(1, self.LEDGER_PATH),
+             scene(2, self.MORNING_PATH, tags=[self.MARKER_TAG])],
+            ScriptedSearch(self.SCRIPT),
+            organized=("2",), tag_ids=self.MARKER_TAG_IDS)
+
+        self.assertEqual(self.stash.calls,
+                         [("unorganized_scenes", (None,), {})])
+        self.assertEqual(self.ids(proposals), ["1"])
+        self.assertEqual(
+            self.ctx.messages[0],
+            "selected 1 of 1 files (0 already proposed, 0 already muted, "
+            "0 outside the filter, 0 deferred)")
+
+    def test_the_marker_name_is_resolved_to_this_servers_own_tag_id(self):
+        """The whole conversation, as one shape.
+
+        Three reads and no writes; the marker reaches the client as a NAME to
+        resolve, and the tag filter as the ID that resolution returned — ids
+        are installation-specific, so a scan that filtered on the configured
+        name would find nothing on a real server. Neither read is given the
+        scan's own limit: that belongs to `select`, after the narrowings."""
+        self.scan([scene(1, self.LEDGER_PATH),
+                   scene(2, self.MORNING_PATH, tags=[self.MARKER_TAG])],
+                  ScriptedSearch(self.SCRIPT), organized=("2",),
+                  tag_ids=self.MARKER_TAG_IDS, marker=self.MARKER, limit=1)
+
+        self.assertEqual(self.stash.calls, [
+            ("unorganized_scenes", (None,), {}),
+            ("tag_id_by_name", (self.MARKER,), {}),
+            ("tagged_scenes", ("t-7", None), {}),
+        ])
+
+    def test_the_scan_leaves_the_marker_on_the_files_it_examined(self):
+        """Shedding the marker belongs to whatever applies a proposal, and
+        this scan never writes to the media server at all. Asserted on the
+        tag list the
+        client handed over — a pass that stripped it would have to mutate
+        that — and on the whole conversation, where a write would appear by
+        name."""
+        marked = scene(2, self.MORNING_PATH, tags=[self.MARKER_TAG])
+
+        proposals = self.scan([scene(1, self.LEDGER_PATH), marked],
+                              ScriptedSearch(self.SCRIPT), organized=("2",),
+                              tag_ids=self.MARKER_TAG_IDS, marker=self.MARKER)
+
+        self.assertEqual(self.ids(proposals), ["1", "2"])
+        self.assertEqual(marked["tags"], [{"id": "t-7",
+                                           "name": "inferred-metadata"}])
+        self.assertEqual([name for name, _, _ in self.stash.calls],
+                         ["unorganized_scenes", "tag_id_by_name",
+                          "tagged_scenes"])
+
+    def test_a_file_that_is_both_unorganized_and_marked_is_offered_once(self):
+        """It was always in the pool, so the marker adds nothing for it: one
+        turn, one lookup, and no share of the count that says what the marker
+        cost. Offered twice it would spend two lookups and propose the same
+        file to the same folder twice in one run."""
+        search = ScriptedSearch(self.SCRIPT)
+        proposals = self.scan(
+            [scene(1, self.LEDGER_PATH, tags=[self.MARKER_TAG])],
+            search, tag_ids=self.MARKER_TAG_IDS, marker=self.MARKER)
+
+        self.assertEqual([p["subject_id"] for p in proposals], ["1"])
+        self.assertEqual(search.queries, ["Ivy Kingsley"])
+        self.assertEqual(
+            self.ctx.messages[0],
+            "selected 1 of 1 files (0 already proposed, 0 already muted, "
+            "0 outside the filter, 0 deferred); 0 of the 1 offered only "
+            "because they carry the marker tag 'inferred-metadata'")
+
+    def test_a_limited_run_spends_its_budget_on_the_unorganized_files_first(self):
+        """The marker's population is an ADDITION, and an addition waits. In
+        the measured library it is nine times the size of the set a scan
+        already had, so putting it first would mean a limited run never
+        reaching a newly-added file again — the files that are actually
+        waiting for a decision."""
+        proposals = self.scan(
+            [scene(2, self.MORNING_PATH, tags=[self.MARKER_TAG]),
+             scene(1, self.LEDGER_PATH)],
+            ScriptedSearch(self.SCRIPT), organized=("2",),
+            tag_ids=self.MARKER_TAG_IDS, marker=self.MARKER, limit=1)
+
+        # Scene 2 is listed first in the library and is the marked one, so an
+        # order that simply preserved the input would take it.
+        self.assertEqual([p["subject_id"] for p in proposals], ["1"])
+
+    def test_the_opening_line_says_how_many_files_the_marker_added(self):
+        """The nine-fold increase, made visible in the run that spends it
+        rather than inferred from a slow night. The number is the files the
+        marker ADDED, not the batch it produced: a line reporting the total
+        here would read as plausibly as the truth."""
+        self.scan([scene(1, self.LEDGER_PATH),
+                   scene(2, self.MORNING_PATH, tags=[self.MARKER_TAG]),
+                   scene(3, self.EVENING_PATH, tags=[self.MARKER_TAG])],
+                  ScriptedSearch(self.SCRIPT), organized=("2", "3"),
+                  tag_ids=self.MARKER_TAG_IDS, marker=self.MARKER)
+
+        self.assertEqual(
+            self.ctx.messages[0],
+            "selected 3 of 3 files (0 already proposed, 0 already muted, "
+            "0 outside the filter, 0 deferred); 2 of the 3 offered only "
+            "because they carry the marker tag 'inferred-metadata'")
+
+    def test_a_marker_naming_a_tag_the_server_does_not_have_fails_the_run(self):
+        """A silent empty is indistinguishable from "nothing is marked",
+        which is the state the configuration exists to change — so a name no
+        tag has fails the run, visibly, naming what could not be found.
+
+        Driven through the real runner: what an operator sees is a failed job
+        with a message, not an exception on a thread nobody reads."""
+        search = ScriptedSearch(self.SCRIPT)
+        job = self.run_under_the_runner(
+            [scene(1, self.LEDGER_PATH),
+             scene(2, self.MORNING_PATH, tags=[self.MARKER_TAG])],
+            search, organized=("2",), tag_ids={}, marker=self.MARKER)
+
+        self.assertEqual(job.state, "failed")
+        self.assertIn(self.MARKER, job.error)
+        # Nothing was decided on the way to failing: no lookup spent, no
+        # proposal recorded off a pool that was missing most of itself.
+        self.assertEqual(search.queries, [])
+        self.assertEqual(list(self.store.items(folder=FOLDER)), [])
+
+    def test_a_server_that_holds_the_marker_under_a_different_name_is_not_it(self):
+        """`tag_id_by_name` matches a name exactly, so a marker configured
+        with the wrong spelling is a marker that names no tag — the failure
+        above, not a quiet fallback to the tag that nearly matched."""
+        with self.assertRaises(ValueError) as caught:
+            self.scan([scene(1, self.LEDGER_PATH)], ScriptedSearch(self.SCRIPT),
+                      tag_ids={"Inferred-Metadata": "t-7"}, marker=self.MARKER)
+
+        self.assertIn(self.MARKER, str(caught.exception))
 
     # -- narrowing before limiting, through the producer ------------------- #
 

@@ -62,6 +62,21 @@ class Counts:
     a failure no per-field check can see — it can only look for the reasons it
     already knows about. Without the sixth field the identity lapses exactly
     when a scan is busiest, which is when a miscount matters most.
+
+    `marked` stands apart from all six and is deliberately NOT a seventh term
+    of that identity. It is not a reason a file was dropped; it is how many of
+    `total` this run would not have been OFFERED at all without a configured
+    marker tag (see `ScanProducer._pool`) — the organized files the marker put
+    back in reach. Every one of them is still counted under exactly one of the
+    five buckets above, so adding it to the identity would double-count it.
+
+    It exists because the marker multiplies the pool — measured against one
+    real library, 298 files without it and roughly 2688 with — and every file
+    in that increase may spend a per-title fallback query per configured
+    store. A total that grew nine-fold with nothing saying why is a cost read
+    off a slow night instead of off the run that chose to spend it. `0` is
+    both "no marker configured" and "the marker matched nothing new", which
+    are the same thing to this count: neither added a file.
     """
     total: int
     already_proposed: int
@@ -69,6 +84,11 @@ class Counts:
     filtered_out: int
     selected: int
     deferred: int
+    # Defaulted, unlike its six siblings, so that every caller and every test
+    # written before the marker existed goes on describing a run with no
+    # marker configured — which is exactly what those runs are. `select`
+    # itself always passes it.
+    marked: int = 0
 
 
 def _paths(scene):
@@ -111,11 +131,22 @@ def _subjects(rows):
 # ever built, it will need its own budget (its own cost class, its own
 # cadence) independent of this one -- at which point stamping a marker
 # becomes worth its cost, because something would finally read it.
-def select(scenes, *, store, folder, name_filter=None, limit=None):
+def select(scenes, *, store, folder, name_filter=None, limit=None, marked=()):
     """The files a scan should work, and why the others were dropped.
 
     Returns `(selected, counts)`, `selected` being the surviving scene dicts
     in the order they were offered.
+
+    `marked` is the subject ids the configured marker tag ADDED to `scenes` —
+    files this run would not have been offered without it (see
+    `ScanProducer._pool`, which is the only thing that can know which those
+    were). It changes no decision here: a marked file is filtered, muted,
+    already-proposed, selected or deferred on exactly the terms every other
+    file is, and nothing below reads it except the count. It is carried this
+    far only so `Counts.marked` can say how much of `total` the marker is
+    responsible for; empty — the default, and what a run with no marker
+    configured passes — makes that count 0 and leaves every other number
+    identical to what this function has always returned.
 
     Narrowing runs first, in this precedence — each dropped file is counted
     under exactly one reason:
@@ -185,6 +216,7 @@ def select(scenes, *, store, folder, name_filter=None, limit=None):
         raise ValueError(f"limit must not be negative, got {limit!r}")
 
     scenes = list(scenes)
+    marked = set(marked)
     pattern = (name_filter or "").casefold()
     muted = {subject_id for subject_type, subject_id in store.muted_subjects()
              if subject_type == SUBJECT_TYPE}
@@ -193,10 +225,17 @@ def select(scenes, *, store, folder, name_filter=None, limit=None):
                          if item["fingerprint"] not in superseded)
 
     narrowed = []
-    filtered_out = muted_count = already_proposed = 0
+    filtered_out = muted_count = already_proposed = marked_count = 0
     for scene in scenes:
         subject_id = str(scene["id"])
         paths = _paths(scene)
+        # Counted BEFORE the narrowings and outside their chain, deliberately:
+        # a marked file that is also muted is one file with a reason and one
+        # file the marker offered, and it has to appear in both readings. An
+        # `elif` here would make the marker look like a fourth way to drop a
+        # file and would take that file out of whichever count came later.
+        if subject_id in marked:
+            marked_count += 1
         if pattern and not any(pattern in path for path in paths):
             filtered_out += 1
         elif subject_id in muted:
@@ -217,6 +256,7 @@ def select(scenes, *, store, folder, name_filter=None, limit=None):
         # narrowing already has a reason, and counting it here as well would
         # double-count it and break the identity `deferred` exists to hold.
         deferred=len(narrowed) - len(selected),
+        marked=marked_count,
     )
 
 
@@ -1870,6 +1910,30 @@ class ScanProducer:
     exactly as `search` returned it, with no second lookup issued at all —
     today's behaviour, unchanged.
 
+    `marker`, when given, is the NAME of a tag a scene carries to say its
+    metadata was inferred rather than checked — a date, a filename, sometimes
+    a creator, guessed by some earlier tool and never confirmed against a
+    catalogue. Such a file is usually marked organized as well, and a scan
+    pools the unorganized set, so the largest population of
+    provisionally-identified files in a library is the one nothing ever looks
+    at again. Naming the tag here adds the scenes carrying it to the pool
+    whatever their `organized` flag says; see `_pool` for exactly how, and
+    for what happens when the server holds no such tag. `None` — the default,
+    and what an operator who has named no marker keeps — pools precisely what
+    this class always pooled.
+
+    THE SCAN DOES NOT REMOVE THE MARKER, and nothing here should be made to.
+    Shedding it belongs to whatever APPLIES a proposal — the point at which
+    the metadata stops being inferred — and is out of scope for a class that
+    never writes to the media server at all (see the paragraph above about
+    that). Stripping it would also be no fix on its own: what hides these
+    files is the `organized` flag the pool is READ by
+    (`Stash.unorganized_scenes`), and `select` never looks at a tag at all —
+    so removing the marker from 2390 organized scenes changes nothing at all
+    about which of them a scan pools,
+    while destroying the one signal that says which organized files were
+    organized provisionally rather than deliberately.
+
     `identify`, when given, is a one-argument callable taking the whole
     batch's subject ids and returning a `FingerprintPass` — ordinarily
     `identify_by_fingerprint` bound to a `Stash`'s own boxes and lookup (see
@@ -1900,7 +1964,8 @@ class ScanProducer:
 
     def __init__(self, stash, sources, *, store, folder="library", limit=None,
                  name_filter=None, threshold=DEFAULT_THRESHOLD, aliases=None,
-                 workers=4, enrich=None, identify=None, name=None, every=None):
+                 workers=4, enrich=None, identify=None, marker=None,
+                 name=None, every=None):
         if workers < 1:
             # A pool of nothing would do nothing at all, forever. Refuse it
             # where the mistake was made rather than on a background thread
@@ -1924,6 +1989,14 @@ class ScanProducer:
         self._threshold = threshold
         self._enrich = enrich
         self._identify = identify
+        # The tag NAME, kept as configured. It is resolved to this server's
+        # own tag id inside `produce`, not here: ids are installation-specific
+        # (see `Stash.tag_id_by_name`), and a producer built at start-up and
+        # run every night must ask about the tag as it stands at each run
+        # rather than hold an id read once — the same reason `build_producer`
+        # reads `stash.stash_boxes()` inside the `identify` closure instead of
+        # at construction.
+        self._marker = marker
         # Indexed and checked HERE, for the same reason `workers` is checked
         # here: a duplicated or empty alias line is a wiring mistake that is
         # wrong for every file, and this is the last point at which the caller
@@ -2010,16 +2083,10 @@ class ScanProducer:
             ctx.log("released %d file(s) muted by the retired "
                     "unresolved-creator rule; they are examined again from "
                     "this run on" % len(released))
-        # Fetched WHOLE, deliberately: `limit` belongs to `select`, which
-        # applies it after the narrowings. Passing it here would limit at the
-        # source, so a batch of 50 would be the first 50 files overall and
-        # the muted and already-proposed ones among them would eat the
-        # budget. The accepted cost is one query for the unorganized set
-        # rather than a page of it.
-        _, scenes = self._stash.unorganized_scenes(None)
+        scenes, marked = self._pool()
         selected, counts = select(
             scenes, store=self._store, folder=self._folder,
-            name_filter=self._name_filter, limit=self._limit)
+            name_filter=self._name_filter, limit=self._limit, marked=marked)
         # Built once and logged twice, opening and closing, because the
         # runner keeps ONE message: `JobRunner._log` assigns `state.message`,
         # so by the time a job ends every line but its last has been
@@ -2035,6 +2102,18 @@ class ScanProducer:
             "%d outside the filter, %d deferred)" % (
                 counts.selected, counts.total, counts.already_proposed,
                 counts.muted, counts.filtered_out, counts.deferred))
+        # Appended only when a marker is actually configured, the same rule
+        # the fingerprint note at the end of this method follows: a run
+        # without one logs exactly the line it always did, so an absent
+        # clause means "no marker was configured" rather than "the marker
+        # matched nothing" — which are different states and call for
+        # different next steps. With one configured the clause is always
+        # present, 0 included: a marker that adds nothing is the fact worth
+        # reading, not a line worth hiding.
+        if self._marker is not None:
+            selection += ("; %d of the %d offered only because they carry "
+                          "the marker tag %r"
+                          % (counts.marked, counts.total, self._marker))
         ctx.log(selection)
 
         # The fingerprint pass runs HERE — before a single `_SingleFlight` is
@@ -2152,6 +2231,82 @@ class ScanProducer:
                 "%d lookups, %d per-title fallback queries; %s%s"
                 % (tally["proposed"], tally["muted"], tally["refused"],
                    tally["errors"], lookups, fallbacks, selection, note))
+
+    def _pool(self):
+        """Everything this run is offered, and which of it the marker tag
+        added.
+
+        Returns `(scenes, marked)` — the scene dicts in the order they will be
+        narrowed, and the subject ids of the ones the marker contributed,
+        which is what `Counts.marked` reports.
+
+        Fetched WHOLE, deliberately: `limit` belongs to `select`, which
+        applies it after the narrowings. Passing it to either read would limit
+        at the SOURCE, so a batch of 50 would be the first 50 files overall
+        and the muted and already-proposed ones among them would eat the
+        budget. The accepted cost is one query for each set rather than a page
+        of it.
+
+        With no marker configured this is the unorganized set and nothing
+        else, exactly as it always was.
+
+        With one, the scenes carrying that tag are added — `Stash.tagged_scenes`
+        does not constrain `organized`, which is the whole point: a file an
+        earlier tool identified by guesswork is ordinarily marked organized,
+        so the unorganized read is precisely the read that cannot see it.
+        What is NOT done is pooling every organized file: the marker is the
+        evidence that this particular file was organized provisionally, and
+        without it a nightly pass would carry a whole library (6275 files in
+        the one measured) instead of the population somebody actually wants
+        looked at again.
+
+        APPENDED to the unorganized set, never placed in front of it. Order
+        decides nothing about WHETHER a file is selected, but it decides what
+        a LIMIT reaches: `select` takes the first survivors, so a marked
+        population nine times the size of the unorganized one, put first,
+        would spend every run's budget on files that were not waiting and
+        defer the ones a scan would already have taken. The addition waits.
+
+        A scene the unorganized read already returned is not added twice, and
+        does not count as marked. It cost this run nothing new — it was always
+        in the pool — and counting it would overstate what the marker is
+        responsible for, while offering it twice would spend two lookups and
+        propose the same file to the same folder twice in one run.
+
+        A CONFIGURED MARKER THE SERVER HAS NO TAG FOR RAISES, and that is the
+        one thing this method refuses to do quietly. Tag ids are
+        installation-specific, so the name is resolved here, per run, against
+        the server as it stands. `Stash.tag_id_by_name` answers `None` for a
+        name no tag has — a typo, a tag renamed, a config copied from another
+        install — and taking that as "no marked files" would produce an empty
+        addition indistinguishable from a marker that is working and matching
+        nothing. That is the exact state the configuration exists to change,
+        so it must be impossible to sit in unnoticed. Raising fails THIS run,
+        visibly, with the name that could not be found in the message; the
+        service stays up, every other producer keeps running, and the operator
+        reads the failure on the page rather than losing the page to a
+        start-up crash.
+
+        Nothing here writes: both calls are reads, and the marker itself is
+        left on every scene that carries it (see this class's docstring for
+        why removing it is neither this code's job nor a fix).
+        """
+        _, scenes = self._stash.unorganized_scenes(None)
+        if self._marker is None:
+            return scenes, frozenset()
+        tag_id = self._stash.tag_id_by_name(self._marker)
+        if tag_id is None:
+            raise ValueError(
+                "the configured marker tag %r does not exist on the media "
+                "server, so this scan would silently pool nothing extra and "
+                "read as though no file were marked. Correct the name to the "
+                "tag your library actually uses, or remove the setting."
+                % (self._marker,))
+        _, tagged = self._stash.tagged_scenes(tag_id, None)
+        already = {str(scene["id"]) for scene in scenes}
+        added = [scene for scene in tagged if str(scene["id"]) not in already]
+        return (scenes + added,
+                frozenset(str(scene["id"]) for scene in added))
 
     def _identify_batch(self, selected):
         """Ask the configured boxes about the whole batch, and never let that

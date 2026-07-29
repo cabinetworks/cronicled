@@ -4,8 +4,9 @@ import tempfile
 import unittest
 
 from cronicled.config import (
-    config_dir, default_schedule_path, default_server_path,
-    default_stashbox_path, load_schedule, load_server, load_stashbox)
+    config_dir, default_scan_path, default_schedule_path, default_server_path,
+    default_stashbox_path, load_marker_tag, load_schedule, load_server,
+    load_stashbox)
 from cronicled.adapters.registry import default_adapters_path, load_adapters
 
 
@@ -233,6 +234,100 @@ class LoadSchedule(unittest.TestCase):
             with self.assertRaises(ValueError) as ctx:
                 load_schedule(env={"CRONICLED_CONFIG_DIR": d})
             self.assertIn(p, str(ctx.exception))
+
+
+class LoadMarkerTag(unittest.TestCase):
+    """The name of the tag that says a scene was organized PROVISIONALLY.
+
+    It falls on `load_adapters`'s side of the rule in `cronicled/config.py`'s
+    module docstring — most libraries carry no such tag, and a scan with none
+    configured pools what it always did — with the one distinction that side
+    of the rule does not otherwise have to draw: a key that is PRESENT and
+    unusable is not absence. Every falsy spelling of it (an empty string, a
+    blank one, a number) would fold into `None` under a plain `or`, quietly
+    restoring the behaviour the operator was configuring their way out of.
+    """
+
+    def _write(self, directory, payload):
+        with open(os.path.join(directory, "scan.json"), "w") as fh:
+            json.dump(payload, fh)
+        return {"CRONICLED_CONFIG_DIR": directory}
+
+    def test_it_is_found_under_the_config_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(default_scan_path({"CRONICLED_CONFIG_DIR": d}),
+                             os.path.join(d, "scan.json"))
+
+    def test_an_absent_file_is_a_legitimate_state_not_an_error(self):
+        with tempfile.TemporaryDirectory() as empty:
+            self.assertIsNone(
+                load_marker_tag(env={"CRONICLED_CONFIG_DIR": empty}))
+
+    def test_the_configured_name_is_handed_back_as_written(self):
+        # As WRITTEN: `Stash.tag_id_by_name` matches a tag name exactly, so a
+        # loader that lowered or trimmed the value would look up a tag the
+        # operator did not name and find nothing.
+        with tempfile.TemporaryDirectory() as d:
+            env = self._write(d, {"marker_tag": "Inferred Metadata"})
+            self.assertEqual(load_marker_tag(env=env), "Inferred Metadata")
+
+    def test_padding_around_the_name_is_not_trimmed_away(self):
+        # The other half of "as written", and the one a loader is tempted to
+        # be helpful about. `Stash.tag_id_by_name` matches EXACTLY, so
+        # trimming here looks up a name the operator did not write: it works
+        # for the typo and breaks for the tag whose name really does carry a
+        # space. Left alone, the typo fails the run with the name quoted --
+        # spaces and all -- which is a mistake somebody can see and fix.
+        with tempfile.TemporaryDirectory() as d:
+            env = self._write(d, {"marker_tag": " Inferred Metadata "})
+            self.assertEqual(load_marker_tag(env=env), " Inferred Metadata ")
+
+    def test_a_file_that_names_no_marker_is_absence_not_a_mistake(self):
+        # The file may one day hold other scan settings; lacking this key is
+        # "no marker configured", which is a state, not a malformed file.
+        with tempfile.TemporaryDirectory() as d:
+            env = self._write(d, {"something_else": True})
+            self.assertIsNone(load_marker_tag(env=env))
+
+    def test_an_empty_name_is_refused_rather_than_read_as_absence(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._write(d, {"marker_tag": ""})
+            with self.assertRaises(ValueError) as ctx:
+                load_marker_tag(env=env)
+            self.assertIn(os.path.join(d, "scan.json"), str(ctx.exception))
+            self.assertIn("marker_tag", str(ctx.exception))
+
+    def test_a_blank_name_is_refused_too(self):
+        # A tag whose whole name is whitespace is not a tag anyone can name
+        # on the server either, so this cannot be a real setting.
+        with tempfile.TemporaryDirectory() as d:
+            env = self._write(d, {"marker_tag": "   "})
+            with self.assertRaises(ValueError):
+                load_marker_tag(env=env)
+
+    def test_a_name_that_is_not_a_string_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._write(d, {"marker_tag": 7})
+            with self.assertRaises(ValueError) as ctx:
+                load_marker_tag(env=env)
+            self.assertIn("7", str(ctx.exception))
+
+    def test_a_top_level_value_that_is_not_an_object_is_refused_by_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self._write(d, ["inferred-metadata"])
+            with self.assertRaises(ValueError) as ctx:
+                load_marker_tag(env=env)
+            self.assertIn(os.path.join(d, "scan.json"), str(ctx.exception))
+
+    def test_an_explicit_path_overrides_the_config_directory(self):
+        with tempfile.TemporaryDirectory() as configured, \
+             tempfile.TemporaryDirectory() as explicit:
+            env = self._write(configured, {"marker_tag": "from-the-config-dir"})
+            p = os.path.join(explicit, "scan.json")
+            with open(p, "w") as fh:
+                json.dump({"marker_tag": "from-the-explicit-path"}, fh)
+            self.assertEqual(load_marker_tag(p, env=env),
+                             "from-the-explicit-path")
 
 
 class MissingConfigRule(unittest.TestCase):

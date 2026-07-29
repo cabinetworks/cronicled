@@ -94,6 +94,17 @@ configured site adapter there is nothing to scan, so the scan alone is left
 out — the description and tag passes read the media server's own text and
 vocabulary and need no store to search.
 
+A scan pools unorganized files. If an earlier tool filled in guessed metadata
+and marked those files organized, they are out of its reach: name the tag that
+tool left behind in a `scan.json` in the config directory
+(`{"marker_tag": "..."}` — see `config/scan.example.json` for the shape), and
+organized files carrying that tag are scanned as well. Organized files without
+it are not, which is what keeps a nightly pass from carrying a whole library.
+The scan reads the tag and never removes it — shedding it belongs to whatever
+applies a proposal. A `marker_tag` naming a tag the media server does not hold
+fails the run rather than quietly selecting nothing, and configuring none
+leaves the scan pooling exactly what it pooled before.
+
 A proposed merge is judged in its own section of the inbox, not among the
 scene proposals, because it is a different weight of decision: it names every
 spelling and how many scenes each carries, and it says plainly that approving

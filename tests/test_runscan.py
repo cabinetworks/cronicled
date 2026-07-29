@@ -488,6 +488,46 @@ class BuildProducerEnrichmentWiring(unittest.TestCase):
         self.assertEqual(item["payload"]["candidate"], thin)
 
 
+class TheMarkerTagReachesEveryScanThisModuleBuilds(unittest.TestCase):
+    """The provisionally-organized marker is read from config by the entry
+    point and passed in — see `build_producer`'s docstring for why it is not
+    read here. What this pins is that it survives the journey: a scan built
+    without it pools the unorganized set, so a marker that quietly stopped
+    here would leave the operator's configuration doing nothing with nothing
+    raised, which is exactly how the alias map came to be ignored on the one
+    path a person actually presses.
+    """
+
+    MARKER = "inferred-metadata"
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+        self.stash = _FakeStash([])
+        self.adapters = {"store": _Adapter()}
+
+    def test_the_configured_marker_reaches_the_producer(self):
+        producer = build_producer(self.stash, self.adapters, self.store,
+                                  limit=10, marker=self.MARKER)
+        self.assertEqual(producer._marker, self.MARKER)
+
+    def test_a_scan_built_without_one_carries_no_marker(self):
+        # The other half: absence is a legitimate state, and a default naming
+        # some tag would send every install looking for one nobody configured
+        # -- which now fails the run rather than passing quietly.
+        producer = build_producer(self.stash, self.adapters, self.store,
+                                  limit=10)
+        self.assertIsNone(producer._marker)
+
+    def test_the_scheduled_scan_carries_it_too(self):
+        # The unattended run is the one nobody watches. A marker that reached
+        # only the manual scan would leave the nightly pass looking at a
+        # different half of the library, with nothing saying which.
+        scheduled = build_scheduled_producer(self.stash, self.adapters,
+                                             self.store, marker=self.MARKER)
+        self.assertEqual(scheduled._marker, self.MARKER)
+
+
 class ConfiguredAdapters(unittest.TestCase):
     def test_raises_a_clear_error_when_none_are_configured(self):
         # HARM: `adapters.registry.load_adapters` returning `{}` is meant to
@@ -572,6 +612,52 @@ class MainOrchestration(unittest.TestCase):
             runner.start.assert_called_once_with("library-scan")
             runner.wait.assert_called_once_with("job-1")
             store_instance.close.assert_called_once()
+
+    def test_the_configured_marker_tag_is_read_and_passed_to_the_producer(self):
+        # The seam: `main` is where this install's config directory is read,
+        # and `build_producer` is deliberately not a second reader of it. A
+        # `main` that never called the loader would leave every command-line
+        # scan pooling the unorganized set while `scan.json` sat there
+        # looking configured.
+        with self._patched() as mocks, \
+             mock.patch("cronicled.runscan.load_marker_tag") as load_marker:
+            load_marker.return_value = "inferred-metadata"
+            mocks["load_server"].return_value = {
+                "url": "http://server.example.test", "api_key": "K"}
+            mocks["configured_adapters"].return_value = {"only": _Adapter()}
+            producer = mock.Mock()
+            producer.name = "library-scan"
+            mocks["build_producer"].return_value = producer
+            runner = mocks["JobRunner"].return_value
+            runner.start.return_value = mock.Mock(id="job-1")
+            runner.job.return_value = mock.Mock(
+                id="job-1", state="done", message="finished", error=None)
+
+            self.assertEqual(main(["--limit", "5"]), 0)
+
+            _args, kwargs = mocks["build_producer"].call_args
+            self.assertEqual(kwargs["marker"], "inferred-metadata")
+
+    def test_an_unreadable_marker_config_refuses_before_anything_is_built(self):
+        # A malformed setting is a start-up failure that names itself, on the
+        # same terms a missing server or adapter already is -- never a scan
+        # that starts and silently pools what it always did.
+        with self._patched() as mocks, \
+             mock.patch("cronicled.runscan.load_marker_tag") as load_marker:
+            load_marker.side_effect = ValueError(
+                "scan.json sets 'marker_tag' to '', which names no tag")
+            mocks["load_server"].return_value = {
+                "url": "http://server.example.test", "api_key": "K"}
+            mocks["configured_adapters"].return_value = {"only": _Adapter()}
+
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = main(["--limit", "5"])
+
+            self.assertEqual(rc, 1)
+            self.assertIn("marker_tag", err.getvalue())
+            mocks["Stash"].assert_not_called()
+            mocks["Store"].assert_not_called()
+            mocks["build_producer"].assert_not_called()
 
     def test_a_failed_job_is_reported_and_exits_nonzero(self):
         with self._patched() as mocks:

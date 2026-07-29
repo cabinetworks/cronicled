@@ -378,16 +378,38 @@ class _ScanStash:
     and one read per proposal to enrich the winning candidate's own URL.
     `apply_scene`/`revert_scene` -- the two ways a media server is actually
     WRITTEN to -- raise rather than quietly succeeding: a scan reaching
-    either is exactly the regression this class exists to catch."""
+    either is exactly the regression this class exists to catch.
 
-    def __init__(self, scenes=()):
+    `organized` names which of `scenes` carry the organized flag, and
+    `tag_ids` is this installation's own tag-name-to-id map. Both reads below
+    filter the one library table the way the server's own `scene_filter`
+    does: an organized scene is invisible to `unorganized_scenes` here
+    exactly as it is there, which is the whole reason a marker tag exists.
+    """
+
+    def __init__(self, scenes=(), organized=(), tag_ids=None):
         self._scenes = list(scenes)
+        self._organized = {str(scene_id) for scene_id in organized}
+        self._tag_ids = dict(tag_ids or {})
         self.calls = []
+
+    def _page(self, scenes, limit):
+        return len(scenes), list(scenes if limit is None else scenes[:limit])
 
     def unorganized_scenes(self, limit):
         self.calls.append(("unorganized_scenes", limit))
-        scenes = self._scenes if limit is None else self._scenes[:limit]
-        return len(self._scenes), list(scenes)
+        return self._page([s for s in self._scenes
+                           if s["id"] not in self._organized], limit)
+
+    def tag_id_by_name(self, name):
+        self.calls.append(("tag_id_by_name", name))
+        return self._tag_ids.get(name)
+
+    def tagged_scenes(self, tag_id, limit):
+        self.calls.append(("tagged_scenes", tag_id, limit))
+        return self._page(
+            [s for s in self._scenes
+             if any(tag["id"] == tag_id for tag in s.get("tags", []))], limit)
 
     def scrape_scenes_by_query(self, scraper_id, query):
         self.calls.append(("scrape_scenes_by_query", scraper_id, query))
@@ -605,6 +627,52 @@ class TheConfiguredAliasesReachAScanStartedFromThePage(unittest.TestCase):
         # reaches the store, which is the behaviour the alias exists to
         # change -- and is what this scan did with an alias configured.
         self.assertEqual(self._scan({}), ["VCrane", "VCrane clip-1"])
+
+
+class TheMarkerTagReachesAScanStartedFromThePage(unittest.TestCase):
+    """The button on the page is the path a configured value goes missing on:
+    `Actions.scan` builds its own producer per click, so anything the entry
+    point read and did not hand over is simply absent from every scan a
+    person ever starts. That is not hypothetical -- the alias map spent a
+    whole ticket in exactly this state (see the class above), and a marker
+    that only the scheduled scan honoured would be the same defect with a
+    quieter symptom: the nightly pass and the button would look at different
+    halves of the library.
+
+    Started HERE, through `Actions.scan`, rather than by calling
+    `build_producer` with a marker of this test's own -- that call would pass
+    against the broken wiring, which is why the alias defect survived.
+    """
+
+    MARKER = "inferred-metadata"
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+        self.runner = JobRunner(self.store)
+        self.addCleanup(self.runner.close)
+
+    def _scan(self, **kwargs):
+        # One scene, ORGANIZED, carrying the marker: invisible to the
+        # unorganized read, so the only way it reaches the scan is the
+        # marker.
+        scene = dict(_library_scene(1), tags=[{"id": "t-7",
+                                               "name": self.MARKER}])
+        stash = _ScanStash([scene], organized=("1",),
+                           tag_ids={self.MARKER: "t-7"})
+        actions = Actions(self.store, stash, runner=self.runner,
+                          adapters={"only": _Adapter()}, **kwargs)
+        job = actions.scan(10)
+        self.assertTrue(self.runner.wait(job.id, WAIT))
+        return self.runner.job(job.id).message
+
+    def test_a_marked_organized_file_is_scanned_from_the_page(self):
+        self.assertIn("selected 1 of 1", self._scan(marker=self.MARKER))
+
+    def test_without_the_marker_the_same_file_is_not_offered_at_all(self):
+        # The control: the only difference between the two is the value the
+        # entry point read out of scan.json.
+        self.assertIn("selected 0 of 0", self._scan())
 
 
 class ScanStatus(unittest.TestCase):

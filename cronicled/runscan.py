@@ -25,7 +25,7 @@ import sys
 
 from cronicled.adapters.registry import load_adapters
 from cronicled.artist import Aliases
-from cronicled.config import load_server
+from cronicled.config import load_marker_tag, load_server
 from cronicled.jobs import JobRunner
 from cronicled.scan import (DEFAULT_THRESHOLD, ScanProducer, Source,
                             identify_by_fingerprint)
@@ -166,7 +166,7 @@ def configured_aliases(adapters):
 
 def build_producer(stash, adapters, store, *, limit, folder="library",
                    name_filter=None, threshold=DEFAULT_THRESHOLD,
-                   workers=4, producer_name=None, every=None):
+                   workers=4, marker=None, producer_name=None, every=None):
     """The `ScanProducer` that scans EVERY one of `adapters` through `stash`,
     recording through `store`.
 
@@ -253,6 +253,18 @@ def build_producer(stash, adapters, store, *, limit, folder="library",
     same map without any of them saying so, and no fourth call site can
     forget it.
 
+    `marker` is the name of the tag that says a scene was organized
+    PROVISIONALLY — see `cronicled.scan.ScanProducer` for what it pools and
+    `cronicled.config.load_marker_tag` for where an operator writes it.
+    Passed in rather than read here, and read with an `env` at each entry
+    point rather than off the ambient environment, because `--config-dir`
+    exists: a loader called here with no `env` would read a different
+    directory than the one the process was started with, find no file, and
+    return `None` — configuration that silently does nothing, which is the
+    failure this argument is being wired to end rather than repeat. `None`
+    (the default) is an operator who has named no marker, and pools the
+    unorganized set exactly as before.
+
     `producer_name` and `every` are what make a producer schedulable and are
     deliberately separate from each other. `producer_name` overrides
     `ScanProducer.name` so a scan started on a cadence is its own
@@ -298,7 +310,7 @@ def build_producer(stash, adapters, store, *, limit, folder="library",
         stash, sources, store=store, folder=folder, limit=limit,
         name_filter=name_filter, threshold=threshold, aliases=aliases,
         workers=workers, enrich=stash.scrape_scene_url, identify=identify,
-        name=producer_name, every=every)
+        marker=marker, name=producer_name, every=every)
 
 
 def build_scheduled_producer(stash, adapters, store, *, every=DAILY, **kwargs):
@@ -390,6 +402,11 @@ def main(argv=None):
     try:
         server = load_server()
         adapters = configured_adapters()
+        # Read HERE, beside the other two, and never inside `build_producer`:
+        # it is configuration, it is read once at start-up, and a failure to
+        # understand it belongs in the same "cannot start a scan" message the
+        # other loaders' failures land in.
+        marker = load_marker_tag()
     except (ValueError, RuntimeError, KeyError) as exc:
         print("cannot start a scan: %s" % exc, file=sys.stderr)
         return 1
@@ -401,7 +418,7 @@ def main(argv=None):
         producer = build_producer(
             stash, adapters, store, limit=args.limit, folder=args.folder,
             name_filter=args.name_filter, threshold=args.threshold,
-            workers=args.workers)
+            workers=args.workers, marker=marker)
         runner.register(producer)
 
         job = runner.start(producer.name)
