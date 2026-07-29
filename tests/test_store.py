@@ -639,7 +639,7 @@ class Mutes(_StoreCase):
         self.assertEqual(self.store.mutes(), [
             {"subject_type": "scene", "subject_id": "1",
              "reason": "never identifiable", "at": "2026-07-01T00:00:00",
-             "payload": None}])
+             "item": None}])
 
     def test_nothing_muted_is_an_empty_list(self):
         self.assertEqual(self.store.mutes(), [])
@@ -649,13 +649,13 @@ class Mutes(_StoreCase):
         self.store.unmute("scene", "1")
         self.assertEqual(self.store.mutes(), [])
 
-    def test_a_subject_muted_with_no_proposal_ever_recorded_has_no_payload(self):
+    def test_a_subject_muted_with_no_proposal_ever_recorded_has_no_item(self):
         # The genuine exception ticket 97 names: muting ahead of any scan
         # ever finding the subject. No `item` row exists at all here, so
-        # there is nothing to recover -- `payload` must say so honestly
+        # there is nothing to recover -- `item` must say so honestly
         # rather than inventing something.
         self.store.mute("scene", "1", reason="never identifiable")
-        self.assertIsNone(self.store.mutes()[0]["payload"])
+        self.assertIsNone(self.store.mutes()[0]["item"])
 
     def test_a_muted_subjects_payload_is_recovered_from_its_proposal(self):
         # The ordinary case: `mute` never deletes the `item` row it
@@ -664,7 +664,36 @@ class Mutes(_StoreCase):
         payload = {"path": "/library/Nine Winters/reel.mp4", "title": "X"}
         self._record(subject_id="1", payload=payload)
         self.store.mute("scene", "1", reason="never identifiable")
-        self.assertEqual(self.store.mutes()[0]["payload"], payload)
+        self.assertEqual(self.store.mutes()[0]["item"]["payload"], payload)
+
+    def test_a_muted_subjects_whole_item_is_recovered_not_just_its_payload(self):
+        # HARM: the Muted section builds its row with the SAME builders the
+        # Dismissed section uses, and those read the fingerprint, the state
+        # and the subject type as well as the payload. A projection here
+        # would leave the row builder to invent the rest -- store state
+        # fabricated on a page whose controls write to a library.
+        #
+        # Asserted as the WHOLE dict against the row `items()` returns for
+        # the same proposal, not field by field: a column dropped from the
+        # recovery is exactly the drift this must catch, and naming three
+        # fields would not see a fourth go missing.
+        fp = self._record(subject_id="1",
+                          payload={"path": "/library/x/reel.mp4"})
+        self.store.mute("scene", "1", reason="never identifiable")
+        self.assertEqual(self.store.mutes()[0]["item"],
+                         self.store.items(state="muted")[0])
+        self.assertEqual(self.store.mutes()[0]["item"]["fingerprint"], fp)
+
+    def test_a_recovered_items_prior_state_is_decoded_like_items_decodes_it(self):
+        # `prior_state` is the other JSON column, and a muted row that
+        # reached the page carrying a JSON STRING where a dict was expected
+        # fails at the first index rather than anywhere a reader would look.
+        fp = self._record(subject_id="1",
+                          payload={"path": "/library/x/reel.mp4"})
+        self.store.mark_applied(fp, prior_state={"title": "what was there"})
+        self.store.mute("scene", "1", reason="never identifiable")
+        self.assertEqual(self.store.mutes()[0]["item"]["prior_state"],
+                         {"title": "what was there"})
 
     def test_recovers_the_most_recently_seen_proposal_when_more_than_one_exists(self):
         # A subject can carry more than one `item` row -- successive
@@ -678,7 +707,22 @@ class Mutes(_StoreCase):
                           payload=newer, producer="test-producer",
                           confidence=0.9, now="2099-01-01T00:00:00")
         self.store.mute("scene", "1", reason="never identifiable")
-        self.assertEqual(self.store.mutes()[0]["payload"], newer)
+        self.assertEqual(self.store.mutes()[0]["item"]["payload"], newer)
+
+    def test_showing_the_richer_row_leaves_unmuting_restoring_it_exactly_as_before(self):
+        # The Muted section now recovers the whole item so it can draw what
+        # a dismissed row draws. That is a READ, and it must not have
+        # changed what Unmute does: the standing block goes, and the row it
+        # hid comes back to `new` -- decidable again, not stuck hidden with
+        # the page reporting it restored.
+        self._record(subject_id="1", payload={"path": "/library/x/reel.mp4"})
+        self.store.mute("scene", "1", reason="never identifiable")
+        self.assertIsNotNone(self.store.mutes()[0]["item"])
+
+        self.store.unmute("scene", "1")
+
+        self.assertEqual(self.store.mutes(), [])
+        self.assertEqual([i["state"] for i in self.store.items()], ["new"])
 
     def test_a_muted_subjects_payload_is_recovered_even_when_the_row_was_applied(self):
         # `mute` deliberately leaves a terminal (`applied`/`failed`) row's
@@ -690,7 +734,7 @@ class Mutes(_StoreCase):
                           payload={"path": "/library/x/reel.mp4"})
         self.store.mark_applied(fp)
         self.store.mute("scene", "1", reason="never identifiable")
-        self.assertEqual(self.store.mutes()[0]["payload"],
+        self.assertEqual(self.store.mutes()[0]["item"]["payload"],
                          {"path": "/library/x/reel.mp4"})
 
 

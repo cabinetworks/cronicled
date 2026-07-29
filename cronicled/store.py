@@ -753,30 +753,39 @@ class Store:
 
     def mutes(self):
         """Every standing mute, as dicts with `subject_type`, `subject_id`,
-        `reason`, `at` and `payload` — the same `mute` table `muted_subjects()`
+        `reason`, `at` and `item` — the same `mute` table `muted_subjects()`
         reads, but keeping the reason and timestamp that method deliberately
         leaves out (it exists for the batch membership test `select()` needs,
         not for display — see its own docstring). This is for showing a person
         what is currently hidden from them, and a bare `(type, id)` pair
         gives them nothing to judge.
 
-        `payload` is the most recently seen `item` row ever recorded for this
-        subject — decoded the same way `items()` decodes its own `payload`
-        column — or `None` when no proposal was ever recorded for this
-        subject at all. That second case is the one `mute`'s own docstring
-        names: a subject muted ahead of any scan ever finding it. `mute`
-        itself never deletes an existing `item` row (it only changes its
-        `state`, and only for a non-terminal one — see `mute`'s docstring),
-        so the payload recorded against whichever row was seen last is still
-        sitting in the `item` table regardless of what state that row ended
-        up in, terminal or not; a subject can also carry more than one `item`
-        row (successive proposals under different producers or payloads
-        before it was muted), so this reads the freshest by `last_seen_at`
-        rather than picking arbitrarily.
+        `item` is the WHOLE most recently seen `item` row ever recorded for
+        this subject, in exactly the shape and with exactly the decoding
+        `items()` returns (they share `_ITEM_COLUMNS` and `_decode_item`) —
+        or `None` when no proposal was ever recorded for this subject at
+        all. That second case is the one `mute`'s own docstring names: a
+        subject muted ahead of any scan ever finding it. `mute` itself never
+        deletes an existing `item` row (it only changes its `state`, and only
+        for a non-terminal one — see `mute`'s docstring), so the row recorded
+        against whichever proposal was seen last is still sitting in the
+        `item` table regardless of what state it ended up in, terminal or
+        not; a subject can also carry more than one `item` row (successive
+        proposals under different producers or payloads before it was muted),
+        so this reads the freshest by `last_seen_at` rather than picking
+        arbitrarily.
+
+        THE WHOLE ROW, not the payload alone, and that is what lets a muted
+        subject be shown with everything a dismissed one is shown with:
+        `cronicled.web.rows.to_mute_row` builds the identical row builders
+        the Dismissed section uses, and those need the fingerprint, the
+        state and the subject type as well as the payload. Handing over the
+        payload and letting the row builder invent the rest would be
+        inventing store state on a page whose controls write to a library.
 
         Deciding what to show a person for a subject with no recoverable
-        payload is `cronicled.web.rows.to_mute_row`'s job, not this method's
-        — this only ever answers what the store actually knows, honestly.
+        item is `to_mute_row`'s job, not this method's — this only ever
+        answers what the store actually knows, honestly.
 
         Ordered by `at` then `subject_id`, the same tie-break `items()` uses
         for its own listing.
@@ -788,15 +797,17 @@ class Store:
             ).fetchall()
             result = []
             for subject_type, subject_id, reason, at in rows:
-                item_row = self._conn.execute(
-                    "SELECT payload FROM item WHERE subject_type = ? AND "
-                    "subject_id = ? ORDER BY last_seen_at DESC LIMIT 1",
-                    (subject_type, subject_id),
-                ).fetchone()
-                payload = json.loads(item_row[0]) if item_row is not None else None
+                cursor = self._conn.execute(
+                    "SELECT %s FROM item WHERE subject_type = ? AND "
+                    "subject_id = ? ORDER BY last_seen_at DESC LIMIT 1"
+                    % self._ITEM_COLUMNS, (subject_type, subject_id))
+                columns = [d[0] for d in cursor.description]
+                item_row = cursor.fetchone()
+                item = (None if item_row is None
+                        else self._decode_item(columns, item_row))
                 result.append({"subject_type": subject_type,
                               "subject_id": subject_id, "reason": reason,
-                              "at": at, "payload": payload})
+                              "at": at, "item": item})
         return result
 
     # Superseding a proposal
@@ -1041,6 +1052,38 @@ class Store:
             for subject_type, subject_id, path, reason, at, stores in rows
         ]
 
+    # Every column an `item` row is READ back as, in one place, because two
+    # methods now return that row to the same consumers -- `items()` for the
+    # inbox's own sections and `mutes()` for the muted subject behind a
+    # standing mute. Two hand-maintained SELECT lists would be free to drift,
+    # and the drift is silent in the expensive direction: the muted row is
+    # built by the SAME row builders the dismissed row is, so a column
+    # missing here draws a muted proposal with a blank field where the
+    # dismissed one beside it shows a real value.
+    _ITEM_COLUMNS = (
+        "fingerprint, folder, subject_type, subject_id, summary, "
+        "confidence, payload, producer, state, prior_state, error, "
+        "created_at, last_seen_at, resolved_at"
+    )
+
+    @staticmethod
+    def _decode_item(columns, row):
+        """One `item` row -> the dict shape every caller of `items()` and
+        `mutes()` already expects, with the two JSON columns decoded back
+        into the Python objects that were recorded.
+
+        Shared rather than written twice for the reason `_ITEM_COLUMNS`
+        states: a second decoder would be free to hand one caller a JSON
+        string where the other gets a dict, and a payload that reached a row
+        builder as a string fails at the first index rather than anywhere a
+        reader would look.
+        """
+        item = dict(zip(columns, row))
+        item["payload"] = json.loads(item["payload"])
+        if item["prior_state"] is not None:
+            item["prior_state"] = json.loads(item["prior_state"])
+        return item
+
     def items(self, folder=None, state=None, limit=None, offset=0):
         """Proposals in the store, as dicts with `payload` (and
         `prior_state`, when present) decoded back into the Python object
@@ -1052,12 +1095,7 @@ class Store:
         rejections. Ask for them explicitly with `items(state="dismissed")`
         or `items(state="muted")`.
         """
-        query = (
-            "SELECT fingerprint, folder, subject_type, subject_id, "
-            "summary, confidence, payload, producer, state, "
-            "prior_state, error, created_at, last_seen_at, resolved_at "
-            "FROM item"
-        )
+        query = "SELECT %s FROM item" % self._ITEM_COLUMNS
         clauses = []
         params = []
         if folder is not None:
@@ -1080,14 +1118,7 @@ class Store:
             cursor = self._conn.execute(query, params)
             columns = [d[0] for d in cursor.description]
             rows = cursor.fetchall()
-        result = []
-        for row in rows:
-            item = dict(zip(columns, row))
-            item["payload"] = json.loads(item["payload"])
-            if item["prior_state"] is not None:
-                item["prior_state"] = json.loads(item["prior_state"])
-            result.append(item)
-        return result
+        return [self._decode_item(columns, row) for row in rows]
 
     def counts(self, folder=None):
         """Number of proposals in each state, optionally scoped to a folder.
