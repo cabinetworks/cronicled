@@ -603,3 +603,148 @@ class UndoLeavesATrace(unittest.TestCase):
         with self.assertRaises(ValueError):
             Actions(store, _FakeStash()).undo("fp-1")
         self.assertEqual(store.calls, [])
+
+
+# -- description proposals ------------------------------------------------- #
+
+
+class _FakeDescriptionStash:
+    """A media server holding one performer's description.
+
+    It carries the real client's LIMITATIONS, not just its interface:
+    `apply_performer_description` refuses when the current text is not what
+    the caller expected, and `revert_performer_description` refuses a
+    snapshot that is missing or carries no description -- both exactly as
+    `cronicled.stash.Stash` does. A double that wrote regardless would turn
+    the missing guard into a passing test.
+
+    `apply_scene` and `revert_scene` raise on sight. The dispatch under test
+    is which write a proposal's subject type reaches, and a double that
+    answered both would be unable to tell a wrong dispatch from a right one.
+    """
+
+    def __init__(self, details="<p>Before.</p>"):
+        self.details = details
+        self.calls = []
+
+    def apply_performer_description(self, performer_id, description, *,
+                                    expected):
+        if self.details != expected:
+            raise RuntimeError(
+                "performer %s's description is not the text this proposal was "
+                "made from" % performer_id)
+        prior = self.details
+        self.details = description
+        self.calls.append(("apply", performer_id, description))
+        return {"prior": {"details": prior}}
+
+    def revert_performer_description(self, performer_id, prior):
+        if not prior or "details" not in prior:
+            raise ValueError(
+                "cannot revert performer %s: snapshot is missing, empty, or "
+                "carries no description" % performer_id)
+        self.details = prior["details"]
+        self.calls.append(("revert", performer_id, prior))
+        return {"details": prior["details"]}
+
+    def apply_scene(self, *args, **kwargs):
+        raise AssertionError(
+            "a description proposal reached the scene apply path")
+
+    def revert_scene(self, *args, **kwargs):
+        raise AssertionError(
+            "a description proposal reached the scene revert path")
+
+
+def _description_item(**over):
+    item = {"fingerprint": "fp-d", "state": "new",
+            "subject_type": "performer", "subject_id": "7",
+            "prior_state": None,
+            "payload": {"name": "Wren Alderly", "field": "details",
+                        "faults": ["markup"],
+                        "original": "<p>Before.</p>",
+                        "cleaned": "Before."}}
+    item.update(over)
+    return item
+
+
+class ApproveADescription(unittest.TestCase):
+    def test_it_writes_the_cleaned_text_through_the_description_path(self):
+        store, stash = _FakeStore(_description_item()), _FakeDescriptionStash()
+
+        self.assertEqual(Actions(store, stash).approve("fp-d"), "applied")
+
+        self.assertEqual(stash.calls, [("apply", "7", "Before.")])
+        self.assertEqual(stash.details, "Before.")
+
+    def test_the_snapshot_stored_is_the_text_the_write_replaced(self):
+        store, stash = _FakeStore(_description_item()), _FakeDescriptionStash()
+
+        Actions(store, stash).approve("fp-d")
+
+        self.assertEqual(store.calls,
+                         [("applied", "fp-d", {"details": "<p>Before.</p>"})])
+
+    def test_a_description_edited_since_the_scan_fails_and_writes_nothing(self):
+        store = _FakeStore(_description_item())
+        stash = _FakeDescriptionStash(details="Rewritten by hand.")
+
+        with self.assertRaises(ApplyFailed):
+            Actions(store, stash).approve("fp-d")
+
+        self.assertEqual(stash.calls, [])
+        self.assertEqual(stash.details, "Rewritten by hand.")
+        # Recorded as FAILED, never applied: an applied row offers an undo,
+        # and there is nothing to undo.
+        self.assertEqual([c[0] for c in store.calls], ["failed"])
+
+
+class UndoADescription(unittest.TestCase):
+    def test_it_restores_the_exact_prior_text_including_whitespace(self):
+        # The whole field, whitespace and all. A revert asserted as "the tag
+        # is back" would pass for one that restored a tidied approximation of
+        # what was there, which is a third state nobody chose.
+        prior = {"details": "  <p>Before.</p>\n\n  and a second line  "}
+        store = _FakeStore(_description_item(
+            state="applied", prior_state=prior))
+        stash = _FakeDescriptionStash(details="Before.\n\nand a second line")
+
+        self.assertEqual(Actions(store, stash).undo("fp-d"), "reverted")
+
+        self.assertEqual(stash.details,
+                         "  <p>Before.</p>\n\n  and a second line  ")
+        self.assertEqual(stash.calls, [("revert", "7", prior)])
+        self.assertEqual(store.calls, [("reverted", "fp-d")])
+
+    def test_an_applied_description_round_trips_back_to_where_it_started(self):
+        # Approve then Undo, through the same objects, asserting the field
+        # itself rather than the calls: the undo has to be reversible in fact,
+        # not merely called.
+        before = "<p>Marsh &amp; Holloway.</p>"
+        stash = _FakeDescriptionStash(details=before)
+        item = _description_item(payload={
+            "name": "Wren Alderly", "field": "details",
+            "faults": ["markup", "entity"],
+            "original": before, "cleaned": "Marsh & Holloway."})
+        store = _FakeStore(item)
+        actions = Actions(store, stash)
+
+        actions.approve("fp-d")
+        self.assertEqual(stash.details, "Marsh & Holloway.")
+        # What the store recorded is what an undo is later handed.
+        snapshot = store.calls[-1][2]
+        item["state"] = "applied"
+        item["prior_state"] = snapshot
+
+        actions.undo("fp-d")
+
+        self.assertEqual(stash.details, before)
+
+    def test_an_applied_row_with_no_snapshot_refuses_rather_than_reverting(self):
+        store = _FakeStore(_description_item(state="applied", prior_state=None))
+        stash = _FakeDescriptionStash()
+
+        with self.assertRaises(ValueError):
+            Actions(store, stash).undo("fp-d")
+
+        self.assertEqual(stash.calls, [])

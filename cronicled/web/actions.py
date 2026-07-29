@@ -6,6 +6,7 @@ Separated from request handling so the write paths can be tested without a
 socket, and so the handler cannot reach the store, the media server, or the
 job runner directly and grow another kind of write nobody reviewed.
 """
+from cronicled.descriptions import SUBJECT_TYPE as DESCRIPTION_SUBJECT
 from cronicled.runscan import build_producer
 from cronicled.web.rows import carries_cover
 
@@ -84,12 +85,26 @@ class Actions:
             self._store.mark_failed(fp, _NO_STASH)
             raise ApplyFailed("could not apply: %s" % _NO_STASH)
         try:
-            # The snapshot is produced INSIDE apply_scene, which reads the
-            # scene immediately before the single write and returns nothing
+            # The snapshot is produced INSIDE the apply, which reads the
+            # subject immediately before the single write and returns nothing
             # at all if it raises first. Taking it here instead would open a
             # window between the read and the write.
-            result = self._stash.apply_scene(
-                subject_id, item["payload"]["candidate"])
+            #
+            # Dispatched on the row's own `subject_type`, the same field the
+            # store keys a mute by, rather than on the shape of its payload:
+            # a proposal about a performer's description and one about a
+            # scene are two different writes to two different endpoints, and
+            # asking "does this payload have a candidate" would guess at
+            # which from a field that a malformed payload could be missing
+            # for a different reason entirely.
+            if item["subject_type"] == DESCRIPTION_SUBJECT:
+                payload = item["payload"]
+                result = self._stash.apply_performer_description(
+                    subject_id, payload["cleaned"],
+                    expected=payload["original"])
+            else:
+                result = self._stash.apply_scene(
+                    subject_id, item["payload"]["candidate"])
         except Exception as exc:
             # Recorded as failed, never as applied: an applied row offers an
             # undo, and an undo of a write that never happened would restore
@@ -126,6 +141,18 @@ class Actions:
             # revert_scene it is still refused, but as a stack trace.
             raise ValueError(
                 "cannot undo %s: no snapshot was stored for it" % fp)
+        if item["subject_type"] == DESCRIPTION_SUBJECT:
+            self._stash.revert_performer_description(item["subject_id"], prior)
+            # Recorded only AFTER the revert succeeds, exactly as below.
+            self._store.mark_reverted(fp)
+            # A plain "reverted", with no caveat, and that is a claim this
+            # one can actually make: the apply wrote a single field and the
+            # snapshot holds that same field, so there is nothing the revert
+            # leaves behind. The cover-image caveat below is about a scene
+            # apply writing something its snapshot has no way to represent,
+            # and reaching for `carries_cover` here would raise on a payload
+            # that has no candidate at all.
+            return "reverted"
         self._stash.revert_scene(item["subject_id"], prior)
         # Recorded only AFTER the revert succeeds. Marking first and then
         # raising would leave a row claiming the write was taken back while it

@@ -200,6 +200,53 @@ class Stash:
                 return out
             page += 1
 
+    def performers_with_descriptions(self):
+        """Every performer this server holds, with just enough to judge a
+        DESCRIPTION: `id`, `name`, and `details` -- the field Stash stores a
+        performer's free-text description in, the same field name a scene's
+        own description is read under in `scene_existing` above.
+
+        `details` may be `None` or `""` for a performer nobody has written
+        one for. That is a normal answer, not a gap to raise on, and
+        `cronicled.descriptions.assess` reads both as "nothing wrong".
+
+        Paged exactly as `performers_with_stash_ids` pages, and for the same
+        reason: a whole-library, no-filter read is the point -- the fault
+        being looked for is visible in the text itself, so there is no filter
+        the server could apply that would not also hide it.
+        """
+        q = """
+        query($f: FindFilterType){
+          findPerformers(filter:$f){
+            count performers{ id name details }
+          }
+        }"""
+        out, page = [], 1
+        while True:
+            data = self.gql(q, {"f": {"per_page": 500, "page": page,
+                                      "sort": "name", "direction": "ASC"}})
+            rows = data["findPerformers"]["performers"]
+            out.extend(rows)
+            if len(rows) < 500 or len(out) >= data["findPerformers"]["count"]:
+                return out
+            page += 1
+
+    def performer_description(self, performer_id):
+        """One performer's description as it stands RIGHT NOW.
+
+        Read immediately before a write so the write can be checked against
+        what is actually there, and so the undo snapshot records the text the
+        write really replaced -- not the text a scan saw hours earlier. See
+        `apply_performer_description`.
+
+        A performer id the server does not know answers `None`, which
+        `apply_performer_description` reports as a mismatch rather than
+        silently writing to nothing.
+        """
+        q = "query($id: ID!){ findPerformer(id:$id){ id details } }"
+        found = self.gql(q, {"id": performer_id}).get("findPerformer") or {}
+        return found.get("details")
+
     def tag_id_by_name(self, name):
         """A tag's id on THIS server, looked up by exact name — ids are
         installation-specific. None when the server has no such tag."""
@@ -469,6 +516,73 @@ class Stash:
         return {"studio_id": prior.get("studio_id"),
                 "performers": len(prior.get("performer_ids") or []),
                 "tags": len(prior.get("tag_ids") or [])}
+
+    # -- performer descriptions ------------------------------------------- #
+
+    _PERFORMER_UPDATE = ("mutation($in: PerformerUpdateInput!)"
+                         "{ performerUpdate(input:$in){ id } }")
+
+    def apply_performer_description(self, performer_id, description, *,
+                                    expected):
+        """Replace one performer's description, refusing if it is not the
+        text the proposal was derived from.
+
+        `expected` is REQUIRED and has no default, on the same terms
+        `cronicled.runscan.build_producer` requires a `limit`: a caller who
+        forgot it and a caller who meant "write regardless" must not be able
+        to write the same thing, and the second is not offered here at all.
+        The cleaned text a proposal carries is a function of the exact
+        description it was computed from -- strip the tags out of THIS text
+        and you get THAT text -- so writing it over a description somebody
+        has edited since would replace their edit with a cleaned-up version
+        of what they edited away. Refused as a `StashError`, which
+        `web.actions.Actions.approve` already records as a failed apply with
+        the reason attached, leaving the proposal live and re-runnable.
+
+        The read happens HERE, one line before the write, rather than in the
+        caller: taking the comparison and the snapshot anywhere else opens a
+        window between them and the write. That is the same ordering
+        `apply_scene` uses and for the same reason.
+
+        The returned `prior` is the undo snapshot, shaped as the input the
+        server would accept to put the description back -- one field, so
+        `revert_performer_description` can replay it verbatim. Unlike a
+        scene's snapshot there is no field this write touches that the
+        snapshot cannot represent, so an applied description IS fully
+        undoable, with no equivalent of the cover-image caveat.
+        """
+        current = self.performer_description(performer_id)
+        if current != expected:
+            raise StashError(
+                "performer %s's description is not the text this proposal was "
+                "made from; it has changed since the scan, so applying would "
+                "overwrite the current text with a cleaned-up version of the "
+                "old one" % (performer_id,))
+        self.gql(self._PERFORMER_UPDATE,
+                 {"in": {"id": performer_id, "details": description}})
+        return {"prior": {"details": current}}
+
+    def revert_performer_description(self, performer_id, prior):
+        """Undo one `apply_performer_description` by writing back exactly the
+        text `prior` holds -- every character of it, whitespace included.
+
+        Raises `ValueError` on a snapshot that is missing, empty, or does not
+        carry the field, rather than quietly doing nothing: a revert that
+        no-ops is indistinguishable from one that worked, which is the one
+        ambiguity undo cannot afford. `apply_scene`'s own `revert_scene`
+        refuses on the same terms.
+
+        A snapshot whose `details` is `None` or `""` is NOT missing -- it is a
+        performer who had no description before the apply, and restoring
+        exactly that is the whole job.
+        """
+        if not prior or "details" not in prior:
+            raise ValueError(
+                "cannot revert performer %s: snapshot is missing, empty, or "
+                "carries no description" % (performer_id,))
+        self.gql(self._PERFORMER_UPDATE,
+                 {"in": {"id": performer_id, "details": prior["details"]}})
+        return {"details": prior["details"]}
 
     # -- tags (consolidation) --------------------------------------------- #
 

@@ -3802,3 +3802,190 @@ class FingerprintLookup(unittest.TestCase):
         self.assertNotIn("9", body["query"])
         self.assertIn("ScrapeMultiScenesInput!", body["query"])
         self.assertIn("ScraperSourceInput!", body["query"])
+
+
+# -- performer descriptions ------------------------------------------------ #
+
+
+def _description_rows(n, prefix):
+    return [{"id": "%s-%d" % (prefix, i), "name": "%s %d" % (prefix, i),
+             "details": "a description for %s %d" % (prefix, i)}
+            for i in range(n)]
+
+
+class PerformersWithDescriptions(unittest.TestCase):
+    """The read the description pass makes, and the field it depends on.
+
+    `details` is the media server's own name for a performer's description --
+    an EXTERNAL fact, restated here rather than imported from the client, so
+    these assertions are a check rather than a mirror. A client that selected
+    some other field would come back with `None` for every performer and the
+    pass would report a library with nothing wrong with it, forever, with
+    nothing anywhere saying otherwise.
+    """
+
+    def test_the_query_asks_for_the_field_the_description_lives_in(self):
+        t = _PerformerReadTransport(pages=[_description_rows(2, "alpha")])
+        _read_stash(t).performers_with_descriptions()
+        query, _ = t.calls[0]
+        self.assertIn("findPerformers(", query)
+        self.assertIn("details", query)
+        self.assertIn("name", query)
+
+    def test_it_returns_every_row_the_server_gave_it_untouched(self):
+        rows = _description_rows(3, "alpha")
+        t = _PerformerReadTransport(pages=[rows])
+        self.assertEqual(_read_stash(t).performers_with_descriptions(), rows)
+
+    def test_it_pages_past_the_first_page(self):
+        # HARM: a performer whose name sorts past the first page would never
+        # be looked at, so a markup-ridden description on any but the first
+        # 500 performers is invisible and stays that way.
+        pages = [_description_rows(PERFORMER_PAGE_SIZE, "alpha"),
+                 _description_rows(3, "omega")]
+        t = _PerformerReadTransport(pages=pages)
+        got = _read_stash(t).performers_with_descriptions()
+        self.assertEqual(got, pages[0] + pages[1])
+        self.assertEqual([v["f"]["page"] for _, v in t.calls], [1, 2])
+
+    def test_a_performer_with_no_description_comes_back_as_it_is(self):
+        # A normal answer, not a gap: most performers have none, and the
+        # client must not invent a string for them.
+        t = _PerformerReadTransport(
+            pages=[[{"id": "1", "name": "Wren Alderly", "details": None}]])
+        got = _read_stash(t).performers_with_descriptions()
+        self.assertEqual(got, [{"id": "1", "name": "Wren Alderly",
+                                "details": None}])
+
+
+class _PerformerWriteTransport:
+    """A media server holding one performer's description.
+
+    The READ answers whatever the description currently is; the WRITE records
+    the whole update input and then changes it, so a test can assert both what
+    was sent and what the server was left holding. `writes` stays empty when
+    the client refuses, which is how "nothing was written" is asserted rather
+    than assumed.
+    """
+
+    def __init__(self, details, performer_id="7", missing=False):
+        self.details = details
+        self.performer_id = performer_id
+        self.missing = missing
+        self.writes = []
+        self.reads = 0
+
+    def __call__(self, body, timeout):
+        query, variables = body["query"], body["variables"]
+        if "findPerformer(" in query:
+            self.reads += 1
+            if self.missing:
+                return {"data": {"findPerformer": None}}
+            return {"data": {"findPerformer": {"id": self.performer_id,
+                                               "details": self.details}}}
+        if "performerUpdate(" in query:
+            self.writes.append(variables["in"])
+            self.details = variables["in"].get("details", self.details)
+            return {"data": {"performerUpdate": {"id": self.performer_id}}}
+        raise AssertionError("test transport does not recognize query: %s"
+                             % query)
+
+
+class ApplyPerformerDescription(unittest.TestCase):
+    def test_it_writes_exactly_the_id_and_the_description_and_nothing_else(self):
+        # The WHOLE input, not a check that `details` is in it. An unlisted
+        # extra key on a performer update is how a field nobody meant to touch
+        # gets blanked across a library, and a field-by-field assertion cannot
+        # see one.
+        t = _PerformerWriteTransport("<p>Before.</p>")
+        Stash("http://example.test", "k", transport=t).\
+            apply_performer_description("7", "Before.",
+                                        expected="<p>Before.</p>")
+        self.assertEqual(t.writes, [{"id": "7", "details": "Before."}])
+
+    def test_it_returns_the_text_it_replaced_as_the_undo_snapshot(self):
+        t = _PerformerWriteTransport("<p>Before.</p>")
+        result = Stash("http://example.test", "k", transport=t).\
+            apply_performer_description("7", "Before.",
+                                        expected="<p>Before.</p>")
+        self.assertEqual(result, {"prior": {"details": "<p>Before.</p>"}})
+
+    def test_a_description_edited_since_the_scan_is_refused_and_not_written(self):
+        # HARM: the cleaned text is a function of the exact description it was
+        # computed from. Writing it over something somebody has since edited
+        # replaces their edit with a tidied-up copy of what they edited away,
+        # and the only record that it happened is an undo snapshot nobody is
+        # looking at.
+        t = _PerformerWriteTransport("Rewritten by hand since the scan.")
+        with self.assertRaises(StashError) as ctx:
+            Stash("http://example.test", "k", transport=t).\
+                apply_performer_description("7", "Before.",
+                                            expected="<p>Before.</p>")
+        self.assertIn("changed since the scan", str(ctx.exception))
+        self.assertEqual(t.writes, [])
+        self.assertEqual(t.details, "Rewritten by hand since the scan.")
+
+    def test_a_performer_the_server_does_not_know_is_refused(self):
+        t = _PerformerWriteTransport(None, missing=True)
+        with self.assertRaises(StashError):
+            Stash("http://example.test", "k", transport=t).\
+                apply_performer_description("7", "Before.",
+                                            expected="<p>Before.</p>")
+        self.assertEqual(t.writes, [])
+
+    def test_the_check_reads_the_server_rather_than_trusting_the_caller(self):
+        # The read has to actually happen: a client that compared `expected`
+        # with itself would agree every time and write unconditionally.
+        t = _PerformerWriteTransport("<p>Before.</p>")
+        Stash("http://example.test", "k", transport=t).\
+            apply_performer_description("7", "Before.",
+                                        expected="<p>Before.</p>")
+        self.assertEqual(t.reads, 1)
+
+
+class RevertPerformerDescription(unittest.TestCase):
+    def test_it_writes_back_the_snapshot_exactly_including_whitespace(self):
+        # Every character, whitespace and all. A revert that tidied what it
+        # restored would leave the field in a third state that is neither what
+        # was there before nor what was applied.
+        prior = {"details": "  <p>Before.</p>\n\n   trailing spaces   "}
+        t = _PerformerWriteTransport("After.")
+        Stash("http://example.test", "k", transport=t).\
+            revert_performer_description("7", prior)
+        self.assertEqual(
+            t.writes,
+            [{"id": "7",
+              "details": "  <p>Before.</p>\n\n   trailing spaces   "}])
+
+    def test_it_restores_an_empty_description_rather_than_refusing(self):
+        # A performer who had no description before the apply. Restoring
+        # exactly that is the job; treating it as a missing snapshot would
+        # leave the applied text in place and report success.
+        t = _PerformerWriteTransport("After.")
+        Stash("http://example.test", "k", transport=t).\
+            revert_performer_description("7", {"details": ""})
+        self.assertEqual(t.writes, [{"id": "7", "details": ""}])
+
+    def test_a_missing_or_empty_snapshot_is_refused_and_nothing_is_written(self):
+        # A revert that no-ops is indistinguishable from one that worked.
+        for prior in (None, {}, {"nothing": "useful"}):
+            with self.subTest(prior=prior):
+                t = _PerformerWriteTransport("After.")
+                with self.assertRaises(ValueError):
+                    Stash("http://example.test", "k", transport=t).\
+                        revert_performer_description("7", prior)
+                self.assertEqual(t.writes, [])
+
+
+class PerformerDescription(unittest.TestCase):
+    def test_it_reads_the_current_text(self):
+        t = _PerformerWriteTransport("<p>Now.</p>")
+        got = Stash("http://example.test", "k",
+                    transport=t).performer_description("7")
+        self.assertEqual(got, "<p>Now.</p>")
+
+    def test_an_unknown_performer_reads_as_no_description(self):
+        t = _PerformerWriteTransport(None, missing=True)
+        got = Stash("http://example.test", "k",
+                    transport=t).performer_description("7")
+        self.assertIsNone(got)

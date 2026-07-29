@@ -12,6 +12,7 @@ from unittest.mock import patch
 from cronicled.__main__ import build_scheduler, main
 from cronicled.adapters.declarative import DeclarativeAdapter
 from cronicled.config import CONFIG_DIR_ENV_VAR
+from cronicled.descriptions import PRODUCER_NAME as DESCRIPTION_PRODUCER_NAME
 from cronicled.jobs import JobRunner
 from cronicled.runscan import SCHEDULED_SCAN_NAME, build_producer
 from cronicled.scan import ScanProducer
@@ -22,6 +23,12 @@ from cronicled.web.actions import Actions
 WAIT = 10
 
 NOW = datetime(2026, 7, 27, 3, 0, 0, tzinfo=timezone.utc)
+
+# Every producer `build_scheduler` registers at start-up, sorted the way
+# `schedule.due` sorts its answer. Imported from the modules that name them
+# rather than copied, so renaming one cannot leave a test asserting the old
+# name against a schedule that no longer has it.
+BOTH_PRODUCERS = sorted([SCHEDULED_SCAN_NAME, DESCRIPTION_PRODUCER_NAME])
 
 # A store that exists nowhere. Every field is invented; `.invalid` is the
 # reserved TLD that cannot resolve, so nothing here can reach anything even
@@ -64,6 +71,14 @@ class _ReadOnlyStash:
 
     def stash_boxes(self):
         self.calls.append(("stash_boxes",))
+        return []
+
+    def performers_with_descriptions(self):
+        # The one read the description producer makes. An empty library, the
+        # same answer `unorganized_scenes` gives: these tests are about the
+        # SCHEDULING wiring, and a producer that found something to propose
+        # would only add store writes to what they have to assert about.
+        self.calls.append(("performers_with_descriptions",))
         return []
 
     def scrape_scene_url(self, url):
@@ -295,7 +310,7 @@ class SceneUrlWiring(_Base):
         with patch("cronicled.__main__.serve", captured):
             main(["--db", self.db_path, "--server", "http://media.example"])
         muted = captured.kwargs["muted"]()
-        self.assertEqual(muted[0]["scene_url"],
+        self.assertEqual(muted[0]["subject_url"],
                          "http://media.example/scenes/9")
 
 
@@ -538,10 +553,16 @@ class ScheduledScanWiring(_Base):
 
         result = scheduler.tick(NOW)
 
-        self.assertEqual(result.due, [SCHEDULED_SCAN_NAME])
-        self.assertEqual(list(result.started), [SCHEDULED_SCAN_NAME])
+        # Both start-up producers, and the whole set of them: the scan and the
+        # description pass are separate registrations with separate cadences,
+        # and asserting only that the scan is there would pass with the second
+        # one silently unscheduled.
+        self.assertEqual(result.due, BOTH_PRODUCERS)
+        self.assertEqual(sorted(result.started), BOTH_PRODUCERS)
         self.assertEqual(result.skipped, {})
         self.assertEqual(result.failed_to_start, {})
+        self.assertTrue(self.runner.wait(
+            result.started[DESCRIPTION_PRODUCER_NAME], WAIT))
         # It started for real, through the runner, and ran to completion --
         # not merely "a name came back from the schedule".
         job_id = result.started[SCHEDULED_SCAN_NAME]
@@ -569,7 +590,7 @@ class ScheduledScanWiring(_Base):
         # unbounded, still on its own cadence.
         scheduler = self._build()
         before = {p.name: p for p in self.runner.producers()}
-        self.assertEqual(sorted(before), [SCHEDULED_SCAN_NAME])
+        self.assertEqual(sorted(before), BOTH_PRODUCERS)
         actions = Actions(self.store, self.stash, runner=self.runner,
                           adapters=self.adapters)
 
@@ -578,7 +599,7 @@ class ScheduledScanWiring(_Base):
 
         after = {p.name: p for p in self.runner.producers()}
         self.assertEqual(sorted(after),
-                         sorted([ScanProducer.name, SCHEDULED_SCAN_NAME]))
+                         sorted([ScanProducer.name] + BOTH_PRODUCERS))
         nightly = after[SCHEDULED_SCAN_NAME]
         self.assertIs(nightly, before[SCHEDULED_SCAN_NAME])
         self.assertIsNone(nightly._limit)
@@ -586,7 +607,9 @@ class ScheduledScanWiring(_Base):
         self.assertEqual(after[ScanProducer.name]._limit, 25)
         # And the schedule still starts the unbounded one afterwards.
         result = scheduler.tick(NOW)
-        self.assertEqual(list(result.started), [SCHEDULED_SCAN_NAME])
+        self.assertEqual(sorted(result.started), BOTH_PRODUCERS)
+        self.assertTrue(self.runner.wait(
+            result.started[DESCRIPTION_PRODUCER_NAME], WAIT))
 
     def test_the_scheduled_and_manual_scans_never_scrape_at_once(self):
         # Asserted on the runner's own accounting, never on timing: the
@@ -602,11 +625,17 @@ class ScheduledScanWiring(_Base):
 
         result = scheduler.tick(NOW)
 
-        self.assertEqual(result.due, [SCHEDULED_SCAN_NAME])
-        self.assertEqual(result.started, {})
+        self.assertEqual(result.due, BOTH_PRODUCERS)
+        # The scan is held off by the busy cost class; the description pass
+        # is NOT, and that is the point of it being `local` rather than
+        # `scraping` -- it drives no scraper, so queueing it behind a
+        # twenty-minute scrape would be a limit protecting nothing.
+        self.assertEqual(list(result.started), [DESCRIPTION_PRODUCER_NAME])
         self.assertEqual(result.failed_to_start, {})
         self.assertEqual(list(result.skipped), [SCHEDULED_SCAN_NAME])
         self.assertIn("cost class", result.skipped[SCHEDULED_SCAN_NAME])
+        self.assertTrue(self.runner.wait(
+            result.started[DESCRIPTION_PRODUCER_NAME], WAIT))
         running = [job.producer for job in self.runner.jobs()
                    if job.state == "running"]
         self.assertEqual(running, [ScanProducer.name])
@@ -632,6 +661,10 @@ class ScheduledScanWiring(_Base):
     def test_the_cadence_is_overridable_through_the_existing_mechanism(self):
         self.store.record_run(SCHEDULED_SCAN_NAME, _ago(hours=2))
         self._schedule_file({SCHEDULED_SCAN_NAME: {"every": 3600}})
+        # Held off so this test says something about the scan's cadence and
+        # nothing about the description pass, which has never run and is
+        # therefore due whatever the override says.
+        self.store.record_run(DESCRIPTION_PRODUCER_NAME, _ago(hours=2))
         scheduler = self._build()
 
         result = scheduler.tick(NOW)
@@ -643,17 +676,19 @@ class ScheduledScanWiring(_Base):
         # fixture that was due anyway, and would go on passing with the
         # overrides never reaching `resolve` at all.
         self.store.record_run(SCHEDULED_SCAN_NAME, _ago(hours=2))
+        self.store.record_run(DESCRIPTION_PRODUCER_NAME, _ago(hours=2))
         scheduler = self._build()
 
         result = scheduler.tick(NOW)
 
         self.assertEqual(result.due, [])
         self.assertEqual(result.started, {})
-        self.assertEqual(list(result.skipped), [SCHEDULED_SCAN_NAME])
+        self.assertEqual(sorted(result.skipped), BOTH_PRODUCERS)
         self.assertIn("next due at", result.skipped[SCHEDULED_SCAN_NAME])
 
     def test_the_scheduled_scan_can_be_disabled_through_the_same_file(self):
-        self._schedule_file({SCHEDULED_SCAN_NAME: {"enabled": False}})
+        self._schedule_file({SCHEDULED_SCAN_NAME: {"enabled": False},
+                             DESCRIPTION_PRODUCER_NAME: {"enabled": False}})
         scheduler = self._build()
 
         result = scheduler.tick(NOW)
@@ -661,8 +696,9 @@ class ScheduledScanWiring(_Base):
         self.assertEqual(result.due, [])
         self.assertEqual(result.started, {})
         self.assertEqual(result.failed_to_start, {})
-        self.assertEqual(list(result.skipped), [SCHEDULED_SCAN_NAME])
+        self.assertEqual(sorted(result.skipped), BOTH_PRODUCERS)
         self.assertIn("disabled", result.skipped[SCHEDULED_SCAN_NAME])
+        self.assertIn("disabled", result.skipped[DESCRIPTION_PRODUCER_NAME])
         self.assertEqual(self.runner.jobs(), [])
 
     def test_an_override_naming_a_producer_that_does_not_exist_is_refused(self):
@@ -686,14 +722,27 @@ class ScheduledScanWiring(_Base):
         self.assertIn("no scan is scheduled", out.getvalue())
         self.assertIn("--server", out.getvalue())
 
-    def test_no_configured_adapter_schedules_nothing_and_says_so(self):
+    def test_no_configured_adapter_schedules_the_description_pass_only(self):
+        # The two producers need different things, so an install missing one
+        # of them must not be an all-or-nothing decision: a scan needs a store
+        # to search against, while a description pass reads a field the server
+        # already holds. Folding them together would leave a producer with a
+        # perfectly good reason to run silently unregistered.
         out = io.StringIO()
         with redirect_stdout(out):
             scheduler = self._build(adapters={})
-        self.assertIsNone(scheduler)
-        self.assertEqual(self.runner.producers(), [])
+        self.assertIsNotNone(scheduler)
+        self.assertEqual([p.name for p in self.runner.producers()],
+                         [DESCRIPTION_PRODUCER_NAME])
         self.assertIn("no scan is scheduled", out.getvalue())
         self.assertIn("adapters.json", out.getvalue())
+
+        result = scheduler.tick(NOW)
+
+        self.assertEqual(result.due, [DESCRIPTION_PRODUCER_NAME])
+        self.assertEqual(list(result.started), [DESCRIPTION_PRODUCER_NAME])
+        self.assertTrue(self.runner.wait(
+            result.started[DESCRIPTION_PRODUCER_NAME], WAIT))
 
 
 class SchedulerLifecycleInMain(_Base):
@@ -741,8 +790,8 @@ class SchedulerLifecycleInMain(_Base):
         captured = self._run_main()
 
         result = captured.kwargs["schedule_status"]().last_result
-        self.assertEqual(result.due, [SCHEDULED_SCAN_NAME])
-        self.assertEqual(list(result.started), [SCHEDULED_SCAN_NAME])
+        self.assertEqual(result.due, BOTH_PRODUCERS)
+        self.assertEqual(sorted(result.started), BOTH_PRODUCERS)
         self.assertEqual(result.skipped, {})
         self.assertEqual(result.failed_to_start, {})
 

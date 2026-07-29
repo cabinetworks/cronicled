@@ -3,8 +3,9 @@ import unittest
 from cronicled.scan import _runners_up
 from cronicled.scoring import Match
 from cronicled.web.rows import (
-    IDENTIFIED_SCORE_TEXT, Row, scene_url, to_mute_row, to_mute_rows,
-    to_refusal_row, to_refusal_rows, to_row, to_rows,
+    IDENTIFIED_SCORE_TEXT, KIND_DESCRIPTION, KIND_SCENE, Row, scene_url,
+    to_description_row, to_mute_row, to_mute_rows, to_refusal_row,
+    to_refusal_rows, to_row, to_rows,
 )
 
 
@@ -40,9 +41,13 @@ def _item(**over):
         "runners_up": _real_runners_up([("The Lantern", 0.61)]),
     }
     payload.update(over.pop("payload", {}))
+    # `subject_type` is a NOT NULL column on `item` (see cronicled/store.py's
+    # schema), so every real row `Store.items()` returns carries one. It is in
+    # this fixture for that reason rather than for `to_rows`' sake: a helper
+    # standing in for a store row must not be more forgiving than the store.
     item = {"fingerprint": "fp-1", "state": "new", "summary": "s",
             "confidence": 0.8123, "payload": payload, "prior_state": None,
-            "subject_id": "42"}
+            "subject_type": "scene", "subject_id": "42"}
     item.update(over)
     return item
 
@@ -275,7 +280,23 @@ class ToMuteRowTest(unittest.TestCase):
     def test_a_recoverable_payload_is_shown_by_filename(self):
         row = to_mute_row(self._entry(
             payload={"path": "/library/Nine Winters/reel.mp4"}))
-        self.assertEqual(row["filename"], "reel.mp4")
+        self.assertEqual(row["subject_label"], "reel.mp4")
+
+    def test_a_muted_performer_is_labelled_by_name_and_linked_as_one(self):
+        # A mute is keyed by (subject_type, subject_id) and one click on a
+        # description proposal's Mute button puts a performer in this list.
+        # Reading a filename off a payload that has no path took out the whole
+        # Muted section -- and with it the only control that lifts the mute.
+        row = to_mute_row(
+            {"subject_type": "performer", "subject_id": "7",
+             "reason": "leave this one alone", "at": "2026-07-27T00:00:00",
+             "payload": {"name": "Wren Alderly", "field": "details",
+                         "faults": ["markup"], "original": "<p>x</p>",
+                         "cleaned": "x"}},
+            base_url="http://media.example")
+        self.assertEqual(row["subject_label"], "Wren Alderly")
+        self.assertEqual(row["subject_url"],
+                         "http://media.example/performers/7")
 
     def test_no_payload_at_all_reports_no_filename(self):
         # The genuine exception: muted ahead of any proposal ever being
@@ -283,7 +304,7 @@ class ToMuteRowTest(unittest.TestCase):
         # become an empty string or the subject id -- that is the
         # template's job to mark as the exception, not this one's to hide.
         row = to_mute_row(self._entry(payload=None))
-        self.assertIsNone(row["filename"])
+        self.assertIsNone(row["subject_label"])
 
     def test_carries_the_subject_reason_and_when(self):
         row = to_mute_row(self._entry())
@@ -295,11 +316,11 @@ class ToMuteRowTest(unittest.TestCase):
     def test_carries_its_scene_url_when_configured(self):
         row = to_mute_row(self._entry(subject_id="9"),
                           base_url="http://media.example")
-        self.assertEqual(row["scene_url"], "http://media.example/scenes/9")
+        self.assertEqual(row["subject_url"], "http://media.example/scenes/9")
 
     def test_has_no_scene_url_without_a_configured_server(self):
         row = to_mute_row(self._entry())
-        self.assertIsNone(row["scene_url"])
+        self.assertIsNone(row["subject_url"])
 
     def test_to_mute_rows_converts_every_entry_and_keeps_their_order(self):
         entries = [self._entry(subject_id="1"), self._entry(subject_id="2")]
@@ -693,3 +714,99 @@ class IdentifiedRow(unittest.TestCase):
         del item["payload"]["score"]
         with self.assertRaises(KeyError):
             to_row(item)
+
+
+# -- description proposals ------------------------------------------------- #
+
+
+def _description_item(**over):
+    item = {"fingerprint": "fp-d", "state": "new",
+            "subject_type": "performer", "subject_id": "7",
+            "summary": "Wren Alderly: description contains markup",
+            "confidence": None, "prior_state": None,
+            "payload": {"name": "Wren Alderly", "field": "details",
+                        "faults": ["markup", "entity"],
+                        "original": "<p>Marsh &amp; Holloway.</p>",
+                        "cleaned": "Marsh & Holloway."}}
+    item.update(over)
+    return item
+
+
+class ToDescriptionRowTest(unittest.TestCase):
+    def test_it_carries_both_texts_so_there_is_something_to_judge_against(self):
+        # THE row's reason for existing. A row carrying only the cleaned value
+        # asks a reviewer to approve a write to a field whose previous
+        # contents they cannot see -- so both are asserted, in full, rather
+        # than one of them plus "the tag is gone".
+        row = to_description_row(_description_item())
+
+        self.assertEqual(row.original, "<p>Marsh &amp; Holloway.</p>")
+        self.assertEqual(row.cleaned, "Marsh & Holloway.")
+        self.assertEqual(row.name, "Wren Alderly")
+        self.assertEqual(row.faults, ("markup", "entity"))
+        self.assertEqual(row.kind, KIND_DESCRIPTION)
+
+    def test_a_payload_missing_either_text_raises_rather_than_showing_blank(self):
+        # An empty "before" panel reads as "this field was empty and is being
+        # filled in" -- the one reading that gets a destructive rewrite
+        # approved without a second look.
+        for missing in ("original", "cleaned", "name", "faults"):
+            with self.subTest(missing=missing):
+                payload = dict(_description_item()["payload"])
+                del payload[missing]
+                with self.assertRaises(KeyError):
+                    to_description_row(_description_item(payload=payload))
+
+    def test_it_links_to_the_performer_not_to_a_scene(self):
+        row = to_description_row(_description_item(),
+                                 base_url="http://media.example")
+        self.assertEqual(row.performer_url, "http://media.example/performers/7")
+
+    def test_no_configured_server_leaves_the_link_out(self):
+        self.assertIsNone(to_description_row(_description_item()).performer_url)
+
+    def test_an_applied_row_with_a_snapshot_offers_undo(self):
+        row = to_description_row(_description_item(
+            state="applied", prior_state={"details": "<p>x</p>"}))
+        self.assertTrue(row.undoable)
+        self.assertFalse(row.actionable)
+
+    def test_an_applied_row_without_a_snapshot_offers_no_undo(self):
+        # `revert_performer_description` raises on an empty snapshot, so the
+        # button would promise something the code cannot do.
+        row = to_description_row(_description_item(state="applied"))
+        self.assertFalse(row.undoable)
+
+    def test_a_failed_row_keeps_its_controls_and_says_why(self):
+        row = to_description_row(_description_item(
+            state="failed", error="server said no"))
+        self.assertTrue(row.actionable)
+        self.assertEqual(row.error, "server said no")
+
+
+class ToRowsDispatch(unittest.TestCase):
+    def test_each_item_becomes_the_row_its_own_subject_type_needs(self):
+        # HARM: a description item put through the scene builder raises on
+        # `payload["path"]`, taking out the whole page for every other row on
+        # it. The reverse -- a scene row drawn with the description shape --
+        # would show a block with no filename, no title and no score, which is
+        # a proposal a person cannot judge and can still approve.
+        rows = to_rows([_item(fingerprint="fp-s"),
+                        _description_item(fingerprint="fp-d")])
+
+        self.assertEqual([r.kind for r in rows],
+                         [KIND_SCENE, KIND_DESCRIPTION])
+        self.assertEqual([r.fingerprint for r in rows], ["fp-s", "fp-d"])
+
+    def test_the_base_url_reaches_both_kinds_of_row(self):
+        rows = to_rows([_item(subject_id="3"), _description_item()],
+                       base_url="http://media.example")
+        self.assertEqual(rows[0].scene_url, "http://media.example/scenes/3")
+        self.assertEqual(rows[1].performer_url,
+                         "http://media.example/performers/7")
+
+    def test_a_scene_row_still_says_which_kind_it_is(self):
+        # Without this the template's branch reads an undefined attribute for
+        # every scene row -- which Jinja renders as empty text rather than
+        # raising, so it would take the description branch's `else` by luck.
+        self.assertEqual(to_row(_item()).kind, KIND_SCENE)
