@@ -294,9 +294,9 @@ def main(argv=None):
         no Refresh, so nothing puts one there.
 
         Muted clusters come from `items(state="muted")`, not from
-        `store.mutes()`: that is what keeps `to_mute_row` -- which knows how
-        to label exactly two subject kinds, a performer by `name` and
-        anything else by `path` -- from ever being handed a merge payload,
+        `store.mutes()`: that is what keeps `to_mute_row` -- which builds
+        its row through `to_rows`, and so knows exactly the two subject
+        kinds `to_rows` does -- from ever being handed a merge payload,
         which answers to neither. It also shows the spellings and their
         counts rather than a bare subject id. A cluster muted with no row
         of its own at all would be
@@ -317,9 +317,9 @@ def main(argv=None):
         # Every section but Merges filters tag clusters out for the reason
         # `_inbox_rows` states: `to_rows` dispatches between a scene and a
         # performer-description row and has no third branch, and `to_mute_row`
-        # labels a performer by `name` and everything else by `path`. A merge
-        # payload answers to none of those, so one cluster in the wrong list
-        # is a KeyError that takes the whole page down.
+        # goes through `to_rows` for exactly that reason. A merge payload
+        # answers to neither, so one cluster in the wrong list is a KeyError
+        # that takes the whole page down.
         serve(rows=_inbox_rows,
               merges=_merge_rows,
               muted=lambda: to_mute_rows(

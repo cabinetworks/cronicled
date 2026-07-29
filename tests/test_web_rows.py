@@ -1,7 +1,7 @@
 import unittest
 from dataclasses import asdict
 
-from cronicled.scan import _runners_up
+from cronicled.scan import _runners_up, candidate_url
 from cronicled.scoring import Match
 from cronicled.tags import MERGE_IS_IRREVERSIBLE, UNDECIDED_MANY, cluster_tags
 from cronicled.tags import proposal as tag_proposal
@@ -14,7 +14,7 @@ from cronicled.web.rows import (
 
 
 def _real_runners_up(losers, winner_title="The Lantern Room",
-                      winner_score=0.8123):
+                      winner_score=0.8123, winner_urls=None):
     """Build a `runners_up` payload value the way `scan._runners_up` actually
     does, rather than hand-writing the dict it returns.
 
@@ -23,12 +23,17 @@ def _real_runners_up(losers, winner_title="The Lantern Room",
     `candidate`. Calling the real function on invented candidates and matches
     means this fixture cannot drift from what `to_row` will actually be
     handed. `losers` is a list of `(title, score)` pairs for the candidates
-    that lost; an empty list is a proposal with no rivals, which is normal.
+    that lost -- or `(title, score, urls)` triples where the loser's own
+    address matters; an empty list is a proposal with no rivals, which is
+    normal.
     """
-    candidates = [{"id": "c-0", "title": winner_title}]
+    candidates = [{"id": "c-0", "title": winner_title,
+                   "urls": winner_urls or []}]
     matches = [Match(value=winner_score, contained=True, meaningful_count=3)]
-    for i, (title, value) in enumerate(losers, start=1):
-        candidates.append({"id": "c-%d" % i, "title": title})
+    for i, loser in enumerate(losers, start=1):
+        title, value = loser[0], loser[1]
+        urls = loser[2] if len(loser) > 2 else []
+        candidates.append({"id": "c-%d" % i, "title": title, "urls": urls})
         matches.append(Match(value=value, contained=True, meaningful_count=2))
     return _runners_up(candidates, matches, winning_index=0)
 
@@ -242,6 +247,119 @@ class RowSceneUrl(unittest.TestCase):
                           "http://media.example/scenes/2"])
 
 
+class RowCandidateUrl(unittest.TestCase):
+    """Where the PROPOSED title came from -- the candidate's own page on the
+    store that offered it, which is the one piece of evidence the proposal is
+    built on and was previously only reachable by retyping a title into a
+    search by hand.
+
+    Not to be confused with `scene_url` above: that is the file as the media
+    server holds it today, this is the record a person is being asked to
+    overwrite it with. Confusing the two sends a reviewer to check a
+    candidate and shows them the thing they were checking it against.
+    """
+
+    def _with_candidate(self, **fields):
+        candidate = {"id": "c-1", "title": "The Lantern Room", "image": None,
+                     "performers": [], "studio": None}
+        candidate.update(fields)
+        return to_row(_item(payload={"candidate": candidate}))
+
+    def test_a_store_candidate_links_to_its_own_page(self):
+        row = self._with_candidate(urls=["https://store.example/lantern-room"])
+        self.assertEqual(row.candidate_url,
+                         "https://store.example/lantern-room")
+
+    def test_a_candidate_with_no_address_at_all_has_none(self):
+        # A name search commonly returns a title and nothing else. `None` is
+        # the honest answer and renders as text; anything else here would be
+        # an address this row invented.
+        self.assertIsNone(self._with_candidate().candidate_url)
+
+    def test_an_empty_url_is_no_url_and_never_an_empty_anchor(self):
+        # Both spellings of "the store gave us the key and nothing in it".
+        # An anchor with an empty href looks like a link and goes to the
+        # page it is already on.
+        self.assertIsNone(self._with_candidate(urls=[], url="").candidate_url)
+
+    def test_it_matches_the_precedence_an_apply_writes_with(self):
+        # `urls` wins over the deprecated singular `url`, which is the
+        # precedence `Stash.apply_scene` uses when deciding what to write
+        # onto the scene. A second derivation here -- one reading `url`
+        # first, or reading only one of the two -- would offer a link to a
+        # page an approve would then NOT write, which is worse than no link:
+        # it is evidence the reviewer did not actually have.
+        row = self._with_candidate(urls=["https://store.example/plural"],
+                                   url="https://store.example/singular")
+        self.assertEqual(row.candidate_url, "https://store.example/plural")
+
+    def test_the_singular_url_is_still_read_when_the_plural_is_empty(self):
+        row = self._with_candidate(urls=[],
+                                   url="https://store.example/singular")
+        self.assertEqual(row.candidate_url, "https://store.example/singular")
+
+    def test_it_is_the_projects_one_rule_and_not_a_second_reading(self):
+        # Asserted as agreement with the shared rule on a candidate whose two
+        # address fields DISAGREE -- the only input on which a re-derivation
+        # and the real thing can be told apart at all.
+        candidate = {"id": "c-1", "title": "The Lantern Room", "image": None,
+                     "performers": [], "studio": None,
+                     "urls": ["https://store.example/plural"],
+                     "url": "https://store.example/singular"}
+        self.assertEqual(to_row(_item(payload={"candidate": candidate})).candidate_url,
+                         candidate_url(candidate))
+
+    def test_every_runner_up_carries_its_own_address(self):
+        # A losing candidate is exactly the one an operator opens before
+        # overriding a decision. Two losers with DIFFERENT addresses, so a
+        # builder handing every runner-up the first loser's link -- or the
+        # winner's -- fails here rather than sending a reviewer to the wrong
+        # page.
+        row = to_row(_item(payload={"runners_up": _real_runners_up(
+            [("The Lantern", 0.61, ["https://store.example/lantern"]),
+             ("Lantern Nights", 0.55, ["https://store.example/nights"])],
+            winner_urls=["https://store.example/winner"])}))
+        self.assertEqual([r["url"] for r in row.runners_up],
+                         ["https://store.example/lantern",
+                          "https://store.example/nights"])
+
+    def test_a_runner_up_with_no_address_has_none_rather_than_the_winners(self):
+        row = to_row(_item(payload={"runners_up": _real_runners_up(
+            [("The Lantern", 0.61)],
+            winner_urls=["https://store.example/winner"])}))
+        self.assertIsNone(row.runners_up[0]["url"])
+
+    def test_a_fingerprint_identified_row_links_the_candidate_not_the_endpoint(self):
+        # A box's `endpoint` is a GraphQL API address, not a page a person
+        # can open, and there is no rule anywhere in this project that turns
+        # one into the other. The match itself comes back through the same
+        # selection set a text scrape uses and carries its own address, so
+        # THAT is what is linked -- and the endpoint and the box's id must
+        # not be assembled into a second, guessed one.
+        row = to_row(_item(payload={
+            "identified_by": "fingerprint", "box": "a-box",
+            "endpoint": "https://box.example/graphql",
+            "remote_site_id": "6d3f-scene",
+            "candidate": {"id": "c-1", "title": "The Lantern Room",
+                          "image": None, "performers": [], "studio": None,
+                          "urls": ["https://store.example/lantern-room"]}}))
+        self.assertEqual(row.candidate_url,
+                         "https://store.example/lantern-room")
+
+    def test_a_fingerprint_identification_with_no_candidate_address_has_none(self):
+        # THE guard against a second derivation: everything needed to build
+        # `endpoint + "/scenes/" + remote_site_id` is sitting in this
+        # payload, and the honest answer is still `None`. Uncertainty may
+        # withhold evidence and never supply it.
+        row = to_row(_item(payload={
+            "identified_by": "fingerprint", "box": "a-box",
+            "endpoint": "https://box.example/graphql",
+            "remote_site_id": "6d3f-scene",
+            "candidate": {"id": "c-1", "title": "The Lantern Room",
+                          "image": None, "performers": [], "studio": None}}))
+        self.assertIsNone(row.candidate_url)
+
+
 class ToRefusalRowSceneUrl(unittest.TestCase):
     def _entry(self, **over):
         entry = {"subject_type": "scene", "subject_id": "1",
@@ -269,46 +387,83 @@ class ToRefusalRowSceneUrl(unittest.TestCase):
 
 
 class ToMuteRowTest(unittest.TestCase):
-    """`Store.mutes()`'s dict shape -> what the Muted section shows --
-    ticket 97's headline case: a muted subject named by its filename, not a
-    bare id, whenever one can be recovered.
+    """`Store.mutes()`'s dict shape -> what the Muted section shows.
+
+    A muted subject and a dismissed one are the same thing seen twice --
+    something a person hid that they may want back -- so a muted entry
+    carries the SAME row the Dismissed section renders, and the only
+    difference between the two is the control.
     """
 
     def _entry(self, **over):
         entry = {"subject_type": "scene", "subject_id": "1",
                  "reason": "never identifiable",
-                 "at": "2026-07-27T00:00:00", "payload": None}
+                 "at": "2026-07-27T00:00:00", "item": None}
         entry.update(over)
         return entry
 
-    def test_a_recoverable_payload_is_shown_by_filename(self):
-        row = to_mute_row(self._entry(
-            payload={"path": "/library/Nine Winters/reel.mp4"}))
-        self.assertEqual(row["subject_label"], "reel.mp4")
+    def test_a_recovered_item_carries_every_field_a_dismissed_row_carries(self):
+        # The requirement itself: the Muted section showed a subject id and
+        # a sentence, while the Dismissed section beside it showed the file,
+        # the proposed title, the attribution and the score. Every one of
+        # those is asserted here against a distinct real value, so dropping
+        # any single one fails -- checking only the filename would have
+        # passed the thin row that started this.
+        row = to_mute_row(
+            self._entry(subject_id="42",
+                        item=_item(state="muted", subject_id="42",
+                                   payload={"candidate": {
+                                       "id": "c-1",
+                                       "title": "The Lantern Room",
+                                       "image": None, "performers": [],
+                                       "studio": None,
+                                       "urls": ["https://store.example/l"]}})),
+            base_url="http://media.example")["row"]
 
-    def test_a_muted_performer_is_labelled_by_name_and_linked_as_one(self):
+        self.assertEqual(row.kind, KIND_SCENE)
+        self.assertEqual(row.filename, "nine-winters-the-lantern-room.mp4")
+        self.assertEqual(row.proposed_title, "The Lantern Room")
+        self.assertEqual(row.creator, "Nine Winters")
+        self.assertEqual(row.creator_source, "folder")
+        self.assertEqual(row.score_text, "0.812")
+        self.assertEqual(row.scene_url, "http://media.example/scenes/42")
+        self.assertEqual(row.candidate_url, "https://store.example/l")
+
+    def test_a_muted_performer_becomes_the_description_row_it_is(self):
         # A mute is keyed by (subject_type, subject_id) and one click on a
         # description proposal's Mute button puts a performer in this list.
-        # Reading a filename off a payload that has no path took out the whole
-        # Muted section -- and with it the only control that lifts the mute.
+        # Putting one through the scene builder raised a `KeyError` that took
+        # out the whole Muted section -- and with it the only control that
+        # lifts the mute. Dispatched on the item's own `subject_type`, the
+        # same way every other section dispatches.
         row = to_mute_row(
             {"subject_type": "performer", "subject_id": "7",
              "reason": "leave this one alone", "at": "2026-07-27T00:00:00",
-             "payload": {"name": "Wren Alderly", "field": "details",
-                         "faults": ["markup"], "original": "<p>x</p>",
-                         "cleaned": "x"}},
-            base_url="http://media.example")
-        self.assertEqual(row["subject_label"], "Wren Alderly")
-        self.assertEqual(row["subject_url"],
+             "item": _description_item()},
+            base_url="http://media.example")["row"]
+
+        self.assertEqual(row.kind, KIND_DESCRIPTION)
+        self.assertEqual(row.name, "Wren Alderly")
+        self.assertEqual(row.performer_url,
                          "http://media.example/performers/7")
 
-    def test_no_payload_at_all_reports_no_filename(self):
+    def test_no_item_at_all_has_no_row_rather_than_a_blank_one(self):
         # The genuine exception: muted ahead of any proposal ever being
-        # recorded for the subject. This must stay `None`, not silently
-        # become an empty string or the subject id -- that is the
-        # template's job to mark as the exception, not this one's to hide.
-        row = to_mute_row(self._entry(payload=None))
-        self.assertIsNone(row["subject_label"])
+        # recorded for the subject. This must stay `None`, not become a row
+        # of empty fields -- blank fields read as a page that failed to
+        # render, and this case is real and must go on saying so. Marking it
+        # visibly as the exception is the template's job, not this one's.
+        self.assertIsNone(to_mute_row(self._entry(item=None))["row"])
+
+    def test_an_item_that_cannot_answer_raises_rather_than_reading_as_none(self):
+        # `Store.mutes()` answers either `None` -- nothing was ever proposed
+        # for this subject -- or a whole decoded row. Anything else is a
+        # wiring fault, and folding it into the `None` branch would draw the
+        # honest exception ("muted before any proposal was ever recorded")
+        # over a subject that HAS one: a real proposal hidden behind a
+        # sentence saying there is none, which is worse than the crash.
+        with self.assertRaises(KeyError):
+            to_mute_row(self._entry(item={}))
 
     def test_carries_the_subject_reason_and_when(self):
         row = to_mute_row(self._entry())
@@ -318,9 +473,18 @@ class ToMuteRowTest(unittest.TestCase):
         self.assertEqual(row["at"], "2026-07-27T00:00:00")
 
     def test_carries_its_scene_url_when_configured(self):
+        # Read by the no-item branch, which has no row to take an address
+        # from and still knows which subject it is.
         row = to_mute_row(self._entry(subject_id="9"),
                           base_url="http://media.example")
         self.assertEqual(row["subject_url"], "http://media.example/scenes/9")
+
+    def test_a_muted_performer_with_no_item_links_to_the_performer_page(self):
+        row = to_mute_row(
+            {"subject_type": "performer", "subject_id": "7", "reason": "r",
+             "at": "t", "item": None}, base_url="http://media.example")
+        self.assertEqual(row["subject_url"],
+                         "http://media.example/performers/7")
 
     def test_has_no_scene_url_without_a_configured_server(self):
         row = to_mute_row(self._entry())
@@ -334,8 +498,10 @@ class ToMuteRowTest(unittest.TestCase):
     def test_a_payload_missing_its_path_raises_rather_than_hiding_the_filename(self):
         # Same discipline as `to_row`'s own `filename`: a payload that
         # exists but cannot answer `path` is malformed, not "no filename".
+        broken = _item()
+        del broken["payload"]["path"]
         with self.assertRaises(KeyError):
-            to_mute_row(self._entry(payload={"title": "no path here"}))
+            to_mute_row(self._entry(item=broken))
 
 
 class CoverImage(unittest.TestCase):

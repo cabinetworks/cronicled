@@ -7,7 +7,7 @@ from cronicled.tags import cluster_tags
 from cronicled.tags import proposal as tag_proposal
 from cronicled.web.render import environment, render
 from cronicled.web.rows import (
-    to_description_row, to_merge_row, to_refusal_row, to_row,
+    to_description_row, to_merge_row, to_mute_row, to_refusal_row, to_row,
 )
 
 _HOSTILE = '<script>alert("x")</script>'
@@ -22,21 +22,28 @@ def _job(**over):
     return Job(**job)
 
 
-def _row(runners_up=None, image=None, base_url=None, **over):
-    # `runners_up` and `image` are their own parameters, not folded into
-    # `**over`: both live under `payload` in the real item shape, and
-    # `item.update(over)` only ever touches the top level. Routing either
-    # through `over` would silently keep the default fixture's value on
-    # every call that tried to override it -- exactly the kind of
+def _scene_item(runners_up=None, image=None, urls=None, payload_over=None,
+                **over):
+    # `runners_up`, `image` and `urls` are their own parameters, not folded
+    # into `**over`: all three live under `payload` in the real item shape,
+    # and `item.update(over)` only ever touches the top level. Routing any
+    # of them through `over` would silently keep the default fixture's value
+    # on every call that tried to override it -- exactly the kind of
     # blank-column bug this task exists to catch, just moved into the test
     # instead of the template. `image` defaults to `None` -- "no cover",
     # matching every existing caller here that never mentions a cover.
+    #
+    # `urls` defaults to NOTHING on the candidate, which is a real shape: a
+    # name search commonly returns a title and no address at all, and it is
+    # the shape that must render as plain text rather than as an anchor
+    # pointing nowhere.
     payload = {
         "path": "/library/x/%s.mp4" % _HOSTILE,
         "creator": {"name": _HOSTILE, "source": "folder",
                     "competing": _HOSTILE, "rejected_folder": _HOSTILE},
         "candidate": {"id": "c-1", "title": _HOSTILE, "image": image,
-                     "performers": [], "studio": None},
+                     "performers": [], "studio": None,
+                     "urls": [] if urls is None else urls},
         "score": 0.812,
         # Nested under `candidate`, matching what `scan._runners_up` actually
         # emits and what `rows.to_row` requires -- see test_web_rows.py's
@@ -46,11 +53,19 @@ def _row(runners_up=None, image=None, base_url=None, **over):
         "runners_up": ([{"candidate": {"title": _HOSTILE}, "score": 0.61}]
                         if runners_up is None else runners_up),
     }
+    payload.update(payload_over or {})
     item = {"fingerprint": "fp-1", "state": "new", "summary": "s",
             "confidence": 0.812, "payload": payload, "prior_state": None,
-            "subject_id": "1"}
+            "subject_type": "scene", "subject_id": "1"}
     item.update(over)
-    return to_row(item, base_url=base_url)
+    return item
+
+
+def _row(runners_up=None, image=None, base_url=None, urls=None,
+         payload_over=None, **over):
+    return to_row(_scene_item(runners_up=runners_up, image=image, urls=urls,
+                              payload_over=payload_over, **over),
+                  base_url=base_url)
 
 
 class Autoescaping(unittest.TestCase):
@@ -668,49 +683,260 @@ class SceneLinks(unittest.TestCase):
         self.assertNotIn("scenes/42", html)
 
 
-class MutedSubjectFilename(unittest.TestCase):
-    """Ticket 97's headline case: the Muted section names the file, not a
-    bare scene id, whenever the store recovered one -- and marks the
-    genuine exception (no proposal ever recorded) visibly rather than
-    blending it in.
+class CandidateLinks(unittest.TestCase):
+    """The proposed title links to the candidate's own page on the store it
+    came from, so the one piece of evidence a proposal is built on is a
+    click away rather than a title retyped into a search by hand.
     """
 
-    def test_a_recoverable_muted_entry_shows_the_filename_not_the_id(self):
-        html = render("inbox.html", rows=[], counts={},
-                      muted=[{"subject_type": "scene", "subject_id": "12962",
-                             "reason": "never identifiable", "at": "t",
-                             "subject_label": "reel.mp4",
-                             "subject_url": None}],
-                      dismissed=[], refused=[])
-        start = html.index("Muted (")
-        section = html[start:html.index("</details>", start)]
-        self.assertIn("reel.mp4", section)
-        self.assertNotIn("scene 12962", section)
+    _WHOLE_ANCHOR = ('<a href="https://store.example/lantern-room" '
+                     'target="_blank" rel="noopener noreferrer">')
 
-    def test_no_recoverable_payload_shows_the_id_marked_as_the_exception(self):
-        # The genuine exception ticket 97 names: muted ahead of any
-        # proposal ever being recorded. Showing the id is honest here, but
-        # it must be visibly the exception -- the `subject-unknown` class
-        # and the explanatory aside are what make it look unlike every
-        # other, ordinary filename row.
-        html = render("inbox.html", rows=[], counts={},
-                      muted=[{"subject_type": "scene", "subject_id": "12962",
-                             "reason": "never identifiable", "at": "t",
-                             "subject_label": None, "subject_url": None}],
-                      dismissed=[], refused=[])
-        start = html.index("Muted (")
-        section = html[start:html.index("</details>", start)]
-        self.assertIn("scene 12962", section)
-        self.assertIn("subject-unknown", section)
+    def _block(self, html):
+        """The one proposal block on the page, whole. Assertions are made
+        inside it rather than over the page, so a link belonging to a
+        different section cannot satisfy them."""
+        start = html.index('<div class="proposal')
+        return html[start:html.index("<h2>Scan</h2>", start)]
 
-    def test_a_muted_entrys_scene_url_is_a_link(self):
-        html = render("inbox.html", rows=[], counts={},
-                      muted=[{"subject_type": "scene", "subject_id": "7",
-                             "reason": "r", "at": "t",
-                             "subject_label": "reel.mp4",
-                             "subject_url": "http://media.example/scenes/7"}],
-                      dismissed=[], refused=[])
-        self.assertIn('<a href="http://media.example/scenes/7"', html)
+    def test_a_proposed_title_links_to_the_candidates_own_page(self):
+        # The WHOLE element, not "the url appears somewhere": a substring
+        # check passes when the anchor is malformed, nested wrongly, or
+        # attached to the filename instead.
+        html = render("inbox.html", counts={}, rows=[_row(
+            urls=["https://store.example/lantern-room"])])
+        self.assertIn(
+            '<p class="title">%s&lt;script&gt;alert(&#34;x&#34;)'
+            '&lt;/script&gt;</a></p>' % self._WHOLE_ANCHOR,
+            self._block(html))
+
+    def test_a_candidate_with_no_address_is_text_with_no_anchor_at_all(self):
+        # The restrictive side pinned as well as the permissive one. A
+        # candidate carrying no address is ordinary -- a name search often
+        # returns a title and nothing else -- and must render as text, never
+        # as an anchor with an empty href, which looks like a link and goes
+        # nowhere.
+        html = render("inbox.html", counts={}, rows=[_row(urls=[])])
+        block = self._block(html)
+        self.assertIn('<p class="title">&lt;script&gt;alert(&#34;x&#34;)'
+                      '&lt;/script&gt;</p>', block)
+        self.assertNotIn("<a ", block)
+
+    def test_the_scene_link_and_the_candidate_link_are_not_confused(self):
+        # HARM: these two addresses are the opposite ends of the decision --
+        # the file as the library holds it today, and the record a person is
+        # being asked to overwrite it with. Swapping them sends a reviewer
+        # who wanted to check the candidate to the thing they were checking
+        # it against, and they would see exactly what they expected.
+        html = render("inbox.html", counts={}, rows=[_row(
+            subject_id="42", base_url="http://media.example",
+            urls=["https://store.example/lantern-room"])])
+        block = self._block(html)
+        self.assertIn(
+            '<p class="file"><a href="http://media.example/scenes/42" '
+            'target="_blank" rel="noopener noreferrer">', block)
+        self.assertIn('<p class="title">%s' % self._WHOLE_ANCHOR, block)
+
+    def test_every_runner_up_links_to_its_own_page(self):
+        # Two losers with different addresses: a loop handing every
+        # runner-up the first one's link, or the winner's, fails here. A
+        # test asserting only the winner's link would not have covered this
+        # at all.
+        html = render("inbox.html", counts={}, rows=[_row(
+            urls=["https://store.example/lantern-room"],
+            runners_up=[
+                {"candidate": {"title": "The Lantern",
+                               "urls": ["https://store.example/lantern"]},
+                 "score": 0.61},
+                {"candidate": {"title": "Lantern Nights",
+                               "urls": ["https://store.example/nights"]},
+                 "score": 0.55}])])
+        self.assertIn(
+            '<a href="https://store.example/lantern" target="_blank" '
+            'rel="noopener noreferrer">The Lantern</a> (0.610)', html)
+        self.assertIn(
+            '<a href="https://store.example/nights" target="_blank" '
+            'rel="noopener noreferrer">Lantern Nights</a> (0.550)', html)
+
+    def test_a_runner_up_with_no_address_stays_plain_text(self):
+        html = render("inbox.html", counts={}, rows=[_row(
+            urls=[], runners_up=[{"candidate": {"title": "The Lantern",
+                                                "urls": []}, "score": 0.61}])])
+        block = self._block(html)
+        self.assertIn("The Lantern (0.610)", block)
+        self.assertNotIn("<a ", block)
+
+    def test_a_fingerprint_row_links_its_candidate_and_never_the_endpoint(self):
+        # A box's endpoint is a GraphQL API address, not a page a person can
+        # open. The match carries its own address and that is what is
+        # linked; the endpoint must not reach the page as a link or as text
+        # pretending to be one.
+        html = render("inbox.html", counts={}, rows=[_row(payload_over={
+            "identified_by": "fingerprint", "box": "a-box",
+            "endpoint": "https://box.example/graphql",
+            "remote_site_id": "6d3f-scene"},
+            urls=["https://store.example/lantern-room"])])
+        block = self._block(html)
+        self.assertIn('<p class="title">%s' % self._WHOLE_ANCHOR, block)
+        self.assertNotIn("box.example", block)
+        self.assertNotIn("6d3f-scene", block)
+
+    def test_a_fingerprint_row_with_no_candidate_address_renders_no_anchor(self):
+        # THE guard against a second derivation: everything an
+        # `endpoint + "/scenes/" + id` rule would need is in this payload,
+        # and the page must still show plain text. Uncertainty may withhold
+        # evidence and never supply it.
+        html = render("inbox.html", counts={}, rows=[_row(payload_over={
+            "identified_by": "fingerprint", "box": "a-box",
+            "endpoint": "https://box.example/graphql",
+            "remote_site_id": "6d3f-scene"}, urls=[])])
+        block = self._block(html)
+        self.assertNotIn("<a ", block)
+        self.assertNotIn("box.example", block)
+
+
+def _muted(item=None, subject_type="scene", subject_id="12962",
+           reason="never identifiable", at="t", base_url=None):
+    """One muted entry, built by the real `to_mute_row` from the real
+    `Store.mutes()` shape -- never a hand-written dict.
+
+    A hand-written entry is free to carry a key the row builder does not
+    emit, which renders blank on the page while every assertion here stays
+    green; that is precisely how the previous, thinner muted row went
+    unnoticed.
+    """
+    return to_mute_row({"subject_type": subject_type,
+                        "subject_id": subject_id, "reason": reason,
+                        "at": at, "item": item}, base_url=base_url)
+
+
+def _identity_elements(section):
+    """The four elements that ARE a row's identity, each whole.
+
+    Whole elements rather than substrings, and all four rather than a
+    sample: "shows what a dismissed row shows" is a claim about the set,
+    and a check that names three of them cannot see the fourth go missing.
+    """
+    def one(pattern):
+        found = re.search(pattern, section, re.S)
+        return found.group(0) if found else None
+    return {
+        "file": one(r'<p class="file"[^>]*>.*?</p>'),
+        "title": one(r'<p class="title"[^>]*>.*?</p>'),
+        "meta": one(r'<div class="meta">.*?</div>'),
+        "score": one(r'<div class="score">.*?</div>'),
+    }
+
+
+def _section(html, name):
+    start = html.index("%s (" % name)
+    return html[start:html.index("</details>", start)]
+
+
+class MutedRowsReadLikeDismissedOnes(unittest.TestCase):
+    """A muted subject and a dismissed one are the same thing seen twice --
+    something a person hid and may want back. They must read the same, and
+    the only difference must be that the control says Unmute.
+    """
+
+    def _page(self, item, **over):
+        kwargs = dict(
+            rows=[], counts={}, refused=[],
+            muted=[_muted(item=item, subject_id="42",
+                          base_url="http://media.example")],
+            dismissed=([] if item is None
+                       else [to_row(item, base_url="http://media.example")]))
+        kwargs.update(over)
+        return render("inbox.html", **kwargs)
+
+    def test_a_muted_row_shows_exactly_what_the_dismissed_row_shows(self):
+        # The same item in both sections, so anything the muted row fails to
+        # carry shows up as a difference rather than as an absence nobody
+        # named. Every element compared whole.
+        item = _scene_item(subject_id="42",
+                           urls=["https://store.example/lantern-room"])
+        html = self._page(item)
+        self.assertEqual(_identity_elements(_section(html, "Muted")),
+                         _identity_elements(_section(html, "Dismissed")))
+
+    def test_the_muted_rows_identity_is_not_empty_to_begin_with(self):
+        # Without this the comparison above passes on two sections that both
+        # show nothing -- the exact shape of a green suite over a blank page.
+        item = _scene_item(subject_id="42",
+                           urls=["https://store.example/lantern-room"])
+        elements = _identity_elements(_section(self._page(item), "Muted"))
+        self.assertIsNotNone(elements["file"])
+        self.assertIsNotNone(elements["title"])
+        self.assertIn("<b>", elements["meta"])
+        self.assertIn("0.812", elements["score"])
+        self.assertIn("store.example/lantern-room", elements["title"])
+        self.assertIn("media.example/scenes/42", elements["file"])
+
+    def test_the_control_is_unmute_and_never_undismiss(self):
+        # HARM: these two write to DIFFERENT tables. An Undismiss here
+        # reports success and leaves the subject muted -- still hidden, and
+        # now with the page saying it was restored. Pinned as the whole
+        # form, because an Unmute posting the wrong fields is the same
+        # failure with a friendlier label.
+        item = _scene_item(subject_id="42")
+        section = _section(self._page(item), "Muted")
+        self.assertIn(
+            '<form method="post" action="/unmute">'
+            '<input type="hidden" name="subject_type" value="scene">'
+            '<input type="hidden" name="subject_id" value="42">'
+            '<button>Unmute</button></form>', section)
+        self.assertNotIn("/undismiss", section)
+        self.assertNotIn("/approve", section)
+
+    def test_a_mute_with_nothing_behind_it_still_renders_and_says_so(self):
+        # The genuine exception: a subject muted before anything was ever
+        # found for it. It must go on saying so plainly rather than drawing
+        # the rich shape with blank fields, which reads as a page that
+        # failed to render.
+        html = self._page(None, dismissed=[])
+        section = _section(html, "Muted")
+        self.assertIn(
+            '<p class="file subject-unknown">'
+            '<a href="http://media.example/scenes/42" target="_blank" '
+            'rel="noopener noreferrer">scene 42</a> <span class="note">'
+            '(muted before any proposal was ever recorded -- only the id '
+            'is known)</span></p>', section)
+        self.assertNotIn('<p class="title">', section)
+        self.assertNotIn('<div class="score">', section)
+
+    def test_that_exception_still_offers_the_control_that_lifts_the_mute(self):
+        section = _section(self._page(None, dismissed=[]), "Muted")
+        self.assertIn("<button>Unmute</button>", section)
+
+    def test_a_muted_entry_still_shows_its_reason_and_when(self):
+        # What the muted row has that a dismissed one does not, and it is
+        # not lost to the richer identity above it.
+        section = _section(self._page(_scene_item(subject_id="42")), "Muted")
+        self.assertIn("never identifiable &middot; muted t", section)
+
+    def test_a_muted_performer_renders_the_description_shape_not_a_scene(self):
+        # A mute can be placed on any subject a producer proposes about.
+        # Drawing a performer with the scene shape shows three blank fields;
+        # putting one through the scene builder took the whole section out.
+        item = {"fingerprint": "fp-d", "state": "muted",
+                "subject_type": "performer", "subject_id": "7",
+                "summary": "s", "confidence": None, "prior_state": None,
+                "payload": {"name": "Wren Alderly", "field": "details",
+                            "faults": ["markup"], "original": "<p>x</p>",
+                            "cleaned": "x"}}
+        section = _section(render(
+            "inbox.html", rows=[], counts={}, refused=[], dismissed=[],
+            muted=[_muted(item=item, subject_type="performer",
+                          subject_id="7",
+                          base_url="http://media.example")]), "Muted")
+        self.assertIn(
+            '<p class="file"><a href="http://media.example/performers/7" '
+            'target="_blank" rel="noopener noreferrer">performer 7</a></p>',
+            section)
+        self.assertIn('<p class="title">Wren Alderly</p>', section)
+        # No score column at all: nothing scored a description rewrite, and
+        # an empty one reads as a value that failed to render.
+        self.assertNotIn('<div class="score">', section)
 
 
 class ApplifiedSectionRendering(unittest.TestCase):

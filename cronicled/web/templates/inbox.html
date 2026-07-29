@@ -95,10 +95,12 @@
                  color: var(--fg); cursor: pointer; }
   .note { color: var(--muted); font-size: 0.85rem; }
 
-  /* A row's own link to the media server: understated, so it reads as part
-     of the identifying text rather than as a call to action competing with
-     Approve/Dismiss/Mute. */
-  .file a, .subject a { color: inherit; text-decoration-color: var(--muted); }
+  /* A row's own links -- the filename to the media server, the proposed
+     title and each runner-up to the store page the candidate came from:
+     understated, so they read as part of the identifying text rather than
+     as calls to action competing with Approve/Dismiss/Mute. */
+  .file a, .subject a, .title a, .runners a, .store a {
+    color: inherit; text-decoration-color: var(--muted); }
 
   /* The one case ticket 97 asks to look like the exception, not the norm: a
      subject muted before any proposal was ever recorded for it, so only its
@@ -172,6 +174,12 @@
    warnings. #}
 {% macro attribution(row) %}{% if row.identifying_box %}identified by fingerprint (<b>{{ row.identifying_box }}</b>){% else %}<b>{{ row.creator }}</b> (from the {{ row.creator_source }}){% if row.agreeing_stores %} &middot; corroborated by <b>{% for s in row.agreeing_stores %}{{ s }}{% if not loop.last %}, {% endif %}{% endfor %}</b>{% endif %}{% endif %}{% endmacro %}
 
+{# One rule for "show this text, and make it a link when there is somewhere
+   to go". Used for BOTH addresses a row carries and they are not the same
+   address: `row.scene_url` is the file as the media server holds it today,
+   `row.candidate_url` is the record a person is being asked to overwrite it
+   with. A missing url renders the text and NO anchor -- never an `<a>` with
+   an empty href, which looks like a link and goes to the page itself. #}
 {% macro identifier(text, url) %}{% if url %}<a href="{{ url }}" target="_blank" rel="noopener noreferrer">{{ text }}</a>{% else %}{{ text }}{% endif %}{% endmacro %}
 
 {% macro proposal_block(row, highlight=False) %}
@@ -179,7 +187,7 @@
   <div class="head">
     <div class="what">
       <p class="file">{{ identifier(row.filename, row.scene_url) }}</p>
-      <p class="title">{{ row.proposed_title }}</p>
+      <p class="title">{{ identifier(row.proposed_title, row.candidate_url) }}</p>
       <div class="meta">
         {{ attribution(row) }}
         {% if row.performers %} &middot; performers: <b>{% for p in row.performers %}{{ p }}{% if not loop.last %}, {% endif %}{% endfor %}</b>{% endif %}
@@ -217,8 +225,10 @@
   <div class="warn">This proposal's cover image cannot be restored by Undo, even after reverting.</div>
   {% endif %}
   {% if row.runners_up %}
+  {# Each loser links to its OWN page, not the winner's -- a losing candidate
+     is exactly what an operator opens before overriding a decision. #}
   <div class="runners">Also considered:
-    {% for r in row.runners_up %}{{ r.title }} ({{ "%.3f"|format(r.score) }}){% if not loop.last %}, {% endif %}{% endfor %}
+    {% for r in row.runners_up %}{{ identifier(r.title, r.url) }} ({{ "%.3f"|format(r.score) }}){% if not loop.last %}, {% endif %}{% endfor %}
   </div>
   {% endif %}
 </div>
@@ -276,7 +286,7 @@
         <div class="meta">description contains <b>{% for f in row.faults %}{{ f }}{% if not loop.last %} and {% endif %}{% endfor %}</b></div>
 {% else %}
         <p class="file">{{ identifier(row.filename, row.scene_url) }}</p>
-        <p class="title">{{ row.proposed_title }}</p>
+        <p class="title">{{ identifier(row.proposed_title, row.candidate_url) }}</p>
         <div class="meta">{{ attribution(row) }}</div>
 {% endif %}{% endmacro %}
 
@@ -394,18 +404,26 @@
   {% endfor %}
 {% endcall %}
 
+{# A muted row and a dismissed row are the same thing seen twice -- something
+   a person hid that they may want back -- so they render through the same
+   `compact_identity`/`compact_score` macros, and the ONLY difference is that
+   the control says Unmute. That control is not cosmetic: Unmute and
+   Undismiss write to different tables, and an Undismiss here would report
+   success while leaving the subject muted and invisible.
+
+   `m.row` is `None` only for a subject muted before anything was ever found
+   for it. That row still says so plainly rather than drawing the rich shape
+   with four blank fields -- blank reads as a page that failed to render,
+   which is the one thing this exception must not look like. #}
 {% call section("Muted", muted, "Nothing muted.") %}
   {% for m in muted %}
   <div class="proposal">
     <div class="head">
       <div class="what">
-        {% if m.subject_label %}
-        <p class="file">{{ identifier(m.subject_label, m.subject_url) }}</p>
-        {% else %}
-        <p class="file subject-unknown">{{ identifier(m.subject_type ~ " " ~ m.subject_id, m.subject_url) }} <span class="note">(muted before any proposal was ever recorded -- only the id is known)</span></p>
-        {% endif %}
-        <div class="meta">{{ m.reason }} &middot; muted {{ m.at }}</div>
+{% if m.row %}{{ compact_identity(m.row) }}{% else %}        <p class="file subject-unknown">{{ identifier(m.subject_type ~ " " ~ m.subject_id, m.subject_url) }} <span class="note">(muted before any proposal was ever recorded -- only the id is known)</span></p>
+{% endif %}        <div class="meta">{{ m.reason }} &middot; muted {{ m.at }}</div>
       </div>
+      {% if m.row %}{{ compact_score(m.row) }}{% endif %}
       <div class="acts">
         <form method="post" action="/unmute"><input type="hidden" name="subject_type" value="{{ m.subject_type }}"><input type="hidden" name="subject_id" value="{{ m.subject_id }}"><button>Unmute</button></form>
       </div>

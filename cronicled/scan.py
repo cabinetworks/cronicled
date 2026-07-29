@@ -415,9 +415,25 @@ def _owners_of(search, owner_of):
     return owners_of
 
 
-def _enrichment_url(candidate):
-    """The URL `examine` hands to `enrich` for the winning candidate, or
-    `None` when there is nothing to scrape.
+def candidate_url(candidate):
+    """The address `candidate` stands at — its own page on the store that
+    offered it — or `None` when it carries none.
+
+    THIS PROJECT'S ONE ANSWER to "where did this candidate come from", and
+    public for that reason: `examine` and `examine_sources` hand it to
+    `enrich`, `_store_report` records it against a refused file's near
+    miss, and `cronicled.web.rows` renders it as the link on a proposed
+    title and on every runner-up beneath it. Four readers, one rule. A
+    second derivation anywhere would be free to disagree with the one an
+    apply uses, and a link that points somewhere an apply would not is
+    worse than no link: it is evidence the page did not have.
+
+    NEVER derived from anything but the candidate itself. There is no
+    address to be assembled out of a store's name, a box's endpoint or an
+    id — see `catalogue_link` for what a fingerprint identification can
+    honestly say instead. Uncertainty here may withhold evidence and never
+    supply it, so a candidate carrying nothing answers `None` and renders
+    as plain text rather than as an anchor pointing nowhere.
 
     Prefers `urls` (the plural, forward-looking field), falling back to the
     deprecated singular `url` only when the plural is empty — the SAME
@@ -482,7 +498,7 @@ def examine(scene, *, search, folder, threshold=DEFAULT_THRESHOLD, aliases=None,
     `decensor` defines as a no-op.
 
     `enrich`, when given, is a one-argument callable: called with the
-    winning candidate's own URL (`_enrichment_url`) and expected to return
+    winning candidate's own URL (`candidate_url`) and expected to return
     either a fuller `ScrapedScene`-shaped dict describing the SAME object
     (ordinarily `Stash.scrape_scene_url`) or `None` when it has nothing new
     to add. Called at most ONCE per call to `examine`, and only after
@@ -492,7 +508,7 @@ def examine(scene, *, search, folder, threshold=DEFAULT_THRESHOLD, aliases=None,
     and never per file examined. When it returns something, that fuller
     object REPLACES `winner` for every purpose below: the payload's
     `candidate`, and the title `summary` reports. When it returns `None`, or
-    when there is no URL to give it (`_enrichment_url` returned `None`),
+    when there is no URL to give it (`candidate_url` returned `None`),
     `winner` is left exactly as `search` returned it — the same thin
     candidate a proposal has always carried.
 
@@ -593,7 +609,7 @@ def examine(scene, *, search, folder, threshold=DEFAULT_THRESHOLD, aliases=None,
     # full reasoning and for why a missing URL is treated the same as a
     # `None` reply rather than as a failure.
     if enrich is not None:
-        url = _enrichment_url(winner)
+        url = candidate_url(winner)
         if url:
             try:
                 enriched = enrich(url)
@@ -971,7 +987,7 @@ def _store_report(source, store_decision, error):
     the display's decision, not this one's; see
     `cronicled.web.rows._refused_store_view`.
 
-    `url` is `_enrichment_url`'s answer, not a second reading of the
+    `url` is `candidate_url`'s answer, not a second reading of the
     candidate: it is already this project's one rule for "which address does
     this candidate stand at", matching the precedence an apply uses, so a link
     offered here cannot point somewhere an apply would disagree with. It is
@@ -995,7 +1011,7 @@ def _store_report(source, store_decision, error):
     report["rows"] = len(store_decision.candidates)
     report["score"] = match.value
     report["title"] = candidate["title"]
-    report["url"] = _enrichment_url(candidate)
+    report["url"] = candidate_url(candidate)
     return report
 
 
@@ -1033,7 +1049,7 @@ def examine_sources(scene, *, sources, folder, threshold=DEFAULT_THRESHOLD,
     `_combined_owners_of`), which `examine`'s single-callable `owners_of`
     contract cannot express — so this reimplements the flow, sharing
     `resolve`, `score`, `decide`, `decensor`, `_runners_up` and
-    `_enrichment_url` with it rather than duplicating their logic.
+    `candidate_url` with it rather than duplicating their logic.
 
     THE RULE THIS FUNCTION EXISTS FOR: every source in `sources` is
     searched, unconditionally, before anything is decided. Nothing here
@@ -1286,7 +1302,7 @@ def examine_sources(scene, *, sources, folder, threshold=DEFAULT_THRESHOLD,
 
     winner = chosen.candidates[chosen.decision.index]
     if enrich is not None:
-        url = _enrichment_url(winner)
+        url = candidate_url(winner)
         if url:
             try:
                 enriched = enrich(url)

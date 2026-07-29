@@ -1271,7 +1271,7 @@ class ExamineEnrichmentTest(unittest.TestCase):
 
 class EnrichmentURLChoice(unittest.TestCase):
     """Which of a winning candidate's two URL fields `examine` hands to
-    `enrich` -- see `cronicled.scan._enrichment_url`'s own docstring for why
+    `enrich` -- see `cronicled.scan.candidate_url`'s own docstring for why
     the choice mirrors `Stash.apply_scene`'s own `urls`/`url` precedence
     rather than inventing a second rule for the same object.
     """
@@ -2115,7 +2115,7 @@ class ARefusalRecordsEveryStoreSearched(unittest.TestCase):
     # -- the address is the one an apply would use ------------------------- #
 
     def test_the_near_miss_url_follows_the_precedence_an_apply_uses(self):
-        """`_enrichment_url`'s rule, reused rather than written a second
+        """`candidate_url`'s rule, reused rather than written a second
         time: the plural `urls` wins over the deprecated singular `url`. A
         second derivation reading `url` first would link a person to an
         address an apply would disagree with."""

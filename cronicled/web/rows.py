@@ -9,6 +9,7 @@ import os
 from dataclasses import dataclass
 
 from cronicled.descriptions import SUBJECT_TYPE as DESCRIPTION_SUBJECT
+from cronicled.scan import candidate_url
 from cronicled.tags import MERGE_IS_IRREVERSIBLE
 from cronicled.text import slug_match, spaceless
 
@@ -51,6 +52,24 @@ class Row:
     # address is threaded in here rather than typed a second time.
     scene_url: str | None
     proposed_title: str
+    # Where the proposed title came FROM: the candidate's own page on the
+    # store that offered it, or `None` when the candidate carries no
+    # address at all. `scene_url` above and this are the two ends of the
+    # decision and must never be confused -- one is the file as the media
+    # server holds it today, the other is the record a person is being
+    # asked to overwrite it with -- which is why they are two fields and
+    # not one, and why nothing derives either from the other.
+    #
+    # `cronicled.scan.candidate_url` is the one rule that answers this,
+    # shared with the enrichment scrape and with a refusal's near miss. A
+    # second derivation here could point somewhere an apply would not, and
+    # a link that disagrees with what Approve will write is worse than no
+    # link -- see that function's own docstring.
+    #
+    # `None` is an ordinary answer, not a failure, and the template renders
+    # it as plain text: a name search commonly returns a title and nothing
+    # else, and no address means no anchor rather than a guessed one.
+    candidate_url: str | None
     # `None` on a proposal a stash-box identified by fingerprint: no creator
     # was resolved for it, because nothing needed one — the file was never
     # searched for by name. `identifying_box` below is what such a row says
@@ -209,8 +228,17 @@ def _runner_up_view(entry):
     module's job, not the template's: reading `title` from the wrong place
     here would surface as a silently blank column there, since Jinja renders
     an undefined attribute as empty text rather than raising.
+
+    `url` is the loser's OWN address, read by the same
+    `cronicled.scan.candidate_url` rule the winner's is -- not the winner's,
+    and not omitted. A losing candidate is exactly the one an operator opens
+    before overriding a decision, so a runner-up that could be looked at and
+    is not linked costs the review the evidence it exists for; and a
+    runner-up wearing the WINNER's address would send that operator to the
+    page they were trying to check against.
     """
-    return {"title": entry["candidate"]["title"], "score": entry["score"]}
+    return {"title": entry["candidate"]["title"], "score": entry["score"],
+            "url": candidate_url(entry["candidate"])}
 
 
 def carries_cover(candidate):
@@ -385,6 +413,14 @@ def to_row(item, base_url=None):
         # handles on its own terms.
         scene_url=scene_url(base_url, item["subject_id"]),
         proposed_title=candidate["title"],
+        # One rule, four readers -- see `Row.candidate_url`. Read off the
+        # candidate itself for BOTH kinds of proposal: a fingerprint
+        # identification's match comes back through the same
+        # `_SCRAPED_SCENE_SELECTION` a text scrape does and carries its own
+        # `urls`/`url` exactly the same way, so nothing here branches on
+        # `identified_by`, and nothing assembles an address out of the box's
+        # endpoint (an API address, not a page a person can open) and its id.
+        candidate_url=candidate_url(candidate),
         creator=creator_name,
         creator_source=creator_source,
         agreeing_stores=agreeing_stores,
@@ -581,7 +617,7 @@ def _refused_store_view(entry):
 
     `entry` is one of `Store.refusals()`'s `stores`, built by
     `cronicled.scan._store_report` -- read with `[]` rather than `.get`, for
-    the reason `to_mute_row` states for a payload: an entry that exists but
+    the reason `to_row` states for a payload: an entry that exists but
     cannot answer is malformed, and a default here would render a store's
     line as a confident blank instead of failing where it can be seen.
 
@@ -657,43 +693,44 @@ def to_mute_row(entry, base_url=None):
     """One standing mute (`Store.mutes()`'s dict shape) -> what the Muted
     section shows for it.
 
-    `entry["payload"]` is `Store.mutes()`'s own recovery of the most
-    recently seen proposal ever made for this subject, or `None` when none
-    ever was -- the genuine exception ticket 97 names: a subject muted
-    ahead of any scan finding it. `subject_label` follows the same "honest
-    exception, not a blended-in normal case" split the ticket asks for:
-    recovered from the payload the same way `to_row`'s own `filename` is
-    (indexed, not `.get`, for the same reason -- a payload that exists but
-    cannot answer is malformed, not "no label"), or `None` when there is
-    no payload at all to read one from. The template is where that `None`
-    becomes visibly the exception, not this function's job.
+    `row` is the proposal behind the mute, built by the SAME builders the
+    Dismissed section's rows are built by (`to_rows`, so a muted performer
+    gets a `DescriptionRow` and a muted scene a `Row`) -- not a second,
+    thinner projection of the same item. Both sections show something a
+    person hid and may want back, and they were not comparable: a dismissed
+    row named the file, the proposed title, the attribution and the score,
+    while a muted one showed a subject id and a sentence. Sharing the
+    builder is what keeps them from drifting apart again, and it is why
+    `Store.mutes()` hands over the whole item rather than its payload.
 
-    WHAT identifies a subject depends on which kind it is, which is why this
-    is `subject_label` and `subject_url` rather than `filename` and
-    `scene_url`. A mute is keyed by `(subject_type, subject_id)` and can be
-    placed on ANY subject a producer proposes about, so one click on a
-    description proposal's Mute button puts a performer in this list -- and
-    a performer has no path to read a filename out of. Reading one anyway
-    raised a `KeyError` that took out the whole Muted section, and with it
-    the only control that could lift the mute again.
+    `row` is `None` -- and ONLY then -- when the store recovered no item at
+    all: a subject muted ahead of any scan ever finding it, the genuine
+    exception ticket 97 names. That case is real and stays honest; the
+    template marks it visibly as the exception rather than drawing the rich
+    shape with every field blank, which is the one reading that would make
+    "nothing was ever proposed here" look like "the page failed to render
+    it". Deciding that is the template's job, not this function's -- what
+    this returns is `None`, never a filled-in stand-in.
+
+    `subject_url` is what that exception branch links, and it is the only
+    thing this still derives itself: with no item there is no row to carry
+    an address, but the mute's own `(subject_type, subject_id)` is enough
+    for the media server's page. WHICH page depends on the kind -- a mute
+    can be placed on ANY subject a producer proposes about, so one click on
+    a description proposal's Mute button puts a performer in this list, and
+    a performer's page is not a scene's.
     """
-    payload = entry["payload"]
     performer = entry["subject_type"] == DESCRIPTION_SUBJECT
-    if payload is None:
-        label = None
-    elif performer:
-        label = payload["name"]
-    else:
-        label = os.path.basename(payload["path"])
-    url = (performer_url(base_url, entry["subject_id"]) if performer
-           else scene_url(base_url, entry["subject_id"]))
+    item = entry["item"]
     return {
         "subject_type": entry["subject_type"],
         "subject_id": entry["subject_id"],
         "reason": entry["reason"],
         "at": entry["at"],
-        "subject_label": label,
-        "subject_url": url,
+        "row": None if item is None else to_rows([item], base_url=base_url)[0],
+        "subject_url": (performer_url(base_url, entry["subject_id"])
+                        if performer
+                        else scene_url(base_url, entry["subject_id"])),
     }
 
 
