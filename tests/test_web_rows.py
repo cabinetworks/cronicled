@@ -104,6 +104,32 @@ class RowContent(unittest.TestCase):
         self.assertIn("alpha", row.disagreement)
         self.assertIn("beta", row.disagreement)
 
+    def test_agreeing_stores_are_carried_onto_the_row(self):
+        """`cronicled.scan.examine_sources` records every OTHER store that
+        named the proposed candidate under `agreeing_stores` when two or
+        more stores were too close to call and said the same thing. All of
+        them reach the page, in a fixture where dropping any one of them,
+        or keeping only the first, would look different."""
+        row = to_row(_item(payload={
+            "agreeing_stores": ["beta", "gamma"]}))
+        self.assertEqual(row.agreeing_stores, ("beta", "gamma"))
+
+    def test_stores_agreeing_is_corroboration_and_never_a_warning(self):
+        """HARM: agreement shown where warnings live is a warning that
+        fires on the BEST rows this tool produces, and a warning a reviewer
+        sees on good rows is one they learn to click past on the bad ones.
+        """
+        row = to_row(_item(payload={"agreeing_stores": ["beta"]}))
+        self.assertFalse(row.contested)
+        self.assertIsNone(row.disagreement)
+
+    def test_no_agreeing_stores_key_at_all_is_an_empty_tuple(self):
+        """Every proposal made before cross-store agreement existed, and
+        every one only a single store answered, has no such key -- and must
+        not raise, and must not read as corroborated by an unnamed
+        somebody."""
+        self.assertEqual(to_row(_item()).agreeing_stores, ())
+
     def test_no_competing_store_key_at_all_is_not_contested_by_itself(self):
         """The common, single-answer case: no `competing_store` key present
         at all (every proposal made before this ticket, and every proposal
@@ -626,6 +652,13 @@ class IdentifiedRow(unittest.TestCase):
         self.assertFalse(row.contested)
         self.assertIsNone(row.disagreement)
         self.assertEqual(row.runners_up, ())
+
+    def test_it_names_no_agreeing_stores(self):
+        # Boxes and stores are two different mechanisms agreeing about two
+        # different things. A box's own agreement travels in the payload's
+        # `agreeing_boxes`; this field is the one for stores, and a
+        # fingerprint row was never searched against a store at all.
+        self.assertEqual(to_row(_identified_item()).agreeing_stores, ())
 
     def test_a_scored_row_names_no_box(self):
         # The other side of the same discriminator: the two shapes must not

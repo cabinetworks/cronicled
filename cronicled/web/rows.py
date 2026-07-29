@@ -27,6 +27,18 @@ class Row:
     # instead, and the template picks between them.
     creator: str | None
     creator_source: str | None
+    # Every OTHER configured store that named this same candidate, from
+    # `payload["agreeing_stores"]` — empty on the ordinary proposal only one
+    # store answered. Corroboration is not a warning, so it belongs beside
+    # the attribution and never in `disagreement`, which is the field that
+    # means "do not approve this": a reviewer who sees an agreement badge in
+    # the place warnings live learns to read past the warnings.
+    #
+    # A fingerprint-identified row carries an empty tuple even when its own
+    # payload has `agreeing_boxes`: boxes and stores are two different
+    # mechanisms agreeing about two different things, and this field is the
+    # one for stores.
+    agreeing_stores: tuple
     contested: bool
     disagreement: str | None
     carries_cover: bool
@@ -250,6 +262,12 @@ def to_row(item, base_url=None):
         score = payload["score"]
         score_text = "%.3f" % score
         identifying_box = None
+        # `.get`, not indexed: every proposal made before cross-store
+        # agreement existed, and every one only a single store answered,
+        # legitimately has no such key. An empty tuple is the honest reading
+        # of its absence — nobody corroborated this — where a missing key
+        # would be a malformed payload, and neither reads as a warning.
+        agreeing_stores = tuple(payload.get("agreeing_stores") or ())
         disagreement = _disagreement(
             creator, os.path.splitext(filename)[0],
             competing_store=payload.get("competing_store"))
@@ -262,6 +280,7 @@ def to_row(item, base_url=None):
         creator_name = creator_source = score = None
         score_text = IDENTIFIED_SCORE_TEXT
         identifying_box = payload["box"]
+        agreeing_stores = ()
         # Nothing to contest: two boxes that disagreed never produced a
         # proposal at all (see `scan.fingerprint_outcome`), and boxes that
         # AGREED are agreement, which is not a warning.
@@ -279,6 +298,7 @@ def to_row(item, base_url=None):
         proposed_title=candidate["title"],
         creator=creator_name,
         creator_source=creator_source,
+        agreeing_stores=agreeing_stores,
         contested=disagreement is not None,
         disagreement=disagreement,
         carries_cover=carries_cover(candidate),

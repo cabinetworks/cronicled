@@ -300,6 +300,56 @@ class PerformersAndStudioOnThePage(unittest.TestCase):
         self.assertIn("&lt;script&gt;", html)
 
 
+class AgreeingStoresOnThePage(unittest.TestCase):
+    """Two independent stores naming one scene is the strongest text
+    evidence this tool produces, and it is worth nothing if the person
+    approving the row cannot see it.
+
+    Built through its own item helper for the same reason
+    `PerformersAndStudioOnThePage` is: `_row`'s `over` replaces only the
+    item's top level, so a `payload=` passed through it would drop `path`,
+    `creator` and `score` rather than add a key to them.
+    """
+
+    def _row_with(self, agreeing, creator_name="Someone"):
+        payload = {
+            "path": "/library/x/reel.mp4",
+            "creator": {"name": creator_name, "source": "folder",
+                       "competing": None, "rejected_folder": None},
+            "candidate": {"id": "c-1", "title": "The Lantern Room",
+                         "image": None, "performers": [], "studio": None},
+            "score": 0.812,
+            "runners_up": [],
+        }
+        if agreeing is not None:
+            payload["agreeing_stores"] = agreeing
+        return to_row({"fingerprint": "fp-1", "state": "new", "summary": "s",
+                       "confidence": 0.812, "payload": payload,
+                       "prior_state": None, "subject_id": "1"})
+
+    def test_every_agreeing_store_is_named_on_the_page(self):
+        html = render("inbox.html",
+                      rows=[self._row_with(["beta", "gamma"])], counts={})
+        self.assertIn("beta", html)
+        self.assertIn("gamma", html)
+
+    def test_a_proposal_nothing_corroborated_says_nothing_about_it(self):
+        # A row only one store answered must not grow an empty badge: a
+        # label with no names after it reads as a field that failed to
+        # render, and this is a page people approve writes from.
+        html = render("inbox.html", rows=[self._row_with(None)], counts={})
+        self.assertNotIn("corroborated", html)
+
+    def test_a_hostile_store_name_is_escaped(self):
+        # Store names come from configuration, but so does every other
+        # field this page escapes; the backstop is worth the two lines
+        # rather than an argument about which inputs are trusted.
+        html = render("inbox.html", rows=[self._row_with([_HOSTILE])],
+                      counts={})
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+
 class ScanStatusEscaping(unittest.TestCase):
     # A job's `message` carries file names -- attacker-influenceable text,
     # the same reason a row's fields are escaped. This is the same backstop

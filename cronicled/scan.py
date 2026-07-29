@@ -728,65 +728,122 @@ def _combined_owners_of(sources):
     return owners_of
 
 
+def _agreed_title(store_decision):
+    """The form of one store's winning title in which two stores' answers
+    are the SAME answer.
+
+    `decensor` is `cronicled.text.normalize` — which it calls — plus THIS
+    store's own declared substitutions, which is exactly the text `_judge`
+    handed the scorer. Agreement is therefore judged on the string that was
+    scored rather than on a second reading of the same title: a store that
+    spells a word around its own censor and one that does not are two
+    spellings of one title, and the only map that can say so is the store's
+    own. Comparing the raw titles would make the two disagree here while
+    the scorer saw them agree.
+
+    Nothing looser than string equality of that form — no token subsetting,
+    no similarity. `normalize` is this project's existing answer to "are
+    these the same string", and a second answer written here would be free
+    to drift from it.
+    """
+    candidate = store_decision.candidates[store_decision.decision.index]
+    return decensor(candidate["title"], store_decision.source.censorship or {})
+
+
 def _choose_winner(winners):
-    """Which store's own eligible candidate a proposal is built from, and
-    which OTHER winning stores are recorded as a cross-store finding.
+    """Which store's own eligible candidate a proposal is built from, which
+    OTHER winning stores named the SAME title, and which named a different
+    one.
+
+    Returns `(chosen, competing, agreeing)`, or `(None, None, None)` when
+    the winners are a genuine ambiguity and nothing may be proposed.
 
     `winners` is every `_StoreDecision` whose own `decide()` cleared the
     threshold for this file — never fewer than one; the empty case is
     handled by `examine_sources` before this is called.
 
-    A single winner needs no choice at all: returned with an empty
-    `competing` list. More than one is the finding this whole module exists
-    to get right — see `examine_sources`'s docstring for why it is a
-    finding and not a tie, and note the shape it must NOT take: refusing
-    outright every time two stores agree would make the common case (the
-    ticket's own "most often the same work published in both places") as
-    disruptive as the rare one, which is not what a folder and a filename
-    disagreeing already does — that case still proposes, with the loser
-    recorded, and this follows the same shape.
+    A single winner needs no choice at all: returned with both lists empty.
+    More than one is the finding this whole module exists to get right —
+    see `examine_sources`'s docstring for why it is a finding and not a
+    tie, and note the shape it must NOT take: refusing outright every time
+    two stores agree would make the common case (the ticket's own "most
+    often the same work published in both places") as disruptive as the
+    rare one, which is not what a folder and a filename disagreeing already
+    does — that case still proposes, with the loser recorded, and this
+    follows the same shape.
 
-    Resolved in two steps:
+    Resolved in three steps:
 
     1. NEVER let a store that cannot confirm ownership out-rank, or tie
        with, one that can. If at least one winner is catalogue-resolvable,
        only catalogue-resolvable winners are candidates for `chosen` at
        all — a non-resolvable winner can still be reported as `competing`,
-       just never picked. Only when EVERY winner is non-resolvable are
-       they compared to each other on the same footing.
+       just never picked, and never counts towards agreement either. Only
+       when EVERY winner is non-resolvable are they compared to each other
+       on the same footing.
     2. Among whichever set step 1 leaves, rank by SCORE — content, never
-       position — and pick the top. If the runner-up is within
-       `scoring.AMBIGUITY_MARGIN` of it, that is a genuine tie between
-       equally-trustworthy evidence, and this refuses (`(None, None)`)
-       rather than let a fraction of a rounding difference, or worse, list
-       order, decide it — the same discipline `scoring.decide` already
-       applies to two candidates scored within one store. Ties within the
-       margin are broken by store NAME only for building the refusal's own
-       message, never to still pick a winner.
+       position — and take everything the margin cannot separate from the
+       top: every winner within `scoring.AMBIGUITY_MARGIN` of it, the top
+       included. A winner further down than that has simply lost on score,
+       exactly as it did before.
+    3. Ask what that tied set actually SAYS, by `_agreed_title`. One
+       distinct title across all of it is agreement, not ambiguity: the
+       stores are not offering a choice, they are corroborating each other,
+       which is the strongest text evidence this tool produces. It is
+       proposed, and the other tied stores are returned in `agreeing` so
+       the corroboration is recorded rather than thrown away. More than one
+       distinct title is a real choice between equally-trustworthy
+       candidates, and this refuses (`(None, None, None)`) rather than let
+       a fraction of a rounding difference, or worse, list order, decide it
+       — the same discipline `scoring.decide` applies to two candidates
+       scored within one store.
+
+    PARTIAL agreement is not agreement. Three tied winners of which two
+    name one title and the third another is still a choice somebody has to
+    make, so it refuses: the test is that the tied set is UNANIMOUS, never
+    that some pair of it happens to match.
+
+    Which of an agreeing set is carried is a preference among equals, not a
+    verdict — the stores agree about the title, which is the thing being
+    decided; what differs is only whose URL and metadata the proposal
+    carries. It falls out of the ranking above as the alphabetically first
+    store NAME, and cannot be anything else: agreement is equality of the
+    very text `_judge` scored, so agreeing winners hold identical scores by
+    construction and the `-value` half of the sort key cannot separate
+    them. (That is a property of step 3 being exact string equality. A
+    looser agreement rule would let scores differ inside an agreeing set,
+    and would have to say for itself which one is carried.)
 
     Never resolved by where a store happens to sit in `sources`: nothing
-    above reads position, only `catalog_resolvable` and each winner's own
-    score, so re-ordering a config file cannot change which store's
-    candidate a proposal carries, or whether one is picked at all.
+    above reads position, only `catalog_resolvable`, each winner's own
+    score, its own title and its own name, so re-ordering a config file
+    cannot change which store's candidate a proposal carries, or whether
+    one is picked at all.
     """
     if len(winners) == 1:
-        return winners[0], []
+        return winners[0], [], []
     resolvable = [w for w in winners if w.source.catalog_resolvable]
     eligible = resolvable if resolvable else winners
 
     ranked = sorted(eligible, key=lambda sd: (-sd.decision.match.value,
                                               sd.source.name))
     top = ranked[0]
-    if len(ranked) > 1:
-        runner_up_value = ranked[1].decision.match.value
-        # Rounded to the same three places `scoring.score` rounds a value
-        # to, for the identical reason `scoring.decide` does: an unrounded
-        # float subtraction would decide this by representation rather than
-        # by intent.
-        if round(top.decision.match.value - runner_up_value, 3) <= AMBIGUITY_MARGIN:
-            return None, None
-    competing = [w for w in winners if w is not top]
-    return top, competing
+    # Rounded to the same three places `scoring.score` rounds a value to,
+    # for the identical reason `scoring.decide` does: an unrounded float
+    # subtraction would decide this by representation rather than by intent.
+    # `top` itself is always in here — a gap of zero — so a lone winner of
+    # step 1 leaves a tied set of one, which is no tie at all.
+    tied = [sd for sd in ranked
+            if round(top.decision.match.value - sd.decision.match.value, 3)
+            <= AMBIGUITY_MARGIN]
+    agreeing = []
+    if len(tied) > 1:
+        if len({_agreed_title(sd) for sd in tied}) != 1:
+            return None, None, None
+        agreeing = [sd for sd in tied if sd is not top]
+    carried = [top] + agreeing
+    competing = [w for w in winners if all(w is not c for c in carried)]
+    return top, competing, agreeing
 
 
 def _closest_refusal(per_store):
@@ -843,18 +900,23 @@ def examine_sources(scene, *, sources, folder, threshold=DEFAULT_THRESHOLD,
     conflict about who made it. `_choose_winner` resolves it BY CONTENT,
     never by position: a store that cannot confirm ownership never
     out-ranks or ties with one that can, and among whichever stores remain
-    eligible the higher SCORE wins — only a genuine tie (within
-    `scoring.AMBIGUITY_MARGIN`, the same margin `scoring.decide` uses for
-    two candidates within one store) is refused rather than picked, so the
-    common case — several stores agreeing, or one clearly ahead of the rest
-    — still produces a proposal instead of demanding a person look at every
-    ordinary republish. See `_choose_winner`'s own docstring for the full
-    rule. When a winner IS chosen despite other stores also matching, the
-    OTHER stores' winning candidates are recorded in the payload's
-    `competing_store` (see below) rather than silently dropped — the
-    cross-store counterpart to `cronicled.artist.Resolution.competing`,
-    reported the same way a reviewer already sees a folder and a filename
-    naming different creators.
+    eligible the higher SCORE wins — only stores the margin cannot separate
+    (`scoring.AMBIGUITY_MARGIN`, the same margin `scoring.decide` uses for
+    two candidates within one store) have anything left to settle, and what
+    settles it is what they SAY. Tied stores that all name one title are
+    agreeing, not disagreeing, and the proposal is made with every one of
+    them recorded in the payload's `agreeing_stores`; tied stores naming
+    different titles are refused. Refusing on agreement would destroy the
+    strongest text evidence this tool produces — the margin rule exists to
+    stop configuration order picking silently between real alternatives,
+    not to refuse when there is nothing to pick between. See
+    `_choose_winner`'s own docstring for the full rule. When a winner is
+    chosen despite other stores matching a DIFFERENT candidate, those
+    stores' candidates are recorded in the payload's `competing_store` (see
+    below) rather than silently dropped — the cross-store counterpart to
+    `cronicled.artist.Resolution.competing`, reported the same way a
+    reviewer already sees a folder and a filename naming different
+    creators.
 
     ONE LOOKUP PER STORE PER CREATOR, not per file: `sources[i].search` is
     expected to already be single-flighted across a batch — see
@@ -902,11 +964,13 @@ def examine_sources(scene, *, sources, folder, threshold=DEFAULT_THRESHOLD,
     nothing here claims it does.
 
     Returns an `Outcome`, on the same three-way contract `examine`
-    documents (`mute_reason` / refused-but-not-muted / `error`), with two
+    documents (`mute_reason` / refused-but-not-muted / `error`), with three
     additions when a proposal is returned: the payload's `"store"` names
-    which source the winning candidate came from, and `"competing_store"`
-    — present only when another store also matched — lists every other
-    winning store's own candidate and score, highest first.
+    which source the winning candidate came from; `"agreeing_stores"` —
+    present only when another store named the SAME title too close to call
+    between — lists those stores by name; and `"competing_store"` — present
+    only when another store matched a DIFFERENT candidate — lists every
+    such store's own candidate and score, highest first.
 
     A store's search raising is isolated to THAT store for this file: it
     is recorded and the remaining stores are still searched and still
@@ -1036,7 +1100,7 @@ def examine_sources(scene, *, sources, folder, threshold=DEFAULT_THRESHOLD,
         return Outcome(reason=with_store_errors(reason),
                        fallback_queries=fallback_queries)
 
-    chosen, competing = _choose_winner(winners)
+    chosen, competing, agreeing = _choose_winner(winners)
     if chosen is None:
         names = ", ".join(sorted(sd.source.name for sd in winners))
         reason = ("ambiguous across stores: %s each matched a candidate "
@@ -1073,6 +1137,15 @@ def examine_sources(scene, *, sources, folder, threshold=DEFAULT_THRESHOLD,
     }
     summary = '%s -> "%s" by %s (score %.3f)' % (
         name, winner["title"], resolution.name, chosen.decision.match.value)
+    if agreeing:
+        # EVERY store that named this title, not only the one carried. The
+        # corroboration is the finding — the difference between one store's
+        # word and two — and the carried store's name alone cannot express
+        # it. Named `agreeing_stores` after `Identified.agreeing`, the same
+        # field the fingerprint pass records the same fact in.
+        agreed = [sd.source.name for sd in agreeing]
+        payload["agreeing_stores"] = agreed
+        summary += " [also named by %s]" % ", ".join(agreed)
     if competing:
         ordered = sorted(
             competing, key=lambda sd: (-sd.decision.match.value, sd.source.name))
