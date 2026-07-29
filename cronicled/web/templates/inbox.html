@@ -60,6 +60,10 @@
            overflow-wrap: anywhere; }
   .meta { color: var(--muted); font-size: 0.86rem; }
   .meta b { color: var(--fg); font-weight: 600; }
+  /* One searched store's line under a refusal. Indented and set in the same
+     muted type as the reason above it: these are the working behind that
+     sentence, not four more findings competing with it. */
+  .store { margin-top: 0.15rem; padding-left: 0.8rem; }
   /* Fixed width and tabular figures so the score sits in the same place in
      every block -- the one thing the table did better than a block would. */
   .score { flex: 0 0 4.5rem; text-align: right; font-size: 1.15rem;
@@ -444,6 +448,30 @@
       <div class="what">
         <p class="file">{{ identifier(r.filename, r.scene_url) }}</p>
         <div class="meta">{{ r.reason }}</div>
+        {# EVERY store that was searched, not only the one the sentence above
+           names. One line naming the closest store reads as though the
+           others were never consulted, and that has already sent a person
+           hunting a configuration problem that did not exist. Seeing all
+           three scores says something the single line cannot: whether one
+           store came close (move the threshold) or nothing anywhere
+           resembles the file (fix the query or the catalogue).
+
+           Branching on `outcome` and never on which fields are set -- see
+           `rows.STORE_ANSWERED` for why the three states may not collapse
+           into two, and `rows._refused_store_view` for which is shown when a
+           store both answered and then failed. #}
+        {% for s in r.stores %}
+        <div class="store">
+          <b>{{ s.store }}</b>:
+          {% if s.outcome == "failed" %}
+          search failed &mdash; {{ s.error }}
+          {% elif s.outcome == "empty" %}
+          returned nothing
+          {% else %}
+          {{ s.rows }} returned, best {{ "%.3f"|format(s.score) }} &mdash; {{ identifier(s.title, s.url) }}
+          {% endif %}
+        </div>
+        {% endfor %}
       </div>
     </div>
   </div>

@@ -23,6 +23,23 @@ from cronicled.text import slug_match, spaceless
 KIND_SCENE = "scene"
 KIND_DESCRIPTION = "performer-description"
 
+# What one store did when it was searched for a refused file, named so the
+# Refused section can pick a line for it without inspecting which of its
+# fields happen to be set. Same reasoning as KIND_SCENE above: a template
+# branching on `s.error` renders an empty line for a state nobody thought
+# about, and a page whose whole job is explaining a refusal must not have one.
+#
+# THREE, never two. A store that returned rows none of which were good enough,
+# a store that returned nothing, and a store that raised are three different
+# findings: the first says the catalogue has entries and none resemble this
+# file, the second says the catalogue has no entry under this creator at all,
+# and the third says nothing whatever about the catalogue -- it is evidence
+# about the network. Collapsing any pair sends a person to look in the wrong
+# place.
+STORE_ANSWERED = "answered"
+STORE_EMPTY = "empty"
+STORE_FAILED = "failed"
+
 
 @dataclass(frozen=True)
 class Row:
@@ -559,9 +576,57 @@ def to_merge_rows(items):
     return [to_merge_row(i) for i in items]
 
 
+def _refused_store_view(entry):
+    """One searched store's line in the Refused section.
+
+    `entry` is one of `Store.refusals()`'s `stores`, built by
+    `cronicled.scan._store_report` -- read with `[]` rather than `.get`, for
+    the reason `to_mute_row` states for a payload: an entry that exists but
+    cannot answer is malformed, and a default here would render a store's
+    line as a confident blank instead of failing where it can be seen.
+
+    `outcome` is the whole editorial decision, and it is made HERE rather
+    than in the template (see `_runner_up_view` for the same split): reading
+    it wrong there is a silently empty line, since Jinja renders an undefined
+    attribute as empty text rather than raising.
+
+    A store that both answered and then raised leads with the failure. Its
+    rows and score are still carried -- nothing is dropped -- but the failure
+    is what changes their meaning: "40 returned, best 0.236" reads as "this
+    store has nothing like your file", and a store whose narrower follow-up
+    query never completed has not shown that.
+
+    `url` is passed through exactly as recorded, `None` included. Deriving an
+    address for a candidate that carries none would be inventing one, and the
+    template's `identifier` macro already renders a missing url as plain text
+    -- the same degradation a row with no configured media server gets for
+    its filename.
+    """
+    if entry["error"] is not None:
+        outcome = STORE_FAILED
+    elif entry["rows"] == 0:
+        outcome = STORE_EMPTY
+    else:
+        outcome = STORE_ANSWERED
+    return {
+        "store": entry["store"],
+        "outcome": outcome,
+        "rows": entry["rows"],
+        "score": entry["score"],
+        "title": entry["title"],
+        "url": entry["url"],
+        "error": entry["error"],
+    }
+
+
 def to_refusal_row(entry, base_url=None):
     """One standing refusal (`Store.refusals()`'s dict shape) -> what the
     Refused section shows for it.
+
+    `stores` is one line per store the scan searched, in the order the scan
+    recorded them (closest miss first -- see `scan._store_reports`). Nothing
+    here re-orders them: a second ordering rule in the row builder would be
+    free to disagree with the one that had the scores in front of it.
 
     `filename`, not the whole path, matching every other row's own
     editorial choice (`to_row`'s `filename` above) — the directory is the
@@ -580,6 +645,7 @@ def to_refusal_row(entry, base_url=None):
         "reason": entry["reason"],
         "at": entry["at"],
         "scene_url": scene_url(base_url, entry["subject_id"]),
+        "stores": tuple(_refused_store_view(s) for s in entry["stores"]),
     }
 
 
