@@ -2,6 +2,7 @@ import threading
 import unittest
 
 from cronicled.adapters.base import SiteAdapter
+from cronicled.adapters.declarative import DeclarativeAdapter
 from cronicled.jobs import JobRejected, JobRunner
 from cronicled.scan import Identified, fingerprint_outcome
 from cronicled.stash import Stash
@@ -541,6 +542,69 @@ class Scan(unittest.TestCase):
         finally:
             gate.set()
             self.runner.wait(first.id, WAIT)
+
+
+class TheConfiguredAliasesReachAScanStartedFromThePage(unittest.TestCase):
+    """The button on the page is the path that mattered and the path that was
+    broken: it called `build_producer` with `limit` and nothing else, so the
+    resolver was handed `None` on every scan a person ever started, and
+    configuring an alias did nothing.
+
+    Started HERE, through `Actions.scan`, and not by calling `build_producer`
+    with a map of this test's own -- that call would have passed against the
+    broken code, which is exactly why the defect survived. The adapter is a
+    real `DeclarativeAdapter` built from the spec shape an `adapters.json`
+    entry has, for the same reason.
+    """
+
+    ALIASES = {"vcrane": "Velvet Crane"}
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+        self.runner = JobRunner(self.store)
+        self.addCleanup(self.runner.close)
+
+    def _adapters(self, aliases):
+        return {"only": DeclarativeAdapter(
+            {"name": "only", "scraper_id": "scraper-only",
+             "owner_source": "none", "catalog_resolvable": False,
+             "title_match_counts_as_ownership": False,
+             "aliases": dict(aliases)})}
+
+    def _scan(self, aliases):
+        # Filed under the abbreviation, so only the alias can turn this
+        # folder into a creator's name. The filename names nobody, so the
+        # folder is the only candidate either way.
+        stash = _ScanStash([{"id": "1", "files": [
+            {"path": "/library/VCrane/clip-1.mp4"}]}])
+        actions = Actions(self.store, stash, runner=self.runner,
+                          adapters=self._adapters(aliases))
+        job = actions.scan(10)
+        self.assertTrue(self.runner.wait(job.id, WAIT))
+        return [call[2] for call in stash.calls
+                if call[0] == "scrape_scenes_by_query"]
+
+    def test_the_scan_searches_under_the_name_the_alias_declares(self):
+        # HARM: the query a scan spends is the resolver's answer made
+        # visible. Searching for "VCrane" asks a store about a creator it has
+        # never heard of, so every file filed that way goes unmatched and is
+        # muted -- and the operator who added the alias to fix exactly that
+        # sees no change and cannot tell it was ignored rather than wrong.
+        # Every query the run spent, in order: the per-creator pass, then the
+        # per-title fallback for a file that pass could not resolve. Both are
+        # phrased from the resolved name, so both are asserted -- a fallback
+        # that reverted to the folder's own spelling would be a half-applied
+        # alias, and a check on one query could not see it.
+        self.assertEqual(self._scan(self.ALIASES),
+                         ["Velvet Crane", "Velvet Crane clip-1"])
+
+    def test_without_the_alias_the_same_scan_searches_the_folder_name(self):
+        # The control: the only difference between the two is the map in
+        # `adapters.json`. Without it the folder's own spelling is what
+        # reaches the store, which is the behaviour the alias exists to
+        # change -- and is what this scan did with an alias configured.
+        self.assertEqual(self._scan({}), ["VCrane", "VCrane clip-1"])
 
 
 class ScanStatus(unittest.TestCase):

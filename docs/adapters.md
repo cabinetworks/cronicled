@@ -123,6 +123,67 @@ before its refusal is recorded. So this field decides how that second query
 is phrased for this store, and it is reached only for a file the cheaper
 question could not answer.
 
+## `aliases` — and how it differs from `censorship`
+
+Two optional substitution maps sit side by side in an adapter entry, and
+their names do not say which is which. Getting them the wrong way round is
+the mistake this section exists to prevent: an alias filed as a title
+substitution is silently useless, and a title substitution filed as an alias
+is refused at load.
+
+- **`aliases`** is about **artist resolution**, and nothing else. It maps a
+  folder name *as it is actually filed on disk* to the creator's full name,
+  so a library that files a creator under an abbreviation still attributes
+  their files to them. The value is a person's name.
+
+  ```json
+  {
+    "name": "examplestore",
+    "aliases": {
+      "vcrane": "Velvet Crane"
+    }
+  }
+  ```
+
+  Matching is exact on the normalised, spaceless form, so `vcrane`,
+  `V-Crane` and `v crane` all reach the same entry. Nothing is guessed:
+  an abbreviation that is not listed resolves to nothing rather than to
+  whoever shares its initials.
+
+- **`censorship`** is about **title text**. It maps a canonical word to the
+  forms this store substitutes for it, so a search built from an uncensored
+  filename still hits the store's censored index, and a censored store title
+  still compares against the local filename. The value is a *list* of
+  spellings.
+
+  ```json
+  {
+    "name": "examplestore",
+    "censorship": {
+      "kettle": ["k3ttle", "k-ettle"]
+    }
+  }
+  ```
+
+If your file says one thing and the store says another, the word you are
+looking for is almost always `censorship`. An `aliases` entry whose value is
+a list is refused at load, naming `censorship`, because that is the shape of
+a censorship entry and can be nothing else. An entry whose value is a plain
+string is taken at its word: a short or unusual name is the operator's to
+declare, and there is no way to tell one from a title word without guessing.
+
+`censorship` stays bound to the store that declares it — one store censoring
+a word says nothing about what any other store does. `aliases` does not:
+a file's creator is resolved once, from the file's own folder, before any
+store is searched, so every configured adapter's map is pooled into the one
+map a scan resolves against. A folder name that two adapters both declare an
+alias for is refused, naming both, rather than resolved by whichever loaded
+last — declare it in exactly one adapter.
+
+Both maps are optional and default to empty. A malformed `aliases` map — two
+keys that normalise alike, a key that normalises to nothing, a value that is
+not a name — fails when `adapters.json` loads, not part-way through a scan.
+
 ## Where adapters come from
 
 `cronicled.adapters.registry.load_adapters` reads `adapters.json` out of the

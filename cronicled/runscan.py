@@ -24,6 +24,7 @@ import os
 import sys
 
 from cronicled.adapters.registry import load_adapters
+from cronicled.artist import Aliases
 from cronicled.config import load_server
 from cronicled.jobs import JobRunner
 from cronicled.scan import (DEFAULT_THRESHOLD, ScanProducer, Source,
@@ -31,6 +32,7 @@ from cronicled.scan import (DEFAULT_THRESHOLD, ScanProducer, Source,
 from cronicled.search import catalog_search
 from cronicled.stash import Stash
 from cronicled.store import Store
+from cronicled.text import spaceless
 
 
 # The name the scan a schedule runs is registered under — deliberately NOT
@@ -66,9 +68,57 @@ class _EveryFile:
 EVERY_FILE = _EveryFile()
 
 
+def configured_aliases(adapters):
+    """The one alias map a scan resolves against: every configured adapter's
+    own map, pooled and checked once.
+
+    An operator's alias entry says "the folder filed as X is really the
+    creator Y" (see `cronicled.artist.Aliases`). It is declared per adapter
+    because `adapters.json` is the only configuration a store has — but
+    unlike `censorship`, which stays bound to the `Source` of the store that
+    censors the word, an alias cannot be applied per store: the resolver runs
+    once per FILE, off that file's own folder, before any store has been
+    searched. There is one answer per file to give, so there is one map.
+
+    That makes a key declared by two adapters ambiguous rather than
+    redundant, and it is REFUSED, naming both adapters. Pooling by
+    `dict.update` would hand the answer to whichever adapter sorted last —
+    the iteration-order attribution this project has already removed from
+    three other places — and refusing even when the two agree keeps the rule
+    an operator can hold in their head the same one `Aliases` states for a
+    single map: one entry per normalised folder name, declared once.
+    Adapters are visited in name order so the refusal names the same pair
+    whatever order the config file happens to list them in.
+
+    Returns an `Aliases`, built here and passed whole to the run, which is
+    where the remaining malformed-map refusals (a duplicated key, a key that
+    normalises to nothing, a value that is not a name) come from. A
+    `DeclarativeAdapter` has already applied those to its own map as it
+    loaded; this catches the cross-adapter cases that check cannot see, and
+    stands as the backstop for a hand-written adapter that never went
+    through it.
+    """
+    pooled = {}
+    declared_by = {}
+    for adapter_name, adapter in sorted(adapters.items()):
+        for key, full in (adapter.aliases or {}).items():
+            slug = spaceless(key)
+            first = declared_by.get(slug)
+            if first is not None and first[0] != adapter_name:
+                raise ValueError(
+                    "adapters %r and %r both declare an alias for %r "
+                    "(as %r and %r); an alias names a creator, not a store, "
+                    "and one map is built for the whole scan, so declare it "
+                    "in exactly one adapter"
+                    % (first[0], adapter_name, slug, first[1], key))
+            declared_by[slug] = (adapter_name, key)
+            pooled[key] = full
+    return Aliases(pooled)
+
+
 def build_producer(stash, adapters, store, *, limit, folder="library",
                    name_filter=None, threshold=DEFAULT_THRESHOLD,
-                   aliases=None, workers=4, producer_name=None, every=None):
+                   workers=4, producer_name=None, every=None):
     """The `ScanProducer` that scans EVERY one of `adapters` through `stash`,
     recording through `store`.
 
@@ -142,6 +192,19 @@ def build_producer(stash, adapters, store, *, limit, folder="library",
     answers `[]`, the closure asks nobody, and every file takes the text
     path exactly as it does today.
 
+    The operator's ALIASES are read off those same adapters and pooled into
+    one map for the run — see `configured_aliases` for why one and not one
+    per store. There is deliberately no `aliases` parameter to pass them in
+    by: every caller here already holds the adapters, and an argument a
+    caller can omit is exactly how this arrived. Configuring an alias had no
+    effect at all, on any scan any of the three entry points started, because
+    the one that mattered — the page's Scan button, through
+    `cronicled.web.actions.Actions.scan` — passed only `limit`, and a test
+    that called this function with an explicit map went on passing. Derived
+    here, the scheduled scan, the page's scan and the command line get the
+    same map without any of them saying so, and no fourth call site can
+    forget it.
+
     `producer_name` and `every` are what make a producer schedulable and are
     deliberately separate from each other. `producer_name` overrides
     `ScanProducer.name` so a scan started on a cadence is its own
@@ -167,6 +230,7 @@ def build_producer(stash, adapters, store, *, limit, folder="library",
             "file it selects spends a lookup against a rate-limited "
             "scraper. Pass an explicit limit (0 runs the selection "
             "accounting with no lookups spent, if that is what is wanted).")
+    aliases = configured_aliases(adapters)
     sources = [
         Source(name=name, search=catalog_search(stash, adapter),
               owner_of=(adapter.owner_of if adapter.catalog_resolvable

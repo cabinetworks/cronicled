@@ -262,6 +262,85 @@ class Defaults(unittest.TestCase):
         self.assertEqual(DeclarativeAdapter(spec).censorship,
                          {"kestrel": ["k3strel"]})
 
+    def test_aliases_come_from_the_spec_when_given(self):
+        # The WHOLE map, not a sampled key: an entry silently dropped on the
+        # way in is an alias an operator wrote and no scan will ever apply.
+        spec = dict(NONE_SPEC,
+                    aliases={"vcrane": "Velvet Crane",
+                             "i m k": "Ivy May Kingsley"})
+        self.assertEqual(DeclarativeAdapter(spec).aliases,
+                         {"vcrane": "Velvet Crane",
+                          "i m k": "Ivy May Kingsley"})
+
+
+class AnAliasMapIsCheckedWhereItWasWritten(unittest.TestCase):
+    """`adapters.json` is where an alias is typed, so it is where a mistake in
+    one is reported.
+
+    Every refusal here already existed in `cronicled.artist.Aliases`, which a
+    scan builds when it starts. What moves is WHEN: the entry point names the
+    config file it could not load (see `cronicled/__main__.py`), so an
+    operator who mistypes an alias is told about the file they just edited
+    rather than about the scan they started afterwards.
+    """
+
+    def test_a_censorship_entry_filed_under_aliases_is_refused_by_name(self):
+        # HARM: the two maps do different jobs and their names do not say
+        # which is which. An operator whose file says one thing and whose
+        # store says another reaches for "aliases" -- observed -- and a title
+        # substitution left there does nothing at all, forever, while reading
+        # as configured. A list value can only be a censorship entry, so this
+        # one is diagnosable rather than guessed at.
+        spec = dict(NONE_SPEC, aliases={"kettle": ["k3ttle", "k-ettle"]})
+        with self.assertRaises(ValueError) as ctx:
+            DeclarativeAdapter(spec)
+        message = str(ctx.exception)
+        self.assertIn("nosite", message)        # which adapter
+        self.assertIn("kettle", message)        # which entry
+        self.assertIn("censorship", message)    # and the map it belongs in
+
+    def test_a_string_value_is_taken_at_its_word(self):
+        # The other side of that guard, and the reason it is drawn on the
+        # value's SHAPE. A short or unusual name is the operator's to
+        # declare, and nothing here can tell one from a title word without
+        # guessing -- a guard that refused it would refuse somebody's name.
+        spec = dict(NONE_SPEC, aliases={"kettle": "Copper"})
+        self.assertEqual(DeclarativeAdapter(spec).aliases, {"kettle": "Copper"})
+
+    def test_two_keys_that_normalise_alike_are_refused_at_load(self):
+        # HARM: "vcrane" and "v crane" are one lookup, and whichever the dict
+        # yielded first would decide who a file is attributed to.
+        spec = dict(NONE_SPEC, aliases={"vcrane": "Velvet Crane",
+                                        "v crane": "Vera Crane"})
+        with self.assertRaises(ValueError) as ctx:
+            DeclarativeAdapter(spec)
+        self.assertIn("nosite", str(ctx.exception))
+
+    def test_a_value_that_is_not_a_name_is_refused_at_load(self):
+        spec = dict(NONE_SPEC, aliases={"vcrane": ""})
+        with self.assertRaises(ValueError) as ctx:
+            DeclarativeAdapter(spec)
+        self.assertIn("nosite", str(ctx.exception))
+
+    def test_a_key_that_normalises_to_nothing_is_refused_at_load(self):
+        spec = dict(NONE_SPEC, aliases={"  ": "Velvet Crane"})
+        with self.assertRaises(ValueError) as ctx:
+            DeclarativeAdapter(spec)
+        self.assertIn("nosite", str(ctx.exception))
+
+    def test_a_malformed_map_stops_the_whole_config_loading(self):
+        # Through the loader, not the adapter class: that is the path the
+        # entry point takes, and the one that reports the file's name.
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory)
+        path = os.path.join(directory, "adapters.json")
+        spec = dict(NONE_SPEC, aliases={"vcrane": "Velvet Crane",
+                                        "V Crane": "Velvet Crane"})
+        with open(path, "w") as fh:
+            json.dump({"adapters": [spec]}, fh)
+        with self.assertRaises(ValueError):
+            load_adapters(path)
+
 
 class ExampleConfig(unittest.TestCase):
     """The shipped example config must itself pass the spec validation added

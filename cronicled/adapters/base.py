@@ -12,8 +12,32 @@ class SiteAdapter(object):
     display = ""                # human label
     scraper_id = ""             # the media server's scraper id
     catalog_resolvable = True   # can a name search identify the creator?
+
+    # Two substitution maps, doing genuinely different jobs, whose names do
+    # not say which is which. An operator whose file says one thing and whose
+    # store says another reaches for "aliases", because that is what the word
+    # means everywhere else — and a title-word substitution filed there has
+    # already been reported. Both are spelled out here, at the point of use:
+    #
+    # `censorship` is about TITLE TEXT. It maps a canonical word to the forms
+    # a platform substitutes for it, and travels per-store, bound to that
+    # adapter's own `cronicled.scan.Source` — one store censoring a word says
+    # nothing about what any other store does. See `cronicled.censorship`.
     censorship = {}             # {canonical: [substituted_form, ...]}
-    aliases = {}                # {abbreviation_slug: real_store_slug}
+
+    # `aliases` is about ARTIST RESOLUTION and has nothing to do with titles.
+    # It maps a folder name as it is actually filed on disk to the creator's
+    # full name, and is read by `cronicled.artist.resolve` through
+    # `cronicled.artist.Aliases`. The value is a PERSON'S NAME, never a slug
+    # and never a title word.
+    #
+    # Unlike `censorship` it is NOT applied per store: the resolver runs once
+    # per file, off that file's own folder, before any store has been
+    # searched, so there is exactly one alias answer per file and no store to
+    # key it on. `cronicled.runscan.configured_aliases` therefore pools every
+    # configured adapter's map into one, and refuses a key two adapters both
+    # declare rather than letting whichever sorted first decide.
+    aliases = {}                # {as_filed_folder_name: creator_full_name}
 
     def owner_of(self, result):
         raise NotImplementedError
