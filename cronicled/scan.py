@@ -228,18 +228,59 @@ def select(scenes, *, store, folder, name_filter=None, limit=None):
 # files' payloads — which the store then hashes, per file, per run.
 MAX_RUNNERS_UP = 3
 
-# The two reasons — and the ONLY two reasons — a file is muted. Both mean the
-# same thing operationally ("stop offering me this file") and different
-# things to whoever reads them later: one says the catalogue had nothing to
-# offer for a creator we did identify, the other says nothing in the library's
-# own layout named a creator at all. Only the second is fixed by an alias.
+# The ONE reason a scan mutes a file, and the reasons it refuses one instead.
 #
-# They are named constants rather than literals so a caller, a test and a
-# stored mute reason cannot drift apart, and so that collapsing them into one
-# catch-all string has to be done deliberately instead of by a copy-paste.
+# Mute is otherwise the operator's own action — "stop showing me this" — and
+# it is permanent: nothing revisits a mute and no later scan re-examines the
+# file. A scan may only borrow it for a verdict that stays true however the
+# operator changes their library.
+#
+# An unresolved creator was such a verdict until it was measured, and it is
+# not one. It is the most FIXABLE outcome a scan produces — one alias, or one
+# folder rename — and it used to mute, justified as rationing lookups. Over
+# every file that rule had muted in a real library, two thirds cost no lookup
+# at all (resolution returns before any store is searched), the whole set was
+# invisible, and no scan revisited any of it: an operator could add the alias
+# that fixed a file, run a scan, and watch nothing happen anywhere. So it
+# refuses now — recorded, visible, and reconsidered by every later scan. See
+# `RETIRED_MUTE_UNRESOLVED_CREATOR` for what that leaves in existing
+# databases.
+#
+# `MUTE_NO_CANDIDATES` stays a mute deliberately, and is out of scope here: a
+# file whose creator WAS identified really does spend the lookups its mute
+# saves, so its budget argument is the one this one's was not.
 MUTE_NO_CANDIDATES = (
     "no candidates: the catalogue offered nothing for this creator")
-MUTE_UNRESOLVED_CREATOR = (
+
+# The two refusals the unresolved-creator path produces, kept apart because
+# only one of them hands the operator something to act on. A folder whose text
+# a name guard turned down is exactly what an alias would be written against
+# (`Resolution.rejected_folder` records it for that reason), and a single
+# catch-all reason would say "unresolved" for both while losing the actionable
+# half. A folder that yielded no text for a guard to judge has nothing to
+# quote, and must say so as itself rather than by quoting an empty string.
+#
+# Neither claims the folder was empty: a folder can be a plausible name and
+# still leave the creator unresolved (the evidence check declining it), in
+# which case it was not rejected by a guard and there is nothing to quote.
+REFUSED_UNRESOLVED_CREATOR = (
+    "creator unresolved: neither the folder nor the filename yielded a "
+    "creator this run could accept")
+REFUSED_REJECTED_FOLDER = (
+    "creator unresolved: the folder text %r was not accepted as a name, and "
+    "the filename yielded none either")
+
+# What the retired rule wrote into the `mute` table before this. HISTORY, not
+# a message this code produces: it exists so `release_auto_mutes` can
+# recognise the rows that rule left in databases that already exist. Nothing
+# writes it again.
+#
+# It must never be folded into the refusal wording above even if the two ever
+# read alike. The release matches this text EXACTLY, and a shared constant
+# would make rewording a refusal silently stop releasing anything — while the
+# rows it should have released stay hidden, which is the failure the whole
+# change exists to end.
+RETIRED_MUTE_UNRESOLVED_CREATOR = (
     "creator unresolved: neither the folder nor the filename names one")
 
 
@@ -252,12 +293,14 @@ class Outcome:
     different kinds of "no proposal" and conflating any two of them is a bug
     a user feels.
 
-    * `mute_reason` — the file is genuinely unidentifiable (no candidates, or
-      no creator resolved). Muting stops it consuming a lookup on every
-      future run, which is the budget the whole module rations.
-    * neither set — the scoring refused: a tie, or nothing over the
-      threshold. A human should look at this. Muting it would silently hide a
-      file that is one glance, or one threshold change, from being resolved.
+    * `mute_reason` — the file is genuinely unidentifiable: the creator was
+      identified and the catalogue offered nothing for them. Muting stops it
+      consuming a lookup on every future run, which is the budget the whole
+      module rations.
+    * neither set — refused: a tie, nothing over the threshold, or no creator
+      resolved at all. A human should look at this. Muting it would silently
+      hide a file that is one glance, one alias, or one threshold change from
+      being resolved.
     * `error` — the lookup raised. That is evidence about the NETWORK, not
       about the file. Muting on error would hide a file permanently because
       a socket blipped once, and no later run would ever revisit it.
@@ -281,6 +324,34 @@ class Outcome:
     error: str = None
     reason: str = ""
     fallback_queries: int = 0
+
+
+def _unresolved_creator(resolution):
+    """The `Outcome` for a file no creator could be resolved for: a REFUSAL,
+    never a mute.
+
+    Refusing costs a row in the Refused section that every later scan
+    reconsiders. Muting cost the file itself — invisible, never revisited,
+    and regenerated on the next run, so releasing a batch of them by hand was
+    never a fix either. The asymmetry is the whole reason this is a separate
+    function rather than a bare `Outcome(...)` at each of its two call sites:
+    both paths reach the same conclusion about the same file, and a second
+    copy of this branch would be free to disagree about which one mutes.
+
+    The reason carries `Resolution.rejected_folder` when the resolver has one
+    — the folder text a name guard threw out. That text is what an operator
+    writes an alias against, and a mute row showed a bare id instead of it.
+
+    Uncertainty withholds evidence rather than supplying it: with no rejected
+    folder, the reason says a creator was not resolved and stops there. It
+    does NOT claim the folder was empty, because a folder that IS a plausible
+    name can still leave the creator unresolved when the evidence check
+    declines it, and that folder was never rejected by any guard.
+    """
+    if resolution.rejected_folder:
+        return Outcome(reason=REFUSED_REJECTED_FOLDER
+                       % (resolution.rejected_folder,))
+    return Outcome(reason=REFUSED_UNRESOLVED_CREATOR)
 
 
 def _primary_path(scene):
@@ -467,8 +538,7 @@ def examine(scene, *, search, folder, threshold=DEFAULT_THRESHOLD, aliases=None,
     resolution = resolve(name, directory, aliases,
                          owners_of=_owners_of(search, owner_of))
     if resolution.name is None:
-        return Outcome(mute_reason=MUTE_UNRESOLVED_CREATOR,
-                       reason=MUTE_UNRESOLVED_CREATOR)
+        return _unresolved_creator(resolution)
 
     try:
         candidates = list(search(resolution.name))
@@ -995,8 +1065,7 @@ def examine_sources(scene, *, sources, folder, threshold=DEFAULT_THRESHOLD,
     resolution = resolve(name, directory, aliases,
                          owners_of=_combined_owners_of(sources))
     if resolution.name is None:
-        return Outcome(mute_reason=MUTE_UNRESOLVED_CREATOR,
-                       reason=MUTE_UNRESOLVED_CREATOR)
+        return _unresolved_creator(resolution)
 
     # Keyed by the source's POSITION, not its name: two sources sharing a
     # name is a caller's wiring mistake `Source` names but cannot catch, and
@@ -1484,6 +1553,47 @@ def catalogue_link(payload):
 # --- Running a batch -------------------------------------------------------
 
 
+def release_auto_mutes(store):
+    """Release every mute the retired unresolved-creator rule left behind,
+    returning the subjects released as `(subject_type, subject_id)` pairs.
+
+    A one-time repair that runs every time, because it must: those rows sit
+    in operators' live databases, hiding files the scan will now refuse and
+    reconsider instead, and nothing else would ever look at them again.
+
+    WHAT IT TOUCHES, precisely, because a manual mute lost here is not
+    recoverable. A row qualifies only when its `reason` is EXACTLY
+    `RETIRED_MUTE_UNRESOLVED_CREATOR` — not a prefix, not a substring, not
+    "any reason a scan might have written". Nothing else writes that
+    sentence: the only other reason a scan ever stored is
+    `MUTE_NO_CANDIDATES` (different text, deliberately still a mute, and out
+    of scope), and the only mute an operator can make carries the inbox's own
+    wording, `Store.mute`'s `reason=None` default being the only other shape
+    in the table. A mute is therefore released only on positive evidence that
+    the retired rule wrote it, never on the absence of evidence that a person
+    did.
+
+    Through `Store.unmute`, one subject at a time, rather than a DELETE over
+    the table: a subject absent from the `mute` table is not the same as a
+    subject a scan can select, and only the second is what an operator
+    wanted. `unmute` also returns the `item` rows the mute hid to `new`,
+    which a DELETE would leave sitting in `state = 'muted'` — hidden from the
+    inbox by a mute that no longer exists.
+
+    Safe to run twice: the second pass finds nothing to match, because the
+    first removed the rows it matched. Safe to run against a database the
+    rule never touched, which is every fresh install: it reads the mute table
+    and writes nothing.
+    """
+    released = []
+    for entry in store.mutes():
+        if entry["reason"] != RETIRED_MUTE_UNRESOLVED_CREATOR:
+            continue
+        store.unmute(entry["subject_type"], entry["subject_id"])
+        released.append((entry["subject_type"], entry["subject_id"]))
+    return released
+
+
 def _query_key(query):
     """The form in which two queries are the SAME query.
 
@@ -1737,11 +1847,14 @@ class ScanProducer:
         ways, and the difference between them is the reason `examine`
         exists as its own step:
 
-        * unidentifiable — no candidates, or no creator resolved — is MUTED,
-          so it stops consuming a lookup on every future run;
-        * a refusal (a tie, or nothing over the threshold) is logged and
-          nothing else: a human should look, and muting would hide a file
-          that is one glance from being resolved;
+        * unidentifiable — the creator was identified and the catalogue
+          offered nothing for them — is MUTED, so it stops consuming a lookup
+          on every future run;
+        * a refusal (a tie, nothing over the threshold, or no creator
+          resolved) is recorded through the store: a human should look, and
+          muting would hide a file that is one glance, or one alias, from
+          being resolved. The retired mutes of the last kind are released on
+          the way in — see `release_auto_mutes`;
         * an error is logged and nothing else: that is evidence about the
           network, not about the file.
 
@@ -1757,6 +1870,24 @@ class ScanProducer:
         # would be checking a value that cannot have changed since, and would
         # put the failure back on a background thread.
         #
+        # The release comes FIRST, before the selection reads the mute table,
+        # so a file it frees is examined by THIS run rather than waiting for
+        # one nobody scheduled.
+        #
+        # Here rather than at start-up because this is the point where it
+        # matters and the one place every scan goes through, however it was
+        # started — the web UI's runner and the command-line scan both. A
+        # release wired into one entry point is a release an operator who
+        # only ever uses the other never gets.
+        #
+        # Logged only when it actually released something, the same rule the
+        # fingerprint note below follows: an absent line means the retired
+        # rule left nothing here, not that nothing was looked at.
+        released = release_auto_mutes(self._store)
+        if released:
+            ctx.log("released %d file(s) muted by the retired "
+                    "unresolved-creator rule; they are examined again from "
+                    "this run on" % len(released))
         # Fetched WHOLE, deliberately: `limit` belongs to `select`, which
         # applies it after the narrowings. Passing it here would limit at the
         # source, so a batch of 50 would be the first 50 files overall and
@@ -1935,10 +2066,12 @@ class ScanProducer:
         """
         subject_id = str(scene["id"])
         if outcome.mute_reason is not None:
-            # Through the store, with the reason, so a later reader
-            # learns whether the catalogue had nothing for a creator
-            # we did identify or the layout named nobody at all —
-            # only the second is fixed by an alias.
+            # Through the store, with the reason, so a later reader learns
+            # what the verdict rested on rather than only that there was
+            # one. One reason reaches here now (`MUTE_NO_CANDIDATES`) and
+            # the parameter stays: a mute with no reason is a row a person
+            # cannot judge, and the constant is what stops a second one
+            # being added by copy-paste instead of on purpose.
             self._store.mute(SUBJECT_TYPE, subject_id,
                              reason=outcome.mute_reason)
             return "muted"
