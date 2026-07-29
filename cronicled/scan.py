@@ -318,12 +318,21 @@ class Outcome:
     the producer sums what comes back and logs the total, so the cost of the
     fallback is a number a reader can see rather than one they infer from the
     file limit.
+
+    `stores` is what each searched store returned for this file, one entry
+    per store, built by `_store_reports` — empty on an outcome no store
+    search stands behind (a creator that never resolved, a single-store
+    `examine`, a file a fingerprint identified). It is set on a REFUSAL,
+    which is the outcome that used to keep nothing but one prose sentence
+    about one store; see `_store_reports` for the shape and for why the
+    other stores' numbers are the diagnosis rather than decoration.
     """
     proposal: dict = None
     mute_reason: str = None
     error: str = None
     reason: str = ""
     fallback_queries: int = 0
+    stores: tuple = ()
 
 
 def _unresolved_creator(resolution):
@@ -930,6 +939,89 @@ def _closest_refusal(per_store):
     return ranked[0]
 
 
+def _store_report(source, store_decision, error):
+    """What ONE searched store returned for one file, as plain data.
+
+    Every number here was already computed by `_judge` and thrown away on the
+    way to `Store.record_refusal`, which kept a single sentence naming a
+    single store. A reader of that sentence cannot tell the other stores were
+    searched at all, and cannot read the score back out of it without parsing
+    English. Both are recorded as values instead.
+
+    THE THREE STATES A STORE CAN BE IN ARE KEPT APART, because collapsing any
+    two of them loses the only signal separating a misconfigured store from an
+    unhelpful one:
+
+    * returned rows, none good enough — `rows` is how many came back, `score`
+      the best of them, `title`/`url` the candidate that earned it.
+    * returned nothing — `rows` is 0 and there is no score, because nothing
+      was scored. Not 0.0: a value would be a number this function invented
+      and then recorded in the same field, in the same type, as scores the
+      scorer really produced.
+    * raised — `error` names what, and `rows` is None rather than 0. An error
+      is evidence about the network, not a confirmed-empty catalogue, and a 0
+      here would assert the second. That is the same distinction
+      `examine_sources` already refuses to blur when deciding whether a file
+      may be muted.
+
+    A store can be in the first and the third at once: its per-creator search
+    answered and its per-title fallback then raised. Everything known about it
+    is kept — the rows and the score AND the error — rather than one being
+    dropped to fit a single state. Which of the two a reader is shown first is
+    the display's decision, not this one's; see
+    `cronicled.web.rows._refused_store_view`.
+
+    `url` is `_enrichment_url`'s answer, not a second reading of the
+    candidate: it is already this project's one rule for "which address does
+    this candidate stand at", matching the precedence an apply uses, so a link
+    offered here cannot point somewhere an apply would disagree with. It is
+    None for a candidate carrying no address at all, which is a candidate that
+    renders as text rather than as an anchor pointing nowhere.
+
+    Which candidate is the near miss is decided by SCORE, ties broken by
+    TITLE — the identical key `_runners_up` sorts a payload's losers by, and
+    for the identical reason: the catalogue's own result order must not decide
+    what a person is shown.
+    """
+    report = {"store": source.name, "rows": None, "score": None,
+              "title": None, "url": None, "error": error}
+    if store_decision is None:
+        if error is None:
+            report["rows"] = 0
+        return report
+    ranked = sorted(zip(store_decision.matches, store_decision.candidates),
+                    key=lambda pair: (-pair[0].value, pair[1]["title"]))
+    match, candidate = ranked[0]
+    report["rows"] = len(store_decision.candidates)
+    report["score"] = match.value
+    report["title"] = candidate["title"]
+    report["url"] = _enrichment_url(candidate)
+    return report
+
+
+def _store_reports(sources, decisions, raised):
+    """One `_store_report` per source, closest miss first.
+
+    `decisions` maps a source's POSITION to its `_StoreDecision` and `raised`
+    maps a position to what that store's search raised — both exactly as
+    `examine_sources` keeps them, so nothing is recomputed and no second
+    scoring path can disagree with `_judge` about the artist subtraction, a
+    store's censorship map, or the threshold.
+
+    Ordered by `(-score, name)`: the same key `_closest_refusal` ranks by, so
+    the store the refusal's own sentence talks about is the one a reader meets
+    first, and so re-ordering a config file cannot re-order what is recorded.
+    Position in `sources` is read only to pair a store with its own verdict
+    and never survives into the result. A store with no score of its own —
+    empty, or raised — sorts as 0.0 and lands at the end, among its peers by
+    name.
+    """
+    reports = [_store_report(source, decisions.get(index), raised.get(index))
+               for index, source in enumerate(sources)]
+    reports.sort(key=lambda r: (-(r["score"] or 0.0), r["store"]))
+    return tuple(reports)
+
+
 def examine_sources(scene, *, sources, folder, threshold=DEFAULT_THRESHOLD,
                     aliases=None, enrich=None):
     """Work out what `scene` is by searching EVERY one of `sources`, and
@@ -1075,14 +1167,20 @@ def examine_sources(scene, *, sources, folder, threshold=DEFAULT_THRESHOLD,
     # content, so re-ordering a config file still changes nothing.
     decisions = {}
     store_errors = []
-    raised = set()
+    # Keyed by position like `decisions`, and holding the failure's own text
+    # rather than only the fact of it: `_store_reports` records what each
+    # store did, and "raised" with no `TypeError: ...` behind it sends a
+    # reader back to a log they may no longer have. The `store_errors` line
+    # is the same text with the store's name in front, built from this one so
+    # the two cannot describe the same failure differently.
+    raised = {}
     for index, source in enumerate(sources):
         try:
             candidates = list(source.search(resolution.name))
         except Exception as exc:
-            store_errors.append(
-                "%s: %s: %s" % (source.name, type(exc).__name__, exc))
-            raised.add(index)
+            detail = "%s: %s" % (type(exc).__name__, exc)
+            store_errors.append("%s: %s" % (source.name, detail))
+            raised[index] = detail
             continue
         if not candidates:
             continue
@@ -1133,8 +1231,14 @@ def examine_sources(scene, *, sources, folder, threshold=DEFAULT_THRESHOLD,
                 try:
                     candidates = list(source.search(query))
                 except Exception as exc:
-                    store_errors.append(
-                        "%s: %s: %s" % (source.name, type(exc).__name__, exc))
+                    # Recorded against the store as well as in the run's own
+                    # error line. Its per-creator pass may have answered, and
+                    # a store whose narrower follow-up then failed has not
+                    # been shown to hold nothing — the same reason a single
+                    # store's error bars a mute.
+                    detail = "%s: %s" % (type(exc).__name__, exc)
+                    store_errors.append("%s: %s" % (source.name, detail))
+                    raised[index] = detail
                     continue
                 if not candidates:
                     continue
@@ -1167,7 +1271,8 @@ def examine_sources(scene, *, sources, folder, threshold=DEFAULT_THRESHOLD,
         best = _closest_refusal(per_store)
         reason = "%s: %s" % (best.source.name, best.decision.reason)
         return Outcome(reason=with_store_errors(reason),
-                       fallback_queries=fallback_queries)
+                       fallback_queries=fallback_queries,
+                       stores=_store_reports(sources, decisions, raised))
 
     chosen, competing, agreeing = _choose_winner(winners)
     if chosen is None:
@@ -1176,7 +1281,8 @@ def examine_sources(scene, *, sources, folder, threshold=DEFAULT_THRESHOLD,
                   "above the threshold, too close to call between them"
                   % names)
         return Outcome(reason=with_store_errors(reason),
-                       fallback_queries=fallback_queries)
+                       fallback_queries=fallback_queries,
+                       stores=_store_reports(sources, decisions, raised))
 
     winner = chosen.candidates[chosen.decision.index]
     if enrich is not None:
@@ -2086,7 +2192,8 @@ class ScanProducer:
             # for why reusing `item` here would re-propose the same
             # unresolved file as a fresh row every night.
             self._store.record_refusal(SUBJECT_TYPE, subject_id,
-                                       _primary_path(scene), outcome.reason)
+                                       _primary_path(scene), outcome.reason,
+                                       stores=outcome.stores)
             return "refused"
         return "proposed"
 

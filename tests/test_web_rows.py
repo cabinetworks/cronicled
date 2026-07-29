@@ -6,9 +6,10 @@ from cronicled.scoring import Match
 from cronicled.tags import MERGE_IS_IRREVERSIBLE, UNDECIDED_MANY, cluster_tags
 from cronicled.tags import proposal as tag_proposal
 from cronicled.web.rows import (
-    IDENTIFIED_SCORE_TEXT, KIND_DESCRIPTION, KIND_SCENE, Row, scene_url,
-    to_description_row, to_merge_row, to_merge_rows, to_mute_row,
-    to_mute_rows, to_refusal_row, to_refusal_rows, to_row, to_rows,
+    IDENTIFIED_SCORE_TEXT, KIND_DESCRIPTION, KIND_SCENE, STORE_ANSWERED,
+    STORE_EMPTY, STORE_FAILED, Row, scene_url, to_description_row,
+    to_merge_row, to_merge_rows, to_mute_row, to_mute_rows, to_refusal_row,
+    to_refusal_rows, to_row, to_rows,
 )
 
 
@@ -246,7 +247,7 @@ class ToRefusalRowSceneUrl(unittest.TestCase):
         entry = {"subject_type": "scene", "subject_id": "1",
                  "path": "/library/Nine Winters/nine-winters-clip.mp4",
                  "reason": "a tie between two candidates",
-                 "at": "2026-07-27T00:00:00"}
+                 "at": "2026-07-27T00:00:00", "stores": []}
         entry.update(over)
         return entry
 
@@ -469,7 +470,7 @@ class ToRefusalRowTest(unittest.TestCase):
         entry = {"subject_type": "scene", "subject_id": "1",
                  "path": "/library/Nine Winters/nine-winters-clip.mp4",
                  "reason": "a tie between two candidates",
-                 "at": "2026-07-27T00:00:00"}
+                 "at": "2026-07-27T00:00:00", "stores": []}
         entry.update(over)
         return entry
 
@@ -490,6 +491,110 @@ class ToRefusalRowTest(unittest.TestCase):
         entries = [self._entry(subject_id="1"), self._entry(subject_id="2")]
         rows = to_refusal_rows(entries)
         self.assertEqual([r["subject_id"] for r in rows], ["1", "2"])
+
+
+class ARefusedRowShowsEveryStoreSearched(unittest.TestCase):
+    """`Store.refusals()`'s `stores` -> one line per store in the Refused
+    section.
+
+    The defect this is the display half of: a refusal showed one sentence
+    naming the one store that scored highest, which reads as though the
+    others were never searched. Seeing 0.236 / 0.342 / 0.259 says something
+    the single line cannot -- that nothing anywhere resembles the file, which
+    points at the query rather than at the threshold.
+    """
+
+    ANSWERED = {"store": "alpha", "rows": 40, "score": 0.342,
+                "title": "Evening Ritual",
+                "url": "https://alpha.example/clip/evening-ritual",
+                "error": None}
+    EMPTY = {"store": "beta", "rows": 0, "score": None, "title": None,
+             "url": None, "error": None}
+    FAILED = {"store": "gamma", "rows": None, "score": None, "title": None,
+              "url": None, "error": "TimeoutError: timed out"}
+
+    def _entry(self, stores):
+        return {"subject_type": "scene", "subject_id": "1",
+                "path": "/library/Nine Winters/nine-winters-clip.mp4",
+                "reason": "alpha: nothing above the threshold (0.70)",
+                "at": "2026-07-27T00:00:00", "stores": stores}
+
+    def _views(self, stores):
+        return to_refusal_row(self._entry(stores))["stores"]
+
+    def test_every_store_gets_its_own_line_as_one_whole_shape(self):
+        """The whole tuple of whole dicts. A check that `alpha` is there
+        passes while `beta` and `gamma` are dropped -- which is the bug."""
+        self.assertEqual(self._views([self.ANSWERED, self.EMPTY, self.FAILED]), (
+            {"store": "alpha", "outcome": STORE_ANSWERED, "rows": 40,
+             "score": 0.342, "title": "Evening Ritual",
+             "url": "https://alpha.example/clip/evening-ritual",
+             "error": None},
+            {"store": "beta", "outcome": STORE_EMPTY, "rows": 0,
+             "score": None, "title": None, "url": None, "error": None},
+            {"store": "gamma", "outcome": STORE_FAILED, "rows": None,
+             "score": None, "title": None, "url": None,
+             "error": "TimeoutError: timed out"},
+        ))
+
+    def test_the_three_states_get_three_different_outcomes(self):
+        """Each asserted against the specific value it must produce, and
+        against each OTHER. One catch-all value would satisfy three separate
+        "is it set" checks while collapsing all three into one line."""
+        answered, empty, failed = self._views(
+            [self.ANSWERED, self.EMPTY, self.FAILED])
+
+        self.assertEqual(answered["outcome"], STORE_ANSWERED)
+        self.assertEqual(empty["outcome"], STORE_EMPTY)
+        self.assertEqual(failed["outcome"], STORE_FAILED)
+        self.assertEqual(len({answered["outcome"], empty["outcome"],
+                              failed["outcome"]}), 3)
+
+    def test_a_store_that_answered_and_then_failed_leads_with_the_failure(self):
+        """Both facts are recorded and both are carried, but the line is the
+        failure's: "40 returned, best 0.342" reads as "this store has nothing
+        like your file", and a store whose follow-up query never completed
+        has not shown that."""
+        both = dict(self.ANSWERED, error="RuntimeError: connection refused")
+
+        view = self._views([both])[0]
+
+        self.assertEqual(view["outcome"], STORE_FAILED)
+        self.assertEqual(view["rows"], 40)
+        self.assertEqual(view["score"], 0.342)
+
+    def test_the_order_recorded_is_the_order_shown(self):
+        """`scan._store_reports` ordered these with the scores in front of
+        it. A second ordering rule here would be free to disagree with that
+        one. The fixture is not in name order, so a re-sort is visible."""
+        views = self._views([self.FAILED, self.ANSWERED, self.EMPTY])
+        self.assertEqual([v["store"] for v in views],
+                         ["gamma", "alpha", "beta"])
+
+    def test_the_near_miss_address_is_carried_through_unchanged(self):
+        view = self._views([self.ANSWERED])[0]
+        self.assertEqual(view["url"],
+                         "https://alpha.example/clip/evening-ritual")
+
+    def test_a_candidate_with_no_address_carries_none_rather_than_a_guess(self):
+        """Uncertainty withholds evidence rather than supplying it. There is
+        no address to derive for a candidate that carries none, and the title
+        is still shown -- as text, by the template's own `identifier`."""
+        addressless = dict(self.ANSWERED, url=None)
+
+        view = self._views([addressless])[0]
+
+        self.assertIsNone(view["url"])
+        self.assertEqual(view["title"], "Evening Ritual")
+
+    def test_an_empty_address_is_no_address(self):
+        """A store that answered with `""` rather than omitting the field
+        must not become an anchor pointing at the page it is on."""
+        view = self._views([dict(self.ANSWERED, url="")])[0]
+        self.assertFalse(view["url"])
+
+    def test_a_refusal_no_store_search_stands_behind_shows_no_lines(self):
+        self.assertEqual(self._views([]), ())
 
 
 class FailedApplyIsNotADeadEnd(unittest.TestCase):

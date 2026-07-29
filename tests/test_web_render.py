@@ -6,7 +6,9 @@ from cronicled.schedule import LoopStatus, TickResult
 from cronicled.tags import cluster_tags
 from cronicled.tags import proposal as tag_proposal
 from cronicled.web.render import environment, render
-from cronicled.web.rows import to_description_row, to_merge_row, to_row
+from cronicled.web.rows import (
+    to_description_row, to_merge_row, to_refusal_row, to_row,
+)
 
 _HOSTILE = '<script>alert("x")</script>'
 
@@ -500,6 +502,99 @@ class MutedDismissedRefusedSections(unittest.TestCase):
         section = html[html.index("Superseded (1)"):html.index("Refused (")]
         self.assertNotIn("<form", section)
         self.assertIn(row.score_text, section)
+
+
+class ARefusedRowShowsWhatEveryStoreReturned(unittest.TestCase):
+    """The Refused section's per-store lines.
+
+    Rendered from `to_refusal_row`'s own output rather than from hand-written
+    dicts, so the `outcome` values the template branches on are the ones
+    `rows.STORE_*` actually defines. A fixture that spelled them out here
+    would keep passing after a constant was renamed, with the page rendering
+    a blank line for every store -- Jinja renders a branch nothing matched as
+    empty text rather than raising.
+    """
+
+    ANSWERED = {"store": "alpha", "rows": 40, "score": 0.342,
+                "title": "Evening Ritual",
+                "url": "https://alpha.example/clip/evening-ritual",
+                "error": None}
+    EMPTY = {"store": "beta", "rows": 0, "score": None, "title": None,
+             "url": None, "error": None}
+    FAILED = {"store": "gamma", "rows": None, "score": None, "title": None,
+              "url": None, "error": "TimeoutError: timed out"}
+
+    _ANCHOR_RE = re.compile(r'<a href="([^"]*)"[^>]*>([^<]*)</a>')
+
+    def section(self, stores):
+        row = to_refusal_row(
+            {"subject_type": "scene", "subject_id": "9",
+             "path": "/library/Nine Winters/clip.mp4",
+             "reason": "alpha: nothing above the threshold (0.70)",
+             "at": "t", "stores": stores})
+        html = render("inbox.html", rows=[], counts={}, muted=[],
+                      dismissed=[], refused=[row])
+        return html[html.index("Refused (1)"):html.index("<h2>Scan</h2>")]
+
+    def test_each_of_the_three_states_says_its_own_specific_thing(self):
+        """Asserted on what each state produces, not on "some text appeared".
+        One catch-all sentence used for all three would satisfy three loose
+        checks while telling a reader nothing about which store did what."""
+        section = self.section([self.ANSWERED, self.EMPTY, self.FAILED])
+
+        # Rows, none good enough: the count AND the score AND the candidate.
+        self.assertIn("40 returned, best 0.342", section)
+        self.assertIn("Evening Ritual", section)
+        # Confirmed empty -- and no invented count or score alongside it.
+        self.assertIn("returned nothing", section)
+        # Raised: named as a failure, with what failed.
+        self.assertIn("search failed", section)
+        self.assertIn("TimeoutError: timed out", section)
+        # ...and the empty store is not described as a failure, nor the
+        # failing one as empty. Three lines, three meanings.
+        self.assertEqual(section.count("returned nothing"), 1)
+        self.assertEqual(section.count("search failed"), 1)
+
+    def test_every_store_is_named_not_only_the_closest(self):
+        section = self.section([self.ANSWERED, self.EMPTY, self.FAILED])
+        for name in ("alpha", "beta", "gamma"):
+            self.assertIn("<b>%s</b>" % name, section)
+
+    def test_the_near_miss_title_links_to_that_candidates_page(self):
+        section = self.section([self.ANSWERED])
+        self.assertEqual(self._ANCHOR_RE.findall(section),
+                         [("https://alpha.example/clip/evening-ritual",
+                           "Evening Ritual")])
+
+    def test_a_candidate_with_no_address_renders_as_text_with_no_anchor(self):
+        """An anchor pointing nowhere is worse than plain text: it looks
+        clickable, goes to the page it is on, and teaches a reviewer the
+        links are not to be trusted. The same degradation a row with no
+        configured media server already gets for its filename."""
+        section = self.section([dict(self.ANSWERED, url=None)])
+
+        self.assertIn("Evening Ritual", section)
+        self.assertEqual(self._ANCHOR_RE.findall(section), [])
+        self.assertNotIn("<a ", section)
+
+    def test_an_empty_address_produces_no_anchor_either(self):
+        section = self.section([dict(self.ANSWERED, url="")])
+        self.assertNotIn("<a ", section)
+
+    def test_a_refusal_with_no_stores_renders_no_store_lines_and_no_error(self):
+        section = self.section([])
+        self.assertNotIn('class="store"', section)
+        self.assertIn("alpha: nothing above the threshold (0.70)", section)
+
+    def test_a_stores_own_fields_are_escaped(self):
+        hostile = {"store": _HOSTILE, "rows": 1, "score": 0.5,
+                   "title": _HOSTILE, "url": None, "error": None}
+        failed = dict(self.FAILED, error=_HOSTILE)
+
+        section = self.section([hostile, failed])
+
+        self.assertEqual(section.count("<script>"), 0)
+        self.assertIn("&lt;script&gt;", section)
 
 
 class NewSectionsEscaping(unittest.TestCase):

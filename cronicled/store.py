@@ -70,9 +70,16 @@ CREATE TABLE IF NOT EXISTS producer_run (
 -- A standing, transient record of "examined and refused" -- see the block
 -- above `record_refusal` for why this is its own table, keyed by subject,
 -- rather than a row in `item`.
+--
+-- `stores` is the JSON list of what every searched store returned for this
+-- subject -- see `record_refusal` for its shape and for why a score has to
+-- be a value here rather than a number spelled inside `reason`. Listed in
+-- `_ADDED_COLUMNS` too, which is what gives a database written before this
+-- column the column rather than a missing one.
 CREATE TABLE IF NOT EXISTS refusal (
     subject_type TEXT NOT NULL, subject_id TEXT NOT NULL,
     path TEXT NOT NULL, reason TEXT NOT NULL, at TEXT NOT NULL,
+    stores TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (subject_type, subject_id));
 """
 
@@ -87,10 +94,47 @@ CREATE TABLE IF NOT EXISTS refusal (
 # `PRAGMA integrity_check` reporting ok. `SchemaAdditionOnAnExistingDatabase`
 # in the tests pins it.
 #
-# That covers *additive* change only. Altering or dropping something that
+# A new COLUMN on a table that already exists is the one additive change
+# `IF NOT EXISTS` does NOT carry: the `CREATE TABLE` is skipped whole, so the
+# column named in it never appears on a database that already has the table.
+# `_ADDED_COLUMNS` below is the list of those, applied by
+# `_add_missing_columns` on every open.
+#
+# Both of those are still *additive* only. Altering or dropping something that
 # already holds data is a different problem, and this schema offers nothing
 # for it on its own — see `SCHEMA_VERSION` below for the marker that at least
 # lets it be detected.
+
+# Columns added to a table after that table had already shipped, as
+# `(table, column, definition)`.
+#
+# Every definition here MUST carry a non-NULL default. It is what SQLite
+# requires to add a `NOT NULL` column to a table that already holds rows, and
+# it is also what makes the addition genuinely additive in both directions:
+# rows written before the column read back as the default rather than as NULL,
+# and code written before the column keeps inserting without naming it.
+#
+# The addition is decided by asking the table what columns it HAS
+# (`PRAGMA table_info`), never by branching on `SCHEMA_VERSION`. A version
+# stamp records what a build believed; `table_info` records what the file
+# actually is, and only the second can be wrong in a way that is visible here.
+_ADDED_COLUMNS = (
+    ("refusal", "stores", "TEXT NOT NULL DEFAULT '[]'"),
+)
+
+
+def _add_missing_columns(conn):
+    """Give `conn`'s tables every column in `_ADDED_COLUMNS` they are missing.
+
+    Idempotent, and cheap enough to run on every open: a database that
+    already has them does one `PRAGMA table_info` per entry and no writes.
+    """
+    for table, column, definition in _ADDED_COLUMNS:
+        present = {row[1] for row in conn.execute(
+            "PRAGMA table_info(%s)" % (table,))}
+        if column not in present:
+            conn.execute("ALTER TABLE %s ADD COLUMN %s %s"
+                         % (table, column, definition))
 
 # The shape's version, stamped into the database file itself via SQLite's
 # built-in `PRAGMA user_version` (an integer the engine reserves for
@@ -122,6 +166,17 @@ CREATE TABLE IF NOT EXISTS refusal (
 # shape risks reading or writing it wrong in a way nothing would ever surface
 # — a refusal that stops the process is recoverable (fix the file, or the
 # code, and try again); a silent misread of a mute is not.
+#
+# NOT bumped by an additive change, and `refusal.stores` is the first one to
+# test that. Bumping would make every build that predates the column refuse to
+# open a database that has it — a real cost — and buy nothing in return: an
+# added column with a default is invisible to code that does not name it
+# (every statement here lists its columns), rows written before it read back
+# as the default, and `_add_missing_columns` needs no version to know whether
+# to act because `PRAGMA table_info` already tells it. What this marker is for
+# is the change that CANNOT be carried that way — altering or dropping
+# something already holding data — which is the case the comment above
+# describes and which still does not exist.
 SCHEMA_VERSION = 1
 
 
@@ -262,9 +317,27 @@ class Store:
             self._conn = sqlite3.connect(path, check_same_thread=False)
             with self._lock:
                 self._conn.execute("PRAGMA journal_mode=WAL")
-                self._conn.executescript(SCHEMA)
-                self._conn.commit()
+                # Read the stamp BEFORE touching the file. A shape this build
+                # does not recognise must be left exactly as it was found:
+                # re-running the schema script against it is harmless (every
+                # statement is `IF NOT EXISTS`), but `_add_missing_columns`
+                # writes, and altering a table inside a shape nothing here can
+                # vouch for is the one thing the refusal below exists to stop.
                 found = self._conn.execute("PRAGMA user_version").fetchone()[0]
+                if found != 0 and found != SCHEMA_VERSION:
+                    raise SchemaVersionError(
+                        f"{canonical_path!r} is stamped schema version "
+                        f"{found}, but this code understands version "
+                        f"{SCHEMA_VERSION}. Refusing to open rather than "
+                        f"run this version's rules against a shape it was "
+                        f"not written for."
+                    )
+                self._conn.executescript(SCHEMA)
+                # Tables the script created just now already carry every
+                # column; tables that survived from an earlier open do not,
+                # because `CREATE TABLE IF NOT EXISTS` skipped them whole.
+                _add_missing_columns(self._conn)
+                self._conn.commit()
                 if found == 0:
                     # Unstamped — either brand new, or written before this
                     # marker existed. Both are this exact shape today (see
@@ -275,14 +348,6 @@ class Store:
                     # always had.
                     self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                     self._conn.commit()
-                elif found != SCHEMA_VERSION:
-                    raise SchemaVersionError(
-                        f"{canonical_path!r} is stamped schema version "
-                        f"{found}, but this code understands version "
-                        f"{SCHEMA_VERSION}. Refusing to open rather than "
-                        f"run this version's rules against a shape it was "
-                        f"not written for."
-                    )
             self._finalizer = weakref.finalize(self, _release_path, canonical_path)
         except Exception:
             _release_path(canonical_path)
@@ -915,44 +980,65 @@ class Store:
     # THAT subject produces a real proposal — see the comment there — so a
     # resolved refusal does not linger next to the proposal that resolved it.
 
-    def record_refusal(self, subject_type, subject_id, path, reason, now=None):
+    def record_refusal(self, subject_type, subject_id, path, reason,
+                       stores=(), now=None):
         """Upsert the standing refusal for `subject_type`/`subject_id`.
 
-        `path` and `reason` are overwritten on every call, same as `at`: only
-        the most recent examination's verdict is worth keeping, not a history
-        of every night a file stayed unresolved. `path` is carried so the
-        Refused section can name the file without a second lookup against the
-        media server at render time — see `cronicled.web.rows.to_refusal_row`.
+        `path`, `reason` and `stores` are overwritten on every call, same as
+        `at`: only the most recent examination's verdict is worth keeping, not
+        a history of every night a file stayed unresolved. `path` is carried
+        so the Refused section can name the file without a second lookup
+        against the media server at render time — see
+        `cronicled.web.rows.to_refusal_row`.
+
+        `stores` is what EVERY store searched returned for this subject, one
+        entry each, built by `cronicled.scan._store_reports` and stored as
+        JSON exactly the way `record()` stores a payload — opaque here, never
+        interpreted. It exists because a refusal used to keep one prose
+        sentence naming one store, which reads as though the others were
+        never consulted, and because the score in that sentence could only be
+        recovered by parsing it back out of the text. Nothing about a stored
+        score may require reading English.
+
+        The order of the entries is the CALLER's, and it is content-ordered
+        rather than iteration-ordered — see `_store_reports`. Nothing here
+        re-sorts them: a second ordering rule in the store would be free to
+        disagree with the one that has the scores in front of it.
         """
         subject_id = str(subject_id)
         when = now if now is not None else _utcnow()
+        encoded = json.dumps(list(stores), sort_keys=True,
+                             separators=(",", ":"), ensure_ascii=False)
         with self._lock:
             self._conn.execute(
                 "INSERT INTO refusal (subject_type, subject_id, path, "
-                "reason, at) VALUES (?, ?, ?, ?, ?) "
+                "reason, at, stores) VALUES (?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(subject_type, subject_id) DO UPDATE SET "
                 "path = excluded.path, reason = excluded.reason, "
-                "at = excluded.at",
-                (subject_type, subject_id, path, reason, when),
+                "at = excluded.at, stores = excluded.stores",
+                (subject_type, subject_id, path, reason, when, encoded),
             )
             self._conn.commit()
 
     def refusals(self):
         """Every standing refusal, as dicts with `subject_type`,
-        `subject_id`, `path`, `reason` and `at`.
+        `subject_id`, `path`, `reason`, `at` and `stores` — the last decoded
+        back into the list of dicts that was recorded, the same way `items()`
+        decodes a payload.
 
         Ordered by `at` then `subject_id`, the same tie-break `items()` and
         `mutes()` use for their own listings.
         """
         with self._lock:
             rows = self._conn.execute(
-                "SELECT subject_type, subject_id, path, reason, at "
+                "SELECT subject_type, subject_id, path, reason, at, stores "
                 "FROM refusal ORDER BY at, subject_id"
             ).fetchall()
         return [
             {"subject_type": subject_type, "subject_id": subject_id,
-             "path": path, "reason": reason, "at": at}
-            for subject_type, subject_id, path, reason, at in rows
+             "path": path, "reason": reason, "at": at,
+             "stores": json.loads(stores)}
+            for subject_type, subject_id, path, reason, at, stores in rows
         ]
 
     def items(self, folder=None, state=None, limit=None, offset=0):

@@ -746,7 +746,7 @@ class Refusals(_StoreCase):
         self.assertEqual(self.store.refusals(), [
             {"subject_type": "scene", "subject_id": "1",
              "path": "/library/x/clip.mp4", "reason": "too close to call",
-             "at": "2026-07-01T00:00:00"}])
+             "at": "2026-07-01T00:00:00", "stores": []}])
 
     def test_nothing_refused_is_an_empty_list(self):
         self.assertEqual(self.store.refusals(), [])
@@ -781,6 +781,73 @@ class Refusals(_StoreCase):
         self.store.record_refusal("scene", "1", "/library/x/clip.mp4", "a tie")
         self._record(subject_id="2")
         self.assertEqual(len(self.store.refusals()), 1)
+
+    # -- what every store returned, kept as values ------------------------- #
+
+    ALPHA = {"store": "alpha", "rows": 40, "score": 0.342,
+             "title": "Evening Ritual",
+             "url": "https://alpha.example/clip/evening-ritual", "error": None}
+    BETA = {"store": "beta", "rows": 0, "score": None, "title": None,
+            "url": None, "error": None}
+    GAMMA = {"store": "gamma", "rows": None, "score": None, "title": None,
+             "url": None, "error": "TimeoutError: timed out"}
+
+    def test_the_stores_round_trip_as_the_list_of_dicts_that_went_in(self):
+        """Asserted as the whole list of whole dicts. This is the record the
+        Refused section is built from, and a check that one store survived
+        passes while the other two are lost on the way through SQLite."""
+        self.store.record_refusal("scene", "1", "/library/x/clip.mp4",
+                                  "alpha: nothing above the threshold",
+                                  stores=[self.ALPHA, self.BETA, self.GAMMA],
+                                  now="2026-07-01T00:00:00")
+        self.assertEqual(self.store.refusals()[0]["stores"],
+                         [self.ALPHA, self.BETA, self.GAMMA])
+
+    def test_a_score_comes_back_as_a_number_not_as_text(self):
+        """The half of this the prose `reason` cannot give: a score readable
+        only by parsing a sentence is not stored. TEXT is what the column
+        holds, so a round trip that lost the JSON decoding would hand back
+        the string "0.342" and every arithmetic on it would still `assertIn`
+        successfully somewhere."""
+        self.store.record_refusal("scene", "1", "/library/x/clip.mp4",
+                                  "alpha: nothing above the threshold",
+                                  stores=[self.ALPHA])
+        score = self.store.refusals()[0]["stores"][0]["score"]
+        self.assertIsInstance(score, float)
+        self.assertEqual(score, 0.342)
+
+    def test_recording_it_again_replaces_the_stores_it_recorded(self):
+        """HARM: a refusal is re-recorded every night the file stays
+        unresolved. Stores that accumulated would grow without bound, and a
+        reader would be shown last week's distribution beside this week's
+        reason. One examination cannot see that -- this runs two."""
+        self.store.record_refusal("scene", "1", "/library/x/clip.mp4",
+                                  "a tie", stores=[self.ALPHA, self.BETA])
+        self.store.record_refusal("scene", "1", "/library/x/clip.mp4",
+                                  "a closer tie", stores=[self.GAMMA])
+
+        self.assertEqual(self.store.refusals()[0]["stores"], [self.GAMMA])
+
+    def test_the_recorded_order_is_the_callers_and_is_not_re_sorted(self):
+        """`scan._store_reports` orders by score with the scores in front of
+        it. A second ordering rule here would be free to disagree, so there
+        is none: the list comes back exactly as it went in. The fixture is
+        deliberately NOT in name order, so a re-sort by name is visible."""
+        given = [self.GAMMA, self.ALPHA, self.BETA]
+        self.store.record_refusal("scene", "1", "/library/x/clip.mp4",
+                                  "a tie", stores=given)
+
+        self.assertEqual([s["store"]
+                          for s in self.store.refusals()[0]["stores"]],
+                         ["gamma", "alpha", "beta"])
+
+    def test_a_refusal_recorded_with_no_stores_reads_back_an_empty_list(self):
+        """The honest shape for a refusal no store search stands behind -- a
+        creator that never resolved. Not `None`: the field is a list of what
+        was searched, and nothing was."""
+        self.store.record_refusal("scene", "1", "/library/x/clip.mp4",
+                                  "creator unresolved")
+        self.assertEqual(self.store.refusals()[0]["stores"], [])
 
 
 class ProducerRuns(_StoreCase):
@@ -1036,6 +1103,149 @@ class SupersedeTableAddedOnAnExistingDatabase(unittest.TestCase):
         with Store(self.path) as store:
             self.assertEqual(len(store.items()), 1)
             self.assertEqual(store.items()[0]["fingerprint"], self.fp)
+
+
+class RefusalColumnAddedOnAnExistingDatabase(unittest.TestCase):
+    """`refusal.stores` on a database written before that column existed.
+
+    The additive guarantee the two classes above rely on -- re-apply the whole
+    schema, every statement `IF NOT EXISTS` -- does NOT reach a new COLUMN:
+    `CREATE TABLE IF NOT EXISTS refusal` is skipped whole on a database that
+    already has the table, so the column named inside it never appears.
+    `_add_missing_columns` is what does, and this is where a live database
+    either gains the column or fails to open.
+
+    The older shape is written out by hand below rather than derived from
+    `store.SCHEMA`: a fixture built by the code it is meant to constrain moves
+    whenever that code does, and would go on passing after the column was
+    quietly dropped from the schema again.
+    """
+
+    # Exactly the `refusal` table as it shipped, before `stores`.
+    _SHAPE_BEFORE = """
+        CREATE TABLE refusal (
+            subject_type TEXT NOT NULL, subject_id TEXT NOT NULL,
+            path TEXT NOT NULL, reason TEXT NOT NULL, at TEXT NOT NULL,
+            PRIMARY KEY (subject_type, subject_id))
+    """
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self.path = os.path.join(self._dir, "s.db")
+        self.addCleanup(shutil.rmtree, self._dir, True)
+        with Store(self.path) as store:
+            self.fp = store.record(
+                folder="scene-matches", subject_type="scene", subject_id="1",
+                summary="a proposal", payload={"title": "Copper Kettle"},
+                producer="nightly-scrape")
+            store.mute("scene", "9", reason="never identifiable")
+        self._rewind_the_refusal_table()
+
+    def _rewind_the_refusal_table(self):
+        connection = sqlite3.connect(self.path)
+        connection.execute("DROP TABLE refusal")
+        connection.execute(self._SHAPE_BEFORE)
+        connection.execute(
+            "INSERT INTO refusal (subject_type, subject_id, path, reason, at) "
+            "VALUES ('scene', '2', '/library/x/clip.mp4', "
+            "'alpha: nothing above the threshold (0.70)', "
+            "'2026-07-01T00:00:00')")
+        connection.commit()
+        columns = self._columns(connection)
+        connection.close()
+        # The emulation is worth nothing if the column is already there.
+        self.assertNotIn("stores", columns)
+
+    def _columns(self, connection):
+        return {row[1] for row in connection.execute(
+            "PRAGMA table_info(refusal)")}
+
+    def _read_columns(self):
+        connection = sqlite3.connect(self.path)
+        try:
+            return self._columns(connection)
+        finally:
+            connection.close()
+
+    def _read_version(self):
+        connection = sqlite3.connect(self.path)
+        try:
+            return connection.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            connection.close()
+
+    def test_the_database_opens_and_gains_the_column(self):
+        """The headline: an operator's live database must not be a file this
+        build refuses. Asserted on the table's own columns, because a Store
+        that opened would not by itself prove the column arrived -- every
+        later read would fail instead."""
+        with Store(self.path):
+            pass
+        self.assertIn("stores", self._read_columns())
+
+    def test_a_refusal_written_before_the_column_reads_back_whole(self):
+        """The whole row. A refusal recorded before the column existed keeps
+        its path, reason and timestamp, and reports the honest thing about
+        the stores nobody recorded: an empty list, never a NULL a caller has
+        to guess at."""
+        with Store(self.path) as store:
+            self.assertEqual(store.refusals(), [
+                {"subject_type": "scene", "subject_id": "2",
+                 "path": "/library/x/clip.mp4",
+                 "reason": "alpha: nothing above the threshold (0.70)",
+                 "at": "2026-07-01T00:00:00", "stores": []}])
+
+    def test_a_refusal_recorded_after_the_upgrade_keeps_its_stores(self):
+        entry = {"store": "alpha", "rows": 40, "score": 0.342,
+                 "title": "Evening Ritual",
+                 "url": "https://alpha.example/clip/evening-ritual",
+                 "error": None}
+        with Store(self.path) as store:
+            store.record_refusal("scene", "3", "/library/x/other.mp4",
+                                 "alpha: nothing above the threshold",
+                                 stores=[entry], now="2026-07-02T00:00:00")
+            recorded = {r["subject_id"]: r["stores"] for r in store.refusals()}
+        self.assertEqual(recorded, {"2": [], "3": [entry]})
+
+    def test_the_other_tables_are_untouched_by_the_addition(self):
+        with Store(self.path) as store:
+            self.assertEqual([i["fingerprint"] for i in store.items()],
+                             [self.fp])
+            self.assertEqual(store.muted_subjects(), {("scene", "9")})
+
+    def test_reopening_twice_does_not_try_to_add_the_column_again(self):
+        """`ALTER TABLE ... ADD COLUMN` is not idempotent on its own -- SQLite
+        raises on a duplicate name -- so the second open is where a missing
+        "does it already have it" check turns every subsequent start into an
+        error."""
+        with Store(self.path):
+            pass
+        with Store(self.path):     # must not raise
+            pass
+        self.assertIn("stores", self._read_columns())
+
+    def test_the_addition_does_not_bump_the_version_stamp(self):
+        """An added column with a default is invisible to code that does not
+        name it, so bumping would make every earlier build refuse a database
+        it can still read correctly -- a cost with nothing bought. The stamp
+        is for the change that CANNOT be carried this way."""
+        with Store(self.path):
+            pass
+        self.assertEqual(self._read_version(), SCHEMA_VERSION)
+
+    def test_a_database_from_the_future_is_refused_before_it_is_altered(self):
+        """The version guard runs FIRST. Adding a column to a shape this
+        build cannot vouch for is a write into someone else's schema, and the
+        refusal exists precisely to stop this code acting on one."""
+        connection = sqlite3.connect(self.path)
+        connection.execute("PRAGMA user_version = %d" % (SCHEMA_VERSION + 1,))
+        connection.commit()
+        connection.close()
+
+        with self.assertRaises(SchemaVersionError):
+            Store(self.path)
+
+        self.assertNotIn("stores", self._read_columns())
 
 
 class SchemaVersioning(unittest.TestCase):

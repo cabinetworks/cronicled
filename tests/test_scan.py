@@ -1893,6 +1893,297 @@ class ExamineSourcesTest(unittest.TestCase):
             examine_sources(scene(1, self.PATH), sources=[], folder=FOLDER)
 
 
+class ARefusalRecordsEveryStoreSearched(unittest.TestCase):
+    """`Outcome.stores` -- what each searched store returned, as values.
+
+    THE DEFECT: a file searched against three stores and refused reported one
+    line, naming the one store that scored highest. Every other store's answer
+    was computed and dropped, so the line reads as though they were never
+    consulted -- observed sending a person to hunt a configuration problem
+    that did not exist, on a file whose store was known with certainty. And
+    the score in that line could only be recovered by parsing English back out
+    of a sentence.
+
+    Every number asserted below was already in memory when the refusal was
+    recorded. Nothing here is rescored: `_store_reports` reads the same
+    `_StoreDecision`s `_judge` produced, so a second scoring path cannot
+    disagree with the first about the artist subtraction, a store's censorship
+    map, or the threshold.
+    """
+
+    PATH = "/library/Velvet Crane/Morning Ritual.mp4"
+    # Scores against that filename, none of them eligible at 0.70 and none
+    # of them CONTAINED (containment bypasses the threshold outright, so a
+    # "Morning Ritual ..." title would win rather than refuse):
+    #   Evening Ritual 0.586 | Harbour Lights 0.107 | Lantern Song 0.092
+    NEAR = candidate("Evening Ritual", "evening-ritual")
+    FAR = candidate("Harbour Lights", "harbour-lights")
+    WORST = candidate("Lantern Song", "lantern-song")
+
+    def source(self, name, results=(), raises=None, **over):
+        kwargs = dict(name=name, search=FakeSearch(results, raises=raises),
+                      owner_of=None, catalog_resolvable=True, censorship={})
+        kwargs.update(over)
+        return Source(**kwargs)
+
+    def recorded(self, sources, threshold=0.7):
+        """What one examination recorded per store. Asserts it refused first:
+        a proposal records no stores at all, so a test reading `()` out of one
+        would be asserting against the wrong outcome entirely."""
+        outcome = examine_sources(scene(1, self.PATH), sources=sources,
+                                  folder=FOLDER, threshold=threshold)
+        self.assertIsNone(outcome.proposal, outcome.reason)
+        self.assertIsNone(outcome.mute_reason, outcome.reason)
+        return outcome.stores
+
+    def report(self, sources, store, **kwargs):
+        """The one recorded entry for `store`, by name -- so a test about one
+        store's own fields cannot pass by reading a different store's."""
+        by_name = {r["store"]: r for r in self.recorded(sources, **kwargs)}
+        self.assertIn(store, by_name)
+        return by_name[store]
+
+    # -- the whole shape, not a sample of it ------------------------------- #
+
+    def test_every_searched_store_is_recorded_as_one_whole_shape(self):
+        """Asserted as the WHOLE tuple of whole dicts. A check that one store
+        appears -- or that one field of one store is right -- passes while the
+        other two stores are dropped, which is the exact defect."""
+        stores = self.recorded([
+            self.source("gamma", [self.FAR]),
+            self.source("alpha", [self.WORST, self.NEAR]),
+            self.source("beta", []),
+            self.source("delta", raises=RuntimeError("connection refused")),
+        ])
+
+        self.assertEqual(stores, (
+            {"store": "alpha", "rows": 2, "score": 0.586,
+             "title": "Evening Ritual",
+             "url": "https://example.invalid/clip/evening-ritual",
+             "error": None},
+            {"store": "gamma", "rows": 1, "score": 0.107,
+             "title": "Harbour Lights",
+             "url": "https://example.invalid/clip/harbour-lights",
+             "error": None},
+            {"store": "beta", "rows": 0, "score": None, "title": None,
+             "url": None, "error": None},
+            {"store": "delta", "rows": None, "score": None, "title": None,
+             "url": None,
+             "error": "RuntimeError: connection refused"},
+        ))
+
+    # -- the score is a value, never a sentence ---------------------------- #
+
+    def test_the_score_is_a_number_and_not_a_number_spelled_in_prose(self):
+        """A score readable only by parsing `reason` is not stored. Pinned as
+        a float of the RIGHT candidate: recording the string, or the first
+        candidate's score, or the threshold, each fails here."""
+        report = self.report([self.source("alpha", [self.WORST, self.NEAR])],
+                             "alpha")
+
+        self.assertIsInstance(report["score"], float)
+        self.assertEqual(report["score"], 0.586)
+        # ...and it is not merely the prose sentence chopped up: the sentence
+        # is still there, separately, and says its own thing.
+        self.assertNotIsInstance(report["score"], str)
+
+    def test_the_near_miss_is_the_best_candidate_not_the_first_returned(self):
+        """`WORST` is returned FIRST and scores lowest. A near miss picked by
+        the catalogue's own result order names it instead."""
+        report = self.report([self.source("alpha", [self.WORST, self.NEAR])],
+                             "alpha")
+
+        self.assertEqual(report["title"], "Evening Ritual")
+        self.assertEqual(report["rows"], 2)
+
+    def test_two_candidates_tied_at_the_top_do_not_break_by_return_order(self):
+        """"Ritual Hours" and "Ritual Stone" both score 0.488, so which is
+        the near miss is settled by TITLE and not by which the catalogue
+        listed first -- offered in both orders here, because a fixture whose
+        reversal gives the same answer for the wrong reason proves nothing.
+
+        Pinned rather than refused: nothing is written off this, and showing
+        no near miss at all would throw away the evidence the ticket exists
+        to surface. The tie is visible either way -- both candidates are
+        counted in `rows`, and their shared score is recorded as a value.
+        """
+        hours = candidate("Ritual Hours", "ritual-hours")
+        stone = candidate("Ritual Stone", "ritual-stone")
+
+        for offered in ([hours, stone], [stone, hours]):
+            report = self.report([self.source("alpha", offered)], "alpha")
+            self.assertEqual(report["title"], "Ritual Hours")
+            self.assertEqual(report["score"], 0.488)
+            self.assertEqual(report["rows"], 2)
+
+    def test_the_row_count_is_every_row_not_only_the_scored_best(self):
+        report = self.report(
+            [self.source("alpha", [self.WORST, self.NEAR, self.FAR])], "alpha")
+
+        self.assertEqual(report["rows"], 3)
+
+    # -- three states, kept apart ------------------------------------------ #
+    #
+    # One test per state would let a pair collapse into each other unnoticed,
+    # so all three are built in one examination and asserted against each
+    # OTHER. Each assertion names the specific thing that state produces --
+    # a single catch-all value would satisfy a looser check for all three.
+
+    def test_rows_that_scored_low_are_not_an_empty_store_are_not_an_error(self):
+        stores = self.recorded([
+            self.source("alpha", [self.NEAR]),
+            self.source("beta", []),
+            self.source("delta", raises=TimeoutError("timed out")),
+        ])
+        by_name = {r["store"]: r for r in stores}
+
+        # Rows, none good enough: a count, a score, a candidate.
+        self.assertEqual(by_name["alpha"]["rows"], 1)
+        self.assertEqual(by_name["alpha"]["score"], 0.586)
+        self.assertIsNone(by_name["alpha"]["error"])
+
+        # Confirmed empty: zero rows and NO score. Not 0.0 -- nothing was
+        # scored, and a value here would be one this code invented and then
+        # recorded in the same field, in the same type, as a real one.
+        self.assertEqual(by_name["beta"]["rows"], 0)
+        self.assertIsNone(by_name["beta"]["score"])
+        self.assertIsNone(by_name["beta"]["error"])
+
+        # Raised: the failure named, and rows None rather than 0. A 0 would
+        # assert a confirmed-empty catalogue, which an error is not evidence
+        # of -- the same distinction that bars a mute.
+        self.assertEqual(by_name["delta"]["error"], "TimeoutError: timed out")
+        self.assertIsNone(by_name["delta"]["rows"])
+        self.assertNotEqual(by_name["delta"]["rows"],
+                            by_name["beta"]["rows"])
+
+    def test_a_store_that_answered_and_then_failed_its_fallback_keeps_both(self):
+        """Its per-creator pass answered; its per-title follow-up raised.
+        Both are recorded -- dropping the error would claim the catalogue was
+        searched to the end, dropping the rows would throw away real
+        evidence."""
+        search = ScriptedSearch({"Velvet Crane": [self.NEAR],
+                                 "Velvet Crane Morning Ritual":
+                                     RuntimeError("connection refused")})
+        source = Source(name="alpha", search=search, owner_of=None,
+                        catalog_resolvable=True, censorship={},
+                        title_query=SiteAdapter().search_query)
+
+        report = self.report([source], "alpha")
+
+        self.assertEqual(report["rows"], 1)
+        self.assertEqual(report["score"], 0.586)
+        self.assertEqual(report["error"], "RuntimeError: connection refused")
+
+    # -- order is content, never configuration ----------------------------- #
+
+    def test_the_order_is_by_score_and_survives_reversing_the_config(self):
+        """Asymmetric on purpose: the expected order is
+        alpha/gamma/beta/delta, whose reversal is visibly a different list, so
+        a mutation that reverses or preserves configuration order cannot pass
+        by accident.
+
+        Rebuilt per direction rather than reordering one list of `Source`s, so
+        nothing either run does to a store is carried into the other.
+        """
+        def sources_in(order):
+            built = {"gamma": self.source("gamma", [self.FAR]),
+                     "alpha": self.source("alpha", [self.WORST, self.NEAR]),
+                     "beta": self.source("beta", []),
+                     "delta": self.source(
+                         "delta", raises=RuntimeError("connection refused"))}
+            return [built[name] for name in order]
+
+        forward = ["gamma", "alpha", "beta", "delta"]
+        recorded = [[r["store"] for r in self.recorded(sources_in(order))]
+                    for order in (forward, list(reversed(forward)))]
+
+        self.assertEqual(recorded[0], ["alpha", "gamma", "beta", "delta"])
+        self.assertEqual(recorded[0], recorded[1])
+
+    def test_stores_with_no_score_of_their_own_are_ordered_by_name(self):
+        """Empty and raised stores have nothing to rank by, so they may not
+        fall back on configuration order either. Configured zeta first."""
+        stores = self.recorded([
+            self.source("zeta", []),
+            self.source("epsilon", raises=RuntimeError("down")),
+        ] + [self.source("alpha", [self.NEAR])])
+
+        self.assertEqual([r["store"] for r in stores],
+                         ["alpha", "epsilon", "zeta"])
+
+    # -- the address is the one an apply would use ------------------------- #
+
+    def test_the_near_miss_url_follows_the_precedence_an_apply_uses(self):
+        """`_enrichment_url`'s rule, reused rather than written a second
+        time: the plural `urls` wins over the deprecated singular `url`. A
+        second derivation reading `url` first would link a person to an
+        address an apply would disagree with."""
+        both = {"title": "Evening Ritual",
+                "url": "https://example.invalid/clip/deprecated",
+                "urls": ["https://example.invalid/clip/canonical"]}
+
+        report = self.report([self.source("alpha", [both])], "alpha")
+
+        self.assertEqual(report["url"],
+                         "https://example.invalid/clip/canonical")
+
+    def test_a_candidate_with_only_the_plural_field_still_has_an_address(self):
+        plural_only = {"title": "Evening Ritual",
+                       "urls": ["https://example.invalid/clip/plural-only"]}
+
+        report = self.report([self.source("alpha", [plural_only])], "alpha")
+
+        self.assertEqual(report["url"],
+                         "https://example.invalid/clip/plural-only")
+
+    def test_a_candidate_carrying_no_address_records_none(self):
+        """Uncertainty withholds evidence rather than supplying it. The
+        candidate is still recorded -- title and score both -- and only the
+        address is absent, so the screen can show it as text."""
+        addressless = {"title": "Evening Ritual"}
+
+        report = self.report([self.source("alpha", [addressless])], "alpha")
+
+        self.assertIsNone(report["url"])
+        self.assertEqual(report["title"], "Evening Ritual")
+        self.assertEqual(report["score"], 0.586)
+
+    # -- the other refusals ------------------------------------------------ #
+
+    def test_a_cross_store_ambiguity_also_records_every_store(self):
+        """The second refusal `examine_sources` produces. Two stores matched
+        DIFFERENT candidates too close to call, and a reader of that sentence
+        needs the same distribution as a reader of a near miss."""
+        alpha_dawn = candidate("Morning Ritual Dawn", "alpha-dawn")
+        beta_dusk = candidate("Morning Ritual Dusk", "beta-dusk")
+        outcome = examine_sources(
+            scene(1, self.PATH), folder=FOLDER, threshold=0.5,
+            sources=[self.source("alpha", [alpha_dawn]),
+                     self.source("beta", [beta_dusk]),
+                     self.source("gamma", [])])
+
+        self.assertIsNone(outcome.proposal)
+        self.assertIn("ambiguous across stores", outcome.reason)
+        self.assertEqual([r["store"] for r in outcome.stores],
+                         ["alpha", "beta", "gamma"])
+        self.assertEqual(outcome.stores[2]["rows"], 0)
+
+    def test_a_proposal_records_no_stores_at_all(self):
+        """`stores` is the refusal's record. A proposal already carries its
+        winner, its runners-up and its competing stores in the payload, and
+        adding a second, parallel account of the same search there would be
+        free to drift from it."""
+        outcome = examine_sources(
+            scene(1, self.PATH), folder=FOLDER, threshold=0.5,
+            sources=[self.source("alpha",
+                                 [candidate("Morning Ritual", "morning")]),
+                     self.source("beta", [])])
+
+        self.assertIsNotNone(outcome.proposal)
+        self.assertEqual(outcome.stores, ())
+
+
 class PerTitleFallbackTest(unittest.TestCase):
     """The per-title query, which is a FALLBACK and never a replacement.
 
@@ -2600,6 +2891,11 @@ class ScanProducerTest(unittest.TestCase):
     MORNING = candidate("Morning Ritual", "morning-ritual")
     EVENING = candidate("Evening Errand", "evening-errand")
     LEDGER = candidate("Winter Ledger", "winter-ledger")
+    # Two that do NOT clear 0.70 against "Morning Ritual.mp4" and are not
+    # contained by it either (containment bypasses the threshold outright),
+    # so a store offering one of them refuses: 0.586 and 0.107.
+    NEAR = candidate("Evening Ritual", "evening-ritual")
+    FAR = candidate("Harbour Lights", "harbour-lights")
 
     # One creator with a catalogue, one with a single title. Both invented.
     SCRIPT = {"Velvet Crane": [MORNING, EVENING],
@@ -3021,9 +3317,15 @@ class ScanProducerTest(unittest.TestCase):
              "path": self.UNNAMED_PATH,
              "reason": "creator unresolved: the folder text '2020-05-04' was "
                        "not accepted as a name, and the filename yielded none "
-                       "either"})
+                       "either",
+             # No store was searched: the creator never resolved, so there
+             # was nothing to search any of them FOR. An empty list is the
+             # honest record of that, and it is the one refusal shape that
+             # has one -- see `ARefusalRecordsEveryStoreSearched` for the
+             # ordinary case.
+             "stores": []})
         self.assertEqual(set(refusals[0]), {"subject_type", "subject_id",
-                                            "path", "reason", "at"})
+                                            "path", "reason", "at", "stores"})
 
     def test_the_mute_names_the_file_that_was_unidentifiable(self):
         """The mute is bound to the scene that produced it, not to the place
@@ -3143,6 +3445,71 @@ class ScanProducerTest(unittest.TestCase):
         self.assertEqual(refusals[0]["subject_id"], "1")
         self.assertEqual(refusals[0]["path"], self.MORNING_PATH)
         self.assertIn("ambiguous", refusals[0]["reason"])
+
+    # -- what every store returned, all the way through the store ---------- #
+
+    def _store_sources(self, script_by_store):
+        return [Source(name=name, search=ScriptedSearch(script),
+                       owner_of=None, catalog_resolvable=True, censorship={})
+                for name, script in script_by_store]
+
+    def test_a_refusal_records_what_every_searched_store_returned(self):
+        """The whole recorded list, as one shape. A check that the closest
+        store appears passes while the other two are dropped -- and two
+        dropped stores is exactly the defect: an operator who knows the clip
+        is on `beta` reads a line naming only `alpha` as evidence `beta` was
+        never consulted, and goes looking for a configuration problem that
+        does not exist."""
+        sources = self._store_sources([
+            ("gamma", {"Velvet Crane": [self.FAR]}),
+            ("alpha", {"Velvet Crane": [self.NEAR]}),
+            ("beta", {"Velvet Crane": []}),
+        ])
+
+        proposals = self.scan([scene(1, self.MORNING_PATH)], None,
+                              sources=sources, threshold=0.7)
+
+        self.assertEqual(proposals, [])
+        refusals = self.store.refusals()
+        self.assertEqual(len(refusals), 1)
+        self.assertEqual(refusals[0]["stores"], [
+            {"store": "alpha", "rows": 1, "score": 0.586,
+             "title": "Evening Ritual",
+             "url": "https://example.invalid/clip/evening-ritual",
+             "error": None},
+            {"store": "gamma", "rows": 1, "score": 0.107,
+             "title": "Harbour Lights",
+             "url": "https://example.invalid/clip/harbour-lights",
+             "error": None},
+            {"store": "beta", "rows": 0, "score": None, "title": None,
+             "url": None, "error": None},
+        ])
+
+    def test_re_examining_replaces_the_recorded_stores(self):
+        """A refusal is upserted per subject, and its stores go with it. One
+        examination cannot detect unbounded growth: this runs two, and the
+        second is configured with a DIFFERENT store answering differently, so
+        keeping the first run's entries -- or appending to them -- is visible
+        as a list that is not exactly the second run's."""
+        first = self._store_sources([
+            ("gamma", {"Velvet Crane": [self.FAR]}),
+            ("alpha", {"Velvet Crane": [self.NEAR]}),
+        ])
+        self.scan([scene(1, self.MORNING_PATH)], None, sources=first,
+                  threshold=0.7)
+        self.assertEqual(len(self.store.refusals()[0]["stores"]), 2)
+
+        second = self._store_sources([("zeta", {"Velvet Crane": [self.FAR]})])
+        self.scan([scene(1, self.MORNING_PATH)], None, sources=second,
+                  threshold=0.7)
+
+        self.assertEqual(len(self.store.refusals()), 1)
+        self.assertEqual(self.store.refusals()[0]["stores"], [
+            {"store": "zeta", "rows": 1, "score": 0.107,
+             "title": "Harbour Lights",
+             "url": "https://example.invalid/clip/harbour-lights",
+             "error": None},
+        ])
 
     def test_a_later_proposal_for_the_same_file_clears_its_refusal(self):
         """A refusal is transient -- it stops being true the moment scoring
