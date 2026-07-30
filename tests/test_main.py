@@ -28,7 +28,7 @@ from cronicled.performer_tags import proposal as reconcile_proposal
 from cronicled.runscan import SCHEDULED_SCAN_NAME, build_producer
 from cronicled.scan import ScanProducer
 from cronicled.schedule import Entry, as_utc, due, resolve
-from cronicled.stash import Stash
+from cronicled.stash import Stash, StashError
 from cronicled.store import Store
 from cronicled.tag_hygiene import NO_SCENES, ONE_SCENE
 from cronicled.tag_hygiene import proposal as unused_proposal
@@ -169,6 +169,35 @@ class _ReadOnlyStash:
         return refuse
 
 
+class _OfflineStash(Stash):
+    """The client `main()` builds, minus the one thing no test may have: a
+    transport that reaches a media server.
+
+    `main()` constructs its own `Stash(url, api_key)`, so the seam the class
+    already offers -- an injected transport -- is reached by replacing the
+    name `__main__` looks the class up under. Everything the assertions below
+    read is still the real constructor's work on the real arguments: this is
+    a `Stash`, its `url` is what `main` resolved with `/graphql` appended,
+    and its `api_key` is whatever was configured.
+
+    It is not more capable than what it stands in for. A media server that
+    cannot be reached raises a transient `StashError` out of the transport,
+    and that is exactly what these tests were already getting -- the address
+    they configure names nothing, so every start-up call failed. What is gone
+    is the resolution attempt on the way to that failure, which is the only
+    part that depended on the machine the suite ran on. Nothing here ANSWERS
+    a query, because a fake that answered one would be standing in for a
+    library these tests never set up.
+    """
+
+    def __init__(self, url, api_key):
+        super().__init__(url, api_key, transport=self._refuse)
+
+    def _refuse(self, body, timeout):
+        raise StashError("no media server is reachable from a test",
+                         transient=True)
+
+
 class _CapturedServe:
     """Stands in for `web.app.serve` so `main()` can be exercised without
     binding a socket or looping forever -- it records exactly what it was
@@ -186,6 +215,16 @@ class _Base(unittest.TestCase):
         self._dir = tempfile.mkdtemp()
         self.db_path = os.path.join(self._dir, "cronicled.sqlite3")
         self.addCleanup(shutil.rmtree, self._dir, ignore_errors=True)
+        # Whole-module, not per-test: any `main()` here that is given a media
+        # server address builds a client for it, and the scheduler it starts
+        # takes the overnight passes' first tick immediately -- so the address
+        # was reached for on a worker thread, long after the line that named
+        # it. That is where all twelve of this suite's resolutions of names
+        # off this machine came from, and a seam applied test by test would
+        # have to be remembered by the next test that configures a server.
+        patcher = patch("cronicled.__main__.Stash", _OfflineStash)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _seed(self, subject_id="1"):
         # Opened and closed before `main()` runs its own `Store` on the same
