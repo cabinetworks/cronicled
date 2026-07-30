@@ -3,17 +3,100 @@
 Kept apart from rendering and from HTTP because the interesting decision here
 is editorial: which facts does a person need in front of them to judge a
 proposal without opening anything else. That is worth testing on its own.
+
+WHICH WAY TIMESTAMPS ARE CONVERTED, AND WHICH WAY THEY ARE NOT
+--------------------------------------------------------------
+Everything the store holds is UTC and stays UTC. `local` below converts on the
+way OUT, here in the view layer, and nothing this module produces is ever read
+back into a write.
+
+That direction is the whole of the rule, and it is asymmetric on purpose. A
+rendering that shows the wrong hour is wrong on a screen a person is looking at,
+and one edit fixes it. A LOCAL time written into the database is a different
+kind of loss: during the hour a clock repeats, two rows an hour apart carry the
+same text, so nothing afterwards can tell which came first -- not the scheduler
+comparing a run against an appointment, not `ORDER BY created_at`, not a person
+reading the table. No edit recovers that, because the information is gone rather
+than mislabelled.
 """
 
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 
 from cronicled import tag_hygiene
 from cronicled.descriptions import SUBJECT_TYPE as DESCRIPTION_SUBJECT
 from cronicled.scan import candidate_url
+from cronicled.schedule import as_utc
 from cronicled.tag_descriptions import SUBJECT_TYPE as TAG_DESCRIPTION_SUBJECT
 from cronicled.tags import MERGE_IS_IRREVERSIBLE
 from cronicled.text import slug_match, spaceless
+
+# An ISO-8601 instant carrying an offset, as it appears INSIDE a sentence the
+# scheduler wrote ("last ran 2026-07-28T21:17:08+00:00; next due at ...").
+# Only with an offset: a naive stamp names no instant, and rewriting one would
+# invent the very fact it is missing.
+#
+# Every part is fixed-width, so a longer number cannot be half-swallowed into a
+# different instant -- there is no `\b` on the left because a digit boundary is
+# not a word boundary, and none is needed.
+_INSTANT_IN_TEXT = re.compile(
+    r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?"
+    r"(?:Z|[+-]\d{2}:\d{2})")
+
+
+def local(value, zone):
+    """A stored UTC timestamp as an ISO-8601 string in `zone`.
+
+    `value` is what the store recorded: an ISO-8601 string, or a `datetime`.
+    The instant is unchanged -- this relabels it, it does not move it -- so a
+    row muted at 21:17 UTC reads 23:17 in a zone two hours ahead, and the two
+    orderings cannot disagree because there is only one instant.
+
+    ANYTHING THIS CANNOT READ AS AN INSTANT COMES BACK EXACTLY AS IT WENT IN,
+    `None` included. A stamp with no offset is the case that matters: it names
+    no instant, so converting it would mean assuming one and then shifting it,
+    putting an hour on the page that was never recorded anywhere. Showing the
+    stored text verbatim is the honest failure -- it looks unlike the rows
+    around it, which is exactly the signal that something upstream wrote a stamp
+    it should not have. `cronicled.schedule.as_utc` draws that line, and it is
+    the same line the scheduler compares timestamps by; a second reader here
+    would be free to disagree with it about a row, silently, in either
+    direction.
+
+    `zone` is required and has no default. A default would hand a caller who
+    forgot it UTC -- the exact output of doing nothing at all -- so the mistake
+    would look like the feature working.
+    """
+    moment = as_utc(value)
+    if moment is None:
+        return value
+    return moment.astimezone(zone).isoformat()
+
+
+def local_times(text, zone):
+    """Every ISO-8601 instant inside `text`, converted to `zone`.
+
+    For the sentences the scheduler hands the page -- "last ran ...; next due at
+    ..." -- which are prose with timestamps in them rather than timestamps. They
+    are rewritten HERE, in the view, rather than by teaching
+    `cronicled.schedule` to format for a page: those reasons come out of rules
+    that are pure arithmetic over UTC arguments, which is what makes every
+    scheduling decision an ordinary unit test, and a zone reaching in there
+    would be reaching into the comparisons as well as the wording.
+
+    A page where one line reads in the operator's hour and the next reads in UTC
+    is worse than one that reads entirely in UTC, because the reader cannot tell
+    which is which and so can trust neither. That is why the reasons are not
+    simply left alone.
+
+    Text with no instant in it comes back unchanged, which is most of it -- a
+    "disabled by override", or a `KeyError` from a producer that would not
+    start.
+    """
+    if not text:
+        return text
+    return _INSTANT_IN_TEXT.sub(lambda m: local(m.group(0), zone), text)
 
 # What a row says it IS, so the page can pick a shape for it without
 # inspecting its fields. A scene proposal and a description proposal are not
@@ -1128,9 +1211,15 @@ def to_refusal_rows(entries, base_url=None):
     return [to_refusal_row(e, base_url=base_url) for e in entries]
 
 
-def to_mute_row(entry, base_url=None):
+def to_mute_row(entry, base_url=None, *, zone):
     """One standing mute (`Store.mutes()`'s dict shape) -> what the Muted
     section shows for it.
+
+    `at` is converted to `zone` for display and the store's own row is not
+    touched -- see this module's docstring for why that direction is the only
+    one this project takes. `zone` is keyword-only and required for the reason
+    `local`'s is: defaulted, a caller who forgot it would get UTC, which is
+    indistinguishable from the conversion not existing.
 
     `row` is the proposal behind the mute, built by the SAME builders the
     Dismissed section's rows are built by (`to_rows`, so a muted performer
@@ -1165,7 +1254,7 @@ def to_mute_row(entry, base_url=None):
         "subject_type": entry["subject_type"],
         "subject_id": entry["subject_id"],
         "reason": entry["reason"],
-        "at": entry["at"],
+        "at": local(entry["at"], zone),
         "row": None if item is None else to_rows([item], base_url=base_url)[0],
         "subject_url": (performer_url(base_url, entry["subject_id"])
                         if performer
@@ -1173,5 +1262,61 @@ def to_mute_row(entry, base_url=None):
     }
 
 
-def to_mute_rows(entries, base_url=None):
-    return [to_mute_row(e, base_url=base_url) for e in entries]
+def to_mute_rows(entries, base_url=None, *, zone):
+    return [to_mute_row(e, base_url=base_url, zone=zone) for e in entries]
+
+
+def to_schedule_view(status, *, zone):
+    """A `cronicled.schedule.LoopStatus` with every timestamp on it shown in
+    `zone`. `None` in, `None` out -- the answer for an install where nothing is
+    scheduled, which the page says out loud.
+
+    The same type back, built with `dataclasses.replace`, rather than a dict or
+    a thinner projection. Two reasons, and the second is the one that decided
+    it: the template already reads a dozen fields off this object and a
+    projection would have to list every one of them, so the next field added to
+    `LoopStatus` would render as empty text on the page -- Jinja renders an
+    undefined attribute as nothing rather than raising, which is the failure
+    mode this whole layer is arranged to avoid.
+
+    FIVE PLACES CARRY A TIME, not one, and they are converted together because
+    a page mixing zones is unreadable in a way a page in one wrong zone is not:
+
+    - `last_tick_at`, the answer to "when did it last look";
+    - `last_error_at`, beside a failure a person is placing against something
+      else they did;
+    - `last_result.at`, the moment the tick decided against;
+    - the reasons in `last_result.skipped` and `last_result.failed_to_start`,
+      which are sentences with instants inside them ("last ran ...; next due at
+      ...") -- see `local_times`;
+    - `last_error` itself, which is an exception's own message and can name an
+      instant: `schedule._previous_occurrence` and `due` both put one in theirs.
+
+    `last_traceback` is deliberately left alone. It is the only field here the
+    template does not render, and frames are evidence to be read as they were
+    recorded rather than a sentence for a person -- if it is ever put on the
+    page, it comes through `local_times` like the rest.
+
+    The counts, the names and the job ids are passed through untouched. What is
+    NOT touched anywhere is the loop's own bookkeeping: this builds a copy for
+    the page, and `LoopStatus` is frozen, so the values the scheduler goes on
+    comparing against the store stay in UTC however often the page is drawn.
+    """
+    if status is None:
+        return None
+    result = status.last_result
+    if result is not None:
+        result = replace(
+            result,
+            at=local(result.at, zone),
+            skipped={name: local_times(reason, zone)
+                     for name, reason in result.skipped.items()},
+            failed_to_start={name: local_times(reason, zone)
+                             for name, reason in
+                             result.failed_to_start.items()},
+        )
+    return replace(status,
+                   last_tick_at=local(status.last_tick_at, zone),
+                   last_error_at=local(status.last_error_at, zone),
+                   last_error=local_times(status.last_error, zone),
+                   last_result=result)

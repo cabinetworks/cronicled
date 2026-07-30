@@ -4,9 +4,9 @@ import tempfile
 import unittest
 
 from cronicled.config import (
-    config_dir, default_scan_path, default_schedule_path, default_server_path,
-    default_stashbox_path, load_marker_tag, load_schedule, load_server,
-    load_stashbox)
+    ZONE_ENV_VAR, config_dir, default_scan_path, default_schedule_path,
+    default_server_path, default_stashbox_path, load_marker_tag, load_schedule,
+    load_server, load_stashbox, load_zone)
 from cronicled.adapters.registry import default_adapters_path, load_adapters
 
 
@@ -454,3 +454,39 @@ class ContainerConfigLayout(unittest.TestCase):
 
             self.assertEqual(server["api_key"], "M")
             self.assertEqual(sorted(adapters), ["mounted"])
+
+
+class LoadZone(unittest.TestCase):
+    """The ONE zone setting: the hour each unattended pass keeps, and the hour
+    every timestamp on the page is shown in.
+
+    One setting rather than two because the two disagreeing is worse than
+    either being wrong: a page saying 3am while a pass runs at a different 3am
+    is evidence FOR the schedule an operator is trying to check. Nothing here
+    validates the name -- `cronicled.schedule.check_zone` is the one rule that
+    does, and it is the same rule an override's own `zone` goes through.
+    """
+
+    def test_honours_the_environment_variable(self):
+        self.assertEqual(load_zone({ZONE_ENV_VAR: "Europe/Madrid"}),
+                         "Europe/Madrid")
+
+    def test_nothing_configured_is_utc_and_not_the_hosts_zone(self):
+        # UTC by name, spelled out here rather than compared to the constant
+        # the code reads: a default that drifted to "localtime" or to the
+        # host's own zone would satisfy `load_zone(...) == DEFAULT_ZONE` and
+        # move every appointment by the deployment's offset.
+        self.assertEqual(load_zone({}), "UTC")
+
+    def test_a_variable_set_to_nothing_is_not_read_as_absence(self):
+        # The `marker_tag` mistake, not repeated: `or DEFAULT_ZONE` would fold
+        # an empty setting into UTC, which is the very behaviour an operator
+        # who set the variable was trying to change, reported as success. It is
+        # handed back as written so `check_zone` refuses it out loud.
+        self.assertEqual(load_zone({ZONE_ENV_VAR: ""}), "")
+
+    def test_it_hands_back_a_name_and_never_a_built_zone(self):
+        # It reads configuration; it does not decide whether the configuration
+        # is usable. A loader that returned a `tzinfo` would be a second
+        # validator, free to accept a name `resolve` refuses.
+        self.assertIsInstance(load_zone({ZONE_ENV_VAR: "Mars/Olympus"}), str)

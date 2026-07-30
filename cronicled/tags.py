@@ -530,7 +530,7 @@ class TagMergeProducer:
     cost = "box"
 
     def __init__(self, stash, *, store, folder="library", every=None,
-                 box_client=None):
+                 at=None, zone=None, box_client=None):
         self._stash = stash
         self._store = store
         self._folder = folder
@@ -547,6 +547,11 @@ class TagMergeProducer:
         # like `ScanProducer.every`, so a producer's cadence is a value that
         # was decided and never an attribute that happens to be missing.
         self.every = every
+        # The other way of saying when, and the one this pass declares: a
+        # stated time of day read in a named zone, read off this object by the
+        # same `resolve`. Set unconditionally for the same reason as `every`.
+        self.at = at
+        self.zone = zone
 
     def _indexes(self, ctx):
         """`(indexes, unread, dropped_keys)`: every configured source's tag

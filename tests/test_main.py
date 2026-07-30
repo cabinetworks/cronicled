@@ -2,24 +2,26 @@ import io
 import json
 import os
 import shutil
+import sqlite3
 import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from cronicled.__main__ import build_scheduler, main
 from cronicled.adapters.declarative import DeclarativeAdapter
 from cronicled.artist import Aliases
-from cronicled.config import CONFIG_DIR_ENV_VAR
+from cronicled.config import CONFIG_DIR_ENV_VAR, ZONE_ENV_VAR
 from cronicled.descriptions import PRODUCER_NAME as DESCRIPTION_PRODUCER_NAME
 from cronicled.jobs import JobRunner
 from cronicled.performer_tags import index_performers, match_tag
 from cronicled.performer_tags import proposal as reconcile_proposal
 from cronicled.runscan import SCHEDULED_SCAN_NAME, build_producer
 from cronicled.scan import ScanProducer
-from cronicled.schedule import Entry, resolve
+from cronicled.schedule import Entry, as_utc, due, resolve
 from cronicled.stash import Stash
 from cronicled.store import Store
 from cronicled.tag_hygiene import NO_SCENES, ONE_SCENE
@@ -31,6 +33,26 @@ from cronicled.web.actions import Actions
 WAIT = 10
 
 NOW = datetime(2026, 7, 27, 3, 0, 0, tzinfo=timezone.utc)
+
+# The zone the three unattended appointments are read in throughout this file.
+#
+# A REAL zone that observes daylight saving, and one whose offset is non-zero on
+# BOTH sides of every transition (+01:00 in winter, +02:00 in summer). Neither
+# property is decoration: a fixed-offset zone cannot tell an offset applied as a
+# constant from one read from a zone, and a zone whose winter offset is zero
+# would make half of these assertions identical to doing nothing at all.
+#
+# Because it is not UTC, `NOW` above (03:00 UTC, so 05:00 here in July) is
+# deliberately NOT one of the appointments -- every fixture below states its own
+# relationship to 03:00 local rather than inheriting one by coincidence.
+ZONE_NAME = "Europe/Madrid"
+ZONE = ZoneInfo(ZONE_NAME)
+
+# A second zone, for the tests about WHICH zone is used. Half an hour off UTC
+# and with no daylight saving of its own, so an instant computed in it cannot
+# coincide with one computed in the zone above, or in UTC, by accident.
+OTHER_ZONE_NAME = "Asia/Kolkata"
+OTHER_ZONE = ZoneInfo(OTHER_ZONE_NAME)
 
 # Every producer `build_scheduler` registers at start-up, sorted the way
 # `schedule.due` sorts its answer. Imported from the modules that name them
@@ -1114,11 +1136,11 @@ class ScheduledScanWiring(_Base):
         # server -- and a helper reading it as "not supplied" would hand back
         # the configured one and quietly test the opposite of what was asked.
         args = {"stash": self.stash, "adapters": self.adapters,
-                "marker": None}
+                "marker": None, "zone": ZONE}
         args.update(over)
         return build_scheduler(self.runner, self.store, args["stash"],
                                args["adapters"], env=self.env,
-                               marker=args["marker"])
+                               marker=args["marker"], zone=args["zone"])
 
     def test_the_nightly_scan_is_in_the_schedule_the_first_tick_reads(self):
         # THE silent one. `Scheduler.__init__` resolves the schedule once,
@@ -1228,7 +1250,8 @@ class ScheduledScanWiring(_Base):
         nightly = after[SCHEDULED_SCAN_NAME]
         self.assertIs(nightly, before[SCHEDULED_SCAN_NAME])
         self.assertIsNone(nightly._limit)
-        self.assertEqual(nightly.every, 86400)
+        self.assertEqual(nightly.at, time(3, 0))
+        self.assertIs(nightly.zone, ZONE)
         self.assertEqual(after[ScanProducer.name]._limit, 25)
         # And the schedule still starts the unbounded one afterwards.
         result = scheduler.tick(NOW)
@@ -1295,10 +1318,22 @@ class ScheduledScanWiring(_Base):
         with self.assertRaisesRegex(ValueError, "cadence"):
             self._build()
 
-    def test_the_cadence_is_overridable_through_the_existing_mechanism(self):
-        self.store.record_run(SCHEDULED_SCAN_NAME, _ago(hours=2))
+    def test_an_interval_override_still_wins_over_the_declared_appointment(self):
+        # The interval form is still supported and an operator who configured
+        # one keeps it: this ticket changes what the producers DECLARE, not
+        # anybody's configuration. `resolve`'s rule is that an override naming
+        # any timing key supplies the whole of that producer's timing, so an
+        # `every` has to set the declared `at` aside -- not merge with it,
+        # which `resolve` would refuse as a contradiction and take start-up
+        # down with.
+        #
+        # 90 minutes ago is chosen so that the two answers genuinely differ,
+        # and not at any boundary: 5400 seconds is well past the overridden
+        # hour, and 01:30 UTC is well past 03:00 in the configured zone (01:00
+        # UTC in July). See the discriminating half below.
+        self.store.record_run(SCHEDULED_SCAN_NAME, _ago(minutes=90))
         # The tag-merge pass is disabled throughout this pair so both tests
-        # stay about the SCAN's cadence: it has never run, so it would be due
+        # stay about the SCAN's timing: it has never run, so it would be due
         # on every tick here and would drown the one answer being read.
         self._schedule_file({SCHEDULED_SCAN_NAME: {"every": 3600},
                              TagMergeProducer.name: {"enabled": False}})
@@ -1306,7 +1341,7 @@ class ScheduledScanWiring(_Base):
         # reason -- by a recorded run rather than a disable, because either
         # keeps it out of `due` and the two mechanisms between them show the
         # override reaching `resolve` at all.
-        self.store.record_run(DESCRIPTION_PRODUCER_NAME, _ago(hours=2))
+        self.store.record_run(DESCRIPTION_PRODUCER_NAME, _ago(minutes=90))
         scheduler = self._build()
 
         result = scheduler.tick(NOW)
@@ -1314,12 +1349,14 @@ class ScheduledScanWiring(_Base):
         self.assertEqual(result.due, [SCHEDULED_SCAN_NAME])
 
     def test_the_same_fixture_is_not_due_without_that_override(self):
-        # The discriminating half. Without it the test above passes on a
-        # fixture that was due anyway, and would go on passing with the
-        # overrides never reaching `resolve` at all. The scan's own `every`
-        # is the override left out; the tag-merge disable is the same in both.
-        self.store.record_run(SCHEDULED_SCAN_NAME, _ago(hours=2))
-        self.store.record_run(DESCRIPTION_PRODUCER_NAME, _ago(hours=2))
+        # The discriminating half, and it discriminates in the direction that
+        # matters now: the declared 03:00 must not override the operator's
+        # configuration, and the only way to see that is a fixture the
+        # DECLARATION leaves alone and the OVERRIDE makes due. The same run,
+        # 90 minutes ago, is after today's 03:00 in the configured zone, so
+        # nothing is owed until tomorrow's.
+        self.store.record_run(SCHEDULED_SCAN_NAME, _ago(minutes=90))
+        self.store.record_run(DESCRIPTION_PRODUCER_NAME, _ago(minutes=90))
         self._schedule_file({TagMergeProducer.name: {"enabled": False}})
         scheduler = self._build()
 
@@ -1330,6 +1367,13 @@ class ScheduledScanWiring(_Base):
         self.assertEqual(sorted(result.skipped), ALL_PRODUCERS)
         self.assertIn("next due at", result.skipped[SCHEDULED_SCAN_NAME])
         self.assertIn("disabled", result.skipped[TagMergeProducer.name])
+        # Tomorrow's 03:00 in the configured zone, named as the instant it is
+        # rather than as "some time later": 03:00 Madrid on 28 July 2026 is
+        # 01:00 UTC, because July is +02:00 there. A reason naming today's
+        # appointment, or one naming an hour drifted from a restart, both fail
+        # here.
+        self.assertIn("next due at 2026-07-28T01:00:00+00:00",
+                      result.skipped[SCHEDULED_SCAN_NAME])
 
     def test_the_scheduled_scan_can_be_disabled_through_the_same_file(self):
         self._schedule_file({SCHEDULED_SCAN_NAME: {"enabled": False},
@@ -1509,6 +1553,371 @@ class SchedulerLifecycleInMain(_Base):
             with redirect_stdout(io.StringIO()):
                 main(["--db", self.db_path])
         self.assertIsNone(captured.kwargs["schedule_status"])
+
+
+class TheThreeUnattendedAppointments(_Base):
+    """The three passes run overnight, and never all at the same moment.
+
+    Asserted through `resolve` over the producers `build_scheduler` actually
+    registered -- the same call `Scheduler.__init__` makes -- rather than
+    against the constants the code declares. A test comparing a constant to
+    itself holds for any value, including one appointment for all three.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.conf = os.path.join(self._dir, "conf")
+        os.makedirs(self.conf)
+        self.env = {CONFIG_DIR_ENV_VAR: self.conf}
+        self.store = Store(self.db_path)
+        self.addCleanup(self.store.close)
+        self.addCleanup(self._drain)
+        self.runner = JobRunner(self.store)
+        self.stash = _ReadOnlyStash("http://media.invalid")
+        self.adapters = {"invented": DeclarativeAdapter(_ADAPTER_SPEC)}
+
+    def _drain(self):
+        for job in self.runner.jobs():
+            self.runner.wait(job.id, WAIT)
+
+    def _entries(self, zone=ZONE):
+        build_scheduler(self.runner, self.store, self.stash, self.adapters,
+                        env=self.env, marker=None, zone=zone)
+        return resolve(self.runner.producers())
+
+    def test_each_pass_declares_an_overnight_time_and_not_an_interval(self):
+        # The whole resolved schedule, every field of every entry, against
+        # values written out here. Three separate things would each pass a
+        # narrower assertion and each be wrong: an appointment left as an
+        # interval, an appointment in the wrong zone, and two appointments
+        # sharing a minute.
+        self.assertEqual(self._entries(), {
+            SCHEDULED_SCAN_NAME: Entry(
+                producer=SCHEDULED_SCAN_NAME, every=None, enabled=True,
+                at=time(3, 0), zone=ZONE),
+            DESCRIPTION_PRODUCER_NAME: Entry(
+                producer=DESCRIPTION_PRODUCER_NAME, every=None, enabled=True,
+                at=time(3, 20), zone=ZONE),
+            TagMergeProducer.name: Entry(
+                producer=TagMergeProducer.name, every=None, enabled=True,
+                at=time(3, 40), zone=ZONE),
+        })
+
+    def test_no_two_of_them_share_one_appointment(self):
+        # The rule in its own right, so that a mutation collapsing two onto
+        # one time fails a test whose NAME is that rule. Computed from the
+        # resolved entries rather than listed, so it holds for a fourth
+        # producer added later.
+        entries = self._entries()
+        appointments = [entry.at for entry in entries.values()]
+        self.assertEqual(len(appointments), 3)
+        self.assertEqual(len(set(appointments)), len(appointments),
+                         "two unattended passes are due at the same moment; "
+                         "two of these three drive the media server's "
+                         "headless browser and they are in different cost "
+                         "classes, so nothing would hold them apart")
+
+    def test_the_scan_is_the_first_of_the_three(self):
+        # The order is a judgement call and this is where it is recorded: what
+        # the scan proposes -- studios, performers, tags on scenes -- is the
+        # material the other two pass over.
+        entries = self._entries()
+        self.assertEqual(
+            sorted(entries, key=lambda name: entries[name].at),
+            [SCHEDULED_SCAN_NAME, DESCRIPTION_PRODUCER_NAME,
+             TagMergeProducer.name])
+
+    def test_they_all_read_the_one_zone_they_were_given(self):
+        # Not `== ZONE` but `is`: the setting is resolved once at start-up and
+        # handed down, and a producer that rebuilt it from a name would be a
+        # second chance to end up with a different zone.
+        for entry in self._entries(zone=OTHER_ZONE).values():
+            self.assertIs(entry.zone, OTHER_ZONE)
+
+    def test_the_appointments_are_instants_the_zone_decides(self):
+        # The appointments are wall-clock times, so the SAME declaration is a
+        # different instant in a different zone -- which is the whole reason
+        # the zone travels with them. 03:00 in Madrid in July is 01:00 UTC;
+        # 03:00 in Kolkata is 21:30 UTC the day before. Both are stated as the
+        # NEXT one due after a run recorded at 03:00 UTC on 27 July, which is
+        # after Madrid's 03:00 that day and after Kolkata's -- so each answer
+        # is the following day's, and the two differ by more than an offset.
+        # Read through `due`'s own reason, which is the number an operator
+        # sees.
+        for zone, expected in ((ZONE, "2026-07-28T01:00:00+00:00"),
+                               (OTHER_ZONE, "2026-07-27T21:30:00+00:00")):
+            runner = JobRunner(self.store)
+            build_scheduler(runner, self.store, self.stash, self.adapters,
+                            env=self.env, marker=None, zone=zone)
+            entries = resolve(runner.producers())
+            _names, reasons = due(
+                {SCHEDULED_SCAN_NAME: entries[SCHEDULED_SCAN_NAME]},
+                {SCHEDULED_SCAN_NAME: NOW.isoformat()}, NOW)
+            self.assertIn("next due at %s" % expected,
+                          reasons[SCHEDULED_SCAN_NAME], str(zone))
+
+
+class OneZoneForTheScheduleAndForThePage(_Base):
+    """The zone the schedule keeps and the zone the page reads are ONE setting.
+
+    Two would be worse than either being wrong on its own: a page saying 3am
+    while a pass ran at a different 3am is evidence FOR the schedule an
+    operator is trying to check. So every test here changes one environment
+    variable and asserts that BOTH halves moved.
+
+    `main()` is exercised whole, with only the media client replaced -- no
+    socket is opened, and everything from the registration through the loop to
+    the shutdown is the real thing.
+    """
+
+    def _run_main(self, zone_name=ZONE_NAME, db=None):
+        """One whole `main()`, on a database of its own.
+
+        A database of its own because `Store` refuses a second handle on a path
+        already open and `main()` never closes the one it built -- so a test
+        that runs the entry point twice, which every test here does, needs two
+        files. `_seed_mute` writes into whichever one is about to be used.
+        """
+        db = self.db_path if db is None else db
+        conf = os.path.join(self._dir, "conf")
+        os.makedirs(conf, exist_ok=True)
+        with open(os.path.join(conf, "adapters.json"), "w") as fh:
+            json.dump({"adapters": [_ADAPTER_SPEC]}, fh)
+        captured = _CapturedServe()
+        out = io.StringIO()
+        environ = {} if zone_name is None else {ZONE_ENV_VAR: zone_name}
+        with patch.dict(os.environ, environ):
+            if zone_name is None:
+                os.environ.pop(ZONE_ENV_VAR, None)
+            with patch("cronicled.__main__.Stash", _ReadOnlyStash):
+                with patch("cronicled.__main__.serve", captured):
+                    with redirect_stdout(out):
+                        main(["--db", db, "--config-dir", conf,
+                              "--server", "http://media.invalid"])
+        return captured, out.getvalue()
+
+    def _mute_row(self, captured):
+        rows = captured.kwargs["muted"]()
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
+    def test_the_setting_moves_the_schedule_and_the_page_together(self):
+        # THE test for one setting rather than two. The same environment
+        # variable is read twice with two different values, and both halves --
+        # the zone the appointments are DECLARED in and the zone the page
+        # renders in -- move with it. Two settings show up here as one half
+        # moving and the other not.
+        #
+        # The schedule half is read off the registered producers, NOT off the
+        # status the page was handed: that status has already been converted
+        # for display, so asserting an offset on it would be asserting the
+        # page's zone twice and calling one of them the schedule's. A
+        # mutation handing `build_scheduler` its own hardcoded UTC survived
+        # exactly that mistake.
+        for name, expected_offset in ((ZONE_NAME, "+02:00"),
+                                      (OTHER_ZONE_NAME, "+05:30")):
+            with self.subTest(zone=name):
+                db = os.path.join(self._dir, "%s.sqlite3" % expected_offset)
+                self._seed_mute(db)
+                captured, _out = self._run_main(name, db=db)
+
+                producers = captured.kwargs["actions"]._runner.producers()
+                declared = {p.name: p.zone for p in producers}
+                self.assertEqual(sorted(declared), ALL_PRODUCERS)
+                self.assertEqual(set(declared.values()), {ZoneInfo(name)},
+                                 "the schedule's own appointments are not in "
+                                 "the configured zone")
+                # And the page, from the same run and the same setting.
+                self.assertTrue(
+                    self._mute_row(captured)["at"].endswith(expected_offset),
+                    self._mute_row(captured)["at"])
+                status = captured.kwargs["schedule_status"]()
+                self.assertTrue(status.last_tick_at.endswith(expected_offset),
+                                status.last_tick_at)
+
+    def test_an_install_naming_no_zone_keeps_utc_in_both_halves(self):
+        # The default is a real answer, not an evasion: UTC everywhere, which
+        # is what this project did before the setting existed. Asserted on
+        # both halves, because a default reaching only one of them is the same
+        # disagreement arriving quietly.
+        self._seed_mute()
+        captured, out = self._run_main(zone_name=None)
+        self.assertIn("zone: UTC", out)
+        # Both halves again: what the passes declare, and what the page shows.
+        declared = {p.zone for p in
+                    captured.kwargs["actions"]._runner.producers()}
+        self.assertEqual(declared, {ZoneInfo("UTC")})
+        self.assertTrue(
+            captured.kwargs["schedule_status"]().last_tick_at.endswith(
+                "+00:00"))
+        self.assertTrue(self._mute_row(captured)["at"].endswith("+00:00"))
+
+    def test_a_zone_this_system_does_not_know_stops_the_service_starting(self):
+        # A configuration mistake belongs at start-up, where an operator reads
+        # a stack trace, and not at 3am as a tick that raises and starts
+        # nothing for anybody. `serve` is asserted never to have been reached,
+        # so this cannot pass on a process that started and then complained.
+        captured = _CapturedServe()
+        with patch.dict(os.environ, {ZONE_ENV_VAR: "Nowhere/Atlantis"}):
+            with patch("cronicled.__main__.Stash", _ReadOnlyStash):
+                with patch("cronicled.__main__.serve", captured):
+                    with redirect_stdout(io.StringIO()):
+                        with self.assertRaisesRegex(ValueError,
+                                                    "not a time zone"):
+                            main(["--db", self.db_path])
+        self.assertIsNone(captured.kwargs)
+
+    def test_the_startup_line_names_the_zone_whether_or_not_it_was_set(self):
+        # Always printed, so an operator wondering why the overnight passes
+        # ran at 4am has the answer in the log. A line printed only when the
+        # setting was written would be silent for exactly the install that got
+        # it wrong -- which is why both directions are asserted here.
+        _captured, configured = self._run_main(ZONE_NAME)
+        self.assertIn("zone: %s" % ZONE_NAME, configured)
+        _captured, unset = self._run_main(
+            zone_name=None, db=os.path.join(self._dir, "unset.sqlite3"))
+        self.assertIn("zone: UTC", unset)
+
+    def _seed_mute(self, db=None):
+        store = Store(self.db_path if db is None else db)
+        try:
+            store.mute("scene", "1", reason="never identifiable")
+        finally:
+            store.close()
+
+
+class StoredTimestampsStayUtc(_Base):
+    """The expensive direction, guarded on the raw database rather than
+    through any reader.
+
+    A rendering in the wrong hour is wrong on a screen and one edit fixes it.
+    A LOCAL time written into the database is a different kind of loss: during
+    the hour a clock repeats, two rows an hour apart carry the same text, so
+    nothing afterwards can order them -- not the scheduler comparing a run
+    against an appointment, not `ORDER BY created_at`, not a person reading the
+    table. Nothing recovers it, because the information is gone rather than
+    mislabelled.
+
+    So this runs the entry point in a zone whose offset is NEVER zero, lets it
+    tick and record, and then reads the timestamps back with sqlite3 directly.
+    Going through `Store` would ask a reader whether a writer wrote what it
+    should have.
+    """
+
+    # Every column in the schema that holds a time. Compared as a whole set
+    # below, so a table added later with a timestamp this sweep does not know
+    # about fails here rather than being quietly exempt from the rule.
+    EXPECTED_COLUMNS = [
+        ("dismissal", "at"),
+        ("item", "created_at"),
+        ("item", "last_seen_at"),
+        ("item", "resolved_at"),
+        ("mute", "at"),
+        ("producer_run", "at"),
+        ("refusal", "at"),
+        ("supersede", "at"),
+    ]
+
+    def _run_main(self):
+        conf = os.path.join(self._dir, "conf")
+        os.makedirs(conf, exist_ok=True)
+        with open(os.path.join(conf, "adapters.json"), "w") as fh:
+            json.dump({"adapters": [_ADAPTER_SPEC]}, fh)
+        captured = _CapturedServe()
+        with patch.dict(os.environ, {ZONE_ENV_VAR: ZONE_NAME}):
+            with patch("cronicled.__main__.Stash", _ReadOnlyStash):
+                with patch("cronicled.__main__.serve", captured):
+                    with redirect_stdout(io.StringIO()):
+                        main(["--db", self.db_path, "--config-dir", conf,
+                              "--server", "http://media.invalid"])
+        return captured
+
+    def _stamps(self):
+        """`{(table, column): [every non-null value]}` for every timestamp
+        column the schema has, read straight out of the file."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            tables = [row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'")]
+            found = {}
+            for table in sorted(tables):
+                for row in conn.execute("PRAGMA table_info(%s)" % table):
+                    column = row[1]
+                    if column != "at" and not column.endswith("_at"):
+                        continue
+                    values = [value for (value,) in conn.execute(
+                        "SELECT %s FROM %s" % (column, table))
+                        if value is not None]
+                    found[(table, column)] = values
+            return found
+        finally:
+            conn.close()
+
+    def test_the_sweep_below_actually_looks_at_every_timestamp_column(self):
+        # A sweep that found nothing would pass every assertion in this class
+        # while the database filled with local times. So the columns it visits
+        # are pinned first, as a whole set.
+        self._run_main()
+        self.assertEqual(sorted(self._stamps()), self.EXPECTED_COLUMNS)
+
+    def test_and_there_is_something_in_the_ones_this_run_writes(self):
+        # The other half of the same guard: three columns are genuinely
+        # written by a run that seeds a proposal, mutes a subject and ticks,
+        # and a fixture that stopped producing rows would make the assertion
+        # below vacuous. Counted, not merely non-empty: a producer_run row per
+        # producer is three, and one is the shape a tick that abandoned the
+        # rest would leave.
+        self._seed()
+        self._mute()
+        self._run_main()
+        stamps = self._stamps()
+        self.assertEqual(len(stamps[("producer_run", "at")]), 3)
+        self.assertEqual(len(stamps[("mute", "at")]), 1)
+        self.assertEqual(len(stamps[("item", "created_at")]), 1)
+        self.assertEqual(len(stamps[("item", "last_seen_at")]), 1)
+
+    def test_every_stored_timestamp_is_utc_and_not_the_configured_zone(self):
+        # Read from the file, not through `Store`. A local stamp anywhere here
+        # is the unrecoverable direction, and the run above was deliberately
+        # made in a zone two hours off UTC so that a conversion leaking into a
+        # write has somewhere visible to show up.
+        self._seed()
+        self._mute()
+        self._run_main()
+        for (table, column), values in sorted(self._stamps().items()):
+            for value in values:
+                where = "%s.%s = %r" % (table, column, value)
+                self.assertTrue(value.endswith("+00:00"), where)
+                # And it is a real instant, not text that merely ends that
+                # way: a stamp the scheduler cannot read is due-immediately
+                # forever.
+                self.assertIsNotNone(as_utc(value), where)
+                self.assertEqual(as_utc(value).utcoffset(), timedelta(0),
+                                 where)
+
+    def test_the_page_shows_those_very_rows_in_the_configured_zone(self):
+        # The pairing that makes the assertion above load-bearing rather than
+        # trivially true. If nothing anywhere converted, every test in this
+        # class would still pass -- so the SAME run is checked from the other
+        # end: the stored instant is UTC, the page's is +02:00, and the two
+        # are the same instant.
+        self._seed()
+        self._mute()
+        captured = self._run_main()
+
+        stored = self._stamps()[("mute", "at")][0]
+        shown = captured.kwargs["muted"]()[0]["at"]
+        self.assertTrue(stored.endswith("+00:00"), stored)
+        self.assertTrue(shown.endswith("+02:00"), shown)
+        self.assertNotEqual(stored, shown)
+        self.assertEqual(as_utc(shown), as_utc(stored))
+
+    def _mute(self):
+        store = Store(self.db_path)
+        try:
+            store.mute("scene", "1", reason="never identifiable")
+        finally:
+            store.close()
 
 
 if __name__ == "__main__":

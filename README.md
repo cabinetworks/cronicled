@@ -11,18 +11,24 @@ inbox that shows a proposal and takes approve/dismiss/mute/undo, an entry point
 that serves it, and a leak guard for the repo itself.
 
 **Running unattended:** `python -m cronicled` now builds a scheduler and starts
-it. A library scan is registered at start-up with a cadence of its own and no
-file limit, and the scheduler starts it when it is due — so proposals arrive
+it. A library scan is registered at start-up with an appointment of its own and
+no file limit, and the scheduler starts it when it is due — so proposals arrive
 without anyone pressing anything. Nothing it starts writes to the media
 server: a scan reads and proposes, and every proposal still waits for a person
 to approve it.
 
-A producer can be scheduled at a stated hour as well as on an interval: `{"at":
-"03:00", "zone": "Europe/Lisbon"}` in the schedule config keeps the same hour
-across restarts, where an interval measured from the last run drifts to
-whichever hour the process last started at. A machine that was off across the
-appointed hour owes the run once when it comes back, and the two days a year an
-hour repeats or does not exist, it fires once.
+The three unattended passes run overnight: 03:00, 03:20 and 03:40 in the
+configured zone, staggered rather than sharing one appointment. A producer can
+still be scheduled on an interval instead (`{"every": 86400}`), but an interval
+is measured from the last recorded run and so drifts to whichever hour the
+process last started at. A machine that was off across the appointed hour owes
+the run once when it comes back, and the two days a year an hour repeats or does
+not exist, it fires once.
+
+Times on the page are shown in that same zone, from one setting
+(`$CRONICLED_ZONE`, default UTC). Stored times are UTC and stay UTC: during the
+hour a clock repeats, two local stamps an hour apart read alike and nothing
+afterwards can order them.
 
 **Not yet built:** a producer choosing to SKIP an appointment it missed instead
 of being owed it. Owing is the answer for every producer today, argued where it
@@ -45,7 +51,7 @@ snapshot can restore, so that one field stays as the approve left it. The
 inbox warns before an approve that would do this, and undo reports the same
 residual afterward, rather than either one reading as a clean, full
 reversal. The unattended half is real too: the entry point registers a scan
-with a declared cadence, builds a scheduler over it and starts it, and the
+with a declared appointment, builds a scheduler over it and starts it, and the
 page reports what the loop last did — when it ticked, what was due, and why
 anything due was left alone.
 
@@ -54,11 +60,19 @@ seconds is an INTERVAL measured from the last recorded run — right for
 something that should run every few minutes, and the reason "nightly" used to
 drift to whatever hour the process last restarted at. A stated time of day in a
 named zone (`{"at": "03:00", "zone": "Europe/Lisbon"}`) keeps the same hour
-across restarts instead. A stated time that was missed because the machine was
-off is OWED: it runs once when the machine comes back, at whatever hour that
-is, rather than being skipped or made up one night at a time. The two days a
-year a local clock repeats an hour or skips one, it fires exactly once — on the
-first reading of a repeated hour, and after a gap rather than before it.
+across restarts instead, and is what the three unattended passes declare. A
+stated time that was missed because the machine was off is OWED: it runs once
+when the machine comes back, at whatever hour that is, rather than being skipped
+or made up one night at a time. The two days a year a local clock repeats an
+hour or skips one, it fires exactly once — on the first reading of a repeated
+hour, and after a gap rather than before it.
+
+The three appointments are deliberately twenty minutes apart. The cost classes
+do not make one shared appointment safe: the three passes sit in three different
+classes, each counted on its own, so a single 03:00 would start all three at
+once — and two of them drive the media server's headless browser, which is the
+very concurrency those classes cap at one job each. The scan goes first, because
+what it proposes is the material the other two pass over.
 
 What is still not decided is the choice between owing a missed appointment and
 skipping it, which is one answer today and not a setting. That remaining gap
@@ -94,24 +108,43 @@ form the container image relies on, since a `docker run` argument list and an
 `-e` list are both just ways of setting the same thing. The flag wins if both
 are set.
 
-That command also registers three unattended passes, each with a cadence of
-its own, and starts the loop that runs them when they are due: a library scan
-with no file limit, a pass over performer descriptions that proposes cleaned
-text for any carrying markup, and a tag pass that looks for one tag written
-under more than one spelling and proposes a merge. To change when any of them
-runs, to move one to a stated hour, or to turn one off, put a `schedule.json` in
-the config directory — see `config/schedule.example.json` for the shape. A
-cadence that is not a positive number of seconds, a key that is not
+That command also registers three unattended passes, each with an overnight
+appointment of its own, and starts the loop that runs them when they are due: a
+library scan with no file limit at 03:00, a pass over performer descriptions
+that proposes cleaned text for any carrying markup at 03:20, and a tag pass that
+looks for one tag written under more than one spelling and proposes a merge at
+03:40. To change when any of them runs, to put one back on an interval, or to
+turn one off, put a `schedule.json` in the config directory — see
+`config/schedule.example.json` for the shape. An override wins over what the
+producer declares, so an interval you already configured keeps working
+untouched. A cadence that is not a positive number of seconds, a key that is not
 `every`/`at`/`zone`/`enabled`, an entry naming both a cadence and a time, a
 stated time with no zone or a zone this system does not know, and a producer
 name that is not registered are all refused at start-up rather than leaving a
-producer running at an hour nobody chose. There is deliberately no default
-zone: a stated time with none named refuses to load rather than inheriting the
-host's, which in a container is UTC and in nobody's head is. Without a media
-server nothing is scheduled at all and the entry point says so; without a
-configured site adapter there is nothing to scan, so the scan alone is left
-out — the description and tag passes read the media server's own text and
-vocabulary and need no store to search.
+producer running at an hour nobody chose. Without a media server nothing is
+scheduled at all and the entry point says so; without a configured site adapter
+there is nothing to scan, so the scan alone is left out — the description and
+tag passes read the media server's own text and vocabulary and need no store to
+search.
+
+### The zone
+
+`$CRONICLED_ZONE` names the zone the overnight appointments are read in — and,
+because it is one setting rather than two, the zone every timestamp on the page
+is shown in. A page saying 3am while a pass runs at a different 3am is worse
+than either being wrong alone. Unset, it is UTC: a stated zone that means the
+same thing everywhere, rather than the host's, which in a container is UTC and
+in nobody's head is. A name this system does not know is refused at start-up,
+and the zone in use is printed on every start.
+
+Timestamps in the database are UTC and are not affected by that setting. The
+conversion happens on the way out, for reading only. Writing local times would
+be unrecoverable rather than merely wrong: during the hour a clock puts back,
+two rows an hour apart carry the same text, so nothing afterwards can tell which
+came first.
+
+An override that states a time still needs its own `zone` key; there is no
+default there either, for the same reason — see `config/schedule.example.json`.
 
 A scan pools unorganized files. If an earlier tool filled in guessed metadata
 and marked those files organized, they are out of its reach: name the tag that
@@ -169,7 +202,7 @@ flowchart TD
     end
 
     subgraph configuration["Configuration, read from the operator's files"]
-        config["config<br/>server connection, config_dir"]
+        config["config<br/>server connection, config_dir, the zone"]
     end
 
     stash["stash<br/>the media server's GraphQL API"]

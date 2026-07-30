@@ -19,7 +19,9 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import time
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 from cronicled.adapters.base import SiteAdapter
 from cronicled.adapters.declarative import DeclarativeAdapter
@@ -33,7 +35,9 @@ from cronicled.store import Store
 from tests.fixtures.cast import CENSORSHIP
 
 WAIT = 10
-HOUR = 3600
+# A zone that observes daylight saving, so a test of an appointment cannot pass
+# on a fixed offset. Named here rather than taken from the code under test.
+ZONE = ZoneInfo("Europe/Madrid")
 
 
 class _Adapter(SiteAdapter):
@@ -194,6 +198,7 @@ class TheScheduledScanIsNotTheManualOne(unittest.TestCase):
     def _both(self, **kwargs):
         manual = build_producer(self.stash, self.adapters, self.store,
                                 limit=25)
+        kwargs.setdefault("zone", ZONE)
         scheduled = build_scheduled_producer(self.stash, self.adapters,
                                              self.store, **kwargs)
         return manual, scheduled
@@ -215,26 +220,49 @@ class TheScheduledScanIsNotTheManualOne(unittest.TestCase):
         self.assertIsNone(scheduled._limit)
         self.assertEqual(manual._limit, 25)
 
-    def test_the_scheduled_scan_declares_a_daily_cadence(self):
-        # 86400 seconds spelled out, not read back from the constant the
-        # producer was built from — that comparison holds whatever the
-        # constant becomes, including a cadence of one second against a
-        # rate-limited scraper.
+    def test_the_scheduled_scan_declares_an_overnight_appointment(self):
+        # 03:00 spelled out, not read back from the constant the producer was
+        # built from — that comparison holds whatever the constant becomes,
+        # including a 2pm scan of a whole library.
         _manual, scheduled = self._both()
-        self.assertEqual(scheduled.every, 86400)
+        self.assertEqual(scheduled.at, time(3, 0))
+        self.assertIs(scheduled.zone, ZONE)
 
-    def test_the_manual_scan_declares_no_cadence_at_all(self):
+    def test_it_declares_an_appointment_INSTEAD_OF_a_cadence(self):
+        # Both at once is a contradiction `schedule.resolve` refuses outright,
+        # so leaving the old daily interval on beside the new appointment would
+        # not be a producer that runs at 3am and also daily — it would be a
+        # producer that takes the whole start-up down. Asserted here, where the
+        # declaration is made, rather than only through the refusal.
+        _manual, scheduled = self._both()
+        self.assertIsNone(scheduled.every)
+
+    def test_the_manual_scan_declares_no_schedule_at_all(self):
         # The other side, and the reason the two are separate registrations:
-        # `schedule.resolve` refuses an enabled producer with no cadence, so
-        # a manual scan that declared one would be schedulable by accident
+        # `schedule.resolve` refuses an enabled producer that declares neither,
+        # so a manual scan that declared one would be schedulable by accident
         # and one that is in the registry at start-up would take the whole
-        # start-up down.
+        # start-up down. All three fields, not just the one that changed:
+        # a manual scan carrying a zone and no time, or a time and no zone, is
+        # refused by `resolve` for its own separate reason.
         manual, _scheduled = self._both()
         self.assertIsNone(manual.every)
+        self.assertIsNone(manual.at)
+        self.assertIsNone(manual.zone)
 
-    def test_the_cadence_is_overridable_but_has_no_permissive_default(self):
-        _manual, scheduled = self._both(every=HOUR)
-        self.assertEqual(scheduled.every, HOUR)
+    def test_the_appointment_is_overridable_but_has_no_permissive_default(self):
+        _manual, scheduled = self._both(at=time(4, 30))
+        self.assertEqual(scheduled.at, time(4, 30))
+        self.assertIs(scheduled.zone, ZONE)
+
+    def test_the_zone_is_required_and_has_no_default_to_fall_back_on(self):
+        # The one argument here that is NOT overridable-with-a-default. A zone
+        # defaulted to UTC would be a second place deciding it — the page reads
+        # `config.load_zone` — and the two disagreeing is the whole failure this
+        # setting exists to prevent: a page saying 3am while the scan runs at a
+        # different 3am. Forgetting it is a TypeError at start-up instead.
+        with self.assertRaises(TypeError):
+            build_scheduled_producer(self.stash, self.adapters, self.store)
 
     def test_it_shares_the_scraping_cost_class_so_the_two_serialise(self):
         # Not a detail: an unattended scan and a manual one both drive the
@@ -524,7 +552,8 @@ class TheMarkerTagReachesEveryScanThisModuleBuilds(unittest.TestCase):
         # only the manual scan would leave the nightly pass looking at a
         # different half of the library, with nothing saying which.
         scheduled = build_scheduled_producer(self.stash, self.adapters,
-                                             self.store, marker=self.MARKER)
+                                             self.store, marker=self.MARKER,
+                                             zone=ZONE)
         self.assertEqual(scheduled._marker, self.MARKER)
 
 

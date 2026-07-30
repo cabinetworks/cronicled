@@ -24,8 +24,8 @@ from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from cronicled.jobs import JobRunner
-from cronicled.schedule import (Entry, LoopStatus, Scheduler, TickResult, due,
-                                resolve)
+from cronicled.schedule import (Entry, LoopStatus, Scheduler, TickResult,
+                                as_utc, check_zone, due, resolve)
 from cronicled.store import Store
 
 HOUR = 3600
@@ -2010,6 +2010,135 @@ class TheStatusCarriesTheLastTicksAnswers(SchedulerCase):
         self.assertEqual(result.skipped, {})
         self.assertEqual(result.failed_to_start, {})
         self.assertEqual(result.at, NOW_ISO)
+
+
+class TheOneZoneSetting(unittest.TestCase):
+    """`check_zone` is what a deployment's single zone setting goes through --
+    the setting the three unattended appointments are read in AND the setting
+    every timestamp on the page is shown in.
+
+    What these tests are FOR is that it is the same rule an override's own
+    `zone` goes through, not a second one beside it. Two validators would let
+    the page render in a zone the schedule had refused (or refuse one the
+    schedule was happily keeping appointments in), which is the disagreement
+    one setting exists to make impossible, arriving from the other side.
+    """
+
+    def test_a_known_name_becomes_the_zone_it_names(self):
+        self.assertEqual(check_zone(ZONE_NAME, "from a setting"), ZONE)
+
+    def test_a_zone_already_built_comes_back_unchanged(self):
+        # How the one setting TRAVELS: resolved once at start-up and handed to
+        # the producers, where `resolve` sees it again. Rebuilding it from a
+        # name a second time would be a second chance to build a different one.
+        #
+        # A FIXED-OFFSET tzinfo, not a `ZoneInfo`. `ZoneInfo` is a cache --
+        # `ZoneInfo(str(z)) is z` for any zone it built -- so `assertIs` on one
+        # of those cannot tell "handed back" from "rebuilt from its own name",
+        # and a mutation doing the second survived exactly that assertion. A
+        # fixed offset has no name to be rebuilt from, which is what makes the
+        # identity observable at all.
+        built = timezone(timedelta(hours=1))
+        self.assertIs(check_zone(built, "from a setting"), built)
+        # And a named zone travels too, which is the case production uses.
+        self.assertEqual(check_zone(ZoneInfo(OTHER_ZONE_NAME),
+                                    "from a setting"), OTHER_ZONE)
+
+    def test_a_stated_time_can_be_read_in_a_zone_that_has_no_name(self):
+        # The consequence of the above, carried through `resolve`: `Entry.zone`
+        # is a `tzinfo`, and a fixed-offset one is a `tzinfo`. If this ever
+        # stopped working the passthrough branch above would be dead code, and
+        # the assertion on it would be pinning nothing.
+        offset = timezone(timedelta(hours=1))
+        entries = resolve([FakeProducer("nightly", at=time(3, 0),
+                                        zone=offset)])
+        self.assertIs(entries["nightly"].zone, offset)
+        _names, reasons = due(entries,
+                              {"nightly": "2026-07-26T12:00:00+00:00"}, NOW)
+        self.assertIn("next due at 2026-07-27T02:00:00+00:00",
+                      reasons["nightly"])
+
+    def test_a_name_this_system_does_not_know_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "not a time zone"):
+            check_zone("Nowhere/Atlantis", "from a setting")
+
+    def test_a_setting_present_and_empty_is_refused_rather_than_defaulted(self):
+        # `cronicled.config.load_zone` hands an empty setting through for
+        # exactly this: an operator who set the variable meant to name a zone,
+        # and quietly substituting UTC would report the mistake as success.
+        with self.assertRaises(ValueError):
+            check_zone("", "from a setting")
+
+    def test_the_refusal_names_where_the_value_was_configured(self):
+        # A message naming a producer would be wrong here and actively
+        # misleading: the setting is wrong for all three of them, and none of
+        # them chose it.
+        with self.assertRaisesRegex(ValueError, r"\$CRONICLED_ZONE"):
+            check_zone("Nowhere/Atlantis", "$CRONICLED_ZONE")
+
+    def test_it_accepts_and_refuses_exactly_what_an_override_does(self):
+        # THE POINT OF THE WHOLE CLASS, and asserted as an agreement rather
+        # than as two lists of names: whatever the sample, the setting and the
+        # override must answer alike. A second validator would show up here as
+        # a name one took and the other did not.
+        for name in (ZONE_NAME, OTHER_ZONE_NAME, "UTC", "Nowhere/Atlantis",
+                     "", "   ", "Europe/Madrid", "not a zone at all"):
+            setting_refused = override_refused = None
+            try:
+                check_zone(name, "from a setting")
+                setting_refused = False
+            except ValueError:
+                setting_refused = True
+            try:
+                resolve([FakeProducer("nightly", at="03:00", zone=name)])
+                override_refused = False
+            except ValueError:
+                override_refused = True
+            self.assertEqual(setting_refused, override_refused, name)
+
+    def test_a_time_stated_in_the_setting_is_read_in_that_very_zone(self):
+        # Not just that the object comes back, but that an appointment made in
+        # it lands where the zone says: 03:00 in a zone four hours behind UTC
+        # in July is 07:00 UTC. Without this, `check_zone` could hand back any
+        # zone at all and every assertion above would hold.
+        zone = check_zone(ZONE_NAME, "from a setting")
+        entries = resolve([FakeProducer("nightly", at=time(3, 0), zone=zone)])
+        names, reasons = due(entries, {"nightly": "2026-07-26T08:00:00+00:00"},
+                             NOW)
+        self.assertEqual(names, [])
+        self.assertEqual(reasons["nightly"],
+                         "last ran 2026-07-26T08:00:00+00:00; next due at "
+                         "2026-07-27T07:00:00+00:00")
+
+
+class TheRuleTheStoreAndThePageShareForReadingATimestamp(unittest.TestCase):
+    """`as_utc` is public so the page can convert the same stamps the schedule
+    compares, by the same rule. A second reader would be free to disagree with
+    this one about a row, silently, in either direction.
+    """
+
+    def test_an_iso_string_with_an_offset_is_that_instant_in_utc(self):
+        self.assertEqual(as_utc("2026-07-26T14:00:00+02:00"),
+                         datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc))
+
+    def test_a_datetime_is_taken_as_it_stands(self):
+        self.assertEqual(as_utc(NOW), NOW)
+
+    def test_a_stamp_with_no_offset_is_none_rather_than_assumed_to_be_utc(self):
+        # The line that matters at the display end too: a naive stamp names no
+        # instant, so the page shows it verbatim instead of shifting it by the
+        # configured offset and saying nothing.
+        self.assertIsNone(as_utc("2026-07-26T12:00:00"))
+
+    def test_something_that_is_not_a_timestamp_at_all_is_none(self):
+        self.assertIsNone(as_utc("never"))
+        self.assertIsNone(as_utc(None))
+
+    def test_it_is_the_rule_the_tick_itself_records_by(self):
+        # Asserted through the scheduler rather than beside it: if `as_utc`
+        # stopped being what `_moment` does, this is where the page and the
+        # store would start disagreeing about a row.
+        self.assertEqual(as_utc(NOW).isoformat(), NOW_ISO)
 
 
 if __name__ == "__main__":
