@@ -57,7 +57,7 @@ def _origin_matches_host(origin, host_header):
 
 def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                   refused=None, superseded=None, applied=None,
-                  schedule_status=None, merges=None):
+                  schedule_status=None, merges=None, reconciles=None):
     # A separate callable rather than always reaching through `actions`:
     # every existing action-path test builds its own recording double for
     # `actions` and none of them implement `scan_status`, so defaulting it
@@ -78,6 +78,10 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
     # double knows nothing about tag clusters, and a page with no merges to
     # show is the ordinary state of a library with no duplicate spellings.
     _merges = merges or (lambda: [])
+    # And again for the tag/performer section: a library where no tag shares a
+    # name with a performer has none of these, which is the ordinary state, and
+    # an existing test's double has no opinion about them.
+    _reconciles = reconciles or (lambda: [])
     # `None` here is not "no information": it is the answer for an install
     # where nothing is scheduled at all, which is a state the page has to be
     # able to say out loud rather than render as an empty section that looks
@@ -125,6 +129,7 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                          superseded=_superseded(),
                          applied=_applied(),
                          merges=_merges(),
+                         reconciles=_reconciles(),
                          schedule=_schedule_status(),
                          just_applied=just_applied).encode()
             self._send(200, body,
@@ -262,7 +267,7 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
 
 def serve(rows, actions, scan_status=None, muted=None, dismissed=None,
          refused=None, superseded=None, applied=None, schedule_status=None,
-         merges=None, host=DEFAULT_HOST, port=DEFAULT_PORT):
+         merges=None, reconciles=None, host=DEFAULT_HOST, port=DEFAULT_PORT):
     # `HTTPServer` is single-threaded: one connection wedged on a slow read
     # or a slow downstream call (a media server taking its whole configured
     # timeout to answer an Approve, say) stalls every other request -- an
@@ -308,6 +313,7 @@ def serve(rows, actions, scan_status=None, muted=None, dismissed=None,
     httpd = HTTPServer((host, port), build_handler(
         rows, actions, scan_status, muted=muted, dismissed=dismissed,
         refused=refused, superseded=superseded, applied=applied,
-        schedule_status=schedule_status, merges=merges))
+        schedule_status=schedule_status, merges=merges,
+        reconciles=reconciles))
     print("inbox on http://%s:%d/" % (host, port))
     httpd.serve_forever()

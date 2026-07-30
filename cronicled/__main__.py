@@ -41,7 +41,7 @@ other two.
 import argparse
 import os
 
-from . import tags
+from . import performer_tags, tags
 from .adapters.registry import default_adapters_path, load_adapters
 from .config import (CONFIG_DIR_ENV_VAR, config_dir, load_marker_tag,
                      load_schedule)
@@ -54,7 +54,17 @@ from .stash import Stash
 from .tags import TagMergeProducer
 from .web.actions import Actions
 from .web.app import DEFAULT_HOST, DEFAULT_PORT, serve
-from .web.rows import to_merge_rows, to_mute_rows, to_refusal_rows, to_rows
+from .web.rows import (to_merge_rows, to_mute_rows, to_reconcile_rows,
+                        to_refusal_rows, to_rows)
+
+# The subject types the scene/description row builders cannot draw. `to_rows`
+# dispatches between a scene row and a performer-description row and has no
+# third branch, so a tag cluster or a tag/performer reconciliation reaching it
+# is a `KeyError` on `payload["path"]` that takes the whole page down rather
+# than rendering oddly. Named once, here, so the five lists below narrow on one
+# list and a fourth producer cannot be added to one of them and missed in the
+# rest.
+_OWN_SECTION_SUBJECTS = (tags.SUBJECT_TYPE, performer_tags.SUBJECT_TYPE)
 
 # How long shutdown waits for the loop to come out of a tick. Bounded rather
 # than `None`: a tick wedged in the store or the media server would otherwise
@@ -306,12 +316,12 @@ def main(argv=None):
         # whole page down with a KeyError rather than render oddly.
         return to_rows([item for item in store.items()
                         if item["state"] != "applied"
-                        and item["subject_type"] != tags.SUBJECT_TYPE],
+                        and item["subject_type"] not in _OWN_SECTION_SUBJECTS],
                        base_url=base_url)
 
     def _scene_items(state):
         return [item for item in store.items(state=state)
-                if item["subject_type"] != tags.SUBJECT_TYPE]
+                if item["subject_type"] not in _OWN_SECTION_SUBJECTS]
 
     def _merge_rows():
         """Every tag-merge proposal that still has something to show, in
@@ -339,6 +349,23 @@ def main(argv=None):
                         if item["subject_type"] == tags.SUBJECT_TYPE)
         return to_merge_rows(seen)
 
+    def _reconcile_rows():
+        """Every tag/performer reconciliation that still has something to show.
+
+        The same three reads `_merge_rows` makes and for the same reason:
+        `items()`'s default view hides a person's own rejections, and a
+        dismissed row needs its Undismiss and a muted one its Unmute. The
+        default view DOES include `applied` and `failed`, which matters more
+        here than it does for a merge -- both of those states can carry an undo
+        snapshot, and the Undo button is only reachable if the row is drawn.
+        """
+        seen = []
+        for state in (None, "dismissed", "muted"):
+            seen.extend(item for item in store.items(state=state)
+                        if item["subject_type"]
+                        == performer_tags.SUBJECT_TYPE)
+        return to_reconcile_rows(seen, base_url=base_url)
+
     scheduler = build_scheduler(runner, store, stash, adapters, env=env,
                                 marker=marker)
     if scheduler is not None:
@@ -353,9 +380,10 @@ def main(argv=None):
         # that takes the whole page down.
         serve(rows=_inbox_rows,
               merges=_merge_rows,
+              reconciles=_reconcile_rows,
               muted=lambda: to_mute_rows(
                   [m for m in store.mutes()
-                   if m["subject_type"] != tags.SUBJECT_TYPE],
+                   if m["subject_type"] not in _OWN_SECTION_SUBJECTS],
                   base_url=base_url),
               dismissed=lambda: to_rows(_scene_items("dismissed"),
                                         base_url=base_url),

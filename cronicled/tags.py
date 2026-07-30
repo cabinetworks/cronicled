@@ -78,7 +78,7 @@ carries no snapshot and why `cronicled.web.rows.to_merge_row` has no
 """
 from dataclasses import dataclass
 
-from cronicled import tag_descriptions
+from cronicled import performer_tags, tag_descriptions
 from cronicled.stashbox import StashBox, base_url
 from cronicled.text import normalize, spaceless
 
@@ -385,6 +385,36 @@ def _describe_summary(counts, dropped_keys):
                                     counts.clustered, reach, dropped))
 
 
+def _reconcile_summary(counts):
+    """The performer half of the pass, in one line.
+
+    Carried in the CLOSING line rather than logged where it is computed, for
+    the reason `_describe_summary` is: `JobRunner._log` keeps one field, so
+    every line this pass writes before its last is overwritten before an
+    operator sees any of it. A count logged mid-pass is a number the code
+    computes and nobody can read.
+
+    The two suppressions are reported SEPARATELY -- `muted` and
+    `already_proposed` are a person's own standing decisions, `unused` is a
+    tag with no scenes to move -- because "0 proposed" reads identically for a
+    library with no mis-filed tags and for one whose every finding a reviewer
+    has already answered, and those call for opposite responses.
+
+    `ambiguous` is mentioned only when it is non-zero: it is a subset of what
+    was proposed, and a permanent "0 name two performers" is noise that stops
+    being read.
+    """
+    ambiguous = ""
+    if counts.ambiguous:
+        ambiguous = (", %d of them name two or more performers and cannot be "
+                     "approved as they stand" % counts.ambiguous)
+    return ("%d tags also name a performer, %d reconciliations proposed "
+            "(%d already proposed, %d muted, %d left to their merge, %d on no "
+            "scenes%s)"
+            % (counts.matched, counts.outstanding, counts.already_proposed,
+               counts.muted, counts.clustered, counts.unused, ambiguous))
+
+
 def proposal(cluster, folder, indexes):
     """One cluster as the proposal dict a producer yields.
 
@@ -421,9 +451,11 @@ def proposal(cluster, folder, indexes):
 
 class TagMergeProducer:
     """Reads every tag the media server holds ONCE and proposes, from that one
-    read, both halves of what is wrong with a library's tag vocabulary: a
-    merge for each cluster of spellings, and a description for each blank tag
-    a configured stash-box already describes.
+    read, every half of what is wrong with a library's tag vocabulary: a merge
+    for each cluster of spellings, a description for each blank tag a
+    configured stash-box already describes, and a reconciliation for each tag
+    that is really a performer filed in the wrong namespace (see
+    `cronicled.performer_tags`, and `_reconcile` below).
 
     ONE PASS, NOT TWO, and that is a decision rather than a convenience. The
     two findings meet on the same tag constantly -- a merge deletes spellings,
@@ -448,6 +480,13 @@ class TagMergeProducer:
     that a library with no box configured still queues under a limit of one;
     that is a pass waiting its turn, which is recoverable, against a rate-limit
     incident, which is not.
+
+    The performer half adds no third-party call and so does not change that
+    class. `Stash.performers_with_aliases` and `Stash.tagged_scenes` are reads
+    of the MEDIA SERVER -- the same server `all_tags` is already read from,
+    which is this operator's own machine and is rationed by nothing. `box`
+    stays the honest class because the description half still pages a public
+    service.
 
     A pass NEVER writes: this proposes, and a person approves.
     """
@@ -549,8 +588,88 @@ class TagMergeProducer:
         described, counted = self._describe(tags, clusters, indexes,
                                             boxes_unread)
         yield from described
-        ctx.log("finished: %s; %s"
-                % (selection, _describe_summary(counted, dropped_keys)))
+
+        reconciled, reconciled_counts = self._reconcile(tags, clusters)
+        yield from reconciled
+        ctx.log("finished: %s; %s; %s"
+                % (selection, _describe_summary(counted, dropped_keys),
+                   _reconcile_summary(reconciled_counts)))
+
+    def _reconcile(self, tags, clusters):
+        """`(proposals, performer_tags.Counts)` for the performer half of the
+        pass: tags whose name is a performer's name or one of their aliases.
+
+        THE SAME `all_tags` READ the merge and description halves work from,
+        which is why this lives inside this producer rather than in a pass of
+        its own. Two passes over one catalogue put two unrelated rows about
+        one tag in front of a reviewer, on two cadences, with nothing relating
+        them.
+
+        Built as a list rather than yielded straight out, so the closing log
+        line can carry the whole tally -- `JobRunner._log` keeps only the last
+        message a job wrote.
+
+        A tag in ANY cluster is skipped, exactly as `_describe` skips one, and
+        for a sharper reason than that method has: a merge DELETES the losing
+        spellings, so a reconciliation approved after the merge would name a
+        tag id the server no longer has, and one approved before it would move
+        the associations out from under the merge a reviewer is also looking
+        at. Muting the merge does not settle it either; it only means nobody
+        wants to be asked again.
+
+        A tag on NO scenes is skipped. There is no association to move, and a
+        row reporting a blast radius of nothing reads exactly like a
+        reconciliation that is safe because it is small. This is also what
+        stops an applied reconciliation coming back the next night: the apply
+        takes the tag off every scene it was on.
+
+        The scenes are read LAST, once per surviving tag, because that read is
+        one request per tag and every check above it costs nothing. A tag a
+        reviewer muted is never asked about.
+
+        A description proposal for a tag matched here is NOT suppressed, and
+        that is deliberate rather than an omission. `_describe` suppresses a
+        clustered tag because a merge deletes the spelling the description
+        would land on; a reconciliation deletes nothing, so the tag is still
+        there afterwards and a description for it is still a description of
+        that tag. The two rows do not point in opposite directions the way a
+        merge and a description do.
+        """
+        index = performer_tags.index_performers(
+            self._stash.performers_with_aliases())
+        clustered = {m["id"] for cluster in clusters for m in cluster.members}
+        muted, proposed = performer_tags.narrowings(self._store, self._folder)
+
+        proposals = []
+        matched = in_cluster = muted_count = already = unused = ambiguous = 0
+        for tag in tags:
+            matches = performer_tags.match_tag(tag, index)
+            if not matches:
+                continue
+            matched += 1
+            tag_id = str(tag["id"])
+            if tag_id in clustered:
+                in_cluster += 1
+                continue
+            if tag_id in muted:
+                muted_count += 1
+                continue
+            if tag_id in proposed:
+                already += 1
+                continue
+            scenes = [str(scene["id"])
+                      for scene in self._stash.tagged_scenes(tag_id, None)[1]]
+            if not scenes:
+                unused += 1
+                continue
+            if len(matches) > 1:
+                ambiguous += 1
+            proposals.append(performer_tags.proposal(
+                tag, matches, scenes, folder=self._folder))
+        return proposals, performer_tags.Counts(
+            matched=matched, clustered=in_cluster, muted=muted_count,
+            already_proposed=already, unused=unused,
+            outstanding=len(proposals), ambiguous=ambiguous)
 
     def _describe(self, tags, clusters, indexes, boxes_unread):
         """`(proposals, Counts)` for the description half of the pass.

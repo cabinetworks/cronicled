@@ -6,7 +6,7 @@ Separated from request handling so the write paths can be tested without a
 socket, and so the handler cannot reach the store, the media server, or the
 job runner directly and grow another kind of write nobody reviewed.
 """
-from cronicled import tags
+from cronicled import performer_tags, tags
 from cronicled.descriptions import SUBJECT_TYPE as DESCRIPTION_SUBJECT
 from cronicled.tag_descriptions import SUBJECT_TYPE as TAG_DESCRIPTION_SUBJECT
 from cronicled.runscan import build_producer
@@ -119,6 +119,8 @@ class Actions:
         item = self._find(fp)
         if item["subject_type"] == tags.SUBJECT_TYPE:
             return self._approve_merge(fp, item)
+        if item["subject_type"] == performer_tags.SUBJECT_TYPE:
+            return self._approve_reconcile(fp, item)
         subject_id = item["subject_id"]
         if self._stash is None:
             # Recorded as failed for the same reason a real apply failure is:
@@ -243,6 +245,74 @@ class Actions:
         self._store.mark_applied(fp)
         return "merged"
 
+    def _approve_reconcile(self, fp, item):
+        """Perform one tag/performer reconciliation: attach the performer to
+        every scene carrying the tag and take the tag off those scenes.
+
+        The TAG IS NOT DELETED. Nothing on this path can delete it -- see
+        `cronicled.performer_tags` for why that is a separate decision, and
+        `Stash.reconcile_tag_to_performer`, which is the only write this calls.
+
+        Refuses an AMBIGUOUS proposal outright, before touching the store or
+        the media server, exactly as `_approve_merge` refuses an undecided
+        cluster: two performers answer to the tag's name, the payload names no
+        one performer, and there is nothing here that may pick between them.
+        Nothing is recorded for that refusal -- it was never a write that could
+        be attempted, and marking it `failed` would put a resolution on a
+        proposal that is still exactly as open as it was.
+
+        Refuses a proposal that ALREADY carries a snapshot for the same reason
+        the row withholds its Approve button in that case (see
+        `web.rows.ReconcileRow`): a partly-applied reconciliation's snapshot is
+        the only record of the scenes it changed, and a second attempt would
+        overwrite it with one covering only the second batch. The undo is the
+        way forward from there.
+
+        A PARTIAL run is recorded as `failed` WITH the snapshot of what landed,
+        which is the one shape the store can express for it: `mark_applied`
+        writes the snapshot, `mark_failed` then writes the state and the
+        reason, and `mark_failed` deliberately leaves `prior_state` alone. So
+        the row says the apply failed, says why, and still offers the undo for
+        the scenes that really did change. A run where NOTHING landed gets no
+        snapshot at all -- there is nothing to undo, and a snapshot describing
+        no scenes would offer a button that does nothing.
+        """
+        payload = item["payload"]
+        performer = payload["performer"]
+        if performer is None:
+            raise ValueError(
+                "cannot reconcile tag %s: %s. Nothing here may pick one for "
+                "you." % (payload["tag"]["name"], payload["ambiguous"]))
+        if item.get("prior_state"):
+            raise ValueError(
+                "cannot reconcile tag %s again: an earlier attempt already "
+                "changed some scenes, and the record of which ones is the "
+                "only way back. Undo it first, then approve it again."
+                % (payload["tag"]["name"],))
+        if self._stash is None:
+            self._store.mark_failed(fp, _NO_STASH)
+            raise ApplyFailed("could not apply: %s" % _NO_STASH)
+        try:
+            result = self._stash.reconcile_tag_to_performer(
+                item["subject_id"], performer["id"])
+        except Exception as exc:
+            self._store.mark_failed(fp, "%s: %s" % (type(exc).__name__, exc))
+            raise ApplyFailed("could not apply: %s" % exc) from exc
+        prior = result["prior"]
+        if result["failures"]:
+            failure = result["failures"][0]
+            reason = ("wrote %d of %d scenes and then stopped at scene %s (%s); "
+                      "the scenes already written carry the performer and no "
+                      "longer carry the tag, and Undo restores exactly those"
+                      % (len(prior["untagged"]), len(result["worklist"]),
+                         failure["scene"], failure["error"]))
+            if prior["untagged"] or prior["attached"]:
+                self._store.mark_applied(fp, prior_state=prior)
+            self._store.mark_failed(fp, reason)
+            raise ApplyFailed("could not apply: %s" % reason)
+        self._store.mark_applied(fp, prior_state=prior)
+        return "reconciled"
+
     def undo(self, fp):
         """Revert one applied proposal to the state its stored snapshot
         describes, and report the outcome.
@@ -278,6 +348,19 @@ class Actions:
             # revert_scene it is still refused, but as a stack trace.
             raise ValueError(
                 "cannot undo %s: no snapshot was stored for it" % fp)
+        if item["subject_type"] == performer_tags.SUBJECT_TYPE:
+            # The tag id is the row's own SUBJECT -- the same value the
+            # approve wrote against -- and the client checks it against the
+            # snapshot's own (see `Stash.revert_reconcile`), so a snapshot that
+            # names another tag is caught before it writes that tag onto these
+            # scenes.
+            self._stash.revert_reconcile(item["subject_id"], prior)
+            # Recorded only AFTER the revert returns, exactly as every branch
+            # below. A revert that raised partway leaves the row `applied` with
+            # its snapshot, and pressing Undo again finishes the job -- see
+            # `revert_reconcile`, which is idempotent for that reason.
+            self._store.mark_reverted(fp)
+            return "reverted"
         if item["subject_type"] == TAG_DESCRIPTION_SUBJECT:
             self._stash.revert_tag_description(item["subject_id"], prior)
             # Recorded only AFTER the revert succeeds, and answered with a
