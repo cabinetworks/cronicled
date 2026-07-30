@@ -640,10 +640,20 @@ class Stash:
     # -- tags (consolidation) --------------------------------------------- #
 
     def all_tags(self):
-        """Every tag with id, name, aliases and scene_count (paged)."""
+        """Every tag with id, name, aliases, description and scene_count
+        (paged).
+
+        `description` is selected because "this tag has no description" is a
+        fact about the library that only the library can answer, and every
+        caller that would otherwise guess at it has to guess wrong in the
+        expensive direction: a tag read as undescribed when it is described
+        gets a proposal to overwrite text somebody wrote. It is the server's
+        own field name, spelled once here.
+        """
         q = """
         query($f: FindFilterType){
-          findTags(filter:$f){ count tags{ id name aliases scene_count } }
+          findTags(filter:$f){
+            count tags{ id name aliases description scene_count } }
         }"""
         out, page = [], 1
         while True:
@@ -655,14 +665,110 @@ class Stash:
                 return out
             page += 1
 
-    def merge_tags(self, destination_id, source_ids, aliases=None):
+    def tag_description(self, tag_id):
+        """One tag's description as it stands RIGHT NOW.
+
+        The tag counterpart of `performer_description`, and here for the same
+        reason: it is read immediately before a write so the write can be
+        checked against what is actually there, rather than against what a
+        pass saw hours or days earlier.
+
+        A tag id the server does not know answers `None`, which every caller
+        below reports as a mismatch rather than silently writing to nothing.
+        """
+        q = "query($id: ID!){ findTag(id:$id){ id description } }"
+        found = self.gql(q, {"id": str(tag_id)}).get("findTag") or {}
+        return found.get("description")
+
+    _TAG_UPDATE = ("mutation($in: TagUpdateInput!)"
+                   "{ tagUpdate(input:$in){ id } }")
+
+    def apply_tag_description(self, tag_id, description, *, expected):
+        """Write one tag's description, refusing if the field is not what the
+        proposal was made against.
+
+        `expected` is REQUIRED and has no default, on exactly the terms
+        `apply_performer_description` requires its own: a caller who forgot it
+        and a caller who meant "write regardless" must not be able to write
+        the same thing, and the second is not offered here at all.
+
+        The comparison is against the WHOLE stored value, verbatim. A
+        proposal to fill an empty description is a proposal about a field
+        that was empty; if somebody has written one since, the text this
+        would write is a third party's sentence overwriting a person's own,
+        and there is no way to tell from the result that it happened.
+
+        The read happens HERE, one line before the write, rather than in the
+        caller: taking the comparison and the snapshot anywhere else opens a
+        window between them and the write.
+        """
+        current = self.tag_description(tag_id)
+        if current != expected:
+            raise StashError(
+                "tag %s's description is not the text this proposal was made "
+                "against; it has changed since the pass ran, so applying "
+                "would overwrite it" % (tag_id,))
+        self.gql(self._TAG_UPDATE,
+                 {"in": {"id": str(tag_id), "description": description}})
+        return {"prior": {"description": current}}
+
+    def revert_tag_description(self, tag_id, prior):
+        """Undo one `apply_tag_description` by writing back exactly what
+        `prior` holds.
+
+        Raises `ValueError` on a snapshot that is missing, empty, or does not
+        carry the field, rather than quietly doing nothing: a revert that
+        no-ops is indistinguishable from one that worked. A snapshot whose
+        `description` is `None` or `""` is NOT missing -- it is a tag that had
+        no description before the apply, and restoring exactly that is the
+        whole job.
+        """
+        if not prior or "description" not in prior:
+            raise ValueError(
+                "cannot revert tag %s: snapshot is missing, empty, or carries "
+                "no description" % (tag_id,))
+        self.gql(self._TAG_UPDATE,
+                 {"in": {"id": str(tag_id), "description": prior["description"]}})
+        return {"description": prior["description"]}
+
+    def merge_tags(self, destination_id, source_ids, aliases=None,
+                   description=None):
         """Merge `source_ids` into `destination_id` via the native tagsMerge
         (moves all scene/marker/etc. associations, deletes the sources). When
         `aliases` is given it REPLACES the destination's alias list, so pass
-        the full desired set (existing + merged names)."""
+        the full desired set (existing + merged names).
+
+        `description` carries text onto the survivor in the SAME mutation
+        that deletes the losing spellings. That is what it is for: tagsMerge
+        keeps the destination's own fields, so a description that lives only
+        on a spelling being deleted is destroyed by the merge, silently and
+        with no record of what it said.
+
+        It is only ever a carry-over onto a survivor that has none. The
+        destination's description is read one line before the write and a
+        NON-EMPTY one refuses the whole merge, rather than the write
+        proceeding and replacing it. The proposal that asked for this was
+        made against a survivor with an empty field, so a survivor that has
+        gained one since is a person having written it in the meantime -- and
+        overwriting that with a sentence lifted off another tag is the one
+        outcome here nobody could detect afterwards. Refusing leaves the
+        merge proposal live and re-runnable, with its reason attached.
+        """
         inp = {"source": [str(s) for s in source_ids], "destination": str(destination_id)}
+        values = {}
         if aliases is not None:
-            inp["values"] = {"id": str(destination_id), "aliases": list(aliases)}
+            values["aliases"] = list(aliases)
+        if description is not None:
+            current = self.tag_description(destination_id)
+            if current:
+                raise StashError(
+                    "tag %s already has a description, so this merge will not "
+                    "carry another one onto it; it has gained one since the "
+                    "pass ran" % (destination_id,))
+            values["description"] = description
+        if values:
+            values["id"] = str(destination_id)
+            inp["values"] = values
         q = "mutation($in: TagsMergeInput!){ tagsMerge(input:$in){ id name aliases } }"
         return self.gql(q, {"in": inp})["tagsMerge"]
 
@@ -853,6 +959,36 @@ class Stash:
         """
         q = """
         query{ configuration{ general{ stashBoxes{ name endpoint } } } }"""
+        general = self.gql(q)["configuration"]["general"]
+        return list(general["stashBoxes"] or [])
+
+    def stash_box_credentials(self):
+        """Every configured stash-box as `{"name", "endpoint", "api_key"}`,
+        in the order the SERVER lists them -- the operator's own configured
+        order, and the order a caller should ask them in.
+
+        This is `stash_boxes` plus the one field that method deliberately
+        does not select, and the split is the point rather than duplication.
+        `stash_boxes` serves callers that only NAME an endpoint for the media
+        server to use on their behalf: the server already holds the key, so
+        selecting it there would put a secret in a response body, and in
+        whatever logs one, in order to throw it away. This serves the caller
+        that talks to the box ITSELF, over its own GraphQL, where the key is
+        the thing without which the request is anonymous. Selecting a secret
+        because it will be used is a different act from selecting one that
+        will not be.
+
+        An install with no box configured answers `[]`, exactly as
+        `stash_boxes` does and for the same reason: it is an ordinary state.
+        A caller with no box to ask has nothing to ask.
+
+        A list, never a mapping. The configured order IS the answer to
+        "which box wins", so it must not be carried in a container that could
+        put it at the mercy of a key's hash.
+        """
+        q = """
+        query{ configuration{ general{
+          stashBoxes{ name endpoint api_key } } } }"""
         general = self.gql(q)["configuration"]["general"]
         return list(general["stashBoxes"] or [])
 

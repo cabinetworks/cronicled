@@ -3,13 +3,15 @@ from dataclasses import asdict
 
 from cronicled.scan import _runners_up, candidate_url
 from cronicled.scoring import Match
+from cronicled.tag_descriptions import Found
+from cronicled.tag_descriptions import proposal as tag_description_proposal
 from cronicled.tags import MERGE_IS_IRREVERSIBLE, UNDECIDED_MANY, cluster_tags
 from cronicled.tags import proposal as tag_proposal
 from cronicled.web.rows import (
-    IDENTIFIED_SCORE_TEXT, KIND_DESCRIPTION, KIND_SCENE, STORE_ANSWERED,
-    STORE_EMPTY, STORE_FAILED, Row, scene_url, to_description_row,
-    to_merge_row, to_merge_rows, to_mute_row, to_mute_rows, to_refusal_row,
-    to_refusal_rows, to_row, to_rows,
+    IDENTIFIED_SCORE_TEXT, KIND_DESCRIPTION, KIND_SCENE, KIND_TAG_DESCRIPTION,
+    STORE_ANSWERED, STORE_EMPTY, STORE_FAILED, Row, scene_url, tag_url,
+    to_description_row, to_merge_row, to_merge_rows, to_mute_row, to_mute_rows,
+    to_refusal_row, to_refusal_rows, to_row, to_rows, to_tag_description_row,
 )
 
 
@@ -1006,6 +1008,100 @@ def _description_item(**over):
     return item
 
 
+# -- tag-description proposals ---------------------------------------------- #
+#
+# Every tag name and description below is invented.
+
+TAG_DESCRIPTION = "Scenes lit only by a hand-carried lamp."
+
+
+def _tag_description_item(**over):
+    """One tag-description item, built through
+    `cronicled.tag_descriptions.proposal` rather than hand-written, so the row
+    builder cannot be tested against a payload shape nothing ever emits."""
+    built = tag_description_proposal(
+        {"id": "7", "name": "Lantern Work", "aliases": [],
+         "description": None, "scene_count": 3},
+        Found(description=TAG_DESCRIPTION, box="first"), folder="library")
+    item = {"fingerprint": "fp-t", "state": "new",
+            "subject_type": built["subject_type"],
+            "subject_id": built["subject_id"], "summary": built["summary"],
+            "confidence": None, "payload": built["payload"],
+            "prior_state": None}
+    item.update(over)
+    return item
+
+
+class TagDescriptionRowShape(unittest.TestCase):
+    def test_the_whole_row(self):
+        # The WHOLE dataclass, not sampled fields: a field added without
+        # anyone deciding to add it -- an `undoable` on a state that cannot
+        # undo, most of all -- is exactly what a field-by-field check cannot
+        # see.
+        self.assertEqual(asdict(to_tag_description_row(
+            _tag_description_item(), base_url="http://media.example")), {
+            "kind": KIND_TAG_DESCRIPTION,
+            "fingerprint": "fp-t",
+            "state": "new",
+            "subject_id": "7",
+            "name": "Lantern Work",
+            "tag_url": "http://media.example/tags/7",
+            "source_box": "first",
+            "original": "",
+            "description": TAG_DESCRIPTION,
+            "undoable": False,
+            "actionable": True,
+            "error": None,
+        })
+
+    def test_the_source_is_on_the_row_and_not_only_in_the_summary(self):
+        # HARM: a reviewer can tell whether a sentence reads well; they
+        # cannot tell whether anybody wrote it. Naming the index it came from
+        # is the only thing that makes that answerable, so it is a field the
+        # page reads rather than prose it has to parse.
+        self.assertEqual(to_tag_description_row(_tag_description_item()).source_box,
+                         "first")
+
+    def test_a_payload_missing_any_field_raises_rather_than_showing_blank(self):
+        # `source_box` is the expensive one: a provenance that silently
+        # rendered blank looks exactly like a sentence with no author, which
+        # is the one thing this proposal exists to be able to deny.
+        for missing in ("name", "original", "description", "source_box"):
+            with self.subTest(missing=missing):
+                payload = dict(_tag_description_item()["payload"])
+                del payload[missing]
+                with self.assertRaises(KeyError):
+                    to_tag_description_row(
+                        _tag_description_item(payload=payload))
+
+    def test_an_applied_row_with_a_snapshot_offers_its_undo(self):
+        row = to_tag_description_row(_tag_description_item(
+            state="applied", prior_state={"description": None}))
+        self.assertTrue(row.undoable)
+        self.assertFalse(row.actionable)
+
+    def test_an_applied_row_with_no_snapshot_offers_no_undo(self):
+        # HARM: `revert_tag_description` raises on an empty snapshot, so the
+        # button would promise an undo the code cannot perform.
+        row = to_tag_description_row(_tag_description_item(
+            state="applied", prior_state=None))
+        self.assertFalse(row.undoable)
+
+    def test_no_server_configured_leaves_the_link_off_rather_than_broken(self):
+        self.assertIsNone(to_tag_description_row(_tag_description_item()).tag_url)
+
+
+class TagUrl(unittest.TestCase):
+    def test_it_addresses_the_tag_page_and_not_a_scene_or_a_performer(self):
+        # HARM: a link to the wrong subject kind renders as an ordinary
+        # working link and lands on somebody else's record.
+        self.assertEqual(tag_url("http://media.example", "7"),
+                         "http://media.example/tags/7")
+
+    def test_no_base_url_is_no_link(self):
+        self.assertIsNone(tag_url(None, "7"))
+
+
 # -- tag-merge proposals ---------------------------------------------------- #
 
 
@@ -1019,10 +1115,10 @@ def _merge_item(**over):
     this cannot drift from what `to_merge_row` will actually be handed.
     """
     tags = over.pop("tags", [
-        {"id": "1", "name": "Velvet Crane", "aliases": [], "scene_count": 12},
-        {"id": "9", "name": "VelvetCrane", "aliases": [], "scene_count": 4},
+        {"id": "1", "name": "Velvet Crane", "aliases": [], "description": None, "scene_count": 12},
+        {"id": "9", "name": "VelvetCrane", "aliases": [], "description": None, "scene_count": 4},
     ])
-    built = tag_proposal(cluster_tags(tags)[0], "library")
+    built = tag_proposal(cluster_tags(tags)[0], "library", [])
     item = {"fingerprint": "fp-m", "state": "new",
             "subject_type": built["subject_type"],
             "subject_id": built["subject_id"], "summary": built["summary"],
@@ -1092,11 +1188,24 @@ class ToRowsDispatch(unittest.TestCase):
         # would show a block with no filename, no title and no score, which is
         # a proposal a person cannot judge and can still approve.
         rows = to_rows([_item(fingerprint="fp-s"),
-                        _description_item(fingerprint="fp-d")])
+                        _description_item(fingerprint="fp-d"),
+                        _tag_description_item(fingerprint="fp-t")])
 
         self.assertEqual([r.kind for r in rows],
-                         [KIND_SCENE, KIND_DESCRIPTION])
-        self.assertEqual([r.fingerprint for r in rows], ["fp-s", "fp-d"])
+                         [KIND_SCENE, KIND_DESCRIPTION, KIND_TAG_DESCRIPTION])
+        self.assertEqual([r.fingerprint for r in rows],
+                         ["fp-s", "fp-d", "fp-t"])
+
+    def test_a_tag_description_never_falls_through_to_the_scene_builder(self):
+        # HARM: the `else` branch is the scene builder, which INDEXES
+        # `payload["path"]`. A tag-description item reaching it raises and
+        # takes out the whole page for every other row on it -- so the third
+        # branch is asserted by the shape it produces, not only by the kind
+        # string it carries.
+        row = to_rows([_tag_description_item()])[0]
+
+        self.assertEqual(row.source_box, "first")
+        self.assertFalse(hasattr(row, "filename"))
 
     def test_the_base_url_reaches_both_kinds_of_row(self):
         rows = to_rows([_item(subject_id="3"), _description_item()],
@@ -1113,9 +1222,9 @@ class ToRowsDispatch(unittest.TestCase):
 
 
 _THREE_SPELLINGS = [
-    {"id": "1", "name": "IvyMayKingsley", "aliases": [], "scene_count": 1},
-    {"id": "2", "name": "Ivy MayKingsley", "aliases": [], "scene_count": 2},
-    {"id": "3", "name": "Ivy May Kingsley", "aliases": [], "scene_count": 3},
+    {"id": "1", "name": "IvyMayKingsley", "aliases": [], "description": None, "scene_count": 1},
+    {"id": "2", "name": "Ivy MayKingsley", "aliases": [], "description": None, "scene_count": 2},
+    {"id": "3", "name": "Ivy May Kingsley", "aliases": [], "description": None, "scene_count": 3},
 ]
 
 
@@ -1133,12 +1242,18 @@ class MergeRowShape(unittest.TestCase):
             "subject_id": "velvetcrane",
             "key": "velvetcrane",
             "members": (
-                {"id": "1", "name": "Velvet Crane", "scene_count": 12},
-                {"id": "9", "name": "VelvetCrane", "scene_count": 4},
+                {"id": "1", "name": "Velvet Crane", "scene_count": 12,
+                 "description": None},
+                {"id": "9", "name": "VelvetCrane", "scene_count": 4,
+                 "description": None},
             ),
             "canonical": "Velvet Crane",
             "losing": ("VelvetCrane",),
             "undecided": None,
+            "inherit": None,
+            "inherit_from_tag": None,
+            "inherit_from_box": None,
+            "conflicting": (),
             "total_scenes": 16,
             "counts_cover": "scenes",
             "warning": MERGE_IS_IRREVERSIBLE,
@@ -1148,6 +1263,50 @@ class MergeRowShape(unittest.TestCase):
             "unmutable": False,
             "error": None,
         })
+
+    def test_the_description_a_survivor_would_inherit_reaches_the_row(self):
+        # HARM: the merge deletes the only spelling carrying the text. A row
+        # that did not show it asks a person to approve an irreversible write
+        # without showing them what it moves.
+        item = _merge_item(tags=[
+            {"id": "1", "name": "Lantern Work", "aliases": [],
+             "description": None, "scene_count": 12},
+            {"id": "9", "name": "LanternWork", "aliases": [],
+             "description": TAG_DESCRIPTION, "scene_count": 4}])
+
+        row = to_merge_row(item)
+
+        self.assertEqual(row.inherit, TAG_DESCRIPTION)
+        self.assertEqual(row.inherit_from_tag, "LanternWork")
+        self.assertIsNone(row.inherit_from_box)
+        self.assertEqual(row.conflicting, ())
+
+    def test_two_differing_descriptions_both_reach_the_row_and_neither_wins(self):
+        item = _merge_item(tags=[
+            {"id": "1", "name": "Lantern Work", "aliases": [],
+             "description": TAG_DESCRIPTION, "scene_count": 12},
+            {"id": "9", "name": "LanternWork", "aliases": [],
+             "description": "Filmed aboard a working passenger boat.",
+             "scene_count": 4}])
+
+        row = to_merge_row(item)
+
+        self.assertIsNone(row.inherit)
+        self.assertEqual([c["name"] for c in row.conflicting],
+                         ["Lantern Work", "LanternWork"])
+
+    def test_a_merge_recorded_before_descriptions_existed_still_renders(self):
+        # HARM: those rows are in the store and on the page. Indexed, the
+        # missing block takes the whole Merges section down with a KeyError;
+        # an empty block is the truthful reading -- that proposal asked no
+        # source anything and found no description at risk.
+        item = _merge_item()
+        del item["payload"]["description"]
+
+        row = to_merge_row(item)
+
+        self.assertIsNone(row.inherit)
+        self.assertEqual(row.conflicting, ())
 
     def test_the_whole_row_for_an_undecided_cluster(self):
         row = asdict(to_merge_row(_merge_item(tags=_THREE_SPELLINGS)))

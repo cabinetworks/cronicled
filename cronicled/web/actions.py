@@ -8,6 +8,7 @@ job runner directly and grow another kind of write nobody reviewed.
 """
 from cronicled import tags
 from cronicled.descriptions import SUBJECT_TYPE as DESCRIPTION_SUBJECT
+from cronicled.tag_descriptions import SUBJECT_TYPE as TAG_DESCRIPTION_SUBJECT
 from cronicled.runscan import build_producer
 from cronicled.scan import catalogue_link
 from cronicled.web.rows import carries_cover
@@ -143,6 +144,16 @@ class Actions:
                 result = self._stash.apply_performer_description(
                     subject_id, payload["cleaned"],
                     expected=payload["original"])
+            elif item["subject_type"] == TAG_DESCRIPTION_SUBJECT:
+                payload = item["payload"]
+                # `expected` is the payload's `original` VERBATIM -- the value
+                # the server gave when the pass ran, `None` and all. The
+                # proposal exists because the field was empty; a tag somebody
+                # has described since is refused by the client rather than
+                # having a third-party sentence written over it.
+                result = self._stash.apply_tag_description(
+                    subject_id, payload["description"],
+                    expected=payload["original"])
             else:
                 result = self._stash.apply_scene(
                     subject_id, _match_to_apply(item["payload"]))
@@ -184,6 +195,16 @@ class Actions:
         made -- days ago, potentially -- so passing it would silently delete
         any alias added since. See `cronicled.tags`'s module docstring.
 
+        A DESCRIPTION, unlike the aliases, IS passed -- and the difference is
+        not inconsistency. The alias list is REPLACED by what is sent, so a
+        stale list deletes aliases added since; a description is carried onto
+        a survivor the proposal recorded as having NONE, and `Stash
+        .merge_tags` re-reads the survivor one line before the write and
+        refuses the whole merge if it has gained one. One is a write whose
+        staleness cannot be checked, the other is a write whose staleness is
+        exactly what is checked. Without it the merge deletes the only tag
+        carrying the description and nothing records what it said.
+
         `mark_applied` is called with NO `prior_state`, and that is where
         this module enforces the irreversibility decision rather than merely
         describing it: there is no snapshot, so the store holds none, so no
@@ -201,8 +222,21 @@ class Actions:
             raise ApplyFailed("could not apply: %s" % _NO_STASH)
         sources = [m["id"] for m in payload["members"]
                    if m["id"] != canonical["id"]]
+        # `.get` on both, and only on these two. A merge proposal recorded
+        # before this pass knew about descriptions carries no block at all,
+        # and the truthful reading of one is "nothing to carry" -- the merge
+        # it already was. Everything above is indexed, because for everything
+        # above a missing value is a malformed payload.
+        #
+        # `text` is `None` for every merge with nothing to carry, including
+        # one whose spellings describe the tag two DIFFERENT ways: that is
+        # reported on the row and left to a person. Passing the survivor's
+        # own text, or the longer, or the first, would be this project's
+        # oldest mistake made in a place a reviewer could not see it.
+        inherit = (payload.get("description") or {}).get("text")
         try:
-            self._stash.merge_tags(canonical["id"], sources)
+            self._stash.merge_tags(canonical["id"], sources,
+                                   description=inherit)
         except Exception as exc:
             self._store.mark_failed(fp, "%s: %s" % (type(exc).__name__, exc))
             raise ApplyFailed("could not apply: %s" % exc) from exc
@@ -244,6 +278,14 @@ class Actions:
             # revert_scene it is still refused, but as a stack trace.
             raise ValueError(
                 "cannot undo %s: no snapshot was stored for it" % fp)
+        if item["subject_type"] == TAG_DESCRIPTION_SUBJECT:
+            self._stash.revert_tag_description(item["subject_id"], prior)
+            # Recorded only AFTER the revert succeeds, and answered with a
+            # plain "reverted" for the same reason the performer branch below
+            # is: one field written, the same one field in the snapshot,
+            # nothing the revert leaves behind.
+            self._store.mark_reverted(fp)
+            return "reverted"
         if item["subject_type"] == DESCRIPTION_SUBJECT:
             self._stash.revert_performer_description(item["subject_id"], prior)
             # Recorded only AFTER the revert succeeds, exactly as below.

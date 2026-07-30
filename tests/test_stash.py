@@ -1007,13 +1007,26 @@ class _TagTransport:
     body itself.
     """
 
-    def __init__(self, merged=None):
+    def __init__(self, merged=None, description=None):
         self.calls = []  # (query, input) for every mutation sent, in order
         self.merged = merged or {"id": "tag-canonical", "name": "Lantern Drift",
                                  "aliases": []}
+        # What the destination tag's description is on the server right now.
+        # `None` -- a tag nobody has described -- is what the real server
+        # answers for the overwhelmingly common case, and is the state that
+        # makes a carry-over legitimate.
+        self.description = description
+        self.reads = []
 
     def __call__(self, body, timeout):
         q = body["query"]
+        if "findTag(" in q:
+            # A READ, recorded apart from the mutations: `only()` would stop
+            # meaning "exactly one mutation" if reads were counted with them,
+            # and every existing test here depends on that meaning.
+            self.reads.append(body["variables"]["id"])
+            return {"data": {"findTag": {"id": body["variables"]["id"],
+                                         "description": self.description}}}
         inp = body["variables"]["in"]
         self.calls.append((q, inp))
         if "tagsMerge" in q:
@@ -1101,6 +1114,179 @@ class MergeTags(unittest.TestCase):
         _tag_stash(t).merge_tags(CANONICAL_TAG_ID, [TYPO_TAG_ID])
         self.assertEqual(len(t.calls), 1)
         self.assertIn("tagsMerge", t.calls[0][0])
+
+
+# An invented description, and a second one that is a visibly different
+# sentence so no assertion below can pass by comparing a value against itself.
+CARRIED_DESCRIPTION = "Scenes lit only by a hand-carried lamp."
+OTHER_DESCRIPTION = "Filmed aboard a working passenger boat."
+
+
+class MergeTagsCarriesADescription(unittest.TestCase):
+    """The merge deletes the losing spellings. Whatever description lived on
+    one of them goes with it unless this carries it across."""
+
+    def test_the_description_rides_in_the_same_mutation_as_the_merge(self):
+        # HARM: a second write after the merge can fail on its own, leaving
+        # the spelling that held the text already deleted and nothing
+        # recording what it said. One mutation cannot half-happen.
+        t = _TagTransport()
+        _tag_stash(t).merge_tags(CANONICAL_TAG_ID, [TYPO_TAG_ID],
+                                 description=CARRIED_DESCRIPTION)
+        inp = t.only()
+        self.assertEqual(inp["values"], {"id": CANONICAL_TAG_ID,
+                                         "description": CARRIED_DESCRIPTION})
+        # and it lands on the tag that survives, never on one being deleted
+        self.assertEqual(inp["values"]["id"], inp["destination"])
+
+    def test_no_description_leaves_the_values_block_alone(self):
+        # HARM: the other half. `values` REPLACES what it names, so sending a
+        # block for a merge that was never asked to touch the description
+        # would blank the survivor's own text as a side effect.
+        t = _TagTransport()
+        _tag_stash(t).merge_tags(CANONICAL_TAG_ID, [TYPO_TAG_ID])
+        self.assertNotIn("values", t.only())
+        self.assertEqual(t.reads, [], "read the destination for no reason")
+
+    def test_aliases_and_a_description_travel_together(self):
+        # HARM: one overwriting the other's `values` block silently drops
+        # whichever was built first.
+        t = _TagTransport()
+        _tag_stash(t).merge_tags(CANONICAL_TAG_ID, [TYPO_TAG_ID],
+                                 aliases=MERGED_ALIASES,
+                                 description=CARRIED_DESCRIPTION)
+        self.assertEqual(t.only()["values"],
+                         {"id": CANONICAL_TAG_ID, "aliases": MERGED_ALIASES,
+                          "description": CARRIED_DESCRIPTION})
+
+    def test_a_survivor_that_has_gained_a_description_refuses_the_merge(self):
+        # HARM: the proposal was made against a survivor with an EMPTY field.
+        # Somebody has written one since, and overwriting it with a sentence
+        # lifted off another tag is the one outcome here nobody could detect
+        # afterwards. The whole merge refuses, so the proposal stays live.
+        t = _TagTransport(description=OTHER_DESCRIPTION)
+        with self.assertRaises(StashError):
+            _tag_stash(t).merge_tags(CANONICAL_TAG_ID, [TYPO_TAG_ID],
+                                     description=CARRIED_DESCRIPTION)
+        self.assertEqual(t.calls, [], "the merge must not have been sent")
+
+    def test_the_survivor_is_read_before_the_write_and_not_by_the_caller(self):
+        # HARM: taking the comparison anywhere else opens a window between it
+        # and the write. Read here, one line before, against the tag that
+        # survives -- reading a losing spelling would compare the wrong text.
+        t = _TagTransport()
+        _tag_stash(t).merge_tags(CANONICAL_TAG_ID, [TYPO_TAG_ID],
+                                 description=CARRIED_DESCRIPTION)
+        self.assertEqual(t.reads, [CANONICAL_TAG_ID])
+
+    def test_an_empty_description_on_the_survivor_is_not_a_description(self):
+        # HARM: a server answering `""` is a tag nobody has described, and
+        # refusing on it would block every legitimate carry-over on an
+        # install whose server spells "empty" that way.
+        for empty in (None, ""):
+            with self.subTest(current=empty):
+                t = _TagTransport(description=empty)
+                _tag_stash(t).merge_tags(CANONICAL_TAG_ID, [TYPO_TAG_ID],
+                                         description=CARRIED_DESCRIPTION)
+                self.assertEqual(t.only()["values"]["description"],
+                                 CARRIED_DESCRIPTION)
+
+
+    def test_a_description_supplied_as_empty_is_still_a_supplied_description(self):
+        # The sentinel that separates "this merge was asked to touch the
+        # description" from "it was not" is `None`, never truthiness. Read as
+        # truthiness, `""` joins the second class: the survivor is not read,
+        # the guard that supplying a description arms never runs, and the
+        # caller's argument is dropped on the floor with the merge going ahead
+        # regardless. A supplied value being silently discarded is the failure
+        # this pins -- the whole values block, so the key going missing is
+        # visible rather than sampled around.
+        t = _TagTransport()
+        _tag_stash(t).merge_tags(CANONICAL_TAG_ID, [TYPO_TAG_ID],
+                                 description="")
+
+        self.assertEqual(t.only()["values"],
+                         {"id": CANONICAL_TAG_ID, "description": ""})
+        self.assertEqual(t.reads, [CANONICAL_TAG_ID],
+                         "supplying a description must arm the staleness read")
+
+
+class TagDescriptionRead(unittest.TestCase):
+    def test_it_answers_what_the_server_holds_right_now(self):
+        t = _TagTransport(description=CARRIED_DESCRIPTION)
+        self.assertEqual(_tag_stash(t).tag_description(CANONICAL_TAG_ID),
+                         CARRIED_DESCRIPTION)
+
+    def test_a_tag_the_server_does_not_know_answers_none(self):
+        # HARM: reported as anything else, an apply against a deleted tag
+        # would either write to nothing and report success, or raise where a
+        # refusal with a reason belongs.
+        def missing(body, timeout):
+            return {"data": {"findTag": None}}
+        self.assertIsNone(_tag_stash(missing).tag_description("gone"))
+
+
+class ApplyTagDescription(unittest.TestCase):
+    def test_it_writes_the_text_when_the_field_is_what_the_proposal_saw(self):
+        t = _TagTransport(description=None)
+        result = _tag_stash(t).apply_tag_description(
+            CANONICAL_TAG_ID, CARRIED_DESCRIPTION, expected=None)
+        self.assertEqual(t.only(), {"id": CANONICAL_TAG_ID,
+                                    "description": CARRIED_DESCRIPTION})
+        self.assertEqual(result, {"prior": {"description": None}})
+
+    def test_a_field_written_since_the_pass_refuses_rather_than_overwriting(self):
+        # HARM: a description somebody wrote replaced by one lifted from a
+        # third-party index, with nothing recording that it happened.
+        t = _TagTransport(description=OTHER_DESCRIPTION)
+        with self.assertRaises(StashError):
+            _tag_stash(t).apply_tag_description(
+                CANONICAL_TAG_ID, CARRIED_DESCRIPTION, expected=None)
+        self.assertEqual(t.calls, [], "nothing may have been written")
+
+    def test_the_snapshot_is_the_text_the_write_replaced(self):
+        # HARM: a snapshot built from the proposal rather than from the read
+        # would restore what the pass saw, not what the write displaced.
+        t = _TagTransport(description="")
+        result = _tag_stash(t).apply_tag_description(
+            CANONICAL_TAG_ID, CARRIED_DESCRIPTION, expected="")
+        self.assertEqual(result["prior"], {"description": ""})
+
+    def test_expected_has_no_default(self):
+        # HARM: a caller who forgot it and a caller who meant "write
+        # regardless" must not be able to write the same thing.
+        with self.assertRaises(TypeError):
+            _tag_stash(_TagTransport()).apply_tag_description(
+                CANONICAL_TAG_ID, CARRIED_DESCRIPTION)
+
+
+class RevertTagDescription(unittest.TestCase):
+    def test_it_writes_back_exactly_what_the_snapshot_holds(self):
+        t = _TagTransport()
+        _tag_stash(t).revert_tag_description(
+            CANONICAL_TAG_ID, {"description": OTHER_DESCRIPTION})
+        self.assertEqual(t.only(), {"id": CANONICAL_TAG_ID,
+                                    "description": OTHER_DESCRIPTION})
+
+    def test_a_tag_that_had_no_description_is_restored_to_having_none(self):
+        # HARM: an undo that skipped this leaves the third-party sentence in
+        # place while reporting the write taken back.
+        for prior in (None, ""):
+            with self.subTest(prior=prior):
+                t = _TagTransport()
+                _tag_stash(t).revert_tag_description(
+                    CANONICAL_TAG_ID, {"description": prior})
+                self.assertEqual(t.only()["description"], prior)
+
+    def test_a_snapshot_that_cannot_describe_anything_refuses(self):
+        # HARM: a revert that no-ops is indistinguishable from one that
+        # worked, which is the one ambiguity undo cannot afford.
+        for prior in (None, {}, {"aliases": []}):
+            with self.subTest(prior=prior):
+                t = _TagTransport()
+                with self.assertRaises(ValueError):
+                    _tag_stash(t).revert_tag_description(CANONICAL_TAG_ID, prior)
+                self.assertEqual(t.calls, [])
 
 
 class UpdateTagAliases(unittest.TestCase):
@@ -1549,7 +1735,8 @@ TAG_PAGE_SIZE = 500
 
 def _tag_rows(n, prefix):
     return [{"id": "%s-%d" % (prefix, i), "name": "%s %d" % (prefix, i),
-             "aliases": [], "scene_count": 0} for i in range(n)]
+             "aliases": [], "description": None, "scene_count": 0}
+            for i in range(n)]
 
 
 def _read_stash(transport):
@@ -3258,6 +3445,24 @@ def _all_tags_request():
     return t.only()
 
 
+class AllTagsSelection(unittest.TestCase):
+    def test_it_asks_for_every_field_a_caller_reads_off_a_tag(self):
+        # Stated as a list of names rather than compared against the query
+        # constant the client also sends: reading the expectation off the
+        # query moves both sides at once.
+        #
+        # HARM differs per field and `description` is the sharp one: without
+        # it, "this tag has no description" becomes unanswerable, and the
+        # honest readings are both wrong -- treat every tag as described and
+        # nothing is ever proposed, treat every tag as blank and a proposal
+        # is offered to overwrite text somebody wrote.
+        query, _ = _all_tags_request()
+        for field in ("id", "name", "aliases", "description", "scene_count"):
+            self.assertIn(field, query,
+                          "a caller reads %s off a tag and it is not being "
+                          "asked for" % (field,))
+
+
 class AllTagsBindings(unittest.TestCase):
     def test_the_tag_page_walk_binds_its_paging_to_filter(self):
         # HARM: the mirror image of the lookup above — here `filter` is the
@@ -3870,6 +4075,63 @@ class ConfiguredStashBoxes(unittest.TestCase):
         t = _transport([_boxes_reply([])])
         Stash("http://example.test", "k", transport=t).stash_boxes()
         self.assertNotIn("api_key", t.calls[0][0]["query"])
+
+
+KEYED_BOX_ONE = dict(BOX_ONE, api_key="key-one")
+KEYED_BOX_TWO = dict(BOX_TWO, api_key="key-two")
+
+
+class ConfiguredStashBoxCredentials(unittest.TestCase):
+    """The sibling read, for the caller that talks to a box ITSELF."""
+
+    def test_it_returns_every_configured_box_in_the_server_s_own_order(self):
+        # The order is the operator's, and a caller treats it as the
+        # preference between two sources that both answer -- so a client that
+        # re-ordered, sorted or de-duplicated would silently change which
+        # source's description a proposal carries.
+        t = _transport([_boxes_reply([KEYED_BOX_TWO, KEYED_BOX_ONE])])
+        got = Stash("http://example.test", "k",
+                    transport=t).stash_box_credentials()
+        self.assertEqual(got, [KEYED_BOX_TWO, KEYED_BOX_ONE])
+
+    def test_the_answer_is_a_sequence_and_never_keyed_by_name(self):
+        # HARM: the order IS the answer to "which source wins", so carrying
+        # it in a container that could put it at the mercy of a key's hash --
+        # or that would collapse two boxes an operator named the same -- is
+        # the resolution-by-iteration-order this project has removed from
+        # five places.
+        t = _transport([_boxes_reply([KEYED_BOX_ONE, KEYED_BOX_TWO])])
+        got = Stash("http://example.test", "k",
+                    transport=t).stash_box_credentials()
+        self.assertIsInstance(got, list)
+
+    def test_no_boxes_configured_is_an_empty_list_not_a_failure(self):
+        t = _transport([_boxes_reply(None)])
+        self.assertEqual(Stash("http://example.test", "k",
+                               transport=t).stash_box_credentials(), [])
+
+    def test_it_selects_the_key_because_this_caller_actually_uses_it(self):
+        # HARM: without it every request to a configured source is anonymous,
+        # and a source that requires a key contributes nothing while
+        # reporting itself as unreachable. This is the one difference from
+        # `stash_boxes`, whose caller genuinely has no use for a secret.
+        t = _transport([_boxes_reply([])])
+        Stash("http://example.test", "k", transport=t).stash_box_credentials()
+        query = t.calls[0][0]["query"]
+        self.assertIn("api_key", query)
+        self.assertIn("name", query)
+        self.assertIn("endpoint", query)
+
+    def test_the_query_asks_the_server_s_configuration_for_its_boxes(self):
+        # Asserted as PROPERTIES of the document, never against a constant
+        # the client also builds the request from: a query swapped for a
+        # sibling would move both sides together.
+        t = _transport([_boxes_reply([])])
+        Stash("http://example.test", "k", transport=t).stash_box_credentials()
+        query = t.calls[0][0]["query"]
+        self.assertIn("configuration", query)
+        self.assertIn("general", query)
+        self.assertIn("stashBoxes", query)
 
 
 class FingerprintLookup(unittest.TestCase):
