@@ -17,11 +17,16 @@ without anyone pressing anything. Nothing it starts writes to the media
 server: a scan reads and proposes, and every proposal still waits for a person
 to approve it.
 
-**Not yet built:** wall-clock scheduling. A cadence is an interval measured
-from the last recorded run, so a daily scan drifts to a different hour across
-restarts. Times of day bring a machine that was off across the appointed hour,
-and daylight-saving transitions where an hour repeats or does not exist, and
-neither is decided yet.
+A producer can be scheduled at a stated hour as well as on an interval: `{"at":
+"03:00", "zone": "Europe/Lisbon"}` in the schedule config keeps the same hour
+across restarts, where an interval measured from the last run drifts to
+whichever hour the process last started at. A machine that was off across the
+appointed hour owes the run once when it comes back, and the two days a year an
+hour repeats or does not exist, it fires once.
+
+**Not yet built:** a producer choosing to SKIP an appointment it missed instead
+of being owed it. Owing is the answer for every producer today, argued where it
+is implemented rather than left to a setting.
 
 One runtime dependency: Jinja2, for autoescaped HTML. Everything else is the
 Python standard library. The inbox renders text the project did not write —
@@ -44,11 +49,21 @@ with a declared cadence, builds a scheduler over it and starts it, and the
 page reports what the loop last did — when it ticked, what was due, and why
 anything due was left alone.
 
-The distinction worth keeping in mind: the cadence is an INTERVAL, not a time
-of day, so "nightly" means "a day since the last run" and drifts across
-restarts. That remaining gap has its own diagram, kept separate from the ones
-describing what is built, on the
-[architecture](docs/index.md#what-is-not-decided-yet) page.
+A schedule says when in one of two ways, and both are useful. A cadence in
+seconds is an INTERVAL measured from the last recorded run — right for
+something that should run every few minutes, and the reason "nightly" used to
+drift to whatever hour the process last restarted at. A stated time of day in a
+named zone (`{"at": "03:00", "zone": "Europe/Lisbon"}`) keeps the same hour
+across restarts instead. A stated time that was missed because the machine was
+off is OWED: it runs once when the machine comes back, at whatever hour that
+is, rather than being skipped or made up one night at a time. The two days a
+year a local clock repeats an hour or skips one, it fires exactly once — on the
+first reading of a repeated hour, and after a gap rather than before it.
+
+What is still not decided is the choice between owing a missed appointment and
+skipping it, which is one answer today and not a setting. That remaining gap
+has its own diagram, kept separate from the ones describing what is built, on
+the [architecture](docs/index.md#what-is-not-decided-yet) page.
 
 ## Quickstart
 
@@ -83,12 +98,16 @@ That command also registers three unattended passes, each with a cadence of
 its own, and starts the loop that runs them when they are due: a library scan
 with no file limit, a pass over performer descriptions that proposes cleaned
 text for any carrying markup, and a tag pass that looks for one tag written
-under more than one spelling and proposes a merge. To change how often any of
-them runs, or to turn one off, put a `schedule.json` in the config directory —
-see `config/schedule.example.json` for the shape. A cadence that
-is not a positive number of seconds, a key that is not `every`/`enabled`, or
-a producer name that is not registered are all refused at start-up rather
-than leaving a producer running on a cadence nobody chose. Without a media
+under more than one spelling and proposes a merge. To change when any of them
+runs, to move one to a stated hour, or to turn one off, put a `schedule.json` in
+the config directory — see `config/schedule.example.json` for the shape. A
+cadence that is not a positive number of seconds, a key that is not
+`every`/`at`/`zone`/`enabled`, an entry naming both a cadence and a time, a
+stated time with no zone or a zone this system does not know, and a producer
+name that is not registered are all refused at start-up rather than leaving a
+producer running at an hour nobody chose. There is deliberately no default
+zone: a stated time with none named refuses to load rather than inheriting the
+host's, which in a container is UTC and in nobody's head is. Without a media
 server nothing is scheduled at all and the entry point says so; without a
 configured site adapter there is nothing to scan, so the scan alone is left
 out — the description and tag passes read the media server's own text and

@@ -11,11 +11,12 @@ an approval gate: `python -m cronicled` serves what the store holds, and
 nothing writes to the media server except through an explicit approve or
 undo. What does not exist is anything that runs unattended.
 
-A scheduler is part of the library code: it resolves each producer's cadence,
-decides what is due, runs it and records the run. What does not exist is a
-process that constructs one and calls it on a timer. A scheduler nobody starts
-is a component, not a service, and the fourth diagram is drawn around that one
-remaining gap.
+A scheduler is part of the library code: it resolves each producer's schedule —
+an interval, or a stated time of day in a named zone — decides what is due,
+runs it and records the run. The entry point constructs one and ticks it in the
+background, so that half is a service rather than a component. The fourth
+diagram is drawn around what is left, which is now a choice rather than a
+mechanism: whether a producer may decline an appointment it slept through.
 
 ## The module map
 
@@ -245,9 +246,11 @@ kill wherever it has got to.
 
 ## What is not decided yet
 
-Only one node below is **planned**. Everything else in this diagram now has
-code behind it — it is drawn separately from the three above only because it
-carries the one node that does not exist, and mixing a planned node into a
+Only one node below is **planned**, and it is no longer the wall clock. Times
+of day are built; what is not decided is whether a producer may ask to SKIP an
+appointment it missed rather than be owed it. Everything else in this diagram
+has code behind it — it is drawn separately from the three above only because
+it carries the one node that does not exist, and mixing a planned node into a
 diagram of what is built is how a picture starts claiming more than the prose
 does.
 
@@ -255,14 +258,16 @@ does.
 flowchart TD
     entry["BUILT: `python -m cronicled`<br/>registers the scheduled scan, then builds and starts the scheduler"]
     sched["BUILT: Scheduler decides what is due,<br/>runs it, and records the run"]
-    wallclock{"PLANNED: a cadence written as a time of day"}
+    wallclock{"BUILT: a schedule written as a time of day and a zone"}
+    catchup{"PLANNED: a producer asking to SKIP a missed appointment<br/>rather than be owed it"}
     built["BUILT: JobRunner drives the producer,<br/>Store records each proposal as it is yielded"]
     inbox["BUILT: the inbox — a person sees what was proposed"]
     gate{"BUILT: approval<br/>no write happens without one"}
     apply["BUILT: Actions.approve calls Stash.apply_scene;<br/>Actions.undo calls Stash.revert_scene"]
 
     entry -- "starts the loop, and closes it on shutdown" --> sched
-    wallclock -. "would replace the interval with an appointed hour" .-> sched
+    wallclock -- "replaces the interval with an appointed hour" --> sched
+    catchup -. "would let a producer decline the run it slept through" .-> sched
     sched --> built
     built -- "the store now holds a proposal" --> inbox
     entry --> inbox
@@ -272,14 +277,20 @@ flowchart TD
 
     classDef planned stroke-dasharray:6 4
     classDef built stroke-width:3px
-    class wallclock planned
-    class entry,sched,built,inbox,gate,apply built
+    class catchup planned
+    class entry,sched,wallclock,built,inbox,gate,apply built
 ```
 
 One node in that diagram is dashed, and it is the only one that does not
-exist: a cadence written as a time of day. Everything else — the entry point,
-the scheduler it now starts, the inbox, the approval gate, and the caller that
-applies or reverts a scene — is built and tested.
+exist: a producer choosing to skip a missed appointment instead of being owed
+it. Everything else — the entry point, the scheduler it now starts, times of
+day, the inbox, the approval gate, and the caller that applies or reverts a
+scene — is built and tested. The wall-clock node used to be the dashed one, and
+what took its place is a real deferral rather than a slot kept warm: the
+missed-appointment choice is made one way for every producer, and making it
+per-producer is the setting that does not exist. `tests/test_docs.py` still
+holds this diagram to exactly one planned node, labelled as such in its own
+text, so the next thing to be built here has to be moved by hand too.
 
 What replaced the dashed arrow *into* the scheduler is worth reading
 carefully, because the ordering it depends on fails silently. A scheduler
@@ -295,10 +306,29 @@ the name it always had and the limit they typed, and the two never replace
 each other; they share the `scraping` cost class instead, so the runner
 serialises them rather than letting both scrape at once.
 
-The remaining gap is narrower than it was, and it is about WHEN rather than
-whether. A cadence is an interval measured from the last recorded run, so a
-daily scan drifts to a different hour across restarts, and a machine that was
-off for a week runs once when it comes back rather than seven times. Times of
-day would bring the two cases that break a naive implementation — a machine
-off across the appointed hour, and daylight-saving transitions where an hour
-repeats or does not exist — and neither is decided here.
+WHEN a producer runs can now be said either way. A cadence is an interval
+measured from the last recorded run — right for something that should run every
+few minutes, and the reason a daily scan drifted to a different hour across
+restarts. A stated time of day is read in a named zone (`{"at": "03:00",
+"zone": "Europe/Lisbon"}`), never in the host's: a container runs in UTC while
+the person who configured it thinks in their own hour, so a stated time with no
+zone refuses to load rather than keeping an appointment several hours from the
+one asked for. Both forms coexist; an entry naming both is refused when the
+schedule is wired up, as a contradiction rather than a precedence rule.
+
+The two cases that break a naive implementation are decided, and each is a
+plain unit test because `now` is an argument here. **A machine off across the
+appointed hour owes the run**: it happens once when the machine comes back, at
+whatever hour that is, and once only — a week off is one run, not seven. The
+alternative, skipping, loses on the failure it produces: a laptop asleep every
+night at 03:00 would never scan and would report nothing wrong. **Daylight
+saving fires once either way.** In the hour that happens twice it is the FIRST
+reading that runs, the second being an hour late for no reason. In the hour
+that does not exist it runs AFTER the gap — a job stated for 02:30 in a gap
+from 02:00 to 03:00 runs at 03:30, never at 01:30, because earlier than the
+stated time is the direction nobody notices until it collides with whatever
+else runs overnight.
+
+What is left is the choice itself: owing is one answer for every producer, and
+the dashed node above is a per-producer setting to skip instead. A setting
+built now would have been a way of not choosing.

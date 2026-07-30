@@ -8,6 +8,15 @@ for a week — is an ordinary unit test rather than something that needs a fake
 clock inside a running loop. `Scheduler.tick` keeps that property: it is called
 directly, once, and returns what it did.
 
+Wall-clock scheduling arrives the same way. A producer may be scheduled at a
+stated time of day in a named zone instead of on an interval, and the two cases
+that break a naive implementation of that — a machine that was off across the
+appointed hour, and the two days a year a wall clock names an hour twice or not
+at all — are still just `now` and a last-run time. See `_occurrence` for the
+daylight-saving rules and `due` for what a missed appointment does; neither
+needs a zone's transitions to be reachable from a running loop to be tested,
+because a transition is a value of `now` like any other.
+
 The loop that calls it on a timer lives here too, at the bottom, and it holds
 none of the rules — `start`, `close` and `status` know about a thread, an
 event and a count, and nothing about cadences. That separation is the reason
@@ -24,13 +33,50 @@ above that.
 import threading
 import traceback
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone, tzinfo
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .jobs import JobRejected
 
 # What a schedule override may say. Anything else is a typo — see `resolve`.
-OVERRIDE_KEYS = ("every", "enabled")
+OVERRIDE_KEYS = ("every", "at", "zone", "enabled")
+
+# The keys that say WHEN, as opposed to whether. An override naming any of
+# them supplies the whole of that producer's timing and the producer's own
+# declaration is set aside — see `resolve` for why that is one rule rather
+# than three keys merging field by field.
+SCHEDULE_KEYS = ("every", "at", "zone")
+
+# How far either side of `now`'s own local date the occurrences of a stated
+# time are looked for. An occurrence does not have to fall on the local date it
+# is named for, in EITHER direction, so this window is measured rather than
+# reasoned about:
+#
+# - Forward, because `_occurrence` pushes a time inside a spring-forward gap
+#   past the end of that gap, and where the gap is the last hour of the local
+#   day it lands on the next date. America/Nuuk does that every spring since
+#   2024 (its clock goes 22:59 -> 00:00), so a producer stated at 23:59 has its
+#   29 March 2025 appointment at 00:59 on the 30th, and on the 30th the latest
+#   appointment that has PASSED is the 28th's — two dates back.
+# - Backward, because a zone that puts its clocks back just after midnight
+#   returns the local date to yesterday while the following date's appointment
+#   is already in the past. America/St_Johns did that until 2011, moving its
+#   clocks at 00:01: at 23:30 on 6 November 2010, midnight of the 7th has
+#   happened and the next midnight is TWO dates ahead of the date on the clock.
+#
+# Enumerated over every zone `zoneinfo` knows, every offset change between 1970
+# and 2040, every hour within two days of each, at four times of day —
+# 12,081,544 cases. The latest appointment that had passed lay two dates back
+# in 262 of them and one date FORWARD in 53; the earliest still to come lay one
+# date back in 262 and two dates forward in 53. Never further either way, so
+# both numbers below are two, and both are load-bearing.
+#
+# Bounded rather than an unbounded walk, and a `ValueError` rather than a silent
+# `None`: a zone this cannot bracket is a fault worth a stack trace, and a
+# producer that quietly never fires is the outcome worth avoiding at any price.
+_DAYS_BACK = 2
+_DAYS_FORWARD = 2
 
 # How long the loop waits between ticks when nobody says otherwise. This is
 # the resolution of the whole schedule, not a cadence: a producer due at
@@ -41,17 +87,30 @@ DEFAULT_INTERVAL = 60.0
 
 @dataclass(frozen=True)
 class Entry:
-    """One producer's resolved schedule: how often, and whether at all.
+    """One producer's resolved schedule: when, and whether at all.
 
-    `every` is a number of seconds. It may be `None` only for a disabled
-    entry — an enabled entry with no cadence is the wiring mistake `resolve`
-    refuses, and `due` refuses it again rather than treating it as a producer
-    that silently never runs.
+    Two shapes can say when, exactly one of them per producer, and both exist
+    because each is right for something:
+
+    - `every`, a number of seconds since the last recorded run. The right
+      answer for something that should run every few minutes.
+    - `at`, a `datetime.time` of day, read in `zone` (a `tzinfo`). The right
+      answer for something nightly, because an interval measured from the last
+      run drifts: a daily pass restarted at 2pm runs at 2pm from then on, and
+      nothing says why.
+
+    `every` and `at` are never both set, and an enabled entry always has one
+    of them. `at` is never set without `zone`. All three are refused by
+    `resolve`, at wiring time, and refused again by `due` — a hand-built entry
+    must not become a producer that silently never runs, or one whose stated
+    hour is read in whatever zone the host happens to be in.
     """
 
     producer: str
     every: Optional[float]
     enabled: bool = True
+    at: Optional[time] = None
+    zone: Optional[tzinfo] = None
 
 
 def _check_every(value, producer, source):
@@ -72,6 +131,66 @@ def _check_every(value, producer, source):
             f"than zero seconds, got {value!r}"
         )
     return value
+
+
+def _check_at(value, producer, source):
+    """A stated time of day: `"HH:MM"`, `"HH:MM:SS"`, or a `datetime.time`.
+
+    A UTC offset on it is refused rather than honoured. `"03:00+01:00"` would
+    be a second way of saying the zone, disagreeing silently with `zone`
+    whenever the two differ — and worse than that, it pins an offset, which is
+    the one thing a zone with daylight saving does not have. An operator who
+    wrote it meant a local hour, and a local hour is `zone`'s job.
+    """
+    if isinstance(value, time):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = time.fromisoformat(value)
+        except ValueError:
+            raise ValueError(
+                f"stated time for producer {producer!r} ({source}) must be a "
+                f'time of day such as "03:00", got {value!r}'
+            ) from None
+    else:
+        raise ValueError(
+            f"stated time for producer {producer!r} ({source}) must be a time "
+            f'of day such as "03:00", got {value!r}'
+        )
+    if parsed.tzinfo is not None:
+        raise ValueError(
+            f"stated time for producer {producer!r} ({source}) must not carry "
+            f"a UTC offset, got {value!r}: name the zone in 'zone' instead, so "
+            "that daylight saving moves the offset rather than an offset "
+            "outliving it"
+        )
+    return parsed
+
+
+def _check_zone(value, producer, source):
+    """The zone a stated time is read in, as a `tzinfo`.
+
+    A name `zoneinfo` knows (`"Europe/Lisbon"`), or a `tzinfo` already built.
+    A name it does not know is refused here, at wiring time: the alternative is
+    a `ZoneInfoNotFoundError` raised from inside a tick, once an interval, for
+    as long as nobody looks — and a tick that raises starts nothing at all, for
+    any producer.
+    """
+    if isinstance(value, tzinfo):
+        return value
+    if not isinstance(value, str):
+        raise ValueError(
+            f"zone for producer {producer!r} ({source}) must be the name of a "
+            f'time zone, such as "Europe/Lisbon", got {value!r}'
+        )
+    try:
+        return ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise ValueError(
+            f"zone for producer {producer!r} ({source}) is not a time zone "
+            f'this system knows: {value!r}. Name one from the IANA database, '
+            'such as "Europe/Lisbon" or "UTC"'
+        ) from None
 
 
 def _check_interval(value):
@@ -105,6 +224,24 @@ def resolve(producers, overrides=None):
     both: `{"nightly-scan": {"every": 3600}}`, `{"box-scrape": {"enabled":
     false}}`.
 
+    An override may instead give a **stated time of day** and the zone to read
+    it in: `{"nightly-scan": {"at": "03:00", "zone": "Europe/Lisbon"}}`. Both
+    forms exist because both are right for something: an interval for a pass
+    that should run every few minutes, a stated time for a nightly one, which
+    on an interval drifts to whichever hour the process last restarted at.
+
+    **An override naming both `every` and `at` is refused.** It is a
+    contradiction, not a preference to resolve by precedence, and it belongs
+    here with the other wiring mistakes rather than at 3am.
+
+    An override naming ANY of `every`/`at`/`zone` supplies that producer's
+    whole timing, and what the producer declared is set aside — so `{"at":
+    "03:00", "zone": "UTC"}` moves a producer off its declared `every` rather
+    than colliding with it. The alternative, merging key by key, would mean an
+    override could only ever ADD a stated time to a declared interval, which is
+    the contradiction above; and it would leave `{"at": ...}` inheriting a zone
+    from somewhere the operator was not looking.
+
     Everything this refuses, it refuses here — at the point the schedule is
     wired up, rather than hours later when a tick tries to use it. The same
     reasoning as `JobRunner.register` rejecting an unknown cost class and a
@@ -114,20 +251,39 @@ def resolve(producers, overrides=None):
 
     So each of these is a `ValueError`:
 
-    - **A producer with no cadence and no override supplying one**, which
-      would otherwise be a producer nobody scheduled. A missing `every`
-      attribute and an `every` of `None` are the same mistake, not two. Note
-      that an override saying only `{"enabled": true}` does NOT satisfy this:
-      naming a producer is not scheduling it, and letting a mention silence
-      the error would hide the mistake behind config that looks deliberate.
-      A producer explicitly *disabled* is exempt — that is a scheduling
-      decision, which is the opposite of an omission.
+    - **A producer with neither a cadence nor a stated time, and no override
+      supplying one**, which would otherwise be a producer nobody scheduled. A
+      missing `every` attribute and an `every` of `None` are the same mistake,
+      not two. Note that an override saying only `{"enabled": true}` does NOT
+      satisfy this: naming a producer is not scheduling it, and letting a
+      mention silence the error would hide the mistake behind config that looks
+      deliberate. A producer explicitly *disabled* is exempt — that is a
+      scheduling decision, which is the opposite of an omission.
     - **An override naming a producer that does not exist**, which is a typo
       in a name; ignoring it would leave the real producer running on the
       cadence the operator believed they had changed.
     - **An override that is not a mapping, or carries a key other than
-      `every`/`enabled`** — again, typos that would otherwise be dropped.
+      `every`/`at`/`zone`/`enabled`** — again, typos that would otherwise be
+      dropped.
     - **A cadence that is not a positive number**, from either source.
+    - **Both a cadence and a stated time**, as above.
+    - **A stated time that is not a time of day, or that carries a UTC
+      offset** — see `_check_at`.
+    - **A stated time with no zone.** THIS IS THE ANSWER TO "what happens when
+      the zone is not configured": nothing happens, because the schedule does
+      not load. There is no default and deliberately not a fallback to the
+      host's zone — a container runs in UTC while its operator thinks in their
+      own hour, so inheriting the host would mean an appointment kept several
+      hours from the one that was asked for, correct-looking in every log, and
+      moving whenever the deployment moves. Nor is UTC assumed: an operator who
+      wanted UTC can write `"zone": "UTC"` in four characters, and inferring it
+      would spend a real, common mistake (forgetting the zone) to save that.
+      Refusing costs one startup failure with a message an operator can act on,
+      which is the cheapest of the three and the only visible one.
+    - **A zone with no stated time.** It schedules nothing and changes nothing,
+      so an operator who wrote it believes something untrue about when their
+      producer runs. That belief is the fault; the key being harmless is what
+      makes it worth saying out loud.
     - **An `enabled` that is not a boolean.** The string `"false"` is true.
     - **Two producers claiming one name**, which would silently drop one
       schedule.
@@ -142,7 +298,8 @@ def resolve(producers, overrides=None):
                 f"two producers are both named {name!r}; a schedule cannot "
                 "tell them apart"
             )
-        declared[name] = getattr(producer, "every", None)
+        declared[name] = {key: getattr(producer, key, None)
+                          for key in SCHEDULE_KEYS}
 
     unknown = sorted(set(overrides) - set(declared))
     if unknown:
@@ -152,7 +309,7 @@ def resolve(producers, overrides=None):
         )
 
     entries = {}
-    for name, every in declared.items():
+    for name, declaration in declared.items():
         override = overrides.get(name, {})
         if not isinstance(override, dict):
             raise ValueError(
@@ -173,20 +330,69 @@ def resolve(producers, overrides=None):
                 f"{enabled!r}"
             )
 
-        if "every" in override:
-            every = _check_every(override["every"], name, "from the override")
-        elif every is not None:
-            every = _check_every(every, name, "declared by the producer")
+        # Either the override says when, or the producer does. A key PRESENT
+        # in the override with a value of `None` still counts as the override
+        # saying when — and is then refused by the check below, which is the
+        # difference between an operator writing `{"every": null}` (a value
+        # that is not a number of seconds) and a producer that declares no
+        # cadence at all (an omission). The declaration side drops its `None`s
+        # for exactly that reason.
+        if any(key in override for key in SCHEDULE_KEYS):
+            timing = {key: override[key] for key in SCHEDULE_KEYS
+                      if key in override}
+            source = "from the override"
+        else:
+            timing = {key: value for key, value in declaration.items()
+                      if value is not None}
+            source = "declared by the producer"
 
-        if every is None and enabled:
+        if "every" in timing and "at" in timing:
             raise ValueError(
-                f"producer {name!r} has no cadence: it declares no 'every' and "
-                "no schedule override supplies one, so nothing would ever run "
-                "it. Give it a cadence, or disable it explicitly with "
+                f"the schedule for producer {name!r} ({source}) names both a "
+                f"cadence ('every': {timing['every']!r}) and a stated time "
+                f"('at': {timing['at']!r}). Those are two different schedules "
+                "and there is no sensible way to keep both: an interval suits "
+                "something that runs every few minutes, a stated time suits "
+                "something nightly. Name one."
+            )
+
+        every = at = zone = None
+        if "every" in timing:
+            every = _check_every(timing["every"], name, source)
+        if "at" in timing:
+            at = _check_at(timing["at"], name, source)
+            if "zone" not in timing:
+                raise ValueError(
+                    f"the schedule for producer {name!r} ({source}) states a "
+                    f"time ({timing['at']!r}) but no 'zone' to read it in. "
+                    "There is no default: the host's zone is whatever the "
+                    "deployment happens to be in — UTC in a container — so "
+                    "inheriting it would keep an appointment hours from the "
+                    'one asked for and say nothing. Name a zone, such as '
+                    '{"at": "03:00", "zone": "Europe/Lisbon"}, or "UTC" if '
+                    "that is genuinely what was meant."
+                )
+            zone = _check_zone(timing["zone"], name, source)
+        elif "zone" in timing:
+            raise ValueError(
+                f"the schedule for producer {name!r} ({source}) names a zone "
+                f"({timing['zone']!r}) but no time of day to read in it, so it "
+                "changes nothing about when that producer runs. Add 'at', or "
+                "drop the zone."
+            )
+
+        if every is None and at is None and enabled:
+            raise ValueError(
+                f"producer {name!r} has no schedule: it declares neither an "
+                "'every' nor an 'at', and no schedule override supplies one, "
+                "so nothing would ever run it. Give it a cadence in seconds, "
+                'or a stated time and zone ({"at": "03:00", "zone": '
+                '"Europe/Lisbon"}), or disable it explicitly with '
                 '{"enabled": false}.'
             )
 
-        entries[name] = Entry(producer=name, every=every, enabled=enabled)
+        entries[name] = Entry(producer=name, every=every, enabled=enabled,
+                              at=at, zone=zone)
     return entries
 
 
@@ -221,6 +427,98 @@ def _utcnow():
     return datetime.now(timezone.utc)
 
 
+def _occurrence(day, at, zone):
+    """The UTC instant that the wall-clock time `at` names on `day` in `zone`.
+
+    The two days a year on which a wall clock is not a one-to-one map are
+    decided here, and both are decided by `fold=0`. That is Python's default,
+    which is exactly why it is written down rather than left to be inherited: a
+    library default is not a rule, and "whichever way the date library happens
+    to go" is how a nightly job comes to run twice.
+
+    **The hour that happens twice** — a clock going back. `fold=0` is the
+    FIRST of the two instants, so a job stated for 01:30 runs at 01:30 summer
+    time and NOT again an hour later at 01:30 winter time. It fires once
+    because `due` compares instants, and by the time the wall clock reads 01:30
+    for the second time the run already recorded is not older than this
+    occurrence. Choosing the first of the two rather than the second is what
+    makes "it ran at the time you asked for" true of the earlier reading; the
+    later one is an hour late for no reason.
+
+    **The hour that does not exist** — a clock going forward. `fold=0` reads
+    the stated time with the offset in force BEFORE the transition, which
+    places the instant AFTER the gap: where 02:00 to 03:00 does not exist, a
+    job stated for 02:30 runs at 03:30 local, once. After the gap, not before
+    it, and that is the choice rather than an accident. Before would mean a job
+    stated for 02:30 running at 01:30 — earlier than the operator asked for,
+    inside an hour they may have kept for something else, and the direction a
+    person notices least until it collides with whatever else runs overnight.
+    After is late by the length of the gap, one night a year, and never earlier
+    than the time it was told.
+    """
+    return datetime.combine(day, at).replace(tzinfo=zone).astimezone(
+        timezone.utc)
+
+
+def _occurrences(at, zone, moment):
+    """Every instant `at` could name near `moment`, earliest first.
+
+    The local dates from `_DAYS_BACK` before `moment`'s own to `_DAYS_FORWARD`
+    after it. All of them, rather than a walk that stops at the first date
+    whose occurrence has passed: an occurrence pushed out of a spring-forward
+    gap can land on the following date, so "the first date going backwards
+    whose occurrence has passed" is not the same as "the latest occurrence that
+    has passed", and it is the second that a schedule needs. Measured, not
+    reasoned about — see `_DAYS_BACK`.
+
+    Kept as a list of instants because `moment` and the last-run time are
+    arguments: no clock is read here, so every case a wall clock can produce is
+    a value a test can pass in.
+    """
+    first = moment.astimezone(zone).date() - timedelta(days=_DAYS_BACK)
+    return [_occurrence(first + timedelta(days=step), at, zone)
+            for step in range(_DAYS_BACK + _DAYS_FORWARD + 1)]
+
+
+def _previous_occurrence(at, zone, moment):
+    """The latest instant `at` named in `zone` that is not after `moment`.
+
+    The instant a stated time is measured against: a producer is due when its
+    last run is older than this. "The machine was off for a week" is a `moment`
+    a week later and nothing else.
+    """
+    passed = [found for found in _occurrences(at, zone, moment)
+              if found <= moment]
+    if not passed:
+        raise ValueError(
+            f"no occurrence of {at.isoformat()} in {zone} has passed by "
+            f"{moment.isoformat()}, which should not be possible: the zone's "
+            "offsets do not behave like a zone's"
+        )
+    return max(passed)
+
+
+def _next_occurrence(at, zone, moment):
+    """The earliest instant `at` names in `zone` that is after `moment`.
+
+    Only ever for the reason string on a producer that is not due — a "next due
+    at" an operator can read against the clock, which is the difference between
+    a schedule that can be debugged and one that has to be re-derived by hand.
+    The earliest, not the first found: a gap can leave the occurrence of an
+    earlier date still ahead of `moment`, and naming the one after it would
+    tell an operator to expect the run a day later than it will happen.
+    """
+    upcoming = [found for found in _occurrences(at, zone, moment)
+                if found > moment]
+    if not upcoming:
+        raise ValueError(
+            f"no occurrence of {at.isoformat()} in {zone} follows "
+            f"{moment.isoformat()}, which should not be possible: the zone's "
+            "offsets do not behave like a zone's"
+        )
+    return min(upcoming)
+
+
 def due(entries, runs, now):
     """What to run now, as `(due_names, reasons)`.
 
@@ -234,17 +532,41 @@ def due(entries, runs, now):
     recorded for a producer no longer in `entries` — a leftover row for
     something that was unwired — appears in neither.
 
-    A producer is due when it has never run, or when at least `every` seconds
-    have passed since it last ran. **Exactly `every` seconds is due**: the
-    other choice delays every producer by a whole tick, every cycle, forever,
-    and nothing about that is visible.
+    A producer on a cadence is due when it has never run, or when at least
+    `every` seconds have passed since it last ran. **Exactly `every` seconds is
+    due**: the other choice delays every producer by a whole tick, every cycle,
+    forever, and nothing about that is visible.
 
-    Nothing here makes up missed runs. A producer whose last run was a week
-    ago on a nightly cadence is due **once**, not seven times: this returns a
-    set of names to run now, and the next run is counted from when that run is
-    actually recorded, not from the schedule that was missed. A service that
-    was off for a week must not wake up and fire seven scrapes at a media
-    server, which is precisely the load the cost classes exist to prevent.
+    A producer at a **stated time** is due when it has never run, or when the
+    most recent occurrence of its time in its zone is later than its last
+    recorded run. So it fires ONCE per occurrence, not on every tick of the
+    hour it names: the run recorded at 03:00:07 is not older than that day's
+    03:00, so the ticks at 03:01 and 03:02 leave it alone, and tomorrow's 03:00
+    is a later instant again. `_occurrence` holds what "the occurrence of a
+    time" means on the two days a wall clock does not cooperate.
+
+    **A missed appointment is owed, not skipped.** A machine that was off
+    across 03:00 runs the moment it is back, at whatever hour that is. THIS IS
+    A CHOICE, and the other one is defensible: skipping means a laptop opened
+    at noon is not immediately made to scan its library. It loses on the
+    failure it can produce. A machine that is off, asleep or in a tunnel every
+    night at 03:00 — a laptop, which is most of them — would never scan at all
+    under skipping, and would report nothing wrong while never doing the one
+    thing it was configured for. Owing costs a scan at an inconvenient hour,
+    which is visible on the very first occurrence and fixable by moving the
+    time or disabling the producer; skipping costs silence that looks like
+    health, and looks like it indefinitely. Where the two disagree, this module
+    already has a direction: prefer the visible, recoverable failure. If the
+    other answer is ever wanted, it becomes a per-producer setting; it is not
+    one now, because a setting would be a way of not choosing.
+
+    Nothing here makes up missed runs, and owing is not queueing. A producer
+    whose last run was a week ago — nightly cadence or stated time — is due
+    **once**, not seven times: this returns a set of names to run now, and the
+    next run is counted from when that run is actually recorded, not from the
+    schedule that was missed. A service that was off for a week must not wake up
+    and fire seven scrapes at a media server, which is precisely the load the
+    cost classes exist to prevent.
 
     **A last run in the future makes a producer due immediately.** The store
     records what it is given and deliberately does not keep the maximum, so a
@@ -265,8 +587,8 @@ def due(entries, runs, now):
     deliberately *not* raised: one bad row must not take out the tick for
     every other producer.
     """
-    at = _moment(now)
-    if at is None:
+    moment = _moment(now)
+    if moment is None:
         raise ValueError(
             "`now` must be a timezone-aware datetime or an ISO-8601 timestamp "
             f"with an offset, got {now!r}"
@@ -279,10 +601,26 @@ def due(entries, runs, now):
         if not entry.enabled:
             reasons[name] = "disabled by override"
             continue
-        if entry.every is None:
+        # `resolve` cannot produce any of the three below. They are refused
+        # again anyway, because the alternative for each is a producer that
+        # silently never runs or one that runs at the wrong hour, and a
+        # hand-built entry reaches here without passing `resolve` at all.
+        if entry.every is not None and entry.at is not None:
             raise ValueError(
-                f"schedule entry for producer {name!r} is enabled but has no "
-                "cadence, so there is no interval to compare against"
+                f"schedule entry for producer {name!r} has both a cadence and "
+                "a stated time, so there is no telling which was meant"
+            )
+        if entry.every is None and entry.at is None:
+            raise ValueError(
+                f"schedule entry for producer {name!r} is enabled but has "
+                "neither a cadence nor a stated time, so there is nothing to "
+                "compare against"
+            )
+        if entry.at is not None and entry.zone is None:
+            raise ValueError(
+                f"schedule entry for producer {name!r} states a time but no "
+                "zone to read it in; the host's zone is not a default, because "
+                "it is a property of the deployment rather than of the schedule"
             )
 
         recorded = runs.get(name)
@@ -290,12 +628,23 @@ def due(entries, runs, now):
             due_names.append(name)
             continue
         last = _moment(recorded)
-        if last is None or last > at:
+        if last is None or last > moment:
             due_names.append(name)
             continue
 
+        if entry.at is not None:
+            scheduled = _previous_occurrence(entry.at, entry.zone, moment)
+            if last < scheduled:
+                due_names.append(name)
+            else:
+                upcoming = _next_occurrence(entry.at, entry.zone, moment)
+                reasons[name] = (
+                    f"last ran {recorded}; next due at {upcoming.isoformat()}"
+                )
+            continue
+
         next_due = last + timedelta(seconds=entry.every)
-        if at >= next_due:
+        if moment >= next_due:
             due_names.append(name)
         else:
             reasons[name] = (
@@ -417,9 +766,11 @@ class Scheduler:
     Wiring
     ------
     The schedule is resolved once, in the constructor, from the producers the
-    runner has registered. A producer with no cadence and no override is a
-    `ValueError` there — at start-up, where an operator reads it as a stack
-    trace, rather than at 3am as a producer that quietly never ran.
+    runner has registered. Everything `resolve` refuses is refused there — a
+    producer nothing schedules, an override naming both a cadence and a stated
+    time, a stated time with no zone or a zone this system does not know — at
+    start-up, where an operator reads it as a stack trace, rather than at 3am as
+    a producer that quietly never ran or ran in the wrong hour.
 
     The consequence is that **a producer registered after the scheduler was
     built is not in the schedule**, so `start()` refuses to run a loop while
