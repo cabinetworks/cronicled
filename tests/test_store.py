@@ -1115,6 +1115,237 @@ class SchemaAdditionOnAnExistingDatabase(unittest.TestCase):
             self.assertEqual(store.items(), self.snapshot["visible"])
 
 
+class MarkingASubjectGone(_StoreCase):
+    """A subject the media server no longer holds.
+
+    Every assertion here guards the same harm from a different side: mutes,
+    dismissals and refusals exist so a scan cannot overrule a person, and the
+    controls this hides would each write to an id the server does not have.
+    What must NOT happen is any of them being destroyed on the way.
+    """
+
+    def _refuse(self, subject_id="1"):
+        self.store.record_refusal("scene", subject_id, "/l/%s.mp4" % subject_id,
+                                  "nothing over the threshold")
+
+    # -- the state on an item row ------------------------------------------ #
+
+    def test_a_marked_row_leaves_the_default_view(self):
+        self._record(subject_id="1")
+        self._record(subject_id="2")
+        self.store.mark_gone("scene", "1")
+        self.assertEqual([item["subject_id"] for item in self.store.items()],
+                         ["2"])
+
+    def test_and_is_still_readable_by_asking_for_that_state(self):
+        # "Marked, not removed" is the whole decision. A row that left every
+        # list including its own is a row that was deleted with extra steps.
+        fp = self._record(subject_id="1")
+        self.store.mark_gone("scene", "1")
+        rows = self.store.items(state="gone")
+        self.assertEqual([row["fingerprint"] for row in rows], [fp])
+        self.assertEqual(rows[0]["payload"], {"title": "Copper Kettle"})
+
+    def test_the_badge_count_stops_counting_it(self):
+        self._record(subject_id="1")
+        self._record(subject_id="2")
+        self._record(subject_id="3")
+        self.store.mark_gone("scene", "2")
+        self.assertEqual(self.store.counts(), {"new": 2})
+
+    def test_only_the_named_subject_is_touched(self):
+        # Asymmetric on purpose: with one subject in the fixture, a WHERE
+        # clause dropped altogether looks identical to one that works.
+        keep_a = self._record(subject_id="1")
+        keep_b = self._record(subject_id="2")
+        self._record(subject_id="3")
+        self.store.mark_gone("scene", "3")
+        self.assertEqual(
+            sorted(item["fingerprint"] for item in self.store.items()),
+            sorted([keep_a, keep_b]))
+
+    def test_a_subject_of_another_type_with_the_same_id_is_not_touched(self):
+        # HARM: subject ids are per-kind. A tag numbered 1 and a scene
+        # numbered 1 are unrelated, and a sweep of deleted SCENES that also
+        # hid tags would take out a population it never looked at.
+        self.store.record(folder="tag-matches", subject_type="tag-cluster",
+                          subject_id="1", summary="a cluster",
+                          payload={"key": "kettle"}, producer="tags")
+        self._record(subject_id="1")
+        self.store.mark_gone("scene", "1")
+        self.assertEqual([item["subject_type"] for item in self.store.items()],
+                         ["tag-cluster"])
+
+    def test_an_int_subject_id_marks_the_same_row_a_string_one_does(self):
+        # HARM: ids arrive from an API as whatever the API sends. A store that
+        # keyed one row by "1" and another by 1 would mark neither.
+        self._record(subject_id="1")
+        self.store.mark_gone("scene", 1)
+        self.assertEqual(self.store.items(), [])
+
+    # -- what it must not destroy ------------------------------------------ #
+
+    def test_an_applied_rows_snapshot_and_resolution_time_are_untouched(self):
+        # HARM: `prior_state` is the ONLY record of what an approve wrote to
+        # the library, and `resolved_at` of when. Clearing either -- as a
+        # "terminal state" transition plausibly would -- destroys the audit
+        # trail for a write that really happened, and the file being gone is
+        # exactly when that record matters most. Whole shape, not sampled
+        # fields: an assertion naming `prior_state` alone would not notice
+        # `resolved_at` being stamped over.
+        fp = self._record(subject_id="1")
+        self.store.mark_applied(fp, prior_state={"title": "was"},
+                                now="2020-05-05T00:00:00")
+        before = self.store.items(state="applied")[0]
+        self.store.mark_gone("scene", "1")
+        after = self.store.items(state="gone")[0]
+        self.assertEqual(after, dict(before, state="gone"))
+
+    def test_a_dismissal_still_blocks_the_fingerprint_it_was_made_against(self):
+        # HARM: the `dismissal` table is what makes a rejection stick. Pruning
+        # it here would let the identical proposal be recorded again the
+        # moment anything re-recorded it.
+        fp = self._record(subject_id="1")
+        self.store.dismiss(fp, reason="wrong match")
+        self.store.mark_gone("scene", "1")
+        self.assertEqual(self.store.items(state="dismissed"), [])
+        self._record(subject_id="1")
+        self.assertEqual(self.store.items(), [])
+        self.assertEqual(self.store.items(state="gone")[0]["fingerprint"], fp)
+
+    def test_a_mute_still_blocks_the_subject_it_was_made_against(self):
+        # HARM: the same, one table over. `muted_subjects` is what `record`
+        # and `scan.select` both consult; losing the row would let a scan
+        # start proposing a subject a person told it to stop offering.
+        self.store.mute("scene", "1", reason="never identifiable")
+        self.store.mark_gone("scene", "1")
+        self.assertEqual(self.store.mutes(), [])
+        self.assertEqual(self.store.muted_subjects(), {("scene", "1")})
+
+    def test_a_refusal_is_hidden_and_kept(self):
+        self._refuse("1")
+        self.store.mark_gone("scene", "1")
+        self.assertEqual(self.store.refusals(), [])
+        rows = self.store._conn.execute(
+            "SELECT subject_id FROM refusal").fetchall()
+        self.assertEqual(rows, [("1",)])
+
+    def test_a_superseded_row_is_hidden_too(self):
+        # The fifth table. `supersede` frees a subject for the next scan to
+        # look at, and there is nothing left to look at -- but the row must
+        # still be readable, like every other kind.
+        fp = self._record(subject_id="1")
+        self.store.supersede(fp)
+        self.store.mark_gone("scene", "1")
+        self.assertEqual(self.store.items(state="superseded"), [])
+        self.assertEqual(self.store.superseded_fingerprints(), {fp})
+
+    def test_the_other_subjects_mute_and_refusal_are_left_alone(self):
+        # The counterpart of `test_only_the_named_subject_is_touched`, for the
+        # two tables whose filtering is a subquery rather than a state.
+        self.store.mute("scene", "1")
+        self.store.mute("scene", "2")
+        self._refuse("3")
+        self._refuse("4")
+        self.store.mark_gone("scene", "1")
+        self.store.mark_gone("scene", "4")
+        self.assertEqual([m["subject_id"] for m in self.store.mutes()], ["2"])
+        self.assertEqual([r["subject_id"] for r in self.store.refusals()], ["3"])
+
+    def test_a_mute_and_a_refusal_for_a_present_subject_survive_a_sweep(self):
+        # The direction the expensive mistake would break: marking one subject
+        # must not empty either list.
+        self.store.mute("scene", "5", reason="never identifiable")
+        self._refuse("6")
+        self.store.mark_gone("scene", "7")
+        self.assertEqual(len(self.store.mutes()), 1)
+        self.assertEqual(len(self.store.refusals()), 1)
+
+    # -- the return value and the recorded moment -------------------------- #
+
+    def test_it_reports_the_first_marking_and_not_the_second(self):
+        # HARM: a sweep that counted re-confirmations would report a library's
+        # whole standing gone population as newly found, every night.
+        self.assertIs(self.store.mark_gone("scene", "1"), True)
+        self.assertIs(self.store.mark_gone("scene", "1"), False)
+
+    def test_the_recorded_moment_is_when_it_was_first_noticed(self):
+        self.store.mark_gone("scene", "1", now="2020-01-01T00:00:00")
+        self.store.mark_gone("scene", "1", now="2030-09-09T00:00:00")
+        rows = self.store._conn.execute("SELECT at FROM gone").fetchall()
+        self.assertEqual(rows, [("2020-01-01T00:00:00",)])
+
+    def test_marking_again_still_hides_a_row_recorded_since(self):
+        # A row that arrived between two sweeps must not stay visible just
+        # because the subject was already in the table.
+        self.store.mark_gone("scene", "1")
+        self._record(subject_id="1")
+        self.assertIs(self.store.mark_gone("scene", "1"), False)
+        self.assertEqual(self.store.items(), [])
+
+    # -- what the sweep reads ---------------------------------------------- #
+
+    def test_subject_ids_unions_every_table_that_keys_by_subject(self):
+        # HARM: a sweep reading proposals alone leaves mutes and refusals for
+        # deleted files sitting in their lists forever -- exactly the defect
+        # this exists to fix, half-fixed.
+        self._record(subject_id="1")
+        self.store.mute("scene", "2")
+        self._refuse("3")
+        self.assertEqual(self.store.subject_ids("scene"), {"1", "2", "3"})
+
+    def test_subject_ids_answers_for_the_kind_it_was_asked_about(self):
+        self._record(subject_id="1")
+        self.store.record(folder="tag-matches", subject_type="tag-cluster",
+                          subject_id="99", summary="a cluster",
+                          payload={"key": "kettle"}, producer="tags")
+        self.store.mute("tag-cluster", "98")
+        self.assertEqual(self.store.subject_ids("scene"), {"1"})
+        self.assertEqual(self.store.subject_ids("tag-cluster"), {"98", "99"})
+
+    def test_subject_ids_still_names_a_subject_already_marked_gone(self):
+        # It reports what the store HOLDS. Filtering here instead of at
+        # `mark_gone` would make "newly marked" unanswerable without a race.
+        self._record(subject_id="1")
+        self.store.mark_gone("scene", "1")
+        self.assertEqual(self.store.subject_ids("scene"), {"1"})
+
+
+class GoneTableAddedOnAnExistingDatabase(unittest.TestCase):
+    """The additive-change guarantee the two classes below check for
+    `producer_run` and `supersede`, now for `gone`: a database written before
+    this ticket gains the table on open and keeps what was already in it."""
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self.path = os.path.join(self._dir, "s.db")
+        self.addCleanup(shutil.rmtree, self._dir, True)
+        with Store(self.path) as store:
+            self.fp = store.record(
+                folder="scene-matches", subject_type="scene", subject_id="1",
+                summary="a proposal", payload={"title": "Copper Kettle"},
+                producer="nightly-scrape")
+            store.mute("scene", "2", reason="never identifiable")
+        connection = sqlite3.connect(self.path)
+        connection.execute("DROP TABLE gone")
+        connection.commit()
+        tables = {row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        connection.close()
+        self.assertNotIn("gone", tables)
+
+    def test_the_missing_table_is_created_on_open(self):
+        with Store(self.path) as store:
+            self.assertIs(store.mark_gone("scene", "1"), True)
+            self.assertEqual(store.items(), [])
+
+    def test_the_pre_existing_rows_survive_the_addition(self):
+        with Store(self.path) as store:
+            self.assertEqual([item["fingerprint"] for item in store.items()],
+                             [self.fp])
+            self.assertEqual([m["subject_id"] for m in store.mutes()], ["2"])
+
+
 class SupersedeTableAddedOnAnExistingDatabase(unittest.TestCase):
     """The same additive-change guarantee `SchemaAdditionOnAnExistingDatabase`
     checks for `producer_run`, now for `supersede`: a database written before

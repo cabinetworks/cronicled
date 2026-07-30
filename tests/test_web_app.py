@@ -269,16 +269,40 @@ class MutedDismissedRefusedRendering(unittest.TestCase):
              "creator_source": "folder", "score_text": "0.900"}])
         self.assertIn("Applied (1)", html)
 
+    def test_the_gone_count_reaches_the_page(self):
+        # HARM: a state with nowhere to render is a state that vanished. The
+        # decision is "mark, do not remove", and a marked row that dropped out
+        # of every list on the page was removed as far as anybody reading the
+        # page can tell.
+        html = self._get(gone=lambda: [
+            {"fingerprint": "fp-1", "state": "gone",
+             "filename": "clip.mp4", "proposed_title": "T", "creator": "N",
+             "creator_source": "folder", "score_text": "0.900"}])
+        self.assertIn("Gone (1)", html)
+
+    def test_the_gone_section_offers_no_control_at_all(self):
+        # HARM: every control the other sections draw -- Approve, Undo,
+        # Undismiss, Unmute -- would write to an id the server does not have.
+        # A button that cannot work is worse than no button.
+        html = self._get(gone=lambda: [
+            {"fingerprint": "fp-1", "state": "gone",
+             "filename": "clip.mp4", "proposed_title": "T", "creator": "N",
+             "creator_source": "folder", "score_text": "0.900"}])
+        section = html.split("Gone (1)", 1)[1].split("</details>", 1)[0]
+        self.assertIn("clip.mp4", section)
+        self.assertNotIn("<form", section)
+
     def test_omitted_sections_default_to_empty_rather_than_erroring(self):
         # Every existing action-path test's double for `rows`/`actions`
-        # supplies none of these five -- the page must still render, with
-        # every count at zero, not raise.
+        # supplies none of these -- the page must still render, with every
+        # count at zero, not raise.
         html = self._get()
         self.assertIn("Muted (0)", html)
         self.assertIn("Dismissed (0)", html)
         self.assertIn("Refused (0)", html)
         self.assertIn("Superseded (0)", html)
         self.assertIn("Applied (0)", html)
+        self.assertIn("Gone (0)", html)
 
     def test_the_applied_query_param_opens_that_rows_section(self):
         # The wiring half of ticket 98's "keep undo reachable" story: a GET

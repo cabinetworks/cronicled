@@ -50,7 +50,7 @@ from .descriptions import DescriptionProducer
 from .jobs import JobRunner
 from .runscan import build_scheduled_producer
 from .schedule import Scheduler, check_zone
-from .store import Store
+from .store import GONE, Store
 from .stash import Stash
 from .tags import TagMergeProducer
 from .web.actions import Actions
@@ -506,6 +506,14 @@ def main(argv=None):
                                               base_url=base_url),
               superseded=lambda: to_rows(_scene_items("superseded"),
                                          base_url=base_url),
+              # The subjects a scan found the media server no longer holds
+              # (see `cronicled.scan.sweep_gone`). Read the way every other
+              # terminal section is read -- by asking for that state
+              # explicitly, because `items()`'s default view hides it -- so a
+              # marked row keeps somewhere to be read rather than dropping out
+              # of every list at once. Its section offers no control at all;
+              # see the template for why.
+              gone=lambda: to_rows(_scene_items(GONE), base_url=base_url),
               applied=lambda: to_rows(_scene_items("applied"),
                                       base_url=base_url),
               actions=actions, scan_status=actions.scan_status,

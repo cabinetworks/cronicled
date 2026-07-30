@@ -44,11 +44,13 @@ from cronicled.scan import (
     Conflict, Counts, DEFAULT_THRESHOLD, FingerprintPass, IDENTIFIED_BY_FINGERPRINT, Identified,
     MAX_RUNNERS_UP, MUTE_NO_CANDIDATES, Outcome, REFUSED_REJECTED_FOLDER,
     REFUSED_UNRESOLVED_CREATOR, RETIRED_MUTE_UNRESOLVED_CREATOR,
+    GONE_READ_EMPTY, GONE_READ_FAILED, GONE_READ_PARTIAL,
     ScanProducer, Source, SUBJECT_TYPE, _SingleFlight, catalogue_link, examine,
     examine_sources, fingerprint_outcome, identify_by_fingerprint,
-    release_auto_mutes, select,
+    release_auto_mutes, select, sweep_gone,
 )
 from cronicled.scoring import title_view
+from cronicled.stash import StashError
 from cronicled.store import Store
 from tests.fixtures.cast import CENSORSHIP
 
@@ -2604,6 +2606,26 @@ class FakeStash:
         self.calls.append(("tag_id_by_name", (name,), {}))
         return self._tag_ids.get(name)
 
+    def scene_ids(self):
+        """`(count, ids)` over the WHOLE library, `organized` and all — the
+        contract `Stash.scene_ids` documents, and the one property of it that
+        decides everything downstream. The two reads above filter on
+        `organized` the way the server's `scene_filter` does; this one must
+        not, because an organized scene with no marker is exactly the file
+        that is absent from every pool and still perfectly present, and a
+        double that filtered here could not tell a sweep that marks it gone
+        from one that does not.
+
+        `count` comes from the same list the ids do, so this double can only
+        ever report a COMPLETE read. A test that needs a partial or a raising
+        one says so explicitly with a double of its own -- inventing a
+        `partial=` switch here would put the disagreement this guard exists to
+        catch inside the collaborator that is supposed to be honest.
+        """
+        self.calls.append(("scene_ids", (), {}))
+        ids = [str(s["id"]) for s in self._scenes]
+        return len(ids), ids
+
     def __getattr__(self, name):
         def refuse(*args, **kwargs):
             self.calls.append((name, args, kwargs))
@@ -2890,6 +2912,270 @@ class SingleFlightTest(unittest.TestCase):
         self.assertEqual(sorted(raised), ["first", "second"])
         self.assertIs(raised["first"], raised["second"])
         self.assertIsInstance(raised["second"], KeyboardInterrupt)
+
+
+class _IdStash:
+    """A media client that answers ONE question: what scene ids exist.
+
+    Deliberately not `FakeStash`. That double builds `count` from the same
+    list it returns the ids from, so it can only ever report a complete read
+    -- which is right for it and useless here, because the disagreement
+    between those two numbers is the entire guard under test. `count` is a
+    separate value here, and a test that wants a partial read says so.
+
+    `raises` makes the read fail. Every other attribute refuses, so a sweep
+    that reached for a second read (or a write) fails loudly rather than
+    quietly working from a fixture that happened to allow it.
+    """
+
+    def __init__(self, ids=(), count=None, raises=None):
+        self.ids = [str(one) for one in ids]
+        self.count = len(self.ids) if count is None else count
+        self.raises = raises
+        self.calls = 0
+
+    def scene_ids(self):
+        self.calls += 1
+        if self.raises is not None:
+            raise self.raises
+        return self.count, list(self.ids)
+
+    def __getattr__(self, name):
+        def refuse(*args, **kwargs):
+            raise AssertionError(
+                "the sweep called %r on the media server; it reads the id set "
+                "and nothing else" % (name,))
+        return refuse
+
+
+class SweepGoneTest(unittest.TestCase):
+    """Marking the subjects the media server no longer holds.
+
+    The harm every test here guards is the same one: a person's mutes,
+    dismissals and refusals exist so a scan cannot overrule them, and a sweep
+    that mistook a bad read for a mass deletion would hide all of them at
+    once, silently, with no way back from this side.
+    """
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+
+    def _record(self, subject_id):
+        return self.store.record(
+            folder=FOLDER, subject_type=SUBJECT_TYPE, subject_id=subject_id,
+            summary="a proposal", payload={"title": "Copper Kettle",
+                                           "id": subject_id},
+            producer="test-producer")
+
+    def _seed_four_tables(self):
+        """One subject held by each of the four tables that record a decision
+        about one, so no single mechanism can satisfy the whole assertion.
+
+        Returns the proposal's fingerprint and the dismissed one's.
+        """
+        proposed = self._record("1")
+        dismissed = self._record("2")
+        self.store.dismiss(dismissed, reason="wrong match")
+        self.store.mute(SUBJECT_TYPE, "3", reason="never identifiable")
+        self.store.record_refusal(SUBJECT_TYPE, "4", "/l/four.mp4",
+                                  "nothing over the threshold")
+        return proposed, dismissed
+
+    def _visible(self):
+        """Everything a person would still be shown, across all four lists."""
+        return {
+            "inbox": [item["subject_id"] for item in self.store.items()],
+            "dismissed": [item["subject_id"]
+                          for item in self.store.items(state="dismissed")],
+            "muted": [m["subject_id"] for m in self.store.mutes()],
+            "refused": [r["subject_id"] for r in self.store.refusals()],
+        }
+
+    # -- both directions --------------------------------------------------- #
+
+    def test_a_stored_id_absent_from_the_complete_set_is_marked(self):
+        self._record("1")
+        sweep = sweep_gone(_IdStash(ids=["2", "3"]), self.store)
+        self.assertEqual((sweep.marked, sweep.problem), (1, None))
+        self.assertEqual(self.store.items(), [])
+
+    def test_a_stored_id_present_in_it_is_not(self):
+        self._record("1")
+        sweep = sweep_gone(_IdStash(ids=["1", "2", "3"]), self.store)
+        self.assertEqual((sweep.marked, sweep.problem), (0, None))
+        self.assertEqual([item["subject_id"] for item in self.store.items()],
+                         ["1"])
+
+    def test_it_marks_the_absent_ones_and_only_those(self):
+        # Asymmetric and greater than one in BOTH directions: with one of
+        # each, "mark everything" and "mark the right ones" agree.
+        for subject_id in ("1", "2", "3", "4", "5"):
+            self._record(subject_id)
+        sweep = sweep_gone(_IdStash(ids=["2", "5"]), self.store)
+        self.assertEqual(sweep.marked, 3)
+        self.assertEqual([item["subject_id"] for item in self.store.items()],
+                         ["2", "5"])
+        self.assertEqual(
+            sorted(item["subject_id"]
+                   for item in self.store.items(state="gone")),
+            ["1", "3", "4"])
+
+    def test_the_count_accumulates_rather_than_being_assigned(self):
+        # THREE, not one: `marked += 1` and `marked = 1` are the same
+        # statement for a fixture with a single absent subject.
+        for subject_id in ("1", "2", "3", "4"):
+            self._record(subject_id)
+        self.assertEqual(sweep_gone(_IdStash(ids=["4"]), self.store).marked, 3)
+
+    def test_a_second_sweep_reports_nothing_newly_marked(self):
+        # HARM: a count that re-reported the standing population every night
+        # would read as an ongoing deletion nobody is causing.
+        self._record("1")
+        self._record("2")
+        first = sweep_gone(_IdStash(ids=["9"]), self.store)
+        second = sweep_gone(_IdStash(ids=["9"]), self.store)
+        self.assertEqual((first.marked, second.marked), (2, 0))
+        self.assertIsNone(second.problem)
+
+    # -- all four tables --------------------------------------------------- #
+
+    def test_every_table_that_holds_a_decision_is_swept(self):
+        # HARM: a sweep reading proposals alone passes its own test while the
+        # mutes, dismissals and refusals for deleted files sit in their lists
+        # forever -- the defect this ticket exists to fix, half-fixed.
+        self._seed_four_tables()
+        sweep = sweep_gone(_IdStash(ids=["8", "9"]), self.store)
+        self.assertEqual(sweep.marked, 4)
+        self.assertEqual(self._visible(),
+                         {"inbox": [], "dismissed": [], "muted": [],
+                          "refused": []})
+
+    def test_and_a_present_subject_in_each_of_them_is_left_alone(self):
+        # The other direction, with the SAME four-table fixture: a sweep that
+        # emptied every list would pass the test above on its own.
+        self._seed_four_tables()
+        sweep = sweep_gone(_IdStash(ids=["1", "2", "3", "4"]), self.store)
+        self.assertEqual(sweep.marked, 0)
+        self.assertEqual(self._visible(),
+                         {"inbox": ["1"], "dismissed": ["2"], "muted": ["3"],
+                          "refused": ["4"]})
+
+    def test_a_mixed_library_marks_only_the_deleted_half(self):
+        self._seed_four_tables()
+        sweep = sweep_gone(_IdStash(ids=["2", "3"]), self.store)
+        self.assertEqual(sweep.marked, 2)
+        self.assertEqual(self._visible(),
+                         {"inbox": [], "dismissed": ["2"], "muted": ["3"],
+                          "refused": []})
+
+    def test_a_subject_of_another_kind_is_never_swept(self):
+        # HARM: tag ids and scene ids are unrelated numbering. Sweeping a tag
+        # cluster against the scene id set would hide a population the read
+        # says nothing about.
+        self.store.record(folder=FOLDER, subject_type="tag-cluster",
+                          subject_id="1", summary="a cluster",
+                          payload={"key": "kettle"}, producer="tags")
+        self.store.mute("tag-cluster", "2")
+        sweep = sweep_gone(_IdStash(ids=["7"]), self.store)
+        self.assertEqual(sweep.marked, 0)
+        self.assertEqual(len(self.store.items()), 1)
+        self.assertEqual(len(self.store.mutes()), 1)
+
+    # -- refusing to mark -------------------------------------------------- #
+
+    def test_a_partial_read_marks_nothing(self):
+        # HARM: the expensive direction. A short list with no error looks
+        # exactly like a complete one, and every id missing from it is a file
+        # that is still there. Four stored subjects, two ids returned, a count
+        # saying there should be nine.
+        self._seed_four_tables()
+        before = self._visible()
+        sweep = sweep_gone(_IdStash(ids=["8", "9"], count=9), self.store)
+        self.assertEqual(sweep.marked, 0)
+        self.assertIn(GONE_READ_PARTIAL, sweep.problem)
+        self.assertEqual(self._visible(), before)
+
+    def test_a_repeated_id_does_not_pass_for_a_complete_read(self):
+        # HARM: three ids of which two are the same is a list whose LENGTH
+        # equals a count of three while the id SET holds two. Comparing
+        # lengths accepts it; comparing the distinct set is what actually
+        # decides anything downstream, so that is what must agree.
+        self._seed_four_tables()
+        sweep = sweep_gone(_IdStash(ids=["1", "1", "2"], count=3), self.store)
+        self.assertEqual(sweep.marked, 0)
+        self.assertIn(GONE_READ_PARTIAL, sweep.problem)
+        self.assertEqual(self._visible()["muted"], ["3"])
+
+    def test_a_raising_read_marks_nothing(self):
+        # HARM: an error is evidence about the network, not about any file.
+        # This project already refuses to mute on one; it must equally refuse
+        # to mark a scene gone.
+        self._seed_four_tables()
+        before = self._visible()
+        sweep = sweep_gone(
+            _IdStash(raises=StashError("cannot reach it", transient=True)),
+            self.store)
+        self.assertEqual(sweep.marked, 0)
+        self.assertIn(GONE_READ_FAILED, sweep.problem)
+        self.assertEqual(self._visible(), before)
+
+    def test_a_read_that_raised_is_distinguishable_from_one_that_found_all(self):
+        # HARM: `0 marked` reads identically for "nothing was deleted" and
+        # "nothing was asked", and those call for opposite responses.
+        self._record("1")
+        found_all = sweep_gone(_IdStash(ids=["1"]), self.store)
+        failed = sweep_gone(_IdStash(raises=StashError("no")), self.store)
+        self.assertEqual(found_all.marked, failed.marked)
+        self.assertIsNone(found_all.problem)
+        self.assertIsNotNone(failed.problem)
+
+    def test_an_unexpected_error_type_is_declined_the_same_way(self):
+        # HARM: narrowing the catch to the client's own error class would let
+        # anything else end the run instead of the sweep, and a scan that died
+        # here would take the whole nightly pass with it.
+        self._record("1")
+        sweep = sweep_gone(_IdStash(raises=RuntimeError("odd")), self.store)
+        self.assertEqual(sweep.marked, 0)
+        self.assertIn(GONE_READ_FAILED, sweep.problem)
+        self.assertEqual(len(self.store.items()), 1)
+
+    def test_an_empty_library_marks_nothing(self):
+        # HARM: `count == 0` agrees with an empty list perfectly, so the
+        # completeness guard passes -- and every stored decision would be
+        # hidden in one sweep. A server pointed at a fresh or rebuilt database
+        # answers exactly this way. A library that genuinely holds no scenes
+        # loses only some tidying by being refused.
+        self._seed_four_tables()
+        before = self._visible()
+        sweep = sweep_gone(_IdStash(ids=[], count=0), self.store)
+        self.assertEqual(sweep.marked, 0)
+        self.assertIn(GONE_READ_EMPTY, sweep.problem)
+        self.assertEqual(self._visible(), before)
+
+    def test_a_library_of_one_is_still_swept(self):
+        # The boundary from the other side: refusing an EMPTY answer must not
+        # become refusing a SMALL one. A guard that drifts too strict stops
+        # doing its job and says nothing.
+        self._record("1")
+        self._record("2")
+        sweep = sweep_gone(_IdStash(ids=["2"]), self.store)
+        self.assertEqual((sweep.marked, sweep.problem), (1, None))
+
+    def test_nothing_stored_and_a_healthy_read_is_not_a_problem(self):
+        sweep = sweep_gone(_IdStash(ids=["1", "2"]), self.store)
+        self.assertEqual((sweep.marked, sweep.problem), (0, None))
+
+    def test_it_reads_the_library_exactly_once(self):
+        # HARM: this runs on every scan against a whole library. One request
+        # is the design (`findScenes(ids:)` errors on a missing id and
+        # `findScene(id:)` is one request per subject -- both checked against
+        # a running server); a per-subject read would be thousands.
+        for subject_id in ("1", "2", "3"):
+            self._record(subject_id)
+        stash = _IdStash(ids=["1"])
+        sweep_gone(stash, self.store)
+        self.assertEqual(stash.calls, 1)
 
 
 class ReleaseAutoMutesTest(unittest.TestCase):
@@ -3315,7 +3601,8 @@ class ScanProducerTest(unittest.TestCase):
         # assertion that speaks: a stray write shows up here by name, while a
         # missing proposal only says something went wrong somewhere.
         self.assertEqual(self.stash.calls,
-                         [("unorganized_scenes", (None,), {})])
+                         [("scene_ids", (), {}),
+                          ("unorganized_scenes", (None,), {})])
         self.assertEqual(self.ids(proposals), ["1", "2"])
 
     def test_the_limit_is_not_spent_at_the_source(self):
@@ -3328,7 +3615,8 @@ class ScanProducerTest(unittest.TestCase):
             ScriptedSearch(self.SCRIPT), limit=1)
 
         self.assertEqual(self.stash.calls,
-                         [("unorganized_scenes", (None,), {})])
+                         [("scene_ids", (), {}),
+                          ("unorganized_scenes", (None,), {})])
         self.assertEqual(self.ids(proposals), ["2"])
 
     # -- organized files a marker tag puts back in reach -------------------- #
@@ -3391,12 +3679,114 @@ class ScanProducerTest(unittest.TestCase):
             organized=("2",), tag_ids=self.MARKER_TAG_IDS)
 
         self.assertEqual(self.stash.calls,
-                         [("unorganized_scenes", (None,), {})])
+                         [("scene_ids", (), {}),
+                          ("unorganized_scenes", (None,), {})])
         self.assertEqual(self.ids(proposals), ["1"])
         self.assertEqual(
             self.ctx.messages[0],
             "selected 1 of 1 files (0 already proposed, 0 already muted, "
             "0 outside the filter, 0 deferred)")
+
+    # -- subjects the media server no longer holds -------------------------- #
+    #
+    # `sweep_gone` has its own tests above, against a client that answers the
+    # id read and nothing else. These run the sweep through the WHOLE producer
+    # against the same double every other test in this class uses, because the
+    # failure that would destroy a library's history is a confusion between
+    # two reads: the pool (`unorganized_scenes`, plus the marked set) and the
+    # complete id set. Only a test that has both can tell them apart.
+
+    def _proposal_for(self, subject_id):
+        return self.store.record(
+            folder=FOLDER, subject_type=SUBJECT_TYPE, subject_id=subject_id,
+            summary="a proposal", payload={"title": "Copper Kettle"},
+            producer="an-earlier-run")
+
+    def test_an_organized_scene_with_no_marker_is_not_marked_gone(self):
+        """THE failure this guard exists to prevent.
+
+        An organized file carrying no marker is absent from the pool and
+        perfectly present in the library -- and a file this tool applied a
+        proposal to is organized by that very act, so this population is
+        every scene the tool has ever finished. A sweep built on pool
+        membership would mark all of them gone in one run.
+
+        The fixture is deliberately NOT all pool members: scene 5 is
+        organized, unmarked, invisible to both pool reads, and carries a
+        standing proposal, a mute and a refusal of its own. A check that read
+        the pool would hide all three.
+        """
+        self._proposal_for("5")
+        self.store.mute(SUBJECT_TYPE, "5", reason="never identifiable")
+        self.store.record_refusal(SUBJECT_TYPE, "5", "/l/five.mp4",
+                                  "nothing over the threshold")
+
+        self.scan([scene(1, self.LEDGER_PATH),
+                   scene(5, "/library/Velvet Crane/Quiet Hours.mp4")],
+                  ScriptedSearch(self.SCRIPT), organized=("5",),
+                  tag_ids=self.MARKER_TAG_IDS, marker=self.MARKER)
+
+        self.assertEqual(self.store.items(state="gone"), [])
+        self.assertEqual([m["subject_id"] for m in self.store.mutes()], ["5"])
+        self.assertEqual([r["subject_id"] for r in self.store.refusals()],
+                         ["5"])
+        self.assertIn("; 0 marked gone", self.ctx.message)
+
+    def test_a_scene_the_library_no_longer_holds_is_marked(self):
+        """The other direction, same shape of fixture: subject 5 is organized
+        and present, subject 8 is in the store and in no read at all."""
+        self._proposal_for("5")
+        self._proposal_for("8")
+
+        self.scan([scene(1, self.LEDGER_PATH),
+                   scene(5, "/library/Velvet Crane/Quiet Hours.mp4")],
+                  ScriptedSearch(self.SCRIPT), organized=("5",))
+
+        self.assertEqual([item["subject_id"]
+                          for item in self.store.items(state="gone")], ["8"])
+        # 5 only: this producer YIELDS proposals and the runner is what
+        # records them, so scene 1's is not in the store here. What matters is
+        # that the organized, present subject kept its row.
+        self.assertEqual([item["subject_id"] for item in self.store.items()],
+                         ["5"])
+
+    def test_the_closing_line_carries_the_count(self):
+        """The runner keeps ONE message, so a count logged when the sweep ran
+        would be overwritten by the first file's progress line and reach
+        nobody. Three gone subjects, so a count and a flag do not agree."""
+        for subject_id in ("6", "7", "8"):
+            self._proposal_for(subject_id)
+
+        job = self.run_under_the_runner([scene(1, self.LEDGER_PATH)],
+                                        ScriptedSearch(self.SCRIPT))
+
+        self.assertEqual(job.state, "done")
+        self.assertIn("; 3 marked gone", job.message)
+
+    def test_a_run_that_marked_nothing_still_says_so(self):
+        """`0 marked gone` is the honest report of a library nothing has been
+        deleted from, and it is a different statement from a sweep that could
+        not ask. An absent clause could only mean the sweep did not run."""
+        self._proposal_for("1")
+
+        self.scan([scene(1, self.LEDGER_PATH)], ScriptedSearch(self.SCRIPT))
+
+        self.assertIn("; 0 marked gone", self.ctx.message)
+
+    def test_the_sweep_happens_even_when_the_marker_is_misconfigured(self):
+        """`_pool` raises for a marker naming no tag on this server. The
+        sweep is a different read answering a different question, and running
+        it first means the housekeeping is not skipped on exactly the runs an
+        operator is already fixing something."""
+        self._proposal_for("8")
+        producer = self.build([scene(1, self.LEDGER_PATH)],
+                              ScriptedSearch(self.SCRIPT), marker="no-such-tag")
+
+        with self.assertRaises(ValueError):
+            list(producer.produce(self.ctx))
+
+        self.assertEqual([item["subject_id"]
+                          for item in self.store.items(state="gone")], ["8"])
 
     def test_the_marker_name_is_resolved_to_this_servers_own_tag_id(self):
         """The whole conversation, as one shape.
@@ -3412,6 +3802,7 @@ class ScanProducerTest(unittest.TestCase):
                   tag_ids=self.MARKER_TAG_IDS, marker=self.MARKER, limit=1)
 
         self.assertEqual(self.stash.calls, [
+            ("scene_ids", (), {}),
             ("unorganized_scenes", (None,), {}),
             ("tag_id_by_name", (self.MARKER,), {}),
             ("tagged_scenes", ("t-7", None), {}),
@@ -3434,8 +3825,8 @@ class ScanProducerTest(unittest.TestCase):
         self.assertEqual(marked["tags"], [{"id": "t-7",
                                            "name": "inferred-metadata"}])
         self.assertEqual([name for name, _, _ in self.stash.calls],
-                         ["unorganized_scenes", "tag_id_by_name",
-                          "tagged_scenes"])
+                         ["scene_ids", "unorganized_scenes",
+                          "tag_id_by_name", "tagged_scenes"])
 
     def test_a_file_that_is_both_unorganized_and_marked_is_offered_once(self):
         """It was always in the pool, so the marker adds nothing for it: one
@@ -3724,7 +4115,7 @@ class ScanProducerTest(unittest.TestCase):
             self.ctx.message,
             "finished: 1 proposed, 0 muted, 0 refused, 1 errors, 2 lookups, 0 per-title fallback queries; selected 2 "
             "of 2 files (0 already proposed, 0 already muted, 0 outside the "
-            "filter, 0 deferred)")
+            "filter, 0 deferred); 0 marked gone")
 
     def test_an_error_never_mutes_and_does_not_end_the_scan(self):
         """A lookup that raised is evidence about the network, not about the
@@ -4061,7 +4452,7 @@ class ScanProducerTest(unittest.TestCase):
             self.ctx.message,
             "finished: 2 proposed, 0 muted, 0 refused, 0 errors, 2 lookups, 0 per-title fallback queries; "
             "selected 2 of 2 files (0 already proposed, 0 already muted, "
-            "0 outside the filter, 0 deferred)")
+            "0 outside the filter, 0 deferred); 0 marked gone")
 
     # -- the per-title fallback, through the whole producer ----------------- #
 
@@ -4106,7 +4497,8 @@ class ScanProducerTest(unittest.TestCase):
             self.ctx.message,
             "finished: 0 proposed, 0 muted, 1 refused, 0 errors, 4 lookups, "
             "2 per-title fallback queries; selected 1 of 1 files (0 already "
-            "proposed, 0 already muted, 0 outside the filter, 0 deferred)")
+            "proposed, 0 already muted, 0 outside the filter, 0 deferred); "
+            "0 marked gone")
 
     def test_two_different_creators_against_two_stores_cost_four_lookups(self):
         """The other half of the same measurement: TWO distinct creators,
@@ -4151,7 +4543,7 @@ class ScanProducerTest(unittest.TestCase):
             self.ctx.message,
             "finished: 2 proposed, 0 muted, 0 refused, 0 errors, 2 lookups, 0 per-title fallback queries; "
             "selected 2 of 5 files (0 already proposed, 1 already muted, "
-            "1 outside the filter, 1 deferred)")
+            "1 outside the filter, 1 deferred); 0 marked gone")
 
     def test_each_completed_file_is_logged_with_what_it_concluded(self):
         self.scan([scene(9, self.LEDGER_PATH)], ScriptedSearch(self.SCRIPT))
@@ -4162,7 +4554,7 @@ class ScanProducerTest(unittest.TestCase):
             "1/1 scene 9: chosen with score 1.000",
             "finished: 1 proposed, 0 muted, 0 refused, 0 errors, 1 lookups, 0 per-title fallback queries; "
             "selected 1 of 1 files (0 already proposed, 0 already muted, "
-            "0 outside the filter, 0 deferred)",
+            "0 outside the filter, 0 deferred); 0 marked gone",
         ])
 
     def test_the_closing_line_tells_a_suppressed_batch_from_an_empty_one(self):
@@ -4193,12 +4585,13 @@ class ScanProducerTest(unittest.TestCase):
             suppressed.message,
             "finished: 0 proposed, 0 muted, 0 refused, 0 errors, 0 lookups, 0 per-title fallback queries; "
             "selected 0 of 3 files (0 already proposed, 3 already muted, "
-            "0 outside the filter, 0 deferred)")
+            "0 outside the filter, 0 deferred); 0 marked gone")
         self.assertEqual(
             empty.message,
             "finished: 0 proposed, 0 muted, 0 refused, 0 errors, 0 lookups, 0 per-title fallback queries; "
             "selected 0 of 0 files (0 already proposed, 0 already muted, "
-            "0 outside the filter, 0 deferred)")
+            "0 outside the filter, 0 deferred); nothing marked gone "
+            "(the library reported no scenes at all)")
         # The residual, pinned rather than papered over: the two runs really
         # are identical in the counted fields, so the message is carrying the
         # whole of the distinction and a summary that dropped the breakdown
@@ -4226,7 +4619,7 @@ class ScanProducerTest(unittest.TestCase):
             self.ctx.message,
             "finished: 1 proposed, 1 muted, 2 refused, 1 errors, 3 lookups, 0 per-title fallback queries; "
             "selected 5 of 5 files (0 already proposed, 0 already muted, "
-            "0 outside the filter, 0 deferred)")
+            "0 outside the filter, 0 deferred); 0 marked gone")
 
 
 if __name__ == "__main__":

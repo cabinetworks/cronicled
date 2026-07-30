@@ -335,6 +335,55 @@ class Stash:
         return self._find_scenes({"tags": {"value": [tag_id], "modifier": "INCLUDES"}},
                                  limit)
 
+    def scene_ids(self):
+        """`(count, ids)` — every scene id this server holds, and the number
+        it says it holds.
+
+        The read that answers "does this scene still exist", asked once for
+        the whole library rather than once per subject. The two alternatives
+        were tried against a running server and neither can do this job:
+
+        * `findScenes(ids: [...])` ERRORS as soon as one id in the list is
+          missing (`scene with id N not found`) rather than omitting it, so a
+          batch containing one deleted scene answers nothing about the other
+          thousands.
+        * `findScene(id:)` answers `{"findScene": null}` with no error for a
+          missing id — definitive, but one request per subject.
+
+        `per_page: -1` returns the lot in a single request (6289 ids on one
+        measured library, with `count` agreeing), which is the same read shape
+        `_find_scenes` already uses for an unbounded pool.
+
+        IDS ONLY. `_find_scenes` selects a scene's whole shape because a scan
+        goes on to examine it; nothing here does, and selecting titles, files,
+        studios, performers and tags for every scene in a library to learn
+        which ones exist is thousands of rows of payload for one bit each.
+        That is also why this does not route through `_find_scenes`: it takes
+        a `scene_filter` this has none to give and selects a shape this must
+        not ask for.
+
+        BOTH halves are returned, deliberately. `count` is the server's own
+        statement of how many scenes there are, and the only thing a caller
+        can check the id list against — a short list with no error looks
+        exactly like a complete one, and mistaking a partial read for a
+        library that lost thousands of scenes is the expensive direction here.
+        Comparing them is the caller's job (see
+        `cronicled.scan.sweep_gone`), because the caller is what decides what
+        to do about a disagreement; this method reports what the server said
+        and interprets none of it.
+        """
+        q = """
+        query($f: FindFilterType){
+          findScenes(filter:$f){ count scenes{ id } }
+        }"""
+        f = {"per_page": -1, "page": 1, "sort": "id", "direction": "ASC"}
+        block = self.gql(q, {"f": f})["findScenes"]
+        # Stringified here, once, for the same reason every subject id this
+        # project stores is a string: the store keys a mute and a refusal by
+        # the string form, so a caller comparing an int id against those
+        # would find no match and read a present scene as a deleted one.
+        return block["count"], [str(scene["id"]) for scene in block["scenes"]]
+
     def performers_with_stash_ids(self):
         """Every performer this server holds, with just enough to link a
         NAME to a stash-box id: `id`, `name`, and `stash_ids` (`endpoint`,

@@ -60,7 +60,7 @@ def _origin_matches_host(origin, host_header):
 def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                   refused=None, superseded=None, applied=None,
                   schedule_status=None, merges=None, reconciles=None,
-                  unused=None):
+                  unused=None, gone=None):
     # A separate callable rather than always reaching through `actions`:
     # every existing action-path test builds its own recording double for
     # `actions` and none of them implement `scan_status`, so defaulting it
@@ -91,6 +91,10 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
     # the page has to be able to draw as an empty section rather than as an
     # error, and an existing test's double has no opinion about either.
     _unused = unused or (lambda: [])
+    # And again for the subjects the media server no longer holds. A library
+    # nothing has been deleted from has none, which is the ordinary state, and
+    # an existing test's double has no opinion about them.
+    _gone = gone or (lambda: [])
     # `None` here is not "no information": it is the answer for an install
     # where nothing is scheduled at all, which is a state the page has to be
     # able to say out loud rather than render as an empty section that looks
@@ -140,6 +144,7 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                          merges=_merges(),
                          reconciles=_reconciles(),
                          unused=_unused(),
+                         gone=_gone(),
                          # Read off the module that owns the claim rather than
                          # typed into the template, for the reason
                          # `MergeRow.warning` reads `tags
@@ -283,8 +288,8 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
 
 def serve(rows, actions, scan_status=None, muted=None, dismissed=None,
          refused=None, superseded=None, applied=None, schedule_status=None,
-         merges=None, reconciles=None, unused=None, host=DEFAULT_HOST,
-         port=DEFAULT_PORT):
+         merges=None, reconciles=None, unused=None, gone=None,
+         host=DEFAULT_HOST, port=DEFAULT_PORT):
     # `HTTPServer` is single-threaded: one connection wedged on a slow read
     # or a slow downstream call (a media server taking its whole configured
     # timeout to answer an Approve, say) stalls every other request -- an
@@ -331,6 +336,6 @@ def serve(rows, actions, scan_status=None, muted=None, dismissed=None,
         rows, actions, scan_status, muted=muted, dismissed=dismissed,
         refused=refused, superseded=superseded, applied=applied,
         schedule_status=schedule_status, merges=merges,
-        reconciles=reconciles, unused=unused))
+        reconciles=reconciles, unused=unused, gone=gone))
     print("inbox on http://%s:%d/" % (host, port))
     httpd.serve_forever()

@@ -651,6 +651,62 @@ class AppliedSectionWiring(_Base):
         self.assertEqual(rows[0].state, "reverted")
 
 
+class GoneSectionWiring(_Base):
+    """A subject the media server no longer holds reaches its own section and
+    leaves every other list.
+
+    The two halves have to be pinned together. Leaving the working lists is
+    what stops a control being drawn for a file that is not there; reaching a
+    section is what makes "marked, not removed" true for the person reading
+    the page, rather than only true inside the database.
+    """
+
+    def _seed_and_mark(self, subject_id="1"):
+        store = Store(self.db_path)
+        fp = store.record(
+            folder="scene-matches", subject_type="scene",
+            subject_id=subject_id, summary="a proposal",
+            payload={"path": "/library/reel.mp4",
+                     "creator": {"name": "Someone", "source": "folder",
+                                 "competing": None, "rejected_folder": None},
+                     "candidate": {"id": "c-1", "title": "A Title",
+                                   "image": None, "performers": [],
+                                   "studio": None},
+                     "score": 0.9, "runners_up": []},
+            producer="test-producer", confidence=0.9)
+        store.mark_gone("scene", subject_id)
+        store.close()
+        return fp
+
+    def _served(self):
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path])
+        return captured.kwargs
+
+    def test_a_marked_row_reaches_the_gone_section(self):
+        fp = self._seed_and_mark()
+        self.assertEqual([r.fingerprint for r in self._served()["gone"]()],
+                         [fp])
+
+    def test_and_appears_in_no_other_scene_section(self):
+        # HARM: a row drawn in the inbox, the dismissed list or the applied
+        # list offers a control that writes to an id the server does not
+        # have. Every section is checked, not the inbox alone.
+        self._seed_and_mark(subject_id="1")
+        self._seed(subject_id="2")  # an ordinary, still-open proposal
+        kwargs = self._served()
+        self.assertEqual([r.state for r in kwargs["rows"]()], ["new"])
+        for section in ("dismissed", "superseded", "applied"):
+            self.assertEqual(kwargs[section](), [], section)
+
+    def test_an_ordinary_proposal_does_not_reach_the_gone_section(self):
+        # The other direction: the section must not be a second copy of the
+        # inbox.
+        self._seed(subject_id="2")
+        self.assertEqual(self._served()["gone"](), [])
+
+
 class SceneUrlWiring(_Base):
     """Ticket 97: the configured `--server` address reaches every row
     builder as its `base_url` -- reused from the same resolution `Stash`
@@ -1809,6 +1865,7 @@ class StoredTimestampsStayUtc(_Base):
     # about fails here rather than being quietly exempt from the rule.
     EXPECTED_COLUMNS = [
         ("dismissal", "at"),
+        ("gone", "at"),
         ("item", "created_at"),
         ("item", "last_seen_at"),
         ("item", "resolved_at"),

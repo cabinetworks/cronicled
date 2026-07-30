@@ -11,6 +11,7 @@ from cronicled.descriptions import SUBJECT_TYPE as DESCRIPTION_SUBJECT
 from cronicled.tag_descriptions import SUBJECT_TYPE as TAG_DESCRIPTION_SUBJECT
 from cronicled.runscan import build_producer
 from cronicled.scan import catalogue_link
+from cronicled.store import GONE
 from cronicled.web.rows import carries_cover
 
 
@@ -366,7 +367,32 @@ class Actions:
         complete reversal. The check is against the proposal's candidate,
         not the snapshot -- the snapshot has nothing to say about the
         cover either way, which is exactly the gap being reported.
+
+        A proposal whose SUBJECT has been marked gone is refused here, with the
+        subject named, before anything else is considered. The write really did
+        happen and the snapshot really does describe the scene as it was --
+        there is simply nothing left to restore it onto, and `revert_scene`
+        reached with that snapshot would fail against an id the server does not
+        have. Checked ahead of `_find`, which searches only the visible set and
+        so cannot see a gone row at all: left to it, the one outcome this exists
+        to explain would arrive as `UnknownProposal`, which says a fingerprint
+        is unknown when the truth is that the file is.
         """
+        missing = next((item for item in self._store.items(state=GONE)
+                        if item["fingerprint"] == fp), None)
+        if missing is not None:
+            # Named by subject and, when the payload carries one, by path --
+            # the id is what the server knows the scene as and the path is what
+            # a person recognises it by. `.get`, because only a scene proposal
+            # has a path at all; a description payload has none and must not
+            # turn this refusal into a KeyError.
+            where = missing["payload"].get("path") if isinstance(
+                missing["payload"], dict) else None
+            raise ValueError(
+                "cannot undo %s: %s %s%s is no longer on the media server, so "
+                "there is nothing left to restore its snapshot onto"
+                % (fp, missing["subject_type"], missing["subject_id"],
+                   "" if where is None else " (%s)" % (where,)))
         item = self._find(fp)
         if item["subject_type"] == tags.SUBJECT_TYPE:
             # Refused with the REASON, not with the generic "no snapshot was

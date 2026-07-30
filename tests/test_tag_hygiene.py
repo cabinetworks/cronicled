@@ -1271,7 +1271,15 @@ class _RecordingStore:
     def items(self, folder=None, state=None, limit=None, offset=0):
         if state == "dismissed":
             return []
-        return [self.item]
+        if state is not None:
+            # Answered for the state the row is ACTUALLY in, never for
+            # whichever one was asked about -- the same note as on
+            # `tests.test_web_actions._FakeStore.items`. A double answering
+            # every explicit `state=` with its one row would report this tag
+            # as a subject the media server no longer holds.
+            return [self.item] if self.item["state"] == state else []
+        return [row for row in [self.item]
+                if row["state"] not in Store._HIDDEN_STATES]
 
     def mark_applied(self, fp, prior_state=None):
         self.calls.append(("applied", fp, prior_state))
