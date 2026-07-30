@@ -6,14 +6,26 @@ proposal will eventually be followed by something that is not a person.
 """
 
 import urllib.parse
+from datetime import timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from cronicled.tag_hygiene import LOW_COUNT_IS_NOT_PROOF
 
 from .render import render
+from .rows import to_summary_view
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8571
+
+# The two pages. `/` is the summary -- "did the passes run, and what did they
+# find" -- and the inbox, which used to be here, is one click away at `/inbox`.
+#
+# Every write redirects to `INBOX_PATH` except the one that belongs to the
+# summary (see `do_POST`). A write that redirected to `/` would answer a person
+# who has just judged one of forty proposals by taking them off the list of the
+# other thirty-nine.
+SUMMARY_PATH = "/"
+INBOX_PATH = "/inbox"
 
 _ACTIONS = ("approve", "dismiss", "mute", "undo", "scan",
            "unmute", "undismiss", "refresh")
@@ -60,7 +72,7 @@ def _origin_matches_host(origin, host_header):
 def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                   refused=None, superseded=None, applied=None,
                   schedule_status=None, merges=None, reconciles=None,
-                  unused=None, gone=None):
+                  unused=None, gone=None, summary=None):
     # A separate callable rather than always reaching through `actions`:
     # every existing action-path test builds its own recording double for
     # `actions` and none of them implement `scan_status`, so defaulting it
@@ -101,6 +113,15 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
     # like a healthy idle one. Ordinarily `cronicled.schedule.Scheduler.status`
     # itself -- see `cronicled.__main__`.
     _schedule_status = schedule_status or (lambda: None)
+    # Defaulted through the REAL builder rather than a hand-written dict of
+    # the keys it currently emits. A literal stand-in would go stale the day
+    # `to_summary_view` grows a key -- and the symptom would be summary.html
+    # rendering that key as empty text for every caller that did not wire this
+    # up, which is the exact failure mode this layer is arranged to avoid. An
+    # install with no runs, nothing waiting and no loop is also a real state
+    # (a fresh one), so this is the honest empty page rather than a fixture.
+    _summary = summary or (lambda: to_summary_view([], {}, None,
+                                                   zone=timezone.utc))
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, status, body=b"", headers=()):
@@ -120,7 +141,11 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                            [("Allow", "POST"),
                             ("Content-Type", "text/plain; charset=utf-8")])
                 return
-            if path != "/":
+            if path == SUMMARY_PATH:
+                self._send(200, self._summary_page(),
+                           [("Content-Type", "text/html; charset=utf-8")])
+                return
+            if path != INBOX_PATH:
                 self._send(404, b"not found")
                 return
             # `applied` in the query string names the fingerprint a
@@ -135,8 +160,6 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
             just_applied = (urllib.parse.parse_qs(parsed.query)
                             .get("applied") or [None])[0]
             body = render("inbox.html", rows=rows(), counts={},
-                         scan=_scan_status(),
-                         scan_default_limit=DEFAULT_SCAN_LIMIT,
                          muted=_muted(), dismissed=_dismissed(),
                          refused=_refused(),
                          superseded=_superseded(),
@@ -155,6 +178,20 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                          just_applied=just_applied).encode()
             self._send(200, body,
                        [("Content-Type", "text/html; charset=utf-8")])
+
+        def _summary_page(self):
+            """The landing page's body.
+
+            The Scan control lives here, so this is the page that carries the
+            running scan's status and the limit its form is pre-filled with.
+            The schedule panel reaches the template inside the summary view
+            (see `rows.to_summary_view`), not as a second variable, so this
+            page cannot draw one status beside a differently-converted copy of
+            the other.
+            """
+            return render("summary.html", summary=_summary(),
+                          scan=_scan_status(),
+                          scan_default_limit=DEFAULT_SCAN_LIMIT).encode()
 
         def _cross_origin_write(self):
             """Refuse a write whose own headers say it did not originate
@@ -223,8 +260,16 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
             # very next GET open that section and mark that one row, rather
             # than requiring the person to go find it themselves among
             # everything else ever applied.
-            location = "/"
+            #
+            # Back to the INBOX, not to the landing page: every one of these
+            # writes is a judgement made on a row while looking at the other
+            # rows, and a redirect to the summary would answer each decision by
+            # closing the list it was made from. `scan` is the exception and
+            # overrides this below -- its control is on the summary page, so
+            # that is the page it returns to.
+            location = INBOX_PATH
             if name == "scan":
+                location = SUMMARY_PATH
                 # `limit` is required here on the same terms
                 # `cronicled.runscan.build_producer` requires it of the CLI:
                 # no permissive default, so a request that omits it (or
@@ -276,7 +321,8 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                                [("Content-Type", "text/plain; charset=utf-8")])
                     return
                 if name == "approve":
-                    location = "/?applied=%s" % urllib.parse.quote(fp, safe="")
+                    location = "%s?applied=%s" % (
+                        INBOX_PATH, urllib.parse.quote(fp, safe=""))
             # 303 so a refresh redraws the page rather than repeating the write.
             self._send(303, b"", [("Location", location)])
 
@@ -288,7 +334,7 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
 
 def serve(rows, actions, scan_status=None, muted=None, dismissed=None,
          refused=None, superseded=None, applied=None, schedule_status=None,
-         merges=None, reconciles=None, unused=None, gone=None,
+         merges=None, reconciles=None, unused=None, gone=None, summary=None,
          host=DEFAULT_HOST, port=DEFAULT_PORT):
     # `HTTPServer` is single-threaded: one connection wedged on a slow read
     # or a slow downstream call (a media server taking its whole configured
@@ -336,6 +382,10 @@ def serve(rows, actions, scan_status=None, muted=None, dismissed=None,
         rows, actions, scan_status, muted=muted, dismissed=dismissed,
         refused=refused, superseded=superseded, applied=applied,
         schedule_status=schedule_status, merges=merges,
-        reconciles=reconciles, unused=unused, gone=gone))
-    print("inbox on http://%s:%d/" % (host, port))
+        reconciles=reconciles, unused=unused, gone=gone, summary=summary))
+    # Names what is actually at that address. It said "inbox" when the inbox
+    # was the landing page; a start-up line that keeps naming the page that
+    # used to be there sends the one person reading it to the wrong place.
+    print("cronicled on http://%s:%d%s (the inbox is at %s)"
+          % (host, port, SUMMARY_PATH, INBOX_PATH))
     httpd.serve_forever()

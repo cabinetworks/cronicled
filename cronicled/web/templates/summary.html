@@ -1,0 +1,65 @@
+{# cronicled/web/templates/summary.html #}
+{#
+  The landing page. It answers one question -- "did the passes run, and what
+  did they find" -- and it answers it for somebody who was not watching.
+
+  Every value here is built by `rows.to_summary_view`; nothing is decided in
+  this file except which of two facts a row shows. That one decision is
+  deliberately here and not in the builder: it is about what a reader should
+  be looking at, which is what a template is for.
+#}
+{% include "_style.html" %}
+
+<h1>Summary</h1>
+
+<h2>Last run</h2>
+<div class="scan">
+{% if not summary.jobs %}
+<p class="empty">No pass has run yet. Press Scan below, or wait for the next scheduled one.</p>
+{% endif %}
+{% for j in summary.jobs %}
+<p><b>{{ j.job }}</b> &mdash; {{ j.started }}, {{ j.trigger }}</p>
+{% if j.outcome is none %}
+{# Still going. Distinguished from a finished run rather than shown with its
+   counts at zero, which reads as a pass that ran and found nothing. #}
+<p class="note">still running</p>
+{% elif j.outcome == "failed" %}
+{# ITS ERROR, NOT ITS COUNTS. A failed run's counters hold whatever it had
+   reached before it stopped, so rendering them as its result says "the pass
+   ran and found this much" about a pass that did not finish -- and a reader
+   checking whether last night worked would come away believing it did. #}
+<p class="note">FAILED &mdash; {{ j.error }}</p>
+{% else %}
+<p class="note">{% for name, n in j.counts.items() %}{{ name }} {{ n }}{% if not loop.last %}, {% endif %}{% else %}nothing recorded{% endfor %}</p>
+{% endif %}
+{% endfor %}
+{# ONCE, for the whole page, because no time above carries an offset any more.
+   A page that shortens its timestamps and then does not say what zone they
+   are in is worse than one that left them in UTC: nothing on it says which. #}
+<p class="note">Times are shown in {{ summary.zone }}.</p>
+</div>
+
+{# The per-inbox totals. Each is a link, because a count is a question a
+   reader wants to follow, and a number they cannot act on is a number they
+   learn to skip.
+
+   Every one of them points at `/inbox`, which is the single page holding all
+   of them today; the per-subject pages are a later stage, and a link to one
+   that does not exist yet is a 404 rather than a feature arriving early. #}
+<h2>Waiting</h2>
+<div class="scan">
+{% for name, n in summary.waiting.items() %}
+<p><a href="/inbox">{{ name }}</a> &mdash; {{ n }}</p>
+{% else %}
+<p class="empty">Nothing waiting.</p>
+{% endfor %}
+</div>
+
+{% include "_scan.html" %}
+{# `to_summary_view` has already put the loop's timestamps in the page's zone,
+   so the panel is handed the converted status under the name it reads. Bound
+   here rather than passed as a second top-level variable so there is exactly
+   one schedule on this page and no way to render a stale one beside it. #}
+{% with schedule = summary.schedule %}
+{% include "_schedule.html" %}
+{% endwith %}

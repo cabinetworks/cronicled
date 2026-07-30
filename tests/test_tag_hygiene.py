@@ -1066,7 +1066,7 @@ class ThePage(unittest.TestCase):
         handler = build_handler(rows=lambda: [], actions=None,
                                 unused=lambda: self._groups())
         instance = object.__new__(handler)
-        instance.path = "/"
+        instance.path = "/inbox"
         sent = {}
         instance._send = lambda status, body=b"", headers=(): sent.update(
             status=status, body=body)

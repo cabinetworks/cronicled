@@ -1,0 +1,129 @@
+{# The one stylesheet, shared by every page this server serves.
+
+   Extracted from inbox.html unchanged when the summary page arrived. A
+   second page with a hand-copied copy of these rules is a second copy free
+   to drift, and the drift would show as two pages that look like two
+   different tools. Included rather than linked: there is no static file
+   route here and adding one to serve a stylesheet would be a new GET
+   endpoint for no benefit at this size. #}
+<style>
+  :root {
+    color-scheme: light dark;
+    --line: #d6d6d6; --bg: #fff; --fg: #1a1a1a; --muted: #616161;
+    --warn-bg: #fff8e1; --warn-line: #c98a00; --warn-fg: #6b4a00;
+    --panel: #fafafa;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --line: #3a3a3a; --bg: #16181a; --fg: #e8e8e8; --muted: #a0a0a0;
+      --warn-bg: #2a2313; --warn-line: #b98900; --warn-fg: #f0d492;
+      --panel: #1e2124;
+    }
+  }
+  body { background: var(--bg); color: var(--fg); margin: 0 auto; padding: 1.5rem;
+         max-width: 68rem; line-height: 1.45;
+         font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  h1, h2 { font-weight: 600; letter-spacing: -0.01em; }
+  h1 { margin: 0 0 1.25rem; font-size: 1.5rem; }
+  h2 { margin: 2rem 0 0.75rem; font-size: 1.1rem; }
+
+  .proposal { border: 1px solid var(--line); border-radius: 6px;
+              margin: 0 0 0.9rem; background: var(--panel); overflow: hidden; }
+  .head { display: flex; gap: 1rem; align-items: flex-start;
+          padding: 0.8rem 0.9rem; }
+  .what { flex: 1 1 auto; min-width: 0; }
+  /* Filenames are long and arbitrary; wrapping mid-word keeps one from
+     pushing the score and the buttons off their line. */
+  .file { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+          font-size: 0.82rem; color: var(--muted);
+          overflow-wrap: anywhere; margin: 0 0 0.15rem; }
+  .title { font-size: 1.05rem; font-weight: 600; margin: 0 0 0.2rem;
+           overflow-wrap: anywhere; }
+  .meta { color: var(--muted); font-size: 0.86rem; }
+  .meta b { color: var(--fg); font-weight: 600; }
+  /* One searched store's line under a refusal. Indented and set in the same
+     muted type as the reason above it: these are the working behind that
+     sentence, not four more findings competing with it. */
+  .store { margin-top: 0.15rem; padding-left: 0.8rem; }
+  /* Fixed width and tabular figures so the score sits in the same place in
+     every block -- the one thing the table did better than a block would. */
+  .score { flex: 0 0 4.5rem; text-align: right; font-size: 1.15rem;
+           font-variant-numeric: tabular-nums; font-weight: 600; }
+  .acts { flex: 0 0 auto; display: flex; gap: 0.35rem; align-items: flex-start; }
+  .acts form { margin: 0; }
+  .acts button { font: inherit; font-size: 0.85rem; padding: 0.3rem 0.7rem;
+                 border: 1px solid var(--line); border-radius: 4px;
+                 background: var(--bg); color: var(--fg); cursor: pointer; }
+  .acts button:hover { border-color: var(--muted); }
+
+  /* A warning has to look unlike the runners-up beside it. Both were plain
+     text before, so the sentence that says "do not approve this" read exactly
+     like the list a reviewer can ignore. */
+  .warn { background: var(--warn-bg); color: var(--warn-fg);
+          border-top: 1px solid var(--line);
+          border-left: 3px solid var(--warn-line);
+          padding: 0.5rem 0.9rem; font-size: 0.88rem; }
+  .runners { border-top: 1px solid var(--line); color: var(--muted);
+             padding: 0.45rem 0.9rem; font-size: 0.82rem; }
+  .empty { color: var(--muted); }
+  .scan { border: 1px solid var(--line); border-radius: 6px;
+          background: var(--panel); padding: 0.9rem; }
+  .scan input { font: inherit; width: 6rem; padding: 0.25rem 0.4rem;
+                border: 1px solid var(--line); border-radius: 4px;
+                background: var(--bg); color: var(--fg); }
+  .scan button { font: inherit; padding: 0.3rem 0.9rem; border-radius: 4px;
+                 border: 1px solid var(--line); background: var(--bg);
+                 color: var(--fg); cursor: pointer; }
+  .note { color: var(--muted); font-size: 0.85rem; }
+
+  /* A row's own links -- the filename to the media server, the proposed
+     title and each runner-up to the store page the candidate came from:
+     understated, so they read as part of the identifying text rather than
+     as calls to action competing with Approve/Dismiss/Mute. */
+  .file a, .subject a, .title a, .runners a, .store a {
+    color: inherit; text-decoration-color: var(--muted); }
+
+  /* The one case ticket 97 asks to look like the exception, not the norm: a
+     subject muted before any proposal was ever recorded for it, so only its
+     id is known. Italic and a visible aside mark it as missing information,
+     not as an ordinary filename that merely happens to be short. */
+  .subject-unknown { font-style: italic; }
+
+  /* Muted/Dismissed/Refused/Superseded/Applied: collapsed by default so a
+     person is not made to scroll past sixteen rows of their own past
+     decisions to reach the inbox, but the count beside each summary is
+     plain page text -- present in the markup, and so in a page search,
+     whether or not the section is open. */
+  details.section { border: 1px solid var(--line); border-radius: 6px;
+                    margin: 0 0 0.9rem; background: var(--panel); }
+  details.section summary { padding: 0.6rem 0.9rem; cursor: pointer;
+                            font-weight: 600; }
+  details.section .proposal { margin: 0; border: none;
+                              border-top: 1px solid var(--line);
+                              border-radius: 0; background: transparent; }
+  details.section .proposal:first-of-type { border-top: 1px solid var(--line); }
+  details.section p.empty { margin: 0; padding: 0.7rem 0.9rem; }
+
+  /* The row an Approve just produced, inside the Applied section it now
+     lives in -- a visible marker so undoing it is still a glance away, not
+     a search through the whole section's history. */
+  details.section .proposal.just-applied { border-left: 3px solid var(--warn-line); }
+
+  /* A description rewrite is reviewed by reading two paragraphs against each
+     other, so both get equal room and identical typography -- anything that
+     styled one more prominently than the other would tilt the judgement the
+     reviewer is being asked to make. `pre-wrap` because the whole question
+     includes the whitespace: a cleanup that flattened the paragraphs would
+     be invisible in a view that collapsed them. */
+  .diff { border-top: 1px solid var(--line); display: grid;
+          grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); }
+  .diff > div { background: var(--panel); padding: 0.55rem 0.9rem; }
+  .diff h3 { margin: 0 0 0.3rem; font-size: 0.75rem; font-weight: 600;
+             letter-spacing: 0.04em; text-transform: uppercase;
+             color: var(--muted); }
+  .diff .text { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere;
+                font-size: 0.9rem; }
+  /* One column on a narrow screen: side by side would shrink each to a few
+     words per line, which is worse than reading them in order. */
+  @media (max-width: 42rem) { .diff { grid-template-columns: 1fr; } }
+</style>

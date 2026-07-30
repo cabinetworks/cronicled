@@ -1,3 +1,4 @@
+import email.message
 import http.client
 import io
 import threading
@@ -5,11 +6,13 @@ import unittest
 from contextlib import redirect_stdout
 from http.server import HTTPServer
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from cronicled.jobs import JobRejected
 from cronicled.schedule import LoopStatus, TickResult
 from cronicled.web.actions import ApplyFailed, UnknownProposal
 from cronicled.web.app import build_handler, serve, DEFAULT_HOST
+from cronicled.web.rows import to_summary_view
 
 
 class _RecordingActions:
@@ -160,7 +163,7 @@ class ApproveRedirectCarriesTheFingerprint(unittest.TestCase):
         with _Server() as s:
             r = s.request("POST", "/approve", "fp=fp-7")
             self.assertEqual(r.status, 303)
-            self.assertEqual(r.getheader("Location"), "/?applied=fp-7")
+            self.assertEqual(r.getheader("Location"), "/inbox?applied=fp-7")
 
     def test_other_actions_redirect_to_the_plain_index(self):
         # Only approve moves a row into Applied -- every other action must
@@ -170,7 +173,7 @@ class ApproveRedirectCarriesTheFingerprint(unittest.TestCase):
                            ("/refresh", "refresh")):
             with _Server() as s:
                 r = s.request("POST", path, "fp=fp-7")
-                self.assertEqual(r.getheader("Location"), "/", name)
+                self.assertEqual(r.getheader("Location"), "/inbox", name)
 
     def test_a_failed_approve_does_not_redirect_at_all(self):
         # `ApplyFailed` is reported as an error (see `ExceptionBranch`), not
@@ -186,7 +189,7 @@ class ApproveRedirectCarriesTheFingerprint(unittest.TestCase):
             r = s.request("POST", "/approve", "fp=fp%2Fwith%2Fslashes")
             self.assertEqual(s.actions.calls, [("approve", "fp/with/slashes")])
             self.assertEqual(r.getheader("Location"),
-                             "/?applied=fp%2Fwith%2Fslashes")
+                             "/inbox?applied=fp%2Fwith%2Fslashes")
 
 
 class UnmutePost(unittest.TestCase):
@@ -235,7 +238,7 @@ class MutedDismissedRefusedRendering(unittest.TestCase):
     template itself renders a given row (covered in
     tests/test_web_render.py)."""
 
-    def _get(self, path="/", **callables):
+    def _get(self, path="/inbox", **callables):
         actions = _RecordingActions()
         handler = build_handler(rows=lambda: [], actions=actions, **callables)
         httpd = HTTPServer(("127.0.0.1", 0), handler)
@@ -310,7 +313,7 @@ class MutedDismissedRefusedRendering(unittest.TestCase):
         # redirect now produces -- must reach the template as
         # `just_applied`, not be dropped on the floor between the query
         # string and `render()`.
-        html = self._get(path="/?applied=fp-1", applied=lambda: [
+        html = self._get(path="/inbox?applied=fp-1", applied=lambda: [
             {"fingerprint": "fp-1", "state": "applied",
              "filename": "clip.mp4", "proposed_title": "T", "creator": "N",
              "creator_source": "folder", "score_text": "0.900"}])
@@ -564,6 +567,158 @@ class ServeWarnsOnNonDefaultHost(unittest.TestCase):
                 serve(rows=lambda: [], actions=_RecordingActions(),
                       host=DEFAULT_HOST, port=0)
         self.assertNotIn("WARNING", out.getvalue())
+
+
+def _drive(method, path, body=b"", headers=None, **callables):
+    """One request through the real handler with no socket underneath it.
+
+    `do_GET`/`do_POST` read `self.path`, `self.headers` and `self.rfile` and
+    answer through `self._send`; all four are supplied here, so the routing and
+    redirect decisions are exercised exactly as they are in production while
+    the transport is injected. Same shape as the driver in
+    `tests/test_tag_hygiene.py`.
+    """
+    actions = callables.pop("actions", None) or _RecordingActions()
+    handler = build_handler(rows=lambda: [], actions=actions, **callables)
+    instance = object.__new__(handler)
+    instance.path = path
+    instance.headers = email.message.Message()
+    for key, value in (headers or {}).items():
+        instance.headers[key] = value
+    if body:
+        instance.headers["Content-Length"] = str(len(body))
+    instance.rfile = io.BytesIO(body)
+    sent = {}
+    instance._send = lambda status, body=b"", headers=(): sent.update(
+        status=status, body=body, headers=dict(headers))
+    getattr(instance, "do_" + method)()
+    sent["actions"] = actions
+    return sent
+
+
+class TheTwoPages(unittest.TestCase):
+    """`/` is the summary and `/inbox` is the inbox.
+
+    The inbox used to be `/`. Moving it is the whole of this change from a
+    reader's point of view, and both halves have to be pinned: a router that
+    served the inbox at both would look correct on the landing page and be
+    missing the summary entirely.
+    """
+
+    def test_the_landing_page_is_the_summary(self):
+        sent = _drive("GET", "/")
+        self.assertEqual(sent["status"], 200)
+        body = sent["body"].decode()
+        self.assertIn("<h1>Summary</h1>", body)
+        self.assertNotIn("<h1>Inbox</h1>", body)
+
+    def test_the_inbox_is_one_click_away(self):
+        sent = _drive("GET", "/inbox")
+        self.assertEqual(sent["status"], 200)
+        body = sent["body"].decode()
+        self.assertIn("<h1>Inbox</h1>", body)
+        self.assertNotIn("<h1>Summary</h1>", body)
+
+    def test_a_path_that_is_neither_is_still_a_404(self):
+        # A misspelt address must not fall through to whichever page the
+        # router happens to reach last.
+        sent = _drive("GET", "/inbx")
+        self.assertEqual(sent["status"], 404)
+
+    def test_the_summary_callable_is_called_rather_than_merely_accepted(self):
+        # A handler that took the callable and never invoked it would draw the
+        # empty page on an install with a full run log -- indistinguishable,
+        # to a reader, from one where nothing has ever run.
+        view = to_summary_view(
+            [{"id": "r-1", "job": "scene-scan", "trigger": "scheduled",
+              "started": "2026-07-15T00:30:00+00:00",
+              "finished": "2026-07-15T00:34:00+00:00", "outcome": "completed",
+              "counts": {"recorded": 4}, "error": None}],
+            {"scenes": 12}, None, zone=ZoneInfo("Europe/Madrid"))
+        body = _drive("GET", "/", summary=lambda: view)["body"].decode()
+        self.assertIn("scene-scan", body)
+        self.assertIn("2026-07-15 02:30", body)
+        self.assertIn("12", body)
+
+    def test_a_handler_with_no_summary_wired_still_draws_the_page(self):
+        # Every existing test's double supplies none of this. The default has
+        # to be a real empty view, not a missing one -- a page that raises is
+        # a page with no way back to the inbox either.
+        body = _drive("GET", "/")["body"].decode()
+        self.assertIn("No pass has run yet.", body)
+        self.assertIn("Nothing waiting.", body)
+
+
+class WhereAWriteReturnsTo(unittest.TestCase):
+    """A redirect answers the question "what was this person doing".
+
+    Judging a proposal is done while looking at the other proposals, so those
+    writes return to the inbox. Starting a scan is done from the summary, and
+    it returns there -- to the page that reports what the scan then does.
+    """
+
+    def test_a_judgement_returns_to_the_inbox(self):
+        for name in ("dismiss", "mute", "undo", "undismiss", "refresh"):
+            with self.subTest(name):
+                sent = _drive("POST", "/" + name, b"fp=fp-7")
+                self.assertEqual(sent["status"], 303)
+                self.assertEqual(sent["headers"]["Location"], "/inbox")
+
+    def test_an_approve_returns_to_the_inbox_carrying_its_fingerprint(self):
+        sent = _drive("POST", "/approve", b"fp=fp-7")
+        self.assertEqual(sent["headers"]["Location"], "/inbox?applied=fp-7")
+
+    def test_an_unmute_returns_to_the_inbox_too(self):
+        sent = _drive("POST", "/unmute", b"subject_type=scene&subject_id=42")
+        self.assertEqual(sent["headers"]["Location"], "/inbox")
+
+    def test_a_scan_returns_to_the_page_its_button_is_on(self):
+        sent = _drive("POST", "/scan", b"limit=25")
+        self.assertEqual(sent["status"], 303)
+        self.assertEqual(sent["headers"]["Location"], "/")
+        self.assertEqual(sent["actions"].calls, [("scan", 25)])
+
+
+class TheScanControlOnItsNewPageStillRefusesCrossOrigin(unittest.TestCase):
+    """The control moved pages; the refusal moves with it.
+
+    `/scan` starts a job that spends a rate-limited third party's budget. Any
+    tab in the operator's own browser can reach 127.0.0.1, so a write whose own
+    headers say it came from some other page is refused -- and a control that
+    lost that on its way to a new page is a live vulnerability, not a missing
+    feature.
+    """
+
+    def test_a_cross_site_scan_is_refused_and_does_not_fire(self):
+        sent = _drive("POST", "/scan", b"limit=25",
+                      headers={"Sec-Fetch-Site": "cross-site"})
+        self.assertEqual(sent["status"], 403)
+        self.assertEqual(sent["actions"].calls, [])
+
+    def test_a_same_site_scan_is_refused_too(self):
+        # `same-site` is a DIFFERENT origin that happens to share a registrable
+        # domain, which is not the same page.
+        sent = _drive("POST", "/scan", b"limit=25",
+                      headers={"Sec-Fetch-Site": "same-site"})
+        self.assertEqual(sent["status"], 403)
+        self.assertEqual(sent["actions"].calls, [])
+
+    def test_a_scan_from_a_foreign_origin_is_refused_and_does_not_fire(self):
+        sent = _drive("POST", "/scan", b"limit=25",
+                      headers={"Origin": "http://elsewhere.invalid",
+                               "Host": "127.0.0.1:8571"})
+        self.assertEqual(sent["status"], 403)
+        self.assertEqual(sent["actions"].calls, [])
+
+    def test_a_scan_from_the_page_this_server_served_still_works(self):
+        # The permissive side. A refusal that fired on the legitimate request
+        # would take the control out of service while looking like security.
+        sent = _drive("POST", "/scan", b"limit=25",
+                      headers={"Sec-Fetch-Site": "same-origin",
+                               "Origin": "http://127.0.0.1:8571",
+                               "Host": "127.0.0.1:8571"})
+        self.assertEqual(sent["status"], 303)
+        self.assertEqual(sent["actions"].calls, [("scan", 25)])
 
 
 if __name__ == "__main__":
