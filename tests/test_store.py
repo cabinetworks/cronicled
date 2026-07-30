@@ -10,7 +10,8 @@ import unicodedata
 import unittest
 from datetime import datetime, timezone
 
-from cronicled.store import SCHEMA_VERSION, SchemaVersionError, Store, fingerprint
+from cronicled.store import (RUN_HISTORY_LIMIT, RUN_TRIGGERS, SCHEMA_VERSION,
+                             SchemaVersionError, Store, fingerprint)
 
 
 class Fingerprint(unittest.TestCase):
@@ -1001,6 +1002,451 @@ class ProducerRunsSurviveARestart(unittest.TestCase):
                              "2026-07-26T02:00:00+00:00")
             self.assertEqual(store.runs(),
                              {"nightly-scrape": "2026-07-26T02:00:00+00:00"})
+
+
+class _RunLogCase(_StoreCase):
+    """Shared fixture for the run log: distinct, increasing start times.
+
+    Every timestamp is distinct on purpose. `_utcnow` has one-second
+    resolution, so a fixture that let the clock supply the times would hand
+    the ordering rules a column that cannot separate the rows, and a test of
+    "newest first" that cannot tell newest from oldest proves nothing.
+    """
+
+    def _at(self, n):
+        """The nth timestamp in an increasing sequence, one second apart."""
+        return "2026-03-01T%02d:%02d:%02d+00:00" % (
+            n // 3600, n // 60 % 60, n % 60)
+
+    def _fill(self, count, job="scene-scan"):
+        """Start and finish `count` runs; return their ids, oldest first."""
+        ids = []
+        for n in range(count):
+            run_id = self.store.start_run(job, trigger="scheduled",
+                                          at=self._at(n))
+            self.store.finish_run(run_id, outcome="completed", at=self._at(n))
+            ids.append(run_id)
+        return ids
+
+
+class TheRunLog(_RunLogCase):
+    """One row per run, kept.
+
+    `producer_run` answers the scheduler's question -- how long ago -- with an
+    upsert, so it holds one row per producer however many times it runs. That
+    is the right answer for a scheduler and the wrong one for a person asking
+    "did last night's pass run, and what did it find", because the answer to
+    the second is made of the runs the upsert threw away.
+    """
+
+    def test_two_runs_of_one_job_are_two_rows(self):
+        """The property the second table exists for. One examination cannot
+        tell an insert from an upsert -- both leave a row that reads back
+        correctly. Only the second run can."""
+        first = self.store.start_run("scene-scan", trigger="scheduled")
+        self.store.finish_run(first, outcome="completed", counts={"proposed": 2})
+        second = self.store.start_run("scene-scan", trigger="manual")
+        self.store.finish_run(second, outcome="completed", counts={"proposed": 3})
+        rows = self.store.recent_runs()
+        # The id identifies the RUN, not the job. Asserted on its own because
+        # the list comparison below cannot see two ids that are equal -- it
+        # would compare a pair of identical strings against itself and pass.
+        self.assertNotEqual(first, second)
+        self.assertEqual([r["id"] for r in rows], [second, first])
+        self.assertEqual([r["trigger"] for r in rows], ["manual", "scheduled"])
+        self.assertEqual([r["counts"] for r in rows],
+                         [{"proposed": 3}, {"proposed": 2}])
+
+    def test_two_runs_inside_one_second_are_still_ordered_by_arrival(self):
+        """`_utcnow` has one-second resolution, so two runs of one job started
+        in the same second carry an identical `started`. Ordering on that
+        column alone leaves the tie to SQLite, which resolves it oldest-first
+        -- the wrong end. Given explicitly here rather than left to the clock,
+        so the collision happens every time rather than almost every time."""
+        same = "2026-03-01T04:00:00+00:00"
+        first = self.store.start_run("scene-scan", trigger="scheduled", at=same)
+        second = self.store.start_run("scene-scan", trigger="scheduled", at=same)
+        self.assertEqual([r["id"] for r in self.store.recent_runs()],
+                         [second, first])
+
+    def test_a_finished_run_reads_back_whole(self):
+        """Asserted as a whole dict rather than field by field: a field-by-field
+        check cannot see a field that should not be there, and this row is
+        handed straight to a page that renders what it is given."""
+        run_id = self.store.start_run("scene-scan", trigger="scheduled",
+                                      at="2026-03-01T03:00:00+00:00")
+        self.store.finish_run(run_id, outcome="completed",
+                              counts={"proposed": 4, "refused": 9},
+                              at="2026-03-01T03:04:00+00:00")
+        self.assertEqual(self.store.recent_runs(), [{
+            "id": run_id,
+            "job": "scene-scan",
+            "trigger": "scheduled",
+            "started": "2026-03-01T03:00:00+00:00",
+            "finished": "2026-03-01T03:04:00+00:00",
+            "outcome": "completed",
+            "counts": {"proposed": 4, "refused": 9},
+            "error": None,
+        }])
+
+    def test_a_failed_run_is_recorded_with_its_error(self):
+        """A failed run is recorded exactly as a completed one is. "Did last
+        night's scan run?" is the question this log exists to answer, and a log
+        of successes answers the opposite one -- it makes a job that has failed
+        every night for a week look like one nobody ever scheduled."""
+        run_id = self.store.start_run("tag-scan", trigger="scheduled",
+                                      at="2026-03-01T03:00:00+00:00")
+        self.store.finish_run(run_id, outcome="failed",
+                              error="the store refused",
+                              at="2026-03-01T03:00:01+00:00")
+        self.assertEqual(self.store.recent_runs(), [{
+            "id": run_id,
+            "job": "tag-scan",
+            "trigger": "scheduled",
+            "started": "2026-03-01T03:00:00+00:00",
+            "finished": "2026-03-01T03:00:01+00:00",
+            "outcome": "failed",
+            "counts": {},
+            "error": "the store refused",
+        }])
+
+    def test_an_open_run_is_visible_with_nothing_filled_in(self):
+        """A run that has been started and not finished -- one still going, or
+        one whose process died mid-run -- is a row a reader can see, not an
+        absence they have to infer from a gap in the list."""
+        run_id = self.store.start_run("tag-scan", trigger="manual",
+                                      at="2026-03-01T02:00:00+00:00")
+        self.assertEqual(self.store.recent_runs(), [{
+            "id": run_id,
+            "job": "tag-scan",
+            "trigger": "manual",
+            "started": "2026-03-01T02:00:00+00:00",
+            "finished": None,
+            "outcome": None,
+            "counts": {},
+            "error": None,
+        }])
+
+    def test_the_start_time_defaults_to_now(self):
+        """Bracketed rather than compared to a fixture, because the point is
+        that an omitted `at` is a real UTC clock reading and not the empty
+        string or the epoch."""
+        before = datetime.now(timezone.utc).replace(microsecond=0)
+        self.store.start_run("scene-scan", trigger="scheduled")
+        after = datetime.now(timezone.utc)
+        started = datetime.fromisoformat(self.store.recent_runs()[0]["started"])
+        self.assertIsNotNone(started.tzinfo)
+        self.assertLessEqual(before, started)
+        self.assertLessEqual(started, after)
+
+    def test_the_finish_time_defaults_to_now(self):
+        before = datetime.now(timezone.utc).replace(microsecond=0)
+        run_id = self.store.start_run("scene-scan", trigger="scheduled")
+        self.store.finish_run(run_id, outcome="completed")
+        after = datetime.now(timezone.utc)
+        finished = datetime.fromisoformat(
+            self.store.recent_runs()[0]["finished"])
+        self.assertIsNotNone(finished.tzinfo)
+        self.assertLessEqual(before, finished)
+        self.assertLessEqual(finished, after)
+
+    def test_runs_of_different_jobs_are_all_kept(self):
+        first = self.store.start_run("scene-scan", trigger="scheduled",
+                                     at=self._at(0))
+        second = self.store.start_run("tag-scan", trigger="scheduled",
+                                      at=self._at(1))
+        self.assertEqual([(r["id"], r["job"]) for r in self.store.recent_runs()],
+                         [(second, "tag-scan"), (first, "scene-scan")])
+
+    def test_a_run_with_no_job_is_refused_rather_than_stored(self):
+        """A row nobody can attribute is worse than no row: a reader groups
+        these by job, and a missing one renders as a blank line that looks
+        like a run of something. Refused at the column, and the store is
+        usable afterwards rather than left holding a half-written row."""
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.start_run(None, trigger="scheduled")
+        self.assertEqual(self.store.recent_runs(), [])
+        run_id = self.store.start_run("scene-scan", trigger="scheduled")
+        self.assertEqual([r["id"] for r in self.store.recent_runs()], [run_id])
+
+    def test_a_run_is_not_a_proposal(self):
+        """The log and the inbox are independent: a run must not appear in the
+        inbox, and must not disturb the counts a badge reads."""
+        run_id = self.store.start_run("scene-scan", trigger="scheduled")
+        self.store.finish_run(run_id, outcome="completed",
+                              counts={"proposed": 3})
+        self.assertEqual(self.store.items(), [])
+        self.assertEqual(self.store.counts(), {})
+
+
+class TheTriggerIsChecked(_RunLogCase):
+    """How a run began is stored, not inferred -- and only a value a reader can
+    interpret is allowed in."""
+
+    def test_an_unknown_trigger_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            self.store.start_run("scene-scan", trigger="cron")
+        self.assertIn("cron", str(caught.exception))
+
+    def test_a_refused_trigger_writes_nothing(self):
+        """Refused before the insert, not after it. A row carrying a trigger
+        nobody can interpret is worse than no row: the summary renders what it
+        is given."""
+        with self.assertRaises(ValueError):
+            self.store.start_run("scene-scan", trigger="cron")
+        self.assertEqual(self.store.recent_runs(), [])
+
+    def test_a_scheduled_trigger_is_accepted(self):
+        """The permissive side of the guard, pinned separately. A check that
+        drifted too strict would refuse every real run, and nothing asserting
+        only the refusal could see it."""
+        self.store.start_run("scene-scan", trigger="scheduled")
+        self.assertEqual(self.store.recent_runs()[0]["trigger"], "scheduled")
+
+    def test_a_manual_trigger_is_accepted(self):
+        self.store.start_run("scene-scan", trigger="manual")
+        self.assertEqual(self.store.recent_runs()[0]["trigger"], "manual")
+
+    def test_the_message_names_what_is_allowed(self):
+        """A refusal a caller cannot act on costs the same as one they can."""
+        with self.assertRaises(ValueError) as caught:
+            self.store.start_run("scene-scan", trigger="")
+        for allowed in RUN_TRIGGERS:
+            self.assertIn(allowed, str(caught.exception))
+
+
+class RunRetention(_RunLogCase):
+    """The log is bounded, and says what the bound dropped.
+
+    Silent truncation reads as "this is everything" when it is not: a reader
+    who cannot see that the list was cut concludes the missing runs never
+    happened, which is the opposite of what the log is for.
+    """
+
+    def test_nothing_is_evicted_at_the_bound(self):
+        """The permissive side. Eviction that started one row early would drop
+        a run nobody asked it to, and a test that only ever looks past the
+        bound cannot see it."""
+        ids = self._fill(RUN_HISTORY_LIMIT)
+        self.assertEqual([r["id"] for r in self.store.recent_runs(limit=10_000)],
+                         list(reversed(ids)))
+        self.assertEqual(self.store.runs_evicted(), 0)
+
+    def test_retention_keeps_the_newest_and_drops_the_oldest(self):
+        """Which rows survive, not merely how many. A count alone is satisfied
+        by eviction from either end, and dropping the newest is the failure
+        that would make the page answer "did last night's pass run" with last
+        month's."""
+        ids = self._fill(RUN_HISTORY_LIMIT + 3)
+        self.assertEqual([r["id"] for r in self.store.recent_runs(limit=10_000)],
+                         list(reversed(ids[3:])))
+
+    def test_retention_says_how_many_it_dropped(self):
+        self._fill(RUN_HISTORY_LIMIT + 3)
+        self.assertEqual(self.store.runs_evicted(), 3)
+
+    def test_one_finish_that_drops_several_rows_counts_every_one(self):
+        """The count accumulates; it is not assigned. A fixture that evicts one
+        row per call cannot tell those apart, because both leave 1 behind each
+        time. Several rows open at once is what a restart leaves, and the first
+        finish after it closes the backlog in a single pass."""
+        ids = [self.store.start_run("scene-scan", trigger="scheduled",
+                                    at=self._at(n))
+               for n in range(RUN_HISTORY_LIMIT + 3)]
+        self.store.finish_run(ids[-1], outcome="completed", at=self._at(9000))
+        self.assertEqual(self.store.runs_evicted(), 3)
+        self.assertEqual(len(self.store.recent_runs(limit=10_000)),
+                         RUN_HISTORY_LIMIT)
+
+    def test_the_boundary_falling_inside_a_tied_second_drops_the_earlier_arrivals(self):
+        """`started` has one-second resolution, so the edge of the bound can
+        land in the middle of a tie. Ordering the eviction by `started` alone
+        leaves which of the tied rows survives to SQLite, and SQLite keeps the
+        one that arrived FIRST -- dropping two runs that happened after the
+        one it kept."""
+        tied = "2026-03-01T00:00:00+00:00"
+        tied_ids = [self.store.start_run("scene-scan", trigger="scheduled",
+                                         at=tied)
+                    for _ in range(3)]
+        # Two rows over the bound, so exactly two of the three tied rows go
+        # and the third stays -- which is what makes "the earlier arrivals"
+        # an observable claim rather than "all of them".
+        for n in range(1, RUN_HISTORY_LIMIT - 1):
+            self.store.start_run("scene-scan", trigger="scheduled",
+                                 at=self._at(n))
+        last = self.store.start_run("scene-scan", trigger="scheduled",
+                                    at=self._at(RUN_HISTORY_LIMIT))
+        self.store.finish_run(last, outcome="completed")
+        kept = {r["id"] for r in self.store.recent_runs(limit=10_000)}
+        self.assertEqual(len(kept), RUN_HISTORY_LIMIT)
+        self.assertEqual(self.store.runs_evicted(), 2)
+        self.assertNotIn(tied_ids[0], kept)
+        self.assertNotIn(tied_ids[1], kept)
+        self.assertIn(tied_ids[2], kept)
+
+    def test_evictions_from_separate_calls_add_up(self):
+        """The other half of the same rule: a later drop adds to the total
+        rather than restating it."""
+        self._fill(RUN_HISTORY_LIMIT + 1)
+        self.assertEqual(self.store.runs_evicted(), 1)
+        run_id = self.store.start_run("scene-scan", trigger="scheduled",
+                                      at=self._at(9000))
+        self.store.finish_run(run_id, outcome="completed", at=self._at(9000))
+        self.assertEqual(self.store.runs_evicted(), 2)
+
+    def test_nothing_dropped_is_zero_not_missing(self):
+        self.assertEqual(self.store.runs_evicted(), 0)
+
+    def test_the_bound_covers_a_meaningful_stretch_of_nightly_runs(self):
+        """A property of the bound rather than a copy of it. Restating the
+        number here would move with it and prove only that the code agrees
+        with itself; what actually matters is that the log can still answer
+        "has this been failing all week". A bound of a handful of rows would
+        be a log that forgets faster than anyone looks at it, and one of zero
+        would evict every run the moment it finished."""
+        self.assertGreaterEqual(RUN_HISTORY_LIMIT, 90)
+
+
+class ReadingRecentRuns(_RunLogCase):
+    def test_recent_runs_defaults_to_twenty(self):
+        ids = self._fill(25)
+        self.assertEqual([r["id"] for r in self.store.recent_runs()],
+                         list(reversed(ids))[:20])
+
+    def test_recent_runs_honours_an_explicit_limit(self):
+        ids = self._fill(25)
+        self.assertEqual([r["id"] for r in self.store.recent_runs(limit=3)],
+                         list(reversed(ids))[:3])
+
+    def test_no_runs_is_an_empty_list(self):
+        self.assertEqual(self.store.recent_runs(), [])
+
+
+class TheRunLogDoesNotDisturbTheScheduler(_RunLogCase):
+    """Two tables, two questions. The scheduler's answer must not move because
+    the log gained a row, and must not be evicted because the log is bounded.
+    """
+
+    def test_the_scheduler_read_is_unchanged_by_the_log(self):
+        self.store.record_run("scene-scan", at="2026-01-01T00:00:00+00:00")
+        run_id = self.store.start_run("scene-scan", trigger="manual",
+                                      at="2026-03-01T00:00:00+00:00")
+        self.store.finish_run(run_id, outcome="completed")
+        self.assertEqual(self.store.runs(),
+                         {"scene-scan": "2026-01-01T00:00:00+00:00"})
+        self.assertEqual(self.store.last_run("scene-scan"),
+                         "2026-01-01T00:00:00+00:00")
+
+    def test_the_scheduler_answer_outlives_the_bound(self):
+        """The log is evicted; `producer_run` is not. A shared table would have
+        to pick one lifetime, and the scheduler losing its last-run answer
+        makes every job due at once."""
+        self.store.record_run("scene-scan", at="2026-01-01T00:00:00+00:00")
+        self._fill(RUN_HISTORY_LIMIT + 3)
+        self.assertEqual(self.store.runs(),
+                         {"scene-scan": "2026-01-01T00:00:00+00:00"})
+
+    def test_the_log_is_not_written_by_the_scheduler_read(self):
+        self.store.record_run("scene-scan", at="2026-01-01T00:00:00+00:00")
+        self.assertEqual(self.store.recent_runs(), [])
+
+
+class TheRunLogSurvivesARestart(unittest.TestCase):
+    """The property the table exists for, across a real close and reopen.
+
+    Everything above would pass just as well against a list held on the
+    instance; only this can tell the two apart.
+    """
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self.path = os.path.join(self._dir, "s.db")
+        self.addCleanup(shutil.rmtree, self._dir, True)
+
+    def test_a_run_recorded_before_a_restart_is_still_there_after_it(self):
+        with Store(self.path) as store:
+            run_id = store.start_run("scene-scan", trigger="scheduled",
+                                     at="2026-03-01T03:00:00+00:00")
+            store.finish_run(run_id, outcome="completed",
+                             counts={"proposed": 2},
+                             at="2026-03-01T03:05:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.recent_runs(), [{
+                "id": run_id,
+                "job": "scene-scan",
+                "trigger": "scheduled",
+                "started": "2026-03-01T03:00:00+00:00",
+                "finished": "2026-03-01T03:05:00+00:00",
+                "outcome": "completed",
+                "counts": {"proposed": 2},
+                "error": None,
+            }])
+
+    def test_the_eviction_count_survives_a_restart(self):
+        """The rows it counts are gone, so nothing can recount them. A total
+        held in memory would reset to zero on every restart and report a
+        complete list that is not one."""
+        with Store(self.path) as store:
+            for n in range(RUN_HISTORY_LIMIT + 2):
+                run_id = store.start_run(
+                    "scene-scan", trigger="scheduled",
+                    at="2026-03-01T%02d:%02d:%02d+00:00" % (
+                        n // 3600, n // 60 % 60, n % 60))
+                store.finish_run(run_id, outcome="completed")
+            self.assertEqual(store.runs_evicted(), 2)
+        with Store(self.path) as store:
+            self.assertEqual(store.runs_evicted(), 2)
+
+
+class RunTableAddedOnAnExistingDatabase(unittest.TestCase):
+    """A database written before the run table existed gains it on open, and
+    keeps everything already in it.
+
+    The run log is a new TABLE, not a new column, so `CREATE TABLE IF NOT
+    EXISTS` carries it and `SCHEMA_VERSION` is deliberately not bumped: a bump
+    would make every build predating this table refuse a database it can still
+    read correctly.
+    """
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self.path = os.path.join(self._dir, "old.sqlite3")
+        self.addCleanup(shutil.rmtree, self._dir, True)
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            "CREATE TABLE producer_run (producer TEXT PRIMARY KEY, "
+            "at TEXT NOT NULL)")
+        connection.execute(
+            "INSERT INTO producer_run VALUES ('scene-scan', "
+            "'2026-01-01T00:00:00+00:00')")
+        connection.commit()
+        connection.close()
+
+    def test_the_older_database_still_opens_and_keeps_its_rows(self):
+        with Store(self.path) as store:
+            self.assertEqual(store.runs(),
+                             {"scene-scan": "2026-01-01T00:00:00+00:00"})
+
+    def test_its_run_log_starts_empty_rather_than_missing(self):
+        with Store(self.path) as store:
+            self.assertEqual(store.recent_runs(), [])
+            self.assertEqual(store.runs_evicted(), 0)
+
+    def test_it_can_be_written_to_at_once(self):
+        with Store(self.path) as store:
+            run_id = store.start_run("scene-scan", trigger="scheduled",
+                                     at="2026-03-01T03:00:00+00:00")
+            store.finish_run(run_id, outcome="completed",
+                             at="2026-03-01T03:01:00+00:00")
+            self.assertEqual([r["id"] for r in store.recent_runs()], [run_id])
+
+    def test_the_schema_version_is_not_bumped_by_the_new_table(self):
+        with Store(self.path):
+            pass
+        connection = sqlite3.connect(self.path)
+        self.addCleanup(connection.close)
+        stamped = connection.execute("PRAGMA user_version").fetchone()[0]
+        self.assertEqual(stamped, SCHEMA_VERSION)
 
 
 class SchemaAdditionOnAnExistingDatabase(unittest.TestCase):
