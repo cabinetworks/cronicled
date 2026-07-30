@@ -123,6 +123,38 @@ class ThePlannedServiceIsMarkedAsPlanned(unittest.TestCase):
                 "every node in the planned-service diagram must open with "
                 "PLANNED: or BUILT:, so which is which cannot be mistaken")
 
+    def test_the_page_does_not_claim_nothing_runs_unattended(self):
+        """The one prose claim on this page worth pinning, and the reason the
+        rest are not.
+
+        This test does NOT pin the page's prose in general, and deliberately so:
+        a test that asserts arbitrary sentences fails on every rewording, which
+        trains people to edit the test rather than read it. Its coverage stops
+        at facts a diagram or a constant can be checked against.
+
+        This claim is the exception because it survived a capability landing.
+        The page said nothing ran unattended for as long as three producers did,
+        two paragraphs above a description of the scheduler ticking them. A
+        reader who believed it would not look for the schedule, and would be
+        surprised by a scan they did not start -- which, on a library where a
+        pass now reaches thousands of files, is the kind of surprise that gets a
+        tool deleted.
+
+        It is pinned as an absence rather than a presence for the same reason:
+        asserting the page says something particular about the scheduler would
+        break on rewording, while asserting it does not say this specific
+        falsehood only breaks if the falsehood comes back.
+        """
+        page = open(INDEX).read().lower()
+        for claim in ("does not exist is anything that runs unattended",
+                      "nothing runs unattended",
+                      "nothing that runs unattended"):
+            self.assertNotIn(
+                claim, page,
+                "docs/index.md claims nothing runs unattended, and three "
+                "producers do. If that changed, delete this test on purpose "
+                "rather than editing the page around it.")
+
     def test_the_diagrams_of_what_exists_claim_nothing_planned(self):
         # A diagram is believed before a paragraph is, so a picture of the
         # whole intended system would undo what the prose is careful about.
