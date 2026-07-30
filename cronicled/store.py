@@ -81,6 +81,13 @@ CREATE TABLE IF NOT EXISTS refusal (
     path TEXT NOT NULL, reason TEXT NOT NULL, at TEXT NOT NULL,
     stores TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (subject_type, subject_id));
+
+-- A durable record that a subject is no longer on the media server -- see the
+-- block above `Store.mark_gone` for why the `item` state cannot carry this on
+-- its own, and why nothing here is ever deleted.
+CREATE TABLE IF NOT EXISTS gone (
+    subject_type TEXT NOT NULL, subject_id TEXT NOT NULL, at TEXT NOT NULL,
+    PRIMARY KEY (subject_type, subject_id));
 """
 
 # On adding to this schema, given databases already exist
@@ -178,6 +185,17 @@ def _add_missing_columns(conn):
 # something already holding data — which is the case the comment above
 # describes and which still does not exist.
 SCHEMA_VERSION = 1
+
+# The state an `item` row carries once its subject is no longer on the media
+# server. Named here rather than spelled in each of the places that read it
+# (`Store._HIDDEN_STATES`, the entry point's own section, `web.actions.undo`)
+# so a fourth reader cannot join by copying the string.
+#
+# A row in this state is HIDDEN from the working lists and kept whole:
+# `payload`, `prior_state` and `resolved_at` are all left exactly as they
+# were, so what a proposal said, what it wrote and when survive the subject
+# it was about disappearing. See `Store.mark_gone`.
+GONE = "gone"
 
 
 class SchemaVersionError(RuntimeError):
@@ -789,10 +807,20 @@ class Store:
 
         Ordered by `at` then `subject_id`, the same tie-break `items()` uses
         for its own listing.
+
+        A subject marked GONE is left out entirely -- see `mark_gone`. A mute
+        is an instruction to stop offering a file, and a file the server no
+        longer holds is not on offer; the Unmute this section draws for it
+        would lift a block on a subject nothing can propose, which reads as a
+        control that does nothing. The `mute` row itself is untouched and the
+        reason survives, exactly as it does for a subject that is still there.
         """
         with self._lock:
             rows = self._conn.execute(
                 "SELECT subject_type, subject_id, reason, at FROM mute "
+                "WHERE NOT EXISTS (SELECT 1 FROM gone g "
+                "                  WHERE g.subject_type = mute.subject_type "
+                "                    AND g.subject_id = mute.subject_id) "
                 "ORDER BY at, subject_id"
             ).fetchall()
             result = []
@@ -913,7 +941,13 @@ class Store:
     # `failed` rows never do -- their subject is freed through the separate
     # `supersede` TABLE instead, precisely because their own `state` is left
     # untouched.
-    _HIDDEN_STATES = ("dismissed", "muted", "superseded")
+    #
+    # `gone` joins them too, and for the sharpest version of the same reason:
+    # a subject the media server no longer holds cannot be acted on at all, so
+    # every control a working list offers for it would write to an id that is
+    # not there. It is still in the table, and `items(state=GONE)` is how the
+    # entry point draws it (see `mark_gone`).
+    _HIDDEN_STATES = ("dismissed", "muted", "superseded", GONE)
 
     def has(self, fp):
         """Whether `fp` names a row currently in a visible state — i.e. one
@@ -1039,11 +1073,20 @@ class Store:
 
         Ordered by `at` then `subject_id`, the same tie-break `items()` and
         `mutes()` use for their own listings.
+
+        A subject marked GONE is left out, for the reason `mutes()` leaves one
+        out: a refusal is a standing "a person should look at this file", and
+        there is no longer a file to look at. The `refusal` row is untouched --
+        nothing here deletes what was decided.
         """
         with self._lock:
             rows = self._conn.execute(
                 "SELECT subject_type, subject_id, path, reason, at, stores "
-                "FROM refusal ORDER BY at, subject_id"
+                "FROM refusal "
+                "WHERE NOT EXISTS (SELECT 1 FROM gone g "
+                "                  WHERE g.subject_type = refusal.subject_type "
+                "                    AND g.subject_id = refusal.subject_id) "
+                "ORDER BY at, subject_id"
             ).fetchall()
         return [
             {"subject_type": subject_type, "subject_id": subject_id,
@@ -1051,6 +1094,105 @@ class Store:
              "stores": json.loads(stores)}
             for subject_type, subject_id, path, reason, at, stores in rows
         ]
+
+    # Marking a subject the media server no longer holds
+    # ---------------------------------------------------
+    # A deleted scene leaves every decision ever made about it behind, and each
+    # of those decisions is drawn with controls that would write to an id the
+    # server does not have. Approving one fails, confusingly, because the row
+    # still reads as though the file were there.
+    #
+    # MARKED, NEVER DELETED, and that is the whole shape of this. Every other
+    # rejection here is a state rather than a deletion so the reason survives
+    # (see `dismiss`), and this one has a second argument on top: a deletion is
+    # not always permanent -- a library rebuilt can hold the same content again
+    # -- and nothing removed from this side is recoverable from it.
+    #
+    # It takes BOTH a table and a state, for the reason `supersede` needs both.
+    # The state is what hides an `item` row from the working lists; the table is
+    # the only place a subject with no `item` row at all can be recorded, and a
+    # muted or refused subject is exactly that -- `mute` and `record_refusal`
+    # are both keyed by subject and both accept one that has never had a
+    # proposal. A state alone would leave `mutes()` and `refusals()` with
+    # nothing to filter on.
+    #
+    # What this does NOT do is prune the `supersede` or `dismissal` tables. Both
+    # are keyed by fingerprint and neither is ever pruned by anything (see
+    # `dismiss`); a superseded or dismissed subject reaches its section through
+    # the `item` row's own state, which this overwrites, so it is hidden either
+    # way. The rows left behind are what keeps a re-record blocked and a
+    # subject unblocked exactly as they were.
+
+    def mark_gone(self, subject_type, subject_id, now=None):
+        """Record that `subject_type`/`subject_id` is no longer on the media
+        server, and hide every `item` row about it.
+
+        Returns whether this is the FIRST time the subject was recorded gone,
+        so a caller can report how many subjects a sweep newly marked rather
+        than how many it re-confirmed. Calling it again is not an error and
+        changes nothing -- the recorded `at` stays the moment it was first
+        noticed, which is the honest answer to "when did this go", not the
+        moment of the most recent sweep.
+
+        The `item` rows are moved to `GONE` UNCONDITIONALLY -- including the
+        `applied` and `failed` ones the terminal-state protection in
+        `dismiss`/`mute`/`supersede` deliberately leaves alone. Those exist to
+        stop a later decision erasing the record of a real write; this is not a
+        later decision about the write, it is the file the write was made to
+        going away, and a row still offering Undo for it would offer an undo
+        that cannot work. What made the protection matter is kept regardless:
+        `prior_state` (the undo snapshot, and the only record of what was
+        written) and `resolved_at` (when it was written) are both untouched --
+        this writes `state` and nothing else. `web.actions.undo` is what turns
+        the row's own honesty into a refusal a person can read.
+        """
+        subject_id = str(subject_id)
+        when = now if now is not None else _utcnow()
+        with self._lock:
+            cursor = self._conn.execute(
+                "INSERT INTO gone (subject_type, subject_id, at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(subject_type, subject_id) DO NOTHING",
+                (subject_type, subject_id, when),
+            )
+            newly = cursor.rowcount == 1
+            self._conn.execute(
+                "UPDATE item SET state = ? "
+                "WHERE subject_type = ? AND subject_id = ?",
+                (GONE, subject_type, subject_id),
+            )
+            self._conn.commit()
+        return newly
+
+    def subject_ids(self, subject_type):
+        """Every subject id of `subject_type` this store holds any decision
+        about, as a set of strings.
+
+        The input to "which of these does the media server still have". Read
+        across every table that keys a decision by subject -- `item`, `mute`
+        and `refusal` -- because each of them can hold one the others do not:
+        `mute` and `record_refusal` both accept a subject with no `item` row,
+        and a proposal exists for plenty of subjects nobody has muted.
+
+        `dismissal` is keyed by FINGERPRINT and names no subject of its own, so
+        it needs no term here: the only way a dismissal is reachable at all is
+        through the `item` row it names (that is what `items(state="dismissed")`
+        draws), and the `item` term already covers that row. The same is true of
+        `supersede`.
+
+        Subjects already marked gone are INCLUDED. This answers what the store
+        holds, not what is new -- deciding that is `mark_gone`'s return value,
+        which is the one place that can answer it without a race between the
+        read and the write.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT subject_id FROM item WHERE subject_type = ? "
+                "UNION SELECT subject_id FROM mute WHERE subject_type = ? "
+                "UNION SELECT subject_id FROM refusal WHERE subject_type = ?",
+                (subject_type, subject_type, subject_type),
+            ).fetchall()
+        return {subject_id for (subject_id,) in rows}
 
     # Every column an `item` row is READ back as, in one place, because two
     # methods now return that row to the same consumers -- `items()` for the

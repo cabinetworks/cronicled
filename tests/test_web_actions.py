@@ -58,7 +58,24 @@ class _FakeStore:
     def items(self, folder=None, state=None, limit=None, offset=0):
         if state == "dismissed":
             return [self.dismissed_item] if self.dismissed_item else []
-        return [self.item] if self.item else []
+        rows = [self.item] if self.item else []
+        if state is not None:
+            # A row is returned for the state it is ACTUALLY in, never for
+            # whichever state was asked about. Answering every explicit
+            # `state=` with the one item made this double strictly more
+            # capable than `Store.items`, and that is the shape that turns a
+            # missing feature into a passing test: `undo`'s check for a
+            # subject the media server no longer holds asks
+            # `items(state=GONE)`, and a double that answered it with a `new`
+            # row would report every proposal in the suite as gone.
+            return [row for row in rows if row["state"] == state]
+        # `state=None` is the store's default view, which hides exactly the
+        # states `Store._HIDDEN_STATES` names. Read off the store rather than
+        # listed again here: a second copy of that tuple would be free to
+        # drift, and it would drift towards this double showing `undo` a row
+        # the real one never would.
+        return [row for row in rows
+                if row["state"] not in Store._HIDDEN_STATES]
 
     def mark_applied(self, fp, prior_state=None):
         self.calls.append(("applied", fp, prior_state))
@@ -173,6 +190,79 @@ class Undo(unittest.TestCase):
         # must not come at the cost of skipping the actual restore.
         self.assertEqual(stash.calls,
                          [("revert", "42", {"title": "was"})])
+
+
+class UndoASubjectTheServerNoLongerHolds(unittest.TestCase):
+    """An applied proposal whose scene has since been deleted.
+
+    The write really happened and the snapshot really does describe the scene
+    as it was -- there is simply nothing left to restore it onto. The row is
+    kept (it is the only record of what was written), the button is gone from
+    the page, and a request that arrives anyway has to be refused with a
+    reason a person can read rather than with a stack trace against an id the
+    server does not have.
+    """
+
+    def test_it_refuses_and_names_the_missing_scene(self):
+        item = _item(state="gone", prior_state={"title": "was"})
+        store, stash = _FakeStore(item), _FakeStash()
+
+        with self.assertRaises(ValueError) as caught:
+            Actions(store, stash).undo("fp-1")
+
+        message = str(caught.exception)
+        # The subject, so the refusal names WHICH file, and the path, because
+        # that is what a person recognises it by. Both, not either: a message
+        # naming only the fingerprint is the obscure failure this replaces.
+        self.assertIn("scene", message)
+        self.assertIn("42", message)
+        self.assertIn("/l/a.mp4", message)
+        self.assertIn("no longer on the media server", message)
+
+    def test_nothing_is_written_to_the_server_or_the_store(self):
+        # HARM: reaching `revert_scene` writes to an id the server does not
+        # have, and recording a revert that never happened would leave the one
+        # record of the original write claiming it was taken back.
+        item = _item(state="gone", prior_state={"title": "was"})
+        store, stash = _FakeStore(item), _FakeStash()
+
+        with self.assertRaises(ValueError):
+            Actions(store, stash).undo("fp-1")
+
+        self.assertEqual(stash.calls, [])
+        self.assertEqual(store.calls, [])
+
+    def test_a_proposal_whose_scene_is_still_there_still_undoes(self):
+        # The other direction, and the reason this cannot be a blanket
+        # refusal: an ordinary applied row must go on reverting.
+        item = _item(state="applied", prior_state={"title": "was"})
+        store, stash = _FakeStore(item), _FakeStash()
+
+        self.assertEqual(Actions(store, stash).undo("fp-1"), "reverted")
+        self.assertEqual(stash.calls, [("revert", "42", {"title": "was"})])
+
+    def test_the_refusal_is_not_the_no_snapshot_one(self):
+        # HARM: "no snapshot was stored for it" reads as an omission somebody
+        # could go and fix. The snapshot is right there; the file is not.
+        item = _item(state="gone", prior_state={"title": "was"})
+
+        with self.assertRaises(ValueError) as caught:
+            Actions(_FakeStore(item), _FakeStash()).undo("fp-1")
+
+        self.assertNotIn("no snapshot", str(caught.exception))
+
+    def test_a_payload_with_no_path_still_names_the_subject(self):
+        # HARM: a description proposal's payload carries no `path`. Indexing
+        # it would turn this refusal into a KeyError -- the obscure failure
+        # again, arriving through the branch added to prevent it.
+        item = _item(state="gone", prior_state={"title": "was"},
+                     subject_type="performer-description",
+                     payload={"cleaned": "text", "original": "was"})
+
+        with self.assertRaises(ValueError) as caught:
+            Actions(_FakeStore(item), _FakeStash()).undo("fp-1")
+
+        self.assertIn("performer-description 42", str(caught.exception))
 
 
 class NoStashConfigured(unittest.TestCase):

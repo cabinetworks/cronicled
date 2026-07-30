@@ -588,6 +588,7 @@
 {% set dismissed = dismissed | default([]) %}
 {% set refused = refused | default([]) %}
 {% set superseded = superseded | default([]) %}
+{% set gone = gone | default([]) %}
 {% set applied = applied | default([]) %}
 {% set just_applied = just_applied | default(None) %}
 {# The one case that gets the section open on load: an approve made THIS
@@ -645,6 +646,25 @@
       <div class="acts">
         <form method="post" action="/undismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Undismiss</button></form>
       </div>
+    </div>
+  </div>
+  {% endfor %}
+{% endcall %}
+
+{# A subject the media server no longer holds. Drawn with NO controls at all,
+   and that is the point of giving it a section rather than letting it drop out
+   of every list: every control the other sections offer -- Approve, Undo,
+   Undismiss, Unmute -- would write to an id the server does not have. What is
+   left is the record: what was proposed, what it scored, and that a decision
+   was once made about a file that is not there any more. A state with nowhere
+   to render is a state that vanished. #}
+{% call section("Gone", gone, "Nothing gone.") %}
+  {% for row in gone %}
+  <div class="proposal">
+    <div class="head">
+      <div class="what">
+{{ compact_identity(row) }}      </div>
+      {{ compact_score(row) }}
     </div>
   </div>
   {% endfor %}

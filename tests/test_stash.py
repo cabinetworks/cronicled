@@ -1840,6 +1840,102 @@ class TaggedScenes(unittest.TestCase):
         self.assertEqual(t.find_filter()["per_page"], 7)
 
 
+class SceneIds(unittest.TestCase):
+    """The read that decides which stored subjects still exist.
+
+    Every assertion here is about a decision that, made wrongly, silently
+    discards a person's mutes, dismissals and refusals -- see
+    `cronicled.scan.sweep_gone`, which is what interprets what this returns.
+    """
+
+    # Ids as the server sends them, and DELIBERATELY not the shape the store
+    # keys by: a running server answers `id` as a GraphQL ID, which arrives as
+    # a string, but a fixture that only ever used strings could not tell a
+    # client that coerces from one that passes through -- and a subject id that
+    # reached the store as an int matches nothing there, so every stored
+    # decision reads as a deleted file.
+    ROWS = [{"id": "4"}, {"id": 11}, {"id": "9"}]
+
+    def test_it_asks_for_the_whole_library_in_one_request(self):
+        # HARM: any positive per_page truncates the answer, and every id past
+        # the cap is a present file this would report as deleted.
+        t = _ReadTransport(scenes=self.ROWS)
+        _read_stash(t).scene_ids()
+        self.assertEqual(t.find_filter(),
+                         {"per_page": -1, "page": 1, "sort": "id",
+                          "direction": "ASC"})
+
+    def test_it_narrows_the_library_by_nothing_at_all(self):
+        # HARM: the ENTIRE point. A scene_filter here -- `organized: False`
+        # most plausibly, copied from the pool read next door -- would answer
+        # with the unorganized set, and every organized scene in the library
+        # would then be absent from the answer and marked gone. That is
+        # thousands of present files in one sweep. The absence is
+        # load-bearing, so the absence is what is pinned.
+        t = _ReadTransport(scenes=self.ROWS)
+        _read_stash(t).scene_ids()
+        self.assertNotIn("s", t.calls[0][1])
+        self.assertNotIn("scene_filter", t.calls[0][0])
+
+    def test_it_selects_ids_and_no_other_field(self):
+        # HARM: selecting a scene's whole shape for every scene in a library
+        # is thousands of rows of payload fetched to learn one bit each. The
+        # fields are named individually rather than by comparing the query to
+        # a constant the client also reads: a shared constant moves with the
+        # code and can only ever confirm the code agrees with itself.
+        t = _ReadTransport(scenes=self.ROWS)
+        _read_stash(t).scene_ids()
+        query = t.calls[0][0]
+        self.assertIn("findScenes(", query)
+        self.assertIn("count", query)
+        self.assertIn("id", query)
+        for extravagance in ("title", "files", "basename", "path", "studio",
+                             "performers", "tags", "date"):
+            self.assertNotIn(extravagance, query)
+
+    def test_it_returns_the_servers_own_count_beside_the_ids(self):
+        # HARM: the count is the ONLY thing a caller can check the id list
+        # against. Returning `len(ids)` in its place would make the
+        # completeness guard downstream compare a number with itself and agree
+        # with every truncated read there is.
+        t = _ReadTransport(scenes=self.ROWS, count=3)
+        count, ids = _read_stash(t).scene_ids()
+        self.assertEqual(count, 3)
+        self.assertEqual(ids, ["4", "11", "9"])
+
+    def test_a_count_that_disagrees_with_the_rows_is_reported_as_it_came(self):
+        # HARM: repairing the disagreement here -- answering `len(ids)`, or
+        # raising -- destroys the one signal that says the read was partial.
+        # This method reports what the server said; deciding what a
+        # disagreement means belongs to the caller that would do the marking.
+        t = _ReadTransport(scenes=self.ROWS, count=6289)
+        count, ids = _read_stash(t).scene_ids()
+        self.assertEqual(count, 6289)
+        self.assertEqual(len(ids), 3)
+
+    def test_every_id_comes_back_as_a_string(self):
+        # HARM: the store keys a mute and a refusal by the STRING form of a
+        # subject id. An int here matches none of them, so every stored
+        # decision about a present file reads as a decision about a deleted
+        # one. `assertIs` on the type, because `11 == "11"` is False but
+        # `["11"] == [11]` failing is the same assertion made weakly.
+        t = _ReadTransport(scenes=self.ROWS)
+        _, ids = _read_stash(t).scene_ids()
+        self.assertEqual([type(one) for one in ids], [str, str, str])
+
+    def test_an_empty_library_is_an_answer_not_an_error(self):
+        # The client reports it; refusing to act on it is the caller's rule.
+        t = _ReadTransport(scenes=[], count=0)
+        self.assertEqual(_read_stash(t).scene_ids(), (0, []))
+
+    def test_a_server_error_reaches_the_caller_as_a_StashError(self):
+        # HARM: an error swallowed into an empty list here is a library that
+        # reports every scene deleted at once.
+        t = _transport([{"errors": [{"message": "no"}]}])
+        with self.assertRaises(StashError):
+            _read_stash(t).scene_ids()
+
+
 class TagIdByName(unittest.TestCase):
     def test_the_name_is_matched_exactly(self):
         # HARM: EQUALS -> MATCHES (or INCLUDES) resolves a short tag name to a

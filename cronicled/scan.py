@@ -1756,6 +1756,113 @@ def release_auto_mutes(store):
     return released
 
 
+@dataclass(frozen=True)
+class GoneSweep:
+    """What one pass of `sweep_gone` did.
+
+    `marked` is how many subjects it recorded gone for the FIRST time —
+    subjects it re-confirmed are not counted, or every night's run would
+    report the same population again as though it had just found it.
+
+    `problem` names why nothing could be decided, and is `None` only when the
+    sweep really did read the whole library. That split is the reason this is
+    a type rather than an int: `marked=0, problem=None` means "every stored
+    subject is still there", and `marked=0` with a problem means "nothing was
+    asked". Those two call for opposite responses and read identically as a
+    bare zero.
+    """
+    marked: int
+    problem: str = None
+
+
+# What a sweep says when it refuses to mark anything, spelled once. Each is a
+# statement about the READ, never about any file — see `sweep_gone`.
+GONE_READ_FAILED = "could not read the library's scene ids"
+GONE_READ_PARTIAL = "the library's scene ids came back incomplete"
+GONE_READ_EMPTY = "the library reported no scenes at all"
+
+
+def sweep_gone(stash, store, subject_type=SUBJECT_TYPE):
+    """Mark every stored subject the media server no longer holds, or refuse.
+
+    Returns a `GoneSweep`. Writes nothing to the media server and nothing to
+    the store unless it has POSITIVE evidence of a complete read.
+
+    Why this is not "not in the scan's pool"
+    ----------------------------------------
+    The pool is the unorganized scenes plus, with a marker configured, the
+    organized ones carrying that tag (see `ScanProducer._pool`). An organized
+    scene without the marker is absent from the pool and perfectly present in
+    the library — and a scene this tool applied a proposal to is organized by
+    that very act. A check built on pool membership would mark thousands of
+    present files gone. So this reads the COMPLETE id set
+    (`Stash.scene_ids`), which does not filter on `organized` at all.
+
+    The three ways it refuses, and why each is the safe direction
+    ------------------------------------------------------------
+    Every stored mute, dismissal and refusal exists so that a scan cannot
+    overrule a person. A sweep that mistook a bad read for a mass deletion
+    would hide all of them at once, from a single wrong answer, with nothing
+    to say it had happened. So:
+
+    * A RAISING read marks nothing. An error is evidence about the network,
+      not about any file — the same rule the rest of this module already
+      applies to a store that will not answer.
+    * A PARTIAL read marks nothing, and the check is positive: the number of
+      DISTINCT ids returned must equal the `count` the server itself reported.
+      Not "the response parsed", not "no error was raised" — a short list with
+      no error is indistinguishable from a complete one, and every id missing
+      from it is a present file this would mark gone. Distinct rather than
+      merely counted, because a repeated id inflates the list length to
+      `count` while leaving the SET short, which is the shape that actually
+      decides anything here.
+    * An EMPTY library marks nothing, even though `count == 0` agrees with
+      itself perfectly. A server pointed at a fresh or rebuilt database
+      answers this way, and it is the one answer that would hide a person's
+      entire history in a single sweep. A library that genuinely holds no
+      scenes loses only some tidying by being refused, which is the cheaper
+      mistake by a wide margin.
+
+    What it CANNOT catch, said plainly: a library halfway through a rebuild
+    reports a consistent count for the scenes it has so far, so this will mark
+    the rest gone. Nothing available here distinguishes that from real
+    deletions. What limits the damage is that marking is not erasing — every
+    row, reason and snapshot survives (see `Store.mark_gone`) — which is why
+    that decision is the one this depends on.
+    """
+    try:
+        count, ids = stash.scene_ids()
+    except Exception as exc:
+        # Caught broadly on purpose. The classification of a media-server
+        # failure belongs to the client (see `cronicled.stash.StashError`),
+        # and NO classification of it changes the answer here: transient or
+        # permanent, a failed read is not evidence that a file was deleted.
+        # Narrowing this would let an unexpected error type reach the caller
+        # as a dead scan instead of as a sweep that declined.
+        return GoneSweep(marked=0, problem="%s: %s: %s"
+                         % (GONE_READ_FAILED, type(exc).__name__, exc))
+    present = set(ids)
+    if len(present) != count:
+        return GoneSweep(marked=0, problem="%s (%d distinct of %d reported)"
+                         % (GONE_READ_PARTIAL, len(present), count))
+    if not present:
+        return GoneSweep(marked=0, problem=GONE_READ_EMPTY)
+    marked = 0
+    # Sorted so a run's writes happen in a stated order rather than in
+    # whatever order a set iterates in. Nothing here depends on the order --
+    # each subject is an independent row -- but a log or a database read back
+    # after the fact is easier to compare against another run's.
+    for subject_id in sorted(store.subject_ids(subject_type) - present):
+        # Accumulated from what the store reports, one subject at a time,
+        # rather than counted from the set above: `mark_gone` is the only
+        # thing that can say whether a subject was newly recorded or was
+        # already gone from an earlier run, and a count of the set would
+        # report the whole standing population every night.
+        if store.mark_gone(subject_type, subject_id):
+            marked += 1
+    return GoneSweep(marked=marked)
+
+
 def _query_key(query):
     """The form in which two queries are the SAME query.
 
@@ -2091,6 +2198,15 @@ class ScanProducer:
             ctx.log("released %d file(s) muted by the retired "
                     "unresolved-creator rule; they are examined again from "
                     "this run on" % len(released))
+        # Here, and before the pool is read, because this is the moment the
+        # library is being read anyway and because the answer must not depend
+        # on the pool: `sweep_gone` asks the server for its COMPLETE id set,
+        # which is a different question from the one `_pool` asks, and putting
+        # it after a `_pool` that RAISES (a marker naming no tag does) would
+        # skip the sweep on exactly the runs an operator is already fixing
+        # something. Not on the page-render path: a per-row call to the media
+        # server while somebody is reading a list is the wrong place for it.
+        sweep = sweep_gone(self._stash, self._store)
         scenes, marked = self._pool()
         selected, counts = select(
             scenes, store=self._store, folder=self._folder,
@@ -2229,6 +2345,24 @@ class ScanProducer:
             note = "; %d identified by fingerprint" % len(by_fingerprint)
             if box_errors:
                 note += " (box errors: %s)" % "; ".join(box_errors)
+        # The gone sweep's own note, appended to the CLOSING line and to no
+        # other, because the runner keeps exactly one message: `JobRunner._log`
+        # assigns `state.message`, so a count logged when the sweep ran would
+        # be overwritten by the first file's progress line and reach nobody.
+        # A count that drops with nobody acting reads as a bug, so the run that
+        # caused the drop has to say so where the drop is still readable.
+        #
+        # Always present, unlike `note` above, and that is the difference
+        # between the two: a fingerprint pass that did nothing did not look,
+        # whereas this sweep looks on every single run, so an absent clause
+        # here could only ever mean this code did not run. `0 marked` with no
+        # problem named is the honest report of a library nothing has been
+        # deleted from, and it is not the same statement as a sweep that could
+        # not ask -- which names its reason instead of a count.
+        if sweep.problem is None:
+            note += "; %d marked gone" % sweep.marked
+        else:
+            note += "; nothing marked gone (%s)" % sweep.problem
         # Reported beside `lookups` rather than folded into it: these are the
         # queries the per-title FALLBACK issued, one per (file, store) for
         # files the cheap pass could not resolve, and a person weighing the
