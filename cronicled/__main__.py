@@ -8,7 +8,7 @@ are deliberately separate registrations:
   they typed and `reregister`s it, per click, under `ScanProducer.name`;
 - `cronicled.schedule.Scheduler`, ticking in the background, which starts
   `runscan.SCHEDULED_SCAN_NAME` — its own registration, its own declared
-  cadence, and no file limit.
+  appointment, and no file limit.
 
 They share the `scraping` cost class, so the runner serialises them: an
 unattended scan and a manual one never scrape the media server at once, and
@@ -40,22 +40,24 @@ other two.
 
 import argparse
 import os
+from datetime import time
 
 from . import performer_tags, tag_hygiene, tags
 from .adapters.registry import default_adapters_path, load_adapters
-from .config import (CONFIG_DIR_ENV_VAR, config_dir, load_marker_tag,
-                     load_schedule)
+from .config import (CONFIG_DIR_ENV_VAR, ZONE_ENV_VAR, config_dir,
+                     load_marker_tag, load_schedule, load_zone)
 from .descriptions import DescriptionProducer
 from .jobs import JobRunner
-from .runscan import DAILY, build_scheduled_producer
-from .schedule import Scheduler
+from .runscan import build_scheduled_producer
+from .schedule import Scheduler, check_zone
 from .store import Store
 from .stash import Stash
 from .tags import TagMergeProducer
 from .web.actions import Actions
 from .web.app import DEFAULT_HOST, DEFAULT_PORT, serve
 from .web.rows import (to_merge_rows, to_mute_rows, to_reconcile_rows,
-                        to_refusal_rows, to_rows, to_unused_groups)
+                        to_refusal_rows, to_rows, to_schedule_view,
+                        to_unused_groups)
 
 # The subject types the scene/description row builders cannot draw. `to_rows`
 # dispatches between a scene row and a performer-description row and has no
@@ -74,17 +76,31 @@ _OWN_SECTION_SUBJECTS = (tags.SUBJECT_TYPE, performer_tags.SUBJECT_TYPE,
 # and that answer is printed rather than dropped.
 SCHEDULER_SHUTDOWN_TIMEOUT = 10.0
 
-# How often the unattended tag-merge pass declares itself due, in seconds.
-# An INTERVAL measured from its last recorded run, exactly like the scan's
-# own cadence (see `cronicled.runscan.DAILY`) and with the same accepted
-# drift. Daily rather than more often because the thing it looks for -- two
-# spellings of one tag -- appears when somebody adds a tag by hand, which is
-# not an hourly event; and because a person has to approve every merge
-# anyway, so finding one sooner buys nothing.
-TAG_MERGE_EVERY = 86400
+# The two unattended appointments this module decides, as wall-clock times read
+# in the zone `cronicled.config.load_zone` names. The third is the scan's, and
+# it belongs to the module that builds it
+# (`cronicled.runscan.SCHEDULED_SCAN_AT`, 03:00).
+#
+# ALL THREE ARE DIFFERENT TIMES, and the stagger is the point rather than a
+# detail -- see `build_scheduler` for what firing together would cost and for
+# why the scan goes first.
+#
+# Twenty minutes apart rather than five, so that the gap is longer than the two
+# passes decided here actually take -- each is one read of the library and then
+# text work -- and short enough that all three still happen in the same small
+# hours.
+#
+# The residual, stated rather than claimed away: a scan of a large library can
+# run past 03:40, so the appointments being apart does not GUARANTEE the runs
+# are. What the stagger delivers is that they do not begin together, which is
+# the part a schedule can promise; bounding a run's duration is something this
+# project deliberately does not claim anywhere (see `schedule.Scheduler`).
+DESCRIPTIONS_AT = time(3, 20)
+TAG_MERGE_AT = time(3, 40)
 
 
-def build_scheduler(runner, store, stash, adapters, env=None, marker=None):
+def build_scheduler(runner, store, stash, adapters, *, zone, env=None,
+                    marker=None):
     """Register the unattended producers, then resolve a schedule over them.
 
     **The order of the two statements below is the whole of this function.**
@@ -112,6 +128,52 @@ def build_scheduler(runner, store, stash, adapters, env=None, marker=None):
     the thing not scheduled -- rather than the three being one all-or-nothing
     decision, which would have left two producers with a perfectly good reason
     to run silently unregistered.
+
+    THE THREE APPOINTMENTS ARE STAGGERED, AND WHY
+    ---------------------------------------------
+    Each of the three declares a stated time of day rather than a 24-hour
+    interval, so the hour stops depending on when the service was last
+    restarted. They are 03:00, 03:20 and 03:40 -- deliberately three different
+    times, never one.
+
+    What firing together would cost is NOT that they queue. It is worth being
+    exact about this, because "the cost classes will serialise them" is the
+    reassurance that sounds right and is wrong here: the three sit in three
+    DIFFERENT classes -- the scan in `scraping`, the description pass in
+    `local`, the tag pass in `box` -- and `jobs.COST_CLASS_LIMITS` counts each
+    class on its own. So one appointment for all three would genuinely start
+    all three at once, and the two limits of one would each be satisfied while
+    doing nothing whatever about the overlap.
+
+    That overlap is exactly what those limits exist to prevent, one class at a
+    time: the comment on `COST_CLASS_LIMITS` says `scraping` and `box` are both
+    capped at one because each drives a headless browser inside the media
+    server, and a second one running alongside thrashes it and makes both
+    slower rather than faster. Two of these three are those two classes. A
+    single 03:00 would hand the media server precisely the concurrency the
+    limits were written to deny it, through the one door they cannot watch.
+
+    The scan goes FIRST, and that is the order rather than an arbitrary
+    tie-break: what it proposes -- studios, performers, tags attached to
+    scenes -- is the material the other two pass over. A person still has to
+    approve any of it, so the dependency is not same-night, but where an order
+    has to be chosen this is the direction that makes sense of it, and the
+    reverse would have the two vocabulary passes reading a library the night's
+    scan had not looked at yet.
+
+    Note what the stagger does NOT rely on. A producer refused because its
+    class is busy is skipped, not queued, and it is not recorded as having run
+    -- so it stays due and the next tick starts it, a minute later rather than
+    a day. Staggering makes that path rare; the schedule survives it either
+    way, which is the property worth having.
+
+    `zone` is the `tzinfo` all three appointments are read in, and it is
+    REQUIRED. It comes from the one setting the PAGE also renders its
+    timestamps in (`cronicled.config.load_zone`, resolved once in `main`
+    below), because a page saying 3am while a pass runs at a different 3am is
+    worse than either being wrong alone -- the page would be evidence for the
+    schedule an operator was trying to check. No default here: a second place
+    deciding the zone is the disagreement itself.
 
     Returns `None`, having said why, only when there is nothing to schedule at
     all, which is an install with no media server: every producer here reads
@@ -149,19 +211,18 @@ def build_scheduler(runner, store, stash, adapters, env=None, marker=None):
         # First. See this function's docstring for what building the scheduler
         # ahead of this line costs, and why nothing would report it.
         runner.register(build_scheduled_producer(stash, adapters, store,
-                                                 marker=marker))
-    # The description pass, which wants nothing but the server. Its cadence is
-    # passed HERE rather than defaulted inside the producer, for the reason
-    # `build_scheduled_producer` passes the scan's: a producer with no cadence
+                                                 marker=marker, zone=zone))
+    # The description pass, which wants nothing but the server. Its appointment
+    # is passed HERE rather than defaulted inside the producer, for the reason
+    # `build_scheduled_producer` passes the scan's: a producer with no schedule
     # is what `resolve` refuses, and defaulting to the refusal would make
-    # forgetting the argument look like a decision. Daily, the same interval
-    # the scan runs on -- there is no reason for a whole-library text pass
-    # that issues one query to run more rarely than the scan beside it.
-    runner.register(DescriptionProducer(stash, every=DAILY))
+    # forgetting the argument look like a decision. Twenty minutes after the
+    # scan, never the same time -- see this function's docstring.
+    runner.register(DescriptionProducer(stash, at=DESCRIPTIONS_AT, zone=zone))
     # The tag-merge pass, which wants nothing but the server either, and for
-    # the same reason carries its cadence in from here.
-    runner.register(TagMergeProducer(stash, store=store,
-                                     every=TAG_MERGE_EVERY))
+    # the same reason carries its appointment in from here. Last of the three.
+    runner.register(TagMergeProducer(stash, store=store, at=TAG_MERGE_AT,
+                                     zone=zone))
     # Last, so `resolve` can see the producers above and read each one's
     # declared cadence off it. Overrides come from the operator's own config
     # and are validated by `resolve`, at this line, where a typo is a start-up
@@ -260,6 +321,24 @@ def main(argv=None):
     # adapters.json is.
     marker = load_marker_tag(env=env)
 
+    # ONE zone, resolved once, for two jobs: the hour each unattended pass
+    # keeps, and the hour every timestamp on the page is shown in. Read with
+    # the same `env` as everything above, and validated HERE rather than
+    # wherever it is first used -- an unknown name is a stack trace before the
+    # service is listening, which is the difference between an operator fixing
+    # a typo and a tick raising at 3am for as long as nobody looks.
+    #
+    # `check_zone` is `resolve`'s own rule for an override's `zone`, not a
+    # second one: the page and the schedule reading one setting is only worth
+    # anything if they agree about which names it may hold.
+    #
+    # Not resolved inside `build_scheduler`, which returns `None` on an install
+    # with no media server: the page still renders there, still shows
+    # timestamps, and a zone validated only on the path that builds a schedule
+    # would be unchecked on exactly the install that has no schedule to check
+    # it.
+    zone = check_zone(load_zone(env=env), "$%s" % ZONE_ENV_VAR)
+
     # AFTER the load, and reporting what the load produced. Printed before
     # it, this line announced a config directory in good health on every one
     # of the malformed configs above -- the log read as though everything was
@@ -279,6 +358,15 @@ def main(argv=None):
     # the outside. Two files, both named, so "which database is this reading"
     # is answered by the start-up line rather than by guessing at the flag.
     print("database: %s" % args.db)
+    # ALWAYS printed, unlike the marker line above, and that asymmetry is the
+    # point: there is no such thing as "no zone configured" here -- an install
+    # that names none keeps its appointments in UTC and shows its timestamps in
+    # UTC, which is a decision with consequences rather than an absence. An
+    # operator wondering why the overnight passes ran at 4am reads this line and
+    # has their answer; a line printed only when the setting was written would
+    # be silent for exactly the install that got it wrong.
+    print("zone: %s (the unattended passes run overnight in it, and every "
+          "time on the page is shown in it)" % zone)
 
     store = Store(args.db)
     if args.server:
@@ -389,7 +477,7 @@ def main(argv=None):
         return to_unused_groups(seen, base_url=base_url)
 
     scheduler = build_scheduler(runner, store, stash, adapters, env=env,
-                                marker=marker)
+                                marker=marker, zone=zone)
     if scheduler is not None:
         scheduler.start()
 
@@ -404,10 +492,14 @@ def main(argv=None):
               merges=_merge_rows,
               reconciles=_reconcile_rows,
               unused=_unused_groups,
+              # `zone` here and on the schedule view below are the SAME object
+              # the three appointments were declared in, threaded from the one
+              # read in `main` -- never re-read here, which would be a second
+              # chance for the page and the schedule to disagree.
               muted=lambda: to_mute_rows(
                   [m for m in store.mutes()
                    if m["subject_type"] not in _OWN_SECTION_SUBJECTS],
-                  base_url=base_url),
+                  base_url=base_url, zone=zone),
               dismissed=lambda: to_rows(_scene_items("dismissed"),
                                         base_url=base_url),
               refused=lambda: to_refusal_rows(store.refusals(),
@@ -419,8 +511,13 @@ def main(argv=None):
               actions=actions, scan_status=actions.scan_status,
               # `None` when nothing is scheduled, which the page says out
               # loud rather than drawing as a healthy idle schedule.
+              # `to_schedule_view` converts the loop's own timestamps -- and
+              # the ones inside the reasons it reports -- into the configured
+              # zone; the loop keeps recording them in UTC, which is what the
+              # store compares against.
               schedule_status=(None if scheduler is None
-                               else scheduler.status),
+                               else lambda: to_schedule_view(
+                                   scheduler.status(), zone=zone)),
               host=args.host, port=args.port)
     finally:
         # In a `finally`, so a `serve` that raises still stops the loop

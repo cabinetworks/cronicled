@@ -1,6 +1,9 @@
 import unittest
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
+from cronicled.schedule import LoopStatus, TickResult
 from cronicled.scan import _runners_up, candidate_url
 from cronicled.scoring import Match
 from cronicled.tag_descriptions import Found
@@ -9,10 +12,23 @@ from cronicled.tags import MERGE_IS_IRREVERSIBLE, UNDECIDED_MANY, cluster_tags
 from cronicled.tags import proposal as tag_proposal
 from cronicled.web.rows import (
     IDENTIFIED_SCORE_TEXT, KIND_DESCRIPTION, KIND_SCENE, KIND_TAG_DESCRIPTION,
-    STORE_ANSWERED, STORE_EMPTY, STORE_FAILED, Row, scene_url, tag_url,
-    to_description_row, to_merge_row, to_merge_rows, to_mute_row, to_mute_rows,
-    to_refusal_row, to_refusal_rows, to_row, to_rows, to_tag_description_row,
+    STORE_ANSWERED, STORE_EMPTY, STORE_FAILED, Row, local, local_times,
+    scene_url, tag_url, to_description_row, to_merge_row, to_merge_rows,
+    to_mute_row, to_mute_rows, to_refusal_row, to_refusal_rows, to_row,
+    to_rows, to_schedule_view, to_tag_description_row,
 )
+
+# A REAL zone that observes daylight saving, and one whose offset differs from
+# UTC on BOTH sides of every transition (+01:00 in winter, +02:00 in summer).
+# Both properties are load-bearing and neither is decoration:
+#
+# - a fixed-offset zone would let an implementation that adds a constant pass
+#   every assertion here, however carefully they were written;
+# - a zone whose winter offset is zero (Europe/Lisbon, say) would make a
+#   winter-dated assertion identical to leaving the timestamp in UTC, so half
+#   the tests below would go on passing against a renderer that converted
+#   nothing at all.
+ZONE = ZoneInfo("Europe/Madrid")
 
 
 def _real_runners_up(losers, winner_title="The Lantern Room",
@@ -420,7 +436,7 @@ class ToMuteRowTest(unittest.TestCase):
                                        "image": None, "performers": [],
                                        "studio": None,
                                        "urls": ["https://store.example/l"]}})),
-            base_url="http://media.example")["row"]
+            base_url="http://media.example", zone=ZONE)["row"]
 
         self.assertEqual(row.kind, KIND_SCENE)
         self.assertEqual(row.filename, "nine-winters-the-lantern-room.mp4")
@@ -442,7 +458,7 @@ class ToMuteRowTest(unittest.TestCase):
             {"subject_type": "performer", "subject_id": "7",
              "reason": "leave this one alone", "at": "2026-07-27T00:00:00",
              "item": _description_item()},
-            base_url="http://media.example")["row"]
+            base_url="http://media.example", zone=ZONE)["row"]
 
         self.assertEqual(row.kind, KIND_DESCRIPTION)
         self.assertEqual(row.name, "Wren Alderly")
@@ -455,7 +471,8 @@ class ToMuteRowTest(unittest.TestCase):
         # of empty fields -- blank fields read as a page that failed to
         # render, and this case is real and must go on saying so. Marking it
         # visibly as the exception is the template's job, not this one's.
-        self.assertIsNone(to_mute_row(self._entry(item=None))["row"])
+        self.assertIsNone(to_mute_row(self._entry(item=None),
+                                     zone=ZONE)["row"])
 
     def test_an_item_that_cannot_answer_raises_rather_than_reading_as_none(self):
         # `Store.mutes()` answers either `None` -- nothing was ever proposed
@@ -465,10 +482,10 @@ class ToMuteRowTest(unittest.TestCase):
         # over a subject that HAS one: a real proposal hidden behind a
         # sentence saying there is none, which is worse than the crash.
         with self.assertRaises(KeyError):
-            to_mute_row(self._entry(item={}))
+            to_mute_row(self._entry(item={}), zone=ZONE)
 
     def test_carries_the_subject_reason_and_when(self):
-        row = to_mute_row(self._entry())
+        row = to_mute_row(self._entry(), zone=ZONE)
         self.assertEqual(row["subject_type"], "scene")
         self.assertEqual(row["subject_id"], "1")
         self.assertEqual(row["reason"], "never identifiable")
@@ -478,23 +495,24 @@ class ToMuteRowTest(unittest.TestCase):
         # Read by the no-item branch, which has no row to take an address
         # from and still knows which subject it is.
         row = to_mute_row(self._entry(subject_id="9"),
-                          base_url="http://media.example")
+                          base_url="http://media.example", zone=ZONE)
         self.assertEqual(row["subject_url"], "http://media.example/scenes/9")
 
     def test_a_muted_performer_with_no_item_links_to_the_performer_page(self):
         row = to_mute_row(
             {"subject_type": "performer", "subject_id": "7", "reason": "r",
-             "at": "t", "item": None}, base_url="http://media.example")
+             "at": "t", "item": None}, base_url="http://media.example",
+            zone=ZONE)
         self.assertEqual(row["subject_url"],
                          "http://media.example/performers/7")
 
     def test_has_no_scene_url_without_a_configured_server(self):
-        row = to_mute_row(self._entry())
+        row = to_mute_row(self._entry(), zone=ZONE)
         self.assertIsNone(row["subject_url"])
 
     def test_to_mute_rows_converts_every_entry_and_keeps_their_order(self):
         entries = [self._entry(subject_id="1"), self._entry(subject_id="2")]
-        rows = to_mute_rows(entries)
+        rows = to_mute_rows(entries, zone=ZONE)
         self.assertEqual([r["subject_id"] for r in rows], ["1", "2"])
 
     def test_a_payload_missing_its_path_raises_rather_than_hiding_the_filename(self):
@@ -503,7 +521,7 @@ class ToMuteRowTest(unittest.TestCase):
         broken = _item()
         del broken["payload"]["path"]
         with self.assertRaises(KeyError):
-            to_mute_row(self._entry(item=broken))
+            to_mute_row(self._entry(item=broken), zone=ZONE)
 
 
 class CoverImage(unittest.TestCase):
@@ -1380,3 +1398,301 @@ class MergeRowShape(unittest.TestCase):
         rows = to_merge_rows([_merge_item(fingerprint="a"),
                               _merge_item(fingerprint="b")])
         self.assertEqual([r.fingerprint for r in rows], ["a", "b"])
+
+
+# Every value below was computed by hand from the zone's own offsets and is
+# written out in full, never derived by calling the code under test. Madrid is
+# +01:00 in winter and +02:00 in summer; its 2026 transitions are 29 March
+# (02:00 -> 03:00) and 25 October (03:00 -> 02:00).
+_WINTER_UTC = "2026-01-15T00:30:00+00:00"
+_WINTER_LOCAL = "2026-01-15T01:30:00+01:00"
+_SUMMER_UTC = "2026-07-15T00:30:00+00:00"
+_SUMMER_LOCAL = "2026-07-15T02:30:00+02:00"
+# The repeated hour, both readings of it. TWO DIFFERENT INSTANTS an hour apart
+# whose local wall clocks both say 02:30, told apart by nothing but the offset.
+_REPEATED_FIRST_UTC = "2026-10-25T00:30:00+00:00"
+_REPEATED_FIRST_LOCAL = "2026-10-25T02:30:00+02:00"
+_REPEATED_SECOND_UTC = "2026-10-25T01:30:00+00:00"
+_REPEATED_SECOND_LOCAL = "2026-10-25T02:30:00+01:00"
+
+
+class LocalTimestamps(unittest.TestCase):
+    """`local` relabels a stored UTC instant in the configured zone. It never
+    moves the instant, and nothing it returns goes back into a write.
+    """
+
+    def test_a_winter_stamp_takes_the_winter_offset(self):
+        self.assertEqual(local(_WINTER_UTC, ZONE), _WINTER_LOCAL)
+
+    def test_a_summer_stamp_takes_the_summer_offset(self):
+        # The pair is the test. One date cannot tell a zone's offset from a
+        # constant, however exactly the expected value is written out: an
+        # implementation adding a fixed hour passes the winter case above and
+        # fails here, and one adding two passes here and fails there.
+        self.assertEqual(local(_SUMMER_UTC, ZONE), _SUMMER_LOCAL)
+
+    def test_the_two_offsets_it_produces_actually_differ(self):
+        # The discriminating assertion behind the pair, stated rather than
+        # left implicit: if these two ever agreed, both tests above would be
+        # pinning one offset twice and the zone would be doing nothing.
+        self.assertNotEqual(local(_WINTER_UTC, ZONE)[-6:],
+                            local(_SUMMER_UTC, ZONE)[-6:])
+
+    def test_an_instant_that_crosses_midnight_moves_the_date_too(self):
+        # 23:30 UTC on the 14th is 01:30 on the 15th in a zone two hours
+        # ahead. A renderer that swapped the offset text without converting
+        # would leave the date on the 14th and read plausibly.
+        self.assertEqual(local("2026-07-14T23:30:00+00:00", ZONE),
+                         "2026-07-15T01:30:00+02:00")
+
+    def test_the_hour_a_clock_repeats_stays_two_distinguishable_instants(self):
+        # WHY STORAGE STAYS UTC, shown rather than argued. These are two real
+        # instants an hour apart. Their local wall clocks are the same text.
+        # What still tells them apart after conversion is the offset -- and
+        # that is precisely what a local time written into the database would
+        # not have kept, leaving two rows nothing could order.
+        first = local(_REPEATED_FIRST_UTC, ZONE)
+        second = local(_REPEATED_SECOND_UTC, ZONE)
+        self.assertEqual(first, _REPEATED_FIRST_LOCAL)
+        self.assertEqual(second, _REPEATED_SECOND_LOCAL)
+        self.assertEqual(first[:19], second[:19])
+        self.assertNotEqual(first, second)
+
+    def test_the_instant_is_never_moved_only_relabelled(self):
+        # Not a vacuous `x == convert(x)` shape: the two sides are read by
+        # different means -- one is the string this produced, parsed back; the
+        # other is the stamp that went in, parsed by the store's own rule.
+        self.assertEqual(
+            datetime.fromisoformat(local(_SUMMER_UTC, ZONE)),
+            datetime.fromisoformat(_SUMMER_UTC))
+
+    def test_a_stamp_with_no_offset_is_shown_exactly_as_stored(self):
+        # It names no instant, so converting it would mean assuming one and
+        # then shifting it -- putting an hour on the page that was never
+        # recorded anywhere. Verbatim is the honest answer, and it looks
+        # unlike the rows around it, which is the signal that matters.
+        self.assertEqual(local("2026-07-15T00:30:00", ZONE),
+                         "2026-07-15T00:30:00")
+
+    def test_something_that_is_not_a_timestamp_comes_back_untouched(self):
+        self.assertEqual(local("never", ZONE), "never")
+        self.assertIsNone(local(None, ZONE))
+
+    def test_a_datetime_is_accepted_as_well_as_a_string(self):
+        self.assertEqual(
+            local(datetime(2026, 7, 15, 0, 30, tzinfo=timezone.utc), ZONE),
+            _SUMMER_LOCAL)
+
+    def test_the_zone_is_required_and_cannot_be_forgotten_into_utc(self):
+        # A default would hand a caller who forgot it UTC, which is the exact
+        # output of the conversion not existing -- so the mistake would look
+        # like the feature working.
+        with self.assertRaises(TypeError):
+            local(_SUMMER_UTC)
+
+
+class LocalTimestampsInsideProse(unittest.TestCase):
+    """`local_times` rewrites the instants inside the sentences the scheduler
+    hands the page ("last ran ...; next due at ..."), because a page where one
+    line reads in the operator's hour and the next reads in UTC is worse than
+    one that reads entirely in UTC: the reader cannot tell which is which.
+    """
+
+    def test_every_instant_in_a_sentence_is_converted_not_just_the_first(self):
+        # BOTH, and this is the shape of the failure the class exists for: a
+        # substitution that stopped after one match would leave the sentence
+        # half in each zone and read perfectly well.
+        self.assertEqual(
+            local_times("last ran %s; next due at %s"
+                        % (_WINTER_UTC, _SUMMER_UTC), ZONE),
+            "last ran %s; next due at %s" % (_WINTER_LOCAL, _SUMMER_LOCAL))
+
+    def test_the_text_around_them_is_left_alone(self):
+        self.assertEqual(
+            local_times("last ran %s; next due at %s" % (_SUMMER_UTC,
+                                                         _SUMMER_UTC), ZONE),
+            "last ran %s; next due at %s" % (_SUMMER_LOCAL, _SUMMER_LOCAL))
+
+    def test_a_reason_with_no_instant_in_it_is_unchanged(self):
+        self.assertEqual(local_times("disabled by override", ZONE),
+                         "disabled by override")
+        self.assertEqual(
+            local_times("cost class saturated: already running as job 3", ZONE),
+            "cost class saturated: already running as job 3")
+
+    def test_a_naive_stamp_inside_prose_is_left_as_it_was_written(self):
+        # The same rule `local` applies to a field: a stamp with no offset
+        # names no instant. Here it also protects against rewriting something
+        # that is not a timestamp at all, such as a version or a path.
+        self.assertEqual(local_times("last ran 2026-07-15T00:30:00", ZONE),
+                         "last ran 2026-07-15T00:30:00")
+
+    def test_an_instant_written_with_z_is_converted_too(self):
+        self.assertEqual(local_times("last ran 2026-07-15T00:30:00Z", ZONE),
+                         "last ran %s" % _SUMMER_LOCAL)
+
+    def test_nothing_and_an_empty_string_survive(self):
+        self.assertIsNone(local_times(None, ZONE))
+        self.assertEqual(local_times("", ZONE), "")
+
+
+class MuteRowTimestamps(unittest.TestCase):
+    def _entry(self, at):
+        return {"subject_type": "scene", "subject_id": "1",
+                "reason": "never identifiable", "at": at, "item": None}
+
+    def test_the_muted_time_is_shown_in_the_configured_zone(self):
+        self.assertEqual(to_mute_row(self._entry(_SUMMER_UTC),
+                                     zone=ZONE)["at"], _SUMMER_LOCAL)
+
+    def test_it_holds_across_a_transition_and_not_on_one_offset(self):
+        self.assertEqual(to_mute_row(self._entry(_WINTER_UTC),
+                                     zone=ZONE)["at"], _WINTER_LOCAL)
+
+    def test_every_row_is_converted_and_not_only_the_first(self):
+        # A counting fixture of one cannot tell "converts the list" from
+        # "converts the head of the list", so there are two -- and they carry
+        # DIFFERENT stamps, so a builder that converted the first and reused
+        # its answer for the rest would fail here as well.
+        rows = to_mute_rows([self._entry(_WINTER_UTC),
+                             self._entry(_SUMMER_UTC)], zone=ZONE)
+        self.assertEqual([r["at"] for r in rows],
+                         [_WINTER_LOCAL, _SUMMER_LOCAL])
+
+
+def _status(**over):
+    """A `LoopStatus` the loop could really have produced, built from the real
+    dataclasses rather than a hand-written stand-in.
+
+    A double here would be free to carry a field `LoopStatus` does not have --
+    or to lack one it does -- and `to_schedule_view` uses
+    `dataclasses.replace`, which would then either raise in production or
+    silently pass a field through unconverted in the test.
+    """
+    fields = dict(
+        running=True, closed=False, ticks=7, failures=1,
+        consecutive_failures=0,
+        last_tick_at=_SUMMER_UTC,
+        last_error="ValueError: nothing passed by %s" % _WINTER_UTC,
+        last_error_at=_WINTER_UTC,
+        last_traceback="Traceback...\n  at %s" % _WINTER_UTC,
+        failing_to_start={"tag-merge": 3},
+        last_result=TickResult(
+            at=_SUMMER_UTC,
+            due=["nightly-library-scan"],
+            started={"nightly-library-scan": "job-1"},
+            skipped={"performer-descriptions":
+                     "last ran %s; next due at %s" % (_WINTER_UTC,
+                                                      _SUMMER_UTC),
+                     "tag-merge": "disabled by override"},
+            failed_to_start={"tag-merge":
+                             "RuntimeError: closed at %s" % _WINTER_UTC}),
+    )
+    fields.update(over)
+    return LoopStatus(**fields)
+
+
+class ScheduleViewTimestamps(unittest.TestCase):
+    """Every time the Schedule section shows, in the configured zone.
+
+    FIVE places carry one, not one place, and they are asserted together for
+    the reason the acceptance criterion names: a test reading `last_tick_at`
+    alone would pass while every reason underneath it stayed in UTC, which is
+    the half an operator actually reads when asking why something has not run.
+    """
+
+    def test_the_last_tick_is_shown_in_the_zone(self):
+        self.assertEqual(to_schedule_view(_status(), zone=ZONE).last_tick_at,
+                         _SUMMER_LOCAL)
+
+    def test_the_last_error_time_is_shown_in_the_zone(self):
+        self.assertEqual(to_schedule_view(_status(), zone=ZONE).last_error_at,
+                         _WINTER_LOCAL)
+
+    def test_the_error_message_carries_its_own_instant_converted(self):
+        # `schedule._previous_occurrence` and `due` both name an instant in
+        # the message they raise with, and the page prints that message beside
+        # the time it happened -- the two disagreeing by an offset is the
+        # confusion this whole change exists to remove.
+        self.assertEqual(to_schedule_view(_status(), zone=ZONE).last_error,
+                         "ValueError: nothing passed by %s" % _WINTER_LOCAL)
+
+    def test_the_moment_the_tick_decided_against_is_shown_in_the_zone(self):
+        view = to_schedule_view(_status(), zone=ZONE)
+        self.assertEqual(view.last_result.at, _SUMMER_LOCAL)
+
+    def test_the_reason_a_producer_was_skipped_is_shown_in_the_zone(self):
+        view = to_schedule_view(_status(), zone=ZONE)
+        self.assertEqual(
+            view.last_result.skipped,
+            {"performer-descriptions":
+             "last ran %s; next due at %s" % (_WINTER_LOCAL, _SUMMER_LOCAL),
+             "tag-merge": "disabled by override"})
+
+    def test_the_reason_a_producer_would_not_start_is_shown_in_the_zone(self):
+        view = to_schedule_view(_status(), zone=ZONE)
+        self.assertEqual(view.last_result.failed_to_start,
+                         {"tag-merge":
+                          "RuntimeError: closed at %s" % _WINTER_LOCAL})
+
+    def test_no_section_is_left_in_utc(self):
+        # The whole-shape assertion behind the six above: every field of the
+        # view, at once, against values computed by hand. A field added to
+        # `LoopStatus` and forgotten here shows up as a difference rather than
+        # as a line that quietly stayed in UTC on the page.
+        view = to_schedule_view(_status(), zone=ZONE)
+        self.assertEqual(asdict(view), {
+            "running": True, "closed": False, "ticks": 7, "failures": 1,
+            "consecutive_failures": 0,
+            "last_tick_at": _SUMMER_LOCAL,
+            "last_error": "ValueError: nothing passed by %s" % _WINTER_LOCAL,
+            "last_error_at": _WINTER_LOCAL,
+            # The one field deliberately NOT converted, and the only one the
+            # template does not render: frames are read as they were recorded.
+            "last_traceback": "Traceback...\n  at %s" % _WINTER_UTC,
+            "failing_to_start": {"tag-merge": 3},
+            "last_result": {
+                "at": _SUMMER_LOCAL,
+                "due": ["nightly-library-scan"],
+                "started": {"nightly-library-scan": "job-1"},
+                "skipped": {
+                    "performer-descriptions":
+                        "last ran %s; next due at %s" % (_WINTER_LOCAL,
+                                                         _SUMMER_LOCAL),
+                    "tag-merge": "disabled by override"},
+                "failed_to_start": {
+                    "tag-merge":
+                        "RuntimeError: closed at %s" % _WINTER_LOCAL},
+            },
+        })
+
+    def test_the_loops_own_record_is_not_touched(self):
+        # The direction that matters: this builds a copy for the page. The
+        # values the scheduler goes on comparing against the store stay in UTC
+        # however often the page is drawn.
+        status = _status()
+        to_schedule_view(status, zone=ZONE)
+        self.assertEqual(status.last_tick_at, _SUMMER_UTC)
+        self.assertEqual(status.last_result.at, _SUMMER_UTC)
+        self.assertEqual(status.last_result.skipped["performer-descriptions"],
+                         "last ran %s; next due at %s" % (_WINTER_UTC,
+                                                          _SUMMER_UTC))
+
+    def test_the_same_type_comes_back_so_the_template_keeps_every_field(self):
+        view = to_schedule_view(_status(), zone=ZONE)
+        self.assertIsInstance(view, LoopStatus)
+        self.assertIsInstance(view.last_result, TickResult)
+
+    def test_nothing_scheduled_stays_nothing_scheduled(self):
+        # `None` is the answer for an install with no media server, which the
+        # page says out loud rather than drawing as a healthy idle schedule.
+        self.assertIsNone(to_schedule_view(None, zone=ZONE))
+
+    def test_a_loop_that_has_not_ticked_yet_converts_nothing_and_survives(self):
+        view = to_schedule_view(
+            _status(last_tick_at=None, last_error=None, last_error_at=None,
+                    last_traceback=None, last_result=None), zone=ZONE)
+        self.assertIsNone(view.last_tick_at)
+        self.assertIsNone(view.last_error_at)
+        self.assertIsNone(view.last_result)
+        self.assertEqual(view.ticks, 7)

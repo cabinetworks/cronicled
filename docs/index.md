@@ -44,7 +44,7 @@ flowchart TD
     end
 
     subgraph configuration["Configuration, read from the operator's files"]
-        config["config<br/>server connection, config_dir"]
+        config["config<br/>server connection, config_dir, the zone"]
     end
 
     stash["stash<br/>the media server's GraphQL API"]
@@ -315,6 +315,27 @@ the person who configured it thinks in their own hour, so a stated time with no
 zone refuses to load rather than keeping an appointment several hours from the
 one asked for. Both forms coexist; an entry naming both is refused when the
 schedule is wired up, as a contradiction rather than a precedence rule.
+
+The three unattended passes DECLARE stated times — 03:00, 03:20 and 03:40 in the
+zone `$CRONICLED_ZONE` names (UTC when it names none). Three times rather than
+one, and the reason is worth stating exactly, because the reassurance that
+sounds right is wrong: the cost classes would not serialise them. The three sit
+in three different classes, each counted on its own, so a single 03:00 would
+genuinely start all three at once — and two of the three drive the media
+server's headless browser, which is precisely the concurrency `scraping` and
+`box` cap at one job each. The scan goes first, because what it proposes is the
+material the other two pass over. An operator's override still wins over any of
+this: the declaration is a default, not a policy.
+
+That one zone setting is also the zone the PAGE reads in. One setting rather
+than two because the two disagreeing is worse than either being wrong: a page
+saying 3am while a pass runs at a different 3am is evidence for the schedule
+somebody is trying to check. The conversion is one direction only. Stored
+timestamps are UTC and stay UTC, and `cronicled.web.rows.local` converts on the
+way out — a rendering in the wrong hour is wrong on a screen and one edit fixes
+it, while a local time in the database is unrecoverable: in the hour a clock
+puts back, two rows an hour apart carry the same text and nothing afterwards can
+order them.
 
 The two cases that break a naive implementation are decided, and each is a
 plain unit test because `now` is an argument here. **A machine off across the

@@ -1965,7 +1965,7 @@ class ScanProducer:
     def __init__(self, stash, sources, *, store, folder="library", limit=None,
                  name_filter=None, threshold=DEFAULT_THRESHOLD, aliases=None,
                  workers=4, enrich=None, identify=None, marker=None,
-                 name=None, every=None):
+                 name=None, every=None, at=None, zone=None):
         if workers < 1:
             # A pool of nothing would do nothing at all, forever. Refuse it
             # where the mistake was made rather than on a background thread
@@ -2029,6 +2029,14 @@ class ScanProducer:
         # value that was decided, never an attribute that happens to be
         # missing.
         self.every = every
+        # The other way of saying when, and the one an unattended scan uses:
+        # `at` is a stated time of day and `zone` the zone it is read in, both
+        # read off this object by `cronicled.schedule.resolve` exactly as
+        # `every` is. Set unconditionally and for the same reason. Never both
+        # at once — `resolve` refuses a producer declaring a cadence AND a
+        # stated time, as a contradiction rather than a precedence rule.
+        self.at = at
+        self.zone = zone
 
     def produce(self, ctx):
         """Yield one proposal per file the scan could decide.

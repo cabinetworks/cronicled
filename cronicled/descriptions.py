@@ -384,7 +384,8 @@ class DescriptionProducer:
     name = PRODUCER_NAME
     cost = "local"
 
-    def __init__(self, stash, *, folder="library", every=None):
+    def __init__(self, stash, *, folder="library", every=None, at=None,
+                 zone=None):
         self._stash = stash
         self._folder = folder
         # The cadence this producer DECLARES, read off the object by
@@ -394,6 +395,14 @@ class DescriptionProducer:
         # no cadence at start-up, which is the whole reason this is here and
         # not defaulted to something.
         self.every = every
+        # The other way of saying when: a stated time of day (`at`) read in a
+        # named zone (`zone`), read off this object by the same `resolve` and
+        # set unconditionally for the same reason. An unattended pass declares
+        # these instead of `every`, because an interval measured from the last
+        # run drifts to whatever hour the process last restarted at — see
+        # `cronicled.__main__` for the three appointments and why they differ.
+        self.at = at
+        self.zone = zone
 
     def produce(self, ctx):
         """Yield one proposal per description this can confidently clean.

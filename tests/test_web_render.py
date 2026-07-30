@@ -1,5 +1,6 @@
 import re
 import unittest
+from zoneinfo import ZoneInfo
 
 from cronicled.jobs import Job
 from cronicled.schedule import LoopStatus, TickResult
@@ -10,10 +11,15 @@ from cronicled.tags import proposal as tag_proposal
 from cronicled.web.render import environment, render
 from cronicled.web.rows import (
     to_description_row, to_merge_row, to_mute_row, to_refusal_row, to_row,
-    to_tag_description_row,
+    to_schedule_view, to_tag_description_row,
 )
 
 _HOSTILE = '<script>alert("x")</script>'
+
+# A real zone that observes daylight saving, and whose offset differs from UTC
+# on both sides of every transition -- see tests/test_web_rows.py for why both
+# properties matter to a test of a rendered timestamp.
+ZONE = ZoneInfo("Europe/Madrid")
 
 
 def _job(**over):
@@ -799,7 +805,7 @@ class CandidateLinks(unittest.TestCase):
 
 
 def _muted(item=None, subject_type="scene", subject_id="12962",
-           reason="never identifiable", at="t", base_url=None):
+           reason="never identifiable", at="t", base_url=None, zone=ZONE):
     """One muted entry, built by the real `to_mute_row` from the real
     `Store.mutes()` shape -- never a hand-written dict.
 
@@ -810,7 +816,7 @@ def _muted(item=None, subject_type="scene", subject_id="12962",
     """
     return to_mute_row({"subject_type": subject_type,
                         "subject_id": subject_id, "reason": reason,
-                        "at": at, "item": item}, base_url=base_url)
+                        "at": at, "item": item}, base_url=base_url, zone=zone)
 
 
 def _identity_elements(section):
@@ -1542,3 +1548,66 @@ class TagMergeSection(unittest.TestCase):
              "description": _HOSTILE, "scene_count": 2}])]
 
         self.assertNotIn("<script>", self._render(rows))
+
+
+class EveryTimeOnThePageReadsInTheConfiguredZone(unittest.TestCase):
+    """One page, both sections that carry a time, one zone.
+
+    A test asserting a single row's format would pass while every other
+    section stayed in UTC -- which is the failure worth designing against here,
+    because a page half in the operator's hour and half in UTC is unreadable in
+    a way a page entirely in UTC is not: nothing on it says which line is
+    which. So this renders the WHOLE page once, with a mute and a schedule
+    panel on it, and asserts across both.
+
+    The values are hand-computed from Europe/Madrid's own offsets: +01:00 in
+    January, +02:00 in July. Both sides of a transition, because a fixture on
+    one date cannot tell a zone from a constant offset.
+    """
+
+    WINTER_UTC = "2026-01-15T00:30:00+00:00"
+    WINTER_LOCAL = "2026-01-15T01:30:00+01:00"
+    SUMMER_UTC = "2026-07-15T00:30:00+00:00"
+    SUMMER_LOCAL = "2026-07-15T02:30:00+02:00"
+
+    def _page(self, mute_at, tick_at, skipped_at):
+        muted = [_muted(at=mute_at, zone=ZONE)]
+        status = to_schedule_view(
+            _loop_status(last_tick_at=tick_at,
+                         last_result=_tick_result(
+                             due=["nightly-library-scan"],
+                             skipped={"nightly-library-scan":
+                                      "last ran %s; next due at %s"
+                                      % (skipped_at, skipped_at)})),
+            zone=ZONE)
+        return render("inbox.html", rows=[], counts={}, muted=muted,
+                      schedule=status)
+
+    def test_both_sections_read_local_on_the_summer_side(self):
+        html = self._page(self.SUMMER_UTC, self.SUMMER_UTC, self.SUMMER_UTC)
+        self.assertIn("muted %s" % self.SUMMER_LOCAL, html)
+        self.assertIn("last tick %s" % self.SUMMER_LOCAL, html)
+        self.assertIn("last ran %s; next due at %s"
+                      % (self.SUMMER_LOCAL, self.SUMMER_LOCAL), html)
+        # And nothing anywhere on the page is still showing the stored text.
+        self.assertNotIn(self.SUMMER_UTC, html)
+
+    def test_both_sections_read_local_on_the_winter_side(self):
+        # The same page across a daylight-saving transition. An offset applied
+        # as a constant passes exactly one of this pair.
+        html = self._page(self.WINTER_UTC, self.WINTER_UTC, self.WINTER_UTC)
+        self.assertIn("muted %s" % self.WINTER_LOCAL, html)
+        self.assertIn("last tick %s" % self.WINTER_LOCAL, html)
+        self.assertIn("last ran %s; next due at %s"
+                      % (self.WINTER_LOCAL, self.WINTER_LOCAL), html)
+        self.assertNotIn(self.WINTER_UTC, html)
+
+    def test_no_section_is_left_behind_when_the_others_are_converted(self):
+        # DIFFERENT stamps in each of the three places, so "converted the one
+        # I asserted" cannot pass: each expected value is only producible by
+        # converting the stamp that particular section was given.
+        html = self._page(self.WINTER_UTC, self.SUMMER_UTC,
+                          "2026-07-14T23:30:00+00:00")
+        self.assertIn("muted %s" % self.WINTER_LOCAL, html)
+        self.assertIn("last tick %s" % self.SUMMER_LOCAL, html)
+        self.assertIn("last ran 2026-07-15T01:30:00+02:00", html)

@@ -167,7 +167,7 @@ def _check_at(value, producer, source):
     return parsed
 
 
-def _check_zone(value, producer, source):
+def _check_zone(value, where):
     """The zone a stated time is read in, as a `tzinfo`.
 
     A name `zoneinfo` knows (`"Europe/Lisbon"`), or a `tzinfo` already built.
@@ -175,22 +175,49 @@ def _check_zone(value, producer, source):
     a `ZoneInfoNotFoundError` raised from inside a tick, once an interval, for
     as long as nobody looks — and a tick that raises starts nothing at all, for
     any producer.
+
+    `where` names the place the value came from, and is the whole of the
+    difference between this being called for one producer's override and being
+    called for the deployment's single zone setting (see `check_zone`). It is a
+    phrase rather than a producer name because the second caller has no
+    producer to name: a setting that is wrong is wrong for all three of them.
     """
     if isinstance(value, tzinfo):
         return value
     if not isinstance(value, str):
         raise ValueError(
-            f"zone for producer {producer!r} ({source}) must be the name of a "
+            f"zone {where} must be the name of a "
             f'time zone, such as "Europe/Lisbon", got {value!r}'
         )
     try:
         return ZoneInfo(value)
     except (ZoneInfoNotFoundError, ValueError):
         raise ValueError(
-            f"zone for producer {producer!r} ({source}) is not a time zone "
+            f"zone {where} is not a time zone "
             f'this system knows: {value!r}. Name one from the IANA database, '
             'such as "Europe/Lisbon" or "UTC"'
         ) from None
+
+
+def check_zone(value, source):
+    """The ONE zone this deployment reads a stated time in — and, because it
+    is the same setting, the zone the page shows every stored timestamp in.
+
+    `source` names where the value was configured, for the refusal's message.
+
+    Public, and a wrapper over the rule `resolve` already applies to an
+    override's `zone`, because there must not be a second way to validate a
+    zone name: the page and the schedule reading one setting is only worth
+    anything if the two agree about which names that setting may hold. A page
+    that rendered in a zone the schedule had refused — or refused a zone the
+    schedule was happily keeping appointments in — would be the same
+    disagreement this setting exists to remove, arriving from the other side.
+
+    Called at start-up, once, so an unknown name is a stack trace an operator
+    reads before the service is listening, rather than something discovered at
+    3am by a tick that raises and starts nothing for anybody.
+    """
+    return _check_zone(value, f"configured for this deployment ({source})")
 
 
 def _check_interval(value):
@@ -372,7 +399,8 @@ def resolve(producers, overrides=None):
                     '{"at": "03:00", "zone": "Europe/Lisbon"}, or "UTC" if '
                     "that is genuinely what was meant."
                 )
-            zone = _check_zone(timing["zone"], name, source)
+            zone = _check_zone(timing["zone"],
+                               f"for producer {name!r} ({source})")
         elif "zone" in timing:
             raise ValueError(
                 f"the schedule for producer {name!r} ({source}) names a zone "
@@ -415,6 +443,23 @@ def _moment(value):
     if parsed.tzinfo is None:
         return None
     return parsed.astimezone(timezone.utc)
+
+
+def as_utc(value):
+    """A timestamp as an aware UTC `datetime`, or `None` when it is not one.
+
+    Public for the page, which converts the same stored stamps for display and
+    must read them by exactly the rule the schedule compares them by. A second
+    parser would be a second place for the two to disagree, and the
+    disagreement would be silent: both would hand back a plausible-looking
+    timestamp for the same row.
+
+    Note what this being the shared rule guarantees at the display end: a
+    stamp with no offset comes back `None`, so the page shows it exactly as
+    stored rather than relabelling it as an instant it may not be. Guessing
+    would move a timestamp by the configured offset and say nothing.
+    """
+    return _moment(value)
 
 
 def _utcnow():

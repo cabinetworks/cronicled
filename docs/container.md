@@ -71,6 +71,15 @@ person can browse, dismiss and mute what a scan already produced, but Approve
 and Undo refuse until a media server is configured (see
 `cronicled/__main__.py`).
 
+`-e CRONICLED_ZONE=Europe/Lisbon` is worth adding in a container, and this is
+the deployment it exists for. It names the zone the overnight passes run in AND
+the zone the page shows every timestamp in — one setting, so the two cannot
+disagree. Unset it is UTC, which inside a container is also the host zone, so
+the appointments and the page would read hours from the ones the person
+configuring them has in mind. The zone in use is printed on every start, and a
+name this system does not know stops the container rather than being guessed
+at. Nothing in the database moves: stored timestamps are UTC either way.
+
 Everything above is also settable as a trailing flag instead of an `-e`
 environment variable — useful for a companion tool that already builds an
 argument list and would rather not also assemble one of environment pairs.

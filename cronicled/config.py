@@ -132,6 +132,53 @@ def load_schedule(path=None, env=None):
     return overrides
 
 
+ZONE_ENV_VAR = "CRONICLED_ZONE"
+
+# What a deployment that names no zone runs and reads in. UTC and not the
+# host's zone, for the reason `cronicled.schedule.resolve` refuses to inherit
+# the host's: it is a property of wherever this happens to be deployed, so a
+# container would keep its appointments in one hour and the operator's laptop
+# in another from the same configuration, both correct-looking in every log.
+# UTC is a STATED zone that says the same thing everywhere, and an operator
+# who wants their own hour names it once — see `load_zone`.
+DEFAULT_ZONE = "UTC"
+
+
+def load_zone(env=None):
+    """The name of the ONE zone this deployment uses, as a string.
+
+    It answers two questions with one setting, deliberately: the zone each
+    unattended pass's stated time is read in, and the zone every timestamp on
+    the page is shown in. Two settings would let a page say 3am while a pass
+    ran at a different 3am, which is worse than either being wrong on its own —
+    the page would be evidence FOR the schedule an operator was trying to
+    check.
+
+    A name, not a `tzinfo`: this reads configuration and does not decide
+    whether the configuration is usable. `cronicled.schedule.check_zone` is
+    the one rule that answers that, and it is the same rule an override's own
+    `zone` goes through — see its docstring for why there must not be a
+    second.
+
+    Absence is a legitimate state, so this follows `load_adapters`'s half of
+    the rule in this module's docstring and returns `DEFAULT_ZONE` rather than
+    raising. That default is a real answer rather than an evasion: every pass
+    keeps its appointment at 03:00 UTC and the page reads in UTC, which is
+    exactly what this project did before the setting existed.
+
+    A setting that is PRESENT and empty is not absence and is handed back as it
+    was written, for `check_zone` to refuse. `or DEFAULT_ZONE` would have folded
+    it into the default -- and that is the shape of mistake this project has
+    already made once with `marker_tag`: an operator who set the variable meant
+    to name a zone, and quietly giving them UTC would restore exactly the
+    behaviour they were trying to change while looking like it worked.
+    """
+    if env is None:
+        env = os.environ
+    name = env.get(ZONE_ENV_VAR)
+    return DEFAULT_ZONE if name is None else name
+
+
 def default_scan_path(env=None):
     return os.path.join(config_dir(env), "scan.json")
 

@@ -13,7 +13,7 @@ Two scans are built here, and the difference between them is the point of
 person asks for, with the limit they chose. `build_scheduled_producer` builds
 the one `cronicled/__main__.py` registers at start-up for
 `cronicled.schedule.Scheduler` to run unattended: its own name, its own
-declared cadence, and no file limit.
+declared appointment, and no file limit.
 
 This module still constructs no `Scheduler` itself — running
 `python -m cronicled.runscan` is a person asking for one scan, not a process
@@ -22,6 +22,7 @@ that decides scans are due on its own.
 import argparse
 import os
 import sys
+from datetime import time
 
 from cronicled.adapters.registry import load_adapters
 from cronicled.artist import Aliases
@@ -42,13 +43,25 @@ from cronicled.text import spaceless
 # files instead of the whole set. See `build_scheduled_producer`.
 SCHEDULED_SCAN_NAME = "nightly-library-scan"
 
-# How often the scheduled scan declares itself due, in seconds. An INTERVAL,
-# not a time of day: `cronicled.schedule` measures from the last recorded run,
-# so a daily scan drifts to a different hour across restarts. That is accepted
-# — wall-clock scheduling brings a machine that was off across the appointed
-# hour, and daylight-saving transitions where an hour repeats or does not
-# exist, and neither is decided here.
+# A cadence of one day, in seconds — an INTERVAL measured from the last
+# recorded run. No longer what the scheduled scan declares (see
+# `SCHEDULED_SCAN_AT`), because an interval drifts: restart the service at 2pm
+# and every subsequent daily scan happens at 2pm, with nothing anywhere saying
+# why. Kept because the interval form is still supported and is still the right
+# answer for anything that should run every few minutes — and because it is
+# what an operator writes to put a producer back on one
+# (`{"every": 86400}` in the schedule config).
 DAILY = 86400
+
+# The hour the unattended scan keeps, as a wall-clock time read in the zone
+# `cronicled.config.load_zone` names. Overnight because a scan that can now
+# reach thousands of files should not begin because somebody restarted the
+# service over lunch.
+#
+# `cronicled.__main__` holds the other two unattended appointments, and all
+# three are deliberately DIFFERENT times — see `build_scheduler` there for what
+# firing together would cost and why this one is first.
+SCHEDULED_SCAN_AT = time(3, 0)
 
 
 class _EveryFile:
@@ -166,7 +179,8 @@ def configured_aliases(adapters):
 
 def build_producer(stash, adapters, store, *, limit, folder="library",
                    name_filter=None, threshold=DEFAULT_THRESHOLD,
-                   workers=4, marker=None, producer_name=None, every=None):
+                   workers=4, marker=None, producer_name=None, every=None,
+                   at=None, zone=None):
     """The `ScanProducer` that scans EVERY one of `adapters` through `stash`,
     recording through `store`.
 
@@ -265,16 +279,21 @@ def build_producer(stash, adapters, store, *, limit, folder="library",
     (the default) is an operator who has named no marker, and pools the
     unorganized set exactly as before.
 
-    `producer_name` and `every` are what make a producer schedulable and are
-    deliberately separate from each other. `producer_name` overrides
-    `ScanProducer.name` so a scan started on a cadence is its own
+    `producer_name` and the timing arguments are what make a producer
+    schedulable and are deliberately separate from each other. `producer_name`
+    overrides `ScanProducer.name` so a scan started on a cadence is its own
     registration rather than sharing the one a manual scan replaces on every
     click (it is spelled differently from the `name` bound inside the
-    `sources` comprehension below, which is an ADAPTER's name). `every` is
-    the cadence the producer DECLARES, which
-    `cronicled.schedule.resolve` reads off it; left `None` — the default, and
-    what a manual scan keeps — the producer declares none, and `resolve`
-    refuses to schedule it rather than inventing an interval.
+    `sources` comprehension below, which is an ADAPTER's name).
+
+    `every` is a cadence in seconds and `at`/`zone` are a stated time of day
+    and the zone to read it in; `cronicled.schedule.resolve` reads whichever
+    was set off the producer. All three are `None` by default — what a manual
+    scan keeps — so the producer declares no schedule at all and `resolve`
+    refuses to schedule it rather than inventing one. Passing BOTH an `every`
+    and an `at` is refused there too, as a contradiction: see
+    `build_scheduled_producer` for the pair the unattended scan actually
+    declares.
     """
     if limit is EVERY_FILE:
         # The deliberate unbounded caller, spelled out at its own call site.
@@ -310,10 +329,11 @@ def build_producer(stash, adapters, store, *, limit, folder="library",
         stash, sources, store=store, folder=folder, limit=limit,
         name_filter=name_filter, threshold=threshold, aliases=aliases,
         workers=workers, enrich=stash.scrape_scene_url, identify=identify,
-        marker=marker, name=producer_name, every=every)
+        marker=marker, name=producer_name, every=every, at=at, zone=zone)
 
 
-def build_scheduled_producer(stash, adapters, store, *, every=DAILY, **kwargs):
+def build_scheduled_producer(stash, adapters, store, *, zone,
+                             at=SCHEDULED_SCAN_AT, **kwargs):
     """The scan a `cronicled.schedule.Scheduler` runs unattended.
 
     Three things separate it from the scan a person presses a button for, and
@@ -337,14 +357,27 @@ def build_scheduled_producer(stash, adapters, store, *, every=DAILY, **kwargs):
       call per box. It also shrinks every night, because each run's proposals
       take their files out of the next run's selection.
 
-    - **A declared cadence**, so `resolve` has an interval to schedule it on.
-      `every` is overridable here for the same reason the schedule accepts
-      overrides at all, but it has a value rather than a `None` default: a
-      producer with no cadence is what `resolve` refuses, and defaulting to
-      the refusal would make forgetting the argument look like a decision.
+    - **A declared appointment**, so `resolve` has something to schedule it
+      on. `SCHEDULED_SCAN_AT` — 03:00 — rather than a 24-hour interval, which
+      drifts to whichever hour the process last restarted at. `at` is
+      overridable here for the same reason the schedule accepts overrides at
+      all, but it has a value rather than a `None` default: a producer with no
+      schedule is what `resolve` refuses, and defaulting to the refusal would
+      make forgetting the argument look like a decision.
+
+    `zone` is REQUIRED and has no default, which is the one thing here that is
+    not overridable. There is no zone this could fall back to: the host's is a
+    property of the deployment rather than of the schedule (a container's is
+    UTC and its operator's is not), and defaulting to UTC here would mean two
+    places deciding the zone — this one and
+    `cronicled.config.load_zone`, which the page reads — with nothing to say
+    they disagreed. A page saying 3am while the scan ran at a different 3am is
+    worse than either being wrong alone. So the caller passes the one setting
+    in, and forgetting it is a `TypeError` at start-up rather than an
+    appointment kept in an hour nobody chose.
     """
     return build_producer(stash, adapters, store, limit=EVERY_FILE,
-                          producer_name=SCHEDULED_SCAN_NAME, every=every,
+                          producer_name=SCHEDULED_SCAN_NAME, at=at, zone=zone,
                           **kwargs)
 
 
