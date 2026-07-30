@@ -3,13 +3,17 @@
 This page describes what the package is made of and how the pieces fit
 together. It is deliberately explicit about a distinction the diagrams below
 would otherwise blur: **everything in the first three diagrams exists in the
-repository today; the fourth mixes what exists with the one thing that
-still does not.**
+repository today; the fourth mixes what exists with the one decision that has
+not been made.**
 
-There is now an inbox of proposed changes, an entry point that serves it, and
-an approval gate: `python -m cronicled` serves what the store holds, and
-nothing writes to the media server except through an explicit approve or
-undo. What does not exist is anything that runs unattended.
+There is an inbox of proposed changes, an entry point that serves it, and an
+approval gate: `python -m cronicled` serves what the store holds, and nothing
+writes to the media server except through an explicit approve or undo.
+
+Three passes now run unattended — a scene scan, a performer scan and a tag scan
+— each on its own appointment. They propose; they do not write. The approval
+gate is what stands between an unattended pass and the media server, and it is
+unchanged by their being unattended.
 
 A scheduler is part of the library code: it resolves each producer's schedule —
 an interval, or a stated time of day in a named zone — decides what is due,
