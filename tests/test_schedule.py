@@ -20,7 +20,8 @@ import shutil
 import tempfile
 import threading
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from cronicled.jobs import JobRunner
 from cronicled.schedule import (Entry, LoopStatus, Scheduler, TickResult, due,
@@ -33,6 +34,21 @@ DAY = 86400
 NOW = datetime(2026, 7, 26, 12, 0, 0, tzinfo=timezone.utc)
 NOW_ISO = "2026-07-26T12:00:00+00:00"
 
+# A zone that OBSERVES daylight saving, which is the whole point of it being
+# this one: the two rules about a repeated and a skipped hour cannot fail in a
+# zone that has neither, however carefully a test asserts. Its 2026
+# transitions are 8 March (02:00 -> 03:00, so 02:30 does not exist) and 1
+# November (02:00 -> 01:00, so 01:30 happens twice). Nothing about the zone is
+# private: it is an entry in a public database.
+ZONE_NAME = "America/New_York"
+ZONE = ZoneInfo(ZONE_NAME)
+
+# A second zone for the tests about whose zone is used. Half an hour off UTC
+# and with no daylight saving of its own, so an instant computed in it cannot
+# coincide with one computed in the zone above, or in UTC, by accident.
+OTHER_ZONE_NAME = "Asia/Kolkata"
+OTHER_ZONE = ZoneInfo(OTHER_ZONE_NAME)
+
 
 def ago(seconds):
     return (NOW - timedelta(seconds=seconds)).isoformat()
@@ -42,13 +58,56 @@ def ahead(seconds):
     return (NOW + timedelta(seconds=seconds)).isoformat()
 
 
-class FakeProducer:
-    """Everything `resolve` is allowed to read off a producer: a name, and a
-    cadence it may or may not declare."""
+def utc(*parts):
+    """An aware UTC instant, written out by hand.
 
-    def __init__(self, name, every=None):
+    Every expected instant in the stated-time tests below is one of these,
+    worked out from the zone's offset on the day in question rather than by
+    asking the code under test what it thinks. A test that derives its
+    expectation from the thing it is testing can only confirm the code agrees
+    with itself.
+    """
+    return datetime(*parts, tzinfo=timezone.utc)
+
+
+def sweep(entries, start, minutes, runs=None):
+    """Call `due` once a minute from `start`, recording the runs it starts.
+
+    A minute apart because that is the loop's own resolution
+    (`DEFAULT_INTERVAL`), and each run is recorded against the tick's own
+    `now`, which is what `Scheduler._tick` records — see
+    `TheRunIsRecordedWhetherItWorkedOrNot`. Nothing here sleeps or holds a
+    clock: the whole sweep is arithmetic over arguments.
+
+    It stands in for a scheduler whose every start is accepted, which is the
+    case the timing rules have to be right about. A refused start records
+    nothing, so the producer stays due and the next tick tries again; that is
+    `_tick`'s rule and it is tested against the real runner, not here.
+
+    Returns `{producer: [instant, ...]}`, so "fired once" and "fired on every
+    tick of the hour it named" are different answers rather than the same
+    `True`.
+    """
+    runs = {} if runs is None else dict(runs)
+    fired = {}
+    for step in range(minutes):
+        moment = start + timedelta(minutes=step)
+        for name in due(entries, runs, moment)[0]:
+            fired.setdefault(name, []).append(moment)
+            runs[name] = moment.isoformat()
+    return fired
+
+
+class FakeProducer:
+    """Everything `resolve` is allowed to read off a producer: a name, and the
+    timing it may or may not declare — a cadence, or a stated time and the zone
+    to read it in."""
+
+    def __init__(self, name, every=None, at=None, zone=None):
         self.name = name
         self.every = every
+        self.at = at
+        self.zone = zone
 
 
 class ProducerWithNoCadenceAttributeAtAll:
@@ -359,6 +418,503 @@ class MissedRunsAreNotMadeUp(unittest.TestCase):
             due(self.entries, {"nightly": NOW_ISO}, NOW_ISO),
             ([], {"nightly": "last ran 2026-07-26T12:00:00+00:00; "
                              "next due at 2026-07-27T12:00:00+00:00"}))
+
+
+class AStatedTimeResolves(unittest.TestCase):
+    """An override may say `every`, or a time of day and a zone, and never
+    both."""
+
+    def test_a_stated_time_and_zone_resolve_to_an_entry(self):
+        # The whole entry, not a sampled field: an `every` left set alongside
+        # the time, or a zone quietly dropped, is exactly what this has to
+        # catch.
+        self.assertEqual(
+            resolve([FakeProducer("nightly")],
+                    {"nightly": {"at": "03:00", "zone": ZONE_NAME}}),
+            {"nightly": Entry(producer="nightly", every=None, enabled=True,
+                              at=time(3, 0), zone=ZONE)})
+
+    def test_a_stated_time_replaces_a_declared_cadence(self):
+        # The producer still declares a daily interval; moving it to an hour
+        # must not leave both in the entry, which `due` would refuse.
+        self.assertEqual(
+            resolve([FakeProducer("nightly", every=DAY)],
+                    {"nightly": {"at": "03:00", "zone": ZONE_NAME}}),
+            {"nightly": Entry(producer="nightly", every=None, enabled=True,
+                              at=time(3, 0), zone=ZONE)})
+
+    def test_seconds_may_be_stated_as_well_as_hours_and_minutes(self):
+        self.assertEqual(
+            resolve([FakeProducer("nightly")],
+                    {"nightly": {"at": "03:30:15", "zone": ZONE_NAME}}),
+            {"nightly": Entry(producer="nightly", every=None, enabled=True,
+                              at=time(3, 30, 15), zone=ZONE)})
+
+    def test_a_producer_may_declare_its_own_stated_time(self):
+        self.assertEqual(
+            resolve([FakeProducer("nightly", at="03:00", zone=ZONE_NAME)]),
+            {"nightly": Entry(producer="nightly", every=None, enabled=True,
+                              at=time(3, 0), zone=ZONE)})
+
+    def test_a_time_and_a_tzinfo_are_accepted_as_well_as_their_names(self):
+        # A config file can only hold strings; a producer written in Python
+        # holds the objects, and both reach `resolve`.
+        self.assertEqual(
+            resolve([FakeProducer("nightly", at=time(3, 0), zone=ZONE)]),
+            {"nightly": Entry(producer="nightly", every=None, enabled=True,
+                              at=time(3, 0), zone=ZONE)})
+
+    def test_an_interval_and_a_stated_time_live_in_one_config(self):
+        # Refusing either form would be a regression for whichever was not
+        # chosen: an interval is right for something that runs every few
+        # minutes, a stated time for something nightly.
+        self.assertEqual(
+            resolve([FakeProducer("frequent", every=HOUR),
+                     FakeProducer("nightly", every=DAY)],
+                    {"nightly": {"at": "03:00", "zone": ZONE_NAME}}),
+            {"frequent": Entry(producer="frequent", every=HOUR, enabled=True,
+                               at=None, zone=None),
+             "nightly": Entry(producer="nightly", every=None, enabled=True,
+                              at=time(3, 0), zone=ZONE)})
+
+    def test_a_disabled_producer_may_still_carry_a_stated_time(self):
+        self.assertEqual(
+            resolve([FakeProducer("nightly")],
+                    {"nightly": {"at": "03:00", "zone": ZONE_NAME,
+                                 "enabled": False}}),
+            {"nightly": Entry(producer="nightly", every=None, enabled=False,
+                              at=time(3, 0), zone=ZONE)})
+
+
+class ResolveRefusesAContradictoryTime(unittest.TestCase):
+    """Everything about a stated time that can be wrong is refused at wiring
+    time. A schedule that will not load is read as a stack trace by whoever is
+    deploying; a schedule that loads wrong is found at 3am, or not at all."""
+
+    def test_an_override_naming_both_an_interval_and_a_time_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "both"):
+            resolve([FakeProducer("nightly")],
+                    {"nightly": {"every": DAY, "at": "03:00",
+                                 "zone": ZONE_NAME}})
+
+    def test_the_refusal_says_which_source_the_contradiction_came_from(self):
+        with self.assertRaisesRegex(ValueError, "from the override"):
+            resolve([FakeProducer("nightly")],
+                    {"nightly": {"every": DAY, "at": "03:00",
+                                 "zone": ZONE_NAME}})
+
+    def test_a_producer_declaring_both_is_refused_and_named_as_the_source(self):
+        with self.assertRaisesRegex(ValueError, "declared by the producer"):
+            resolve([FakeProducer("nightly", every=DAY, at="03:00",
+                                  zone=ZONE_NAME)])
+
+    def test_a_stated_time_with_no_zone_is_refused(self):
+        # The answer to "what happens when the zone is not configured". Not the
+        # host's zone, and not an assumed UTC: a startup failure naming the
+        # producer.
+        with self.assertRaisesRegex(ValueError, "zone"):
+            resolve([FakeProducer("nightly")], {"nightly": {"at": "03:00"}})
+
+    def test_that_refusal_holds_for_a_disabled_producer_too(self):
+        # Disabling exempts a producer from needing a schedule; it does not
+        # turn a broken one into a good one, and the operator who re-enables it
+        # is not the one who wrote it.
+        with self.assertRaisesRegex(ValueError, "zone"):
+            resolve([FakeProducer("nightly")],
+                    {"nightly": {"at": "03:00", "enabled": False}})
+
+    def test_a_zone_with_no_stated_time_is_refused(self):
+        # It changes nothing about when the producer runs, so whoever wrote it
+        # believes something untrue.
+        with self.assertRaisesRegex(ValueError, "no time of day"):
+            resolve([FakeProducer("nightly", every=DAY)],
+                    {"nightly": {"zone": ZONE_NAME}})
+
+    def test_a_zone_the_system_does_not_know_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "nightly"):
+            resolve([FakeProducer("nightly")],
+                    {"nightly": {"at": "03:00", "zone": "Nowhere/Atlantis"}})
+
+    def test_a_stated_time_carrying_an_offset_is_refused(self):
+        # `"03:00+01:00"` is a second way of saying the zone, and it pins an
+        # offset that daylight saving moves.
+        with self.assertRaisesRegex(ValueError, "offset"):
+            resolve([FakeProducer("nightly")],
+                    {"nightly": {"at": "03:00+01:00", "zone": ZONE_NAME}})
+
+    def test_a_stated_time_that_is_not_a_time_of_day_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "nightly"):
+            resolve([FakeProducer("nightly")],
+                    {"nightly": {"at": "3 o'clock", "zone": ZONE_NAME}})
+
+    def test_a_boolean_stated_time_is_refused(self):
+        # For the reason `{"every": true}` is refused: JSON `true` arrives as
+        # something Python is happy to treat as a number.
+        with self.assertRaisesRegex(ValueError, "nightly"):
+            resolve([FakeProducer("nightly")],
+                    {"nightly": {"at": True, "zone": ZONE_NAME}})
+
+    def test_a_zone_that_is_not_a_name_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "nightly"):
+            resolve([FakeProducer("nightly")],
+                    {"nightly": {"at": "03:00", "zone": 60}})
+
+    def test_an_explicit_null_cadence_is_still_a_cadence_that_is_not_a_number(self):
+        # An override that NAMES a schedule key has said something about the
+        # timing, even when the value is null — which is a bad value, not the
+        # absence `resolve` reports as "no schedule". The two messages send an
+        # operator to different lines of different files.
+        with self.assertRaisesRegex(ValueError, "number of seconds"):
+            resolve([FakeProducer("nightly", every=DAY)],
+                    {"nightly": {"every": None}})
+
+    def test_a_producer_with_neither_form_is_still_refused(self):
+        with self.assertRaisesRegex(ValueError, "no schedule"):
+            resolve([FakeProducer("nightly")])
+
+
+class AStatedTimeIsDue(unittest.TestCase):
+    """03:00 in a named zone, once a night: the hour it names and no other."""
+
+    def setUp(self):
+        self.entries = resolve([FakeProducer("nightly")],
+                               {"nightly": {"at": "03:00",
+                                            "zone": ZONE_NAME}})
+        # 03:00 on 25 July 2026 in a zone four hours behind UTC that summer.
+        self.last_night = "2026-07-25T07:00:00+00:00"
+
+    def test_a_producer_that_has_never_run_is_due(self):
+        self.assertEqual(due(self.entries, {}, NOW_ISO), (["nightly"], {}))
+
+    def test_it_is_due_at_the_instant_the_stated_hour_arrives(self):
+        self.assertEqual(
+            due(self.entries, {"nightly": self.last_night},
+                utc(2026, 7, 26, 7, 0)),
+            (["nightly"], {}))
+
+    def test_it_is_not_due_a_minute_before_that(self):
+        # The permissive side of the guard above has its own test because a
+        # rule that fires an hour early is as wrong as one that never fires,
+        # and this pins which minute is which.
+        self.assertEqual(
+            due(self.entries, {"nightly": self.last_night},
+                utc(2026, 7, 26, 6, 59)),
+            ([], {"nightly": "last ran 2026-07-25T07:00:00+00:00; "
+                             "next due at 2026-07-26T07:00:00+00:00"}))
+
+    def test_once_it_has_run_it_is_not_due_again_until_tomorrow(self):
+        self.assertEqual(
+            due(self.entries, {"nightly": "2026-07-26T07:00:00+00:00"}, NOW),
+            ([], {"nightly": "last ran 2026-07-26T07:00:00+00:00; "
+                             "next due at 2026-07-27T07:00:00+00:00"}))
+
+    def test_at_the_stated_instant_the_reason_already_names_tomorrow(self):
+        # The tick that has just run it asks again a moment later, and "next
+        # due" must have moved on. A "next" that means "at or after now"
+        # answers with the appointment just kept, which reads as a schedule
+        # that is about to run something it already ran.
+        self.assertEqual(
+            due(self.entries, {"nightly": "2026-07-26T07:00:00+00:00"},
+                utc(2026, 7, 26, 7, 0)),
+            ([], {"nightly": "last ran 2026-07-26T07:00:00+00:00; "
+                             "next due at 2026-07-27T07:00:00+00:00"}))
+
+    def test_it_fires_exactly_once_over_a_whole_day_of_ticks(self):
+        # 1440 ticks a minute apart, from local midnight. A rule that fired on
+        # every tick of the hour it named would return sixty instants here, and
+        # one that compared only the hour would return sixty more at 03:00
+        # tomorrow.
+        self.assertEqual(
+            sweep(self.entries, utc(2026, 7, 26, 4, 0), 1440,
+                  {"nightly": self.last_night}),
+            {"nightly": [utc(2026, 7, 26, 7, 0)]})
+
+    def test_an_interval_alongside_it_keeps_its_own_rate(self):
+        # Adding a stated time must not disturb the form that was already
+        # there, and the two are in one config here rather than in two tests.
+        entries = resolve([FakeProducer("frequent", every=HOUR),
+                           FakeProducer("nightly")],
+                          {"nightly": {"at": "03:00", "zone": ZONE_NAME}})
+        fired = sweep(entries, utc(2026, 7, 26, 4, 0), 1440,
+                      {"nightly": self.last_night,
+                       "frequent": "2026-07-26T03:00:00+00:00"})
+        self.assertEqual(fired["nightly"], [utc(2026, 7, 26, 7, 0)])
+        self.assertEqual(
+            fired["frequent"],
+            [utc(2026, 7, 26, 4, 0) + timedelta(hours=n) for n in range(24)])
+
+
+class AMissedStatedTimeIsOwed(unittest.TestCase):
+    """The decision: a machine that was off across 03:00 runs when it comes
+    back, at whatever hour that is.
+
+    Skipping is defensible and loses on the failure it produces — a laptop
+    that is asleep every night at 03:00 would never scan, and would say
+    nothing was wrong. These tests fail if that answer is ever swapped in
+    quietly."""
+
+    def setUp(self):
+        self.entries = resolve([FakeProducer("nightly")],
+                               {"nightly": {"at": "03:00",
+                                            "zone": ZONE_NAME}})
+
+    def test_a_gap_spanning_the_stated_hour_makes_it_due_at_once(self):
+        # Last ran five nights ago; it is noon. Owed, not left until tonight.
+        self.assertEqual(
+            due(self.entries, {"nightly": "2026-07-21T07:00:00+00:00"},
+                utc(2026, 7, 26, 16, 0)),
+            (["nightly"], {}))
+
+    def test_five_missed_nights_are_owed_once_and_not_five_times(self):
+        # Owing is not queueing: five scrapes at a media server is the load
+        # the cost classes exist to prevent.
+        self.assertEqual(
+            sweep(self.entries, utc(2026, 7, 26, 16, 0), 240,
+                  {"nightly": "2026-07-21T07:00:00+00:00"}),
+            {"nightly": [utc(2026, 7, 26, 16, 0)]})
+
+    def test_after_the_owed_run_it_settles_back_onto_the_stated_hour(self):
+        # The owed run happens at noon; the next is the following 03:00 rather
+        # than a day after noon, which is the difference between a stated time
+        # and the interval this replaced.
+        self.assertEqual(
+            sweep(self.entries, utc(2026, 7, 26, 16, 0), 1440,
+                  {"nightly": "2026-07-21T07:00:00+00:00"}),
+            {"nightly": [utc(2026, 7, 26, 16, 0), utc(2026, 7, 27, 7, 0)]})
+
+
+class DaylightSaving(unittest.TestCase):
+    """The two days a year a wall clock is not a clock.
+
+    Both use a zone that observes daylight saving, because in a zone that does
+    not there is nothing here to get wrong and a test asserting there is would
+    pass whatever the code did."""
+
+    def entries_at(self, stated):
+        return resolve([FakeProducer("nightly")],
+                       {"nightly": {"at": stated, "zone": ZONE_NAME}})
+
+    def test_the_hour_that_happens_twice_fires_once(self):
+        # 1 November 2026: 01:30 arrives at 05:30 UTC on summer time and again
+        # at 06:30 UTC on winter time. 1500 ticks covers the whole 25-hour
+        # local day.
+        self.assertEqual(
+            sweep(self.entries_at("01:30"), utc(2026, 11, 1, 4, 0), 1500,
+                  {"nightly": "2026-10-31T05:30:00+00:00"}),
+            {"nightly": [utc(2026, 11, 1, 5, 30)]})
+
+    def test_and_it_is_the_first_of_the_two_readings(self):
+        # Which of the two is not cosmetic: the second is an hour late for no
+        # reason. Asserted through the local reading, so the assertion says
+        # 01:30 on the offset that was in force first rather than restating
+        # the UTC instant above.
+        fired, = sweep(self.entries_at("01:30"), utc(2026, 11, 1, 4, 0), 1500,
+                       {"nightly": "2026-10-31T05:30:00+00:00"})["nightly"]
+        local = fired.astimezone(ZONE)
+        self.assertEqual(local.time(), time(1, 30))
+        self.assertEqual(local.utcoffset(), timedelta(hours=-4))
+
+    def test_the_day_after_the_clocks_go_back_fires_at_the_stated_time_again(self):
+        # 01:30 on winter time is 06:30 UTC. The shift belongs to the
+        # transition day and to no other, and without this the rule above
+        # could be "always an hour early after November".
+        self.assertEqual(
+            sweep(self.entries_at("01:30"), utc(2026, 11, 2, 5, 0), 1440,
+                  {"nightly": "2026-11-01T05:30:00+00:00"}),
+            {"nightly": [utc(2026, 11, 2, 6, 30)]})
+
+    def test_the_hour_that_does_not_exist_fires_once(self):
+        # 8 March 2026: the local clock goes 01:59 -> 03:00, so 02:30 is never
+        # read. 1380 ticks covers the whole 23-hour local day.
+        self.assertEqual(
+            sweep(self.entries_at("02:30"), utc(2026, 3, 8, 5, 0), 1380,
+                  {"nightly": "2026-03-07T07:30:00+00:00"}),
+            {"nightly": [utc(2026, 3, 8, 7, 30)]})
+
+    def test_and_it_fires_after_the_gap_rather_than_before_it(self):
+        # 07:30 UTC reads as 03:30 local: the stated 02:30 pushed past the
+        # gap, not pulled back to 01:30 before it. A job stated for 02:30 must
+        # not run at 01:30, in an hour its operator kept for something else.
+        fired, = sweep(self.entries_at("02:30"), utc(2026, 3, 8, 5, 0), 1380,
+                       {"nightly": "2026-03-07T07:30:00+00:00"})["nightly"]
+        local = fired.astimezone(ZONE)
+        self.assertEqual(local.time(), time(3, 30))
+        self.assertGreater(local.time(), time(2, 30))
+
+    def test_the_day_after_the_clocks_go_forward_fires_at_the_stated_time(self):
+        # 02:30 on summer time is 06:30 UTC, the ordinary reading.
+        self.assertEqual(
+            sweep(self.entries_at("02:30"), utc(2026, 3, 9, 4, 0), 1440,
+                  {"nightly": "2026-03-08T07:30:00+00:00"}),
+            {"nightly": [utc(2026, 3, 9, 6, 30)]})
+
+
+class AnOccurrencePushedPastMidnight(unittest.TestCase):
+    """A zone whose spring-forward gap is the LAST hour of the local day, so
+    the rule that fires after a gap puts that day's appointment on the next
+    date.
+
+    This is the case that decides how far back the search for a passed
+    occurrence has to go, and it is not hypothetical: this zone's clock has
+    gone 22:59 -> 00:00 every spring since 2024. A window of one date back
+    cannot answer it, and answering it wrongly is a producer that fires early,
+    twice, or not at all on one night a year.
+
+    The instants below are the zone's own, on a transition that has already
+    happened: 29 March 2025 in this zone ends at 22:59 local, and the offset
+    moves from two hours behind UTC to one."""
+
+    ZONE_NAME = "America/Nuuk"
+
+    def setUp(self):
+        self.entries = resolve([FakeProducer("nightly")],
+                               {"nightly": {"at": "23:59",
+                                            "zone": self.ZONE_NAME}})
+        # 23:59 on 28 March, the last ordinary night before the transition.
+        self.last_night = "2025-03-29T01:59:00+00:00"
+
+    def test_the_appointment_it_owes_is_the_one_before_the_gap(self):
+        # Local midnight on 30 March. The occurrence named for 29 March has
+        # been pushed to 00:59 on the 30th and has NOT happened yet, so what
+        # this run is measured against is 28 March's — two dates back.
+        self.assertEqual(
+            due(self.entries, {"nightly": self.last_night},
+                utc(2025, 3, 30, 1, 0)),
+            ([], {"nightly": "last ran 2025-03-29T01:59:00+00:00; "
+                             "next due at 2025-03-30T01:59:00+00:00"}))
+
+    def test_it_fires_once_on_the_night_the_hour_goes_missing(self):
+        # A sweep of the whole local day of 29 March and the hour after it.
+        # 02:00 UTC is local midnight on the 29th; the one appointment kept in
+        # that window is 00:59 local on the 30th, after the gap.
+        fired = sweep(self.entries, utc(2025, 3, 29, 2, 0), 1440,
+                      {"nightly": self.last_night})
+        self.assertEqual(fired, {"nightly": [utc(2025, 3, 30, 1, 59)]})
+        self.assertEqual(fired["nightly"][0].astimezone(
+            ZoneInfo(self.ZONE_NAME)).isoformat(), "2025-03-30T00:59:00-01:00")
+
+
+class AZoneThatGoesBackJustAfterMidnight(unittest.TestCase):
+    """The mirror image of the class above, and the reason the search for an
+    occurrence looks FORWARD of the local date as well as back.
+
+    This zone put its clocks back at one minute past midnight. So on the night
+    of 6 November 2010 the local clock reached 00:00 on the 7th, ran for a
+    minute, and went back to 23:01 on the 6th — which means that at 23:30 on
+    the 6th, midnight of the 7th is already in the PAST. A producer stated at
+    00:00 must not keep that appointment twice, and the answer to "when next"
+    is two dates ahead of the date the clock is showing.
+
+    Measured rather than imagined: enumerating every zone `zoneinfo` knows over
+    every offset change between 1970 and 2040, this shape is where the search
+    window has to reach furthest, and this zone on this night is the most
+    recent instance of it."""
+
+    ZONE_NAME = "America/St_Johns"
+
+    def setUp(self):
+        self.entries = resolve([FakeProducer("nightly")],
+                               {"nightly": {"at": "00:00",
+                                            "zone": self.ZONE_NAME}})
+
+    def test_the_appointment_just_kept_is_not_owed_again(self):
+        # 03:00 UTC reads as 23:30 on the 6th locally, after the clocks went
+        # back — and midnight of the 7th happened half an hour earlier.
+        self.assertEqual(
+            due(self.entries, {"nightly": "2010-11-07T02:30:00+00:00"},
+                utc(2010, 11, 7, 3, 0)),
+            ([], {"nightly": "last ran 2010-11-07T02:30:00+00:00; "
+                             "next due at 2010-11-08T03:30:00+00:00"}))
+
+    def test_a_midnight_that_has_passed_is_owed_even_from_a_later_date(self):
+        self.assertEqual(
+            due(self.entries, {"nightly": "2010-11-06T02:30:00+00:00"},
+                utc(2010, 11, 7, 3, 0)),
+            (["nightly"], {}))
+
+    def test_it_fires_once_per_local_midnight_over_the_long_night(self):
+        # The 25-hour local day of 6 November: two midnights fall in it, the
+        # 6th's at its start and the 7th's at its end, and neither is kept
+        # twice while the clock reads 23:30 for the second time.
+        self.assertEqual(
+            sweep(self.entries, utc(2010, 11, 6, 2, 30), 1500,
+                  {"nightly": "2010-11-05T02:30:00+00:00"}),
+            {"nightly": [utc(2010, 11, 6, 2, 30), utc(2010, 11, 7, 2, 30)]})
+
+
+class AHalfHourThatDoesNotExist(unittest.TestCase):
+    """Not every transition is a whole hour, and not every zone is behind UTC.
+
+    This one moved HALF an hour forward at 23:30 on 4 May 2018, so 23:59 that
+    evening never happened locally and the appointment for the 4th landed at
+    00:29 on the 5th — the same shape as the class above, at a different
+    granularity and in a zone nine hours ahead rather than one behind. A rule
+    written around whole hours, or around zones west of UTC, passes everything
+    above this line and fails here."""
+
+    ZONE_NAME = "Asia/Pyongyang"
+
+    def setUp(self):
+        self.entries = resolve([FakeProducer("nightly")],
+                               {"nightly": {"at": "23:59",
+                                            "zone": self.ZONE_NAME}})
+        # 23:59 on 3 May, when the zone was half an hour behind what it became.
+        self.last_night = "2018-05-03T15:29:00+00:00"
+
+    def test_it_is_not_due_yet_and_the_reason_reaches_back_two_dates(self):
+        self.assertEqual(
+            due(self.entries, {"nightly": self.last_night},
+                utc(2018, 5, 4, 15, 0)),
+            ([], {"nightly": "last ran 2018-05-03T15:29:00+00:00; "
+                             "next due at 2018-05-04T15:29:00+00:00"}))
+
+    def test_it_fires_once_after_the_half_hour_that_does_not_exist(self):
+        fired = sweep(self.entries, utc(2018, 5, 4, 15, 0), 60,
+                      {"nightly": self.last_night})
+        self.assertEqual(fired, {"nightly": [utc(2018, 5, 4, 15, 29)]})
+        self.assertEqual(fired["nightly"][0].astimezone(
+            ZoneInfo(self.ZONE_NAME)).isoformat(), "2018-05-05T00:29:00+09:00")
+
+
+class AStatedTimeIsReadInItsOwnZone(unittest.TestCase):
+    """Never the host's. A container runs in UTC while the person who
+    configured it thinks in their own hour, and an appointment kept four hours
+    from the one that was asked for looks correct in every log."""
+
+    def test_two_producers_at_one_stated_time_fire_in_their_own_zones(self):
+        # 03:00 is 07:00 UTC in one zone and 21:30 UTC the previous day in the
+        # other. Both instants are hand-computed from the offsets; a schedule
+        # that read either in the host's zone would fire them together.
+        entries = resolve(
+            [FakeProducer("west"), FakeProducer("east")],
+            {"west": {"at": "03:00", "zone": ZONE_NAME},
+             "east": {"at": "03:00", "zone": OTHER_ZONE_NAME}})
+        self.assertEqual(
+            sweep(entries, utc(2026, 7, 26, 0, 0), 1440,
+                  {"west": "2026-07-25T07:00:00+00:00",
+                   "east": "2026-07-25T21:30:00+00:00"}),
+            {"west": [utc(2026, 7, 26, 7, 0)],
+             "east": [utc(2026, 7, 26, 21, 30)]})
+
+    def test_the_zone_that_was_asked_for_is_the_one_in_the_entry(self):
+        entries = resolve([FakeProducer("east")],
+                          {"east": {"at": "03:00", "zone": OTHER_ZONE_NAME}})
+        self.assertEqual(entries["east"].zone, OTHER_ZONE)
+
+    def test_due_refuses_an_entry_with_a_time_and_no_zone(self):
+        # `resolve` cannot build one, and a hand-built one must not fall back
+        # to the host's zone here either — the fallback would be invisible
+        # everywhere except in the hour things happened.
+        entries = {"nightly": Entry(producer="nightly", every=None,
+                                    enabled=True, at=time(3, 0), zone=None)}
+        with self.assertRaisesRegex(ValueError, "zone"):
+            due(entries, {}, NOW_ISO)
+
+    def test_due_refuses_an_entry_holding_both_forms(self):
+        entries = {"nightly": Entry(producer="nightly", every=DAY,
+                                    enabled=True, at=time(3, 0), zone=ZONE)}
+        with self.assertRaisesRegex(ValueError, "both"):
+            due(entries, {}, NOW_ISO)
 
 
 class RunnableProducer:
@@ -732,6 +1288,46 @@ class TheRunIsRecordedWhetherItWorkedOrNot(SchedulerCase):
                      "next due at 2026-07-27T12:00:00+00:00",
              "bad": "last ran 2026-07-26T12:00:00+00:00; "
                     "next due at 2026-07-27T12:00:00+00:00"})
+
+
+class ATickKeepsAStatedTimeAppointment(SchedulerCase):
+    """The pure rule reaching the real runner and the real store. Every rule
+    above this line is arithmetic over arguments; this is the one test that the
+    arithmetic is what a tick asks."""
+
+    def scheduled_at_three(self):
+        return self.scheduler(
+            RunnableProducer("nightly", every=None),
+            overrides={"nightly": {"at": "03:00", "zone": ZONE_NAME}})
+
+    def test_a_tick_at_the_stated_hour_starts_it_and_records_the_run(self):
+        scheduler = self.scheduled_at_three()
+        result = scheduler.tick(utc(2026, 7, 26, 7, 0))
+        self.assertEqual(result.due, ["nightly"])
+        self.assertEqual(list(result.started), ["nightly"])
+        self.assertEqual(result.skipped, {})
+        self.assertEqual(result.failed_to_start, {})
+        self.assertEqual(self.store.runs(),
+                         {"nightly": "2026-07-26T07:00:00+00:00"})
+
+    def test_the_next_tick_in_the_same_hour_does_not_start_it_again(self):
+        scheduler = self.scheduled_at_three()
+        scheduler.tick(utc(2026, 7, 26, 7, 0))
+        again = scheduler.tick(utc(2026, 7, 26, 7, 1))
+        self.assertEqual(again.due, [])
+        self.assertEqual(again.started, {})
+        self.assertEqual(again.skipped,
+                         {"nightly": "last ran 2026-07-26T07:00:00+00:00; "
+                                     "next due at 2026-07-27T07:00:00+00:00"})
+
+    def test_a_tick_before_the_hour_still_owes_a_first_run(self):
+        scheduler = self.scheduled_at_three()
+        result = scheduler.tick(utc(2026, 7, 26, 6, 0))
+        # It has never run, so it is owed its first appointment immediately —
+        # the same rule as a missed one. Pinned here rather than left implied,
+        # because the alternative reading of this tick is that a stated time
+        # waits for its hour before it has ever run at all.
+        self.assertEqual(result.due, ["nightly"])
 
 
 class ATickThatRanNothingSaysWhichKindOfNothing(SchedulerCase):
