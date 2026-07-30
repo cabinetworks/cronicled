@@ -470,9 +470,72 @@
 </div>
 {% endmacro %}
 
-{% macro section(name, entries, empty_text, open=False) %}
+{# `count` overrides the number in the summary, and exists for exactly one
+   caller: the low-count tag section, whose `entries` are GROUPS rather than
+   proposals. `entries | length` there would announce "(2)" over a thousand
+   tags, which is the one number on that summary line a person would read as
+   how much work is waiting. Every other caller omits it and gets the count of
+   its own entries, unchanged. #}
+{# A tag that classifies nought or one scene. Not a scene proposal, not a merge,
+   not a reconciliation: what a person is judging is how much work the tag does,
+   so the COUNT sits in the slot a scene row's score occupies and is labelled,
+   exactly as a merge's blast radius and a reconciliation's are.
+
+   Every control here is per TAG. There is deliberately no form anywhere in the
+   group block below -- a group carries no fingerprint for one to post -- so a
+   thousand tags cannot be deleted by one click over a set nobody examined. The
+   grouping is how the rows become readable; it is not how the decisions are
+   made.
+
+   No Undo control anywhere in this macro, and `UnusedTagRow` carries no
+   `undoable` field for one to read: a deletion cannot be taken back. #}
+{% macro unused_block(row) %}
+<div class="proposal">
+  <div class="head">
+    <div class="what">
+      <p class="file">{{ identifier(row.name, row.tag_url) }}</p>
+      <p class="title">Delete the tag <b>{{ row.name }}</b></p>
+    </div>
+    <div class="score">{{ row.scene_count }}<div class="note">{{ row.counts_cover }}</div></div>
+    <div class="acts">
+      {% if row.appliable %}
+      <form method="post" action="/approve"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>{% if row.error %}Try again{% else %}Delete{% endif %}</button></form>
+      {% endif %}
+      {% if row.actionable %}
+      <form method="post" action="/dismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Not now</button></form>
+      <form method="post" action="/mute"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Keep</button></form>
+      {% endif %}
+      {% if row.undismissable %}
+      <form method="post" action="/undismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Undismiss</button></form>
+      {% endif %}
+      {% if row.unmutable %}
+      <form method="post" action="/unmute"><input type="hidden" name="subject_type" value="{{ row.subject_type }}"><input type="hidden" name="subject_id" value="{{ row.subject_id }}"><button>Stop keeping</button></form>
+      {% endif %}
+    </div>
+  </div>
+  {% if row.error %}
+  <div class="warn">The last attempt to delete this failed, and nothing was written: {{ row.error }}</div>
+  {% endif %}
+  <div class="warn">{{ row.warning }}</div>
+</div>
+{% endmacro %}
+
+{# One group, one summary line, expandable -- the whole shape this section
+   exists for. The summary carries the label and the count and NOTHING a person
+   can press. #}
+{% macro unused_group_block(group) %}
+<details class="group">
+  <summary>{{ group.label }} ({{ group.count }})</summary>
+  <p class="note">{{ group.note }}</p>
+  {% for row in group.rows %}
+  {{ unused_block(row) }}
+  {% endfor %}
+</details>
+{% endmacro %}
+
+{% macro section(name, entries, empty_text, open=False, count=None) %}
 <details class="section"{% if open %} open{% endif %}>
-  <summary>{{ name }} ({{ entries | length }})</summary>
+  <summary>{{ name }} ({% if count is none %}{{ entries | length }}{% else %}{{ count }}{% endif %})</summary>
   {% if not entries %}
   <p class="empty">{{ empty_text }}</p>
   {% endif %}
@@ -503,6 +566,21 @@
 {% call section("Tags that are a performer", reconciles, "No tag matches a performer's name.") %}
   {% for row in reconciles %}
   {{ reconcile_block(row) }}
+  {% endfor %}
+{% endcall %}
+
+{% set unused = unused | default([]) %}
+{# The TOTAL number of tags, not the number of groups. See the `section` macro's
+   own note: "(2)" over a thousand rows is the one number on that line a person
+   would read as how much is waiting. #}
+{% call section("Tags that do almost no work", unused,
+                "No tag is on nought or one scene, or a configured source could not be read.",
+                count=(unused | sum(attribute="count"))) %}
+  {% if unused %}
+  <p class="note">{{ low_count_is_not_proof }}</p>
+  {% endif %}
+  {% for group in unused %}
+  {{ unused_group_block(group) }}
   {% endfor %}
 {% endcall %}
 

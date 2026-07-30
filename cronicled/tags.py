@@ -78,7 +78,7 @@ carries no snapshot and why `cronicled.web.rows.to_merge_row` has no
 """
 from dataclasses import dataclass
 
-from cronicled import performer_tags, tag_descriptions
+from cronicled import performer_tags, tag_descriptions, tag_hygiene
 from cronicled.stashbox import StashBox, base_url
 from cronicled.text import normalize, spaceless
 
@@ -415,6 +415,39 @@ def _reconcile_summary(counts):
                counts.muted, counts.clustered, counts.unused, ambiguous))
 
 
+def _hygiene_summary(counts):
+    """The low-count half of the pass, in one line.
+
+    Carried in the CLOSING line rather than logged where it is computed, for
+    the reason `_describe_summary` and `_reconcile_summary` are: `JobRunner
+    ._log` keeps ONE field, so every line this pass writes before its last is
+    overwritten before an operator sees any of it. A count logged mid-pass is a
+    number the code computes and nobody can read.
+
+    The two populations are reported SEPARATELY, because they are not the same
+    finding: one changes no scene and the other changes one.
+
+    A night that examined nothing says exactly that INSTEAD of reporting
+    suppressions it never counted. `tag_hygiene`'s own docstring is why the pass
+    withholds on an unread source; this is why that night cannot be mistaken for
+    a library with nothing to clean up, which is the one reading that would get
+    a permanently broken source planned around.
+    """
+    if counts.withheld:
+        return ("%d tags on nought or one scene were not examined: a "
+                "configured source could not be read in full, and 'no source "
+                "describes this tag' is half the reason for proposing its "
+                "deletion" % counts.withheld)
+    return ("%d tags on nought or one scene, %d proposed for deletion (%d on "
+            "no scenes, %d on one scene; %d already described, %d described by "
+            "a source, %d left to their merge, %d left to their performer, %d "
+            "already proposed, %d kept by hand)"
+            % (counts.low, counts.outstanding, counts.no_scenes,
+               counts.one_scene, counts.described, counts.sourced,
+               counts.clustered, counts.reconciled, counts.already_proposed,
+               counts.kept))
+
+
 def proposal(cluster, folder, indexes):
     """One cluster as the proposal dict a producer yields.
 
@@ -455,7 +488,9 @@ class TagMergeProducer:
     for each cluster of spellings, a description for each blank tag a
     configured stash-box already describes, and a reconciliation for each tag
     that is really a performer filed in the wrong namespace (see
-    `cronicled.performer_tags`, and `_reconcile` below).
+    `cronicled.performer_tags`, and `_reconcile` below), and a deletion for each
+    tag that classifies nought or one scene and that nothing anywhere describes
+    (see `cronicled.tag_hygiene`, and `_hygiene` below).
 
     ONE PASS, NOT TWO, and that is a decision rather than a convenience. The
     two findings meet on the same tag constantly -- a merge deletes spellings,
@@ -591,9 +626,103 @@ class TagMergeProducer:
 
         reconciled, reconciled_counts = self._reconcile(tags, clusters)
         yield from reconciled
-        ctx.log("finished: %s; %s; %s"
+
+        # The performer half's LIVE rows, which the low-count half must not
+        # duplicate. Two sources, both necessary: the reconciliations THIS run
+        # yielded, and the ones an earlier run already put on the page (which
+        # `_reconcile` skipped as `already_proposed`, so they are absent from
+        # the list above while still being a row about that tag).
+        #
+        # A MUTED reconciliation is deliberately not in here. "Stop telling me
+        # this tag is a performer" is a decision about that question and says
+        # nothing about whether the tag is worth keeping, which is the
+        # distinction every `SUBJECT_TYPE` in this package exists to draw.
+        covered = {p["subject_id"] for p in reconciled}
+        covered |= performer_tags.narrowings(self._store, self._folder)[1]
+        unused, unused_counts = self._hygiene(tags, clusters, indexes,
+                                              boxes_unread, covered)
+        yield from unused
+        ctx.log("finished: %s; %s; %s; %s"
                 % (selection, _describe_summary(counted, dropped_keys),
-                   _reconcile_summary(reconciled_counts)))
+                   _reconcile_summary(reconciled_counts),
+                   _hygiene_summary(unused_counts)))
+
+    def _hygiene(self, tags, clusters, indexes, boxes_unread, covered):
+        """`(proposals, tag_hygiene.Counts)` for the low-count half of the
+        pass: the tags on nought or one scene that nothing describes.
+
+        THE SAME `all_tags` READ, the same clusters and the same source indexes
+        the three halves above work from, which is why this lives inside this
+        producer rather than in a pass of its own. It issues no request of any
+        kind -- `tag_hygiene.evidence_against` looks up indexes already in
+        hand -- so the `box` cost class this pass is in is unchanged by it.
+
+        Built as a list rather than yielded straight out, so the closing log
+        line can carry the whole tally: `JobRunner._log` keeps only the LAST
+        message a job wrote.
+
+        The order of the checks is the order of the argument, cheapest and most
+        conclusive first, and two of them are load-bearing rather than
+        cosmetic:
+
+        * `boxes_unread` comes FIRST, before anything is examined, because on
+          such a night the answer for every low-count tag is the same and it is
+          "this pass cannot say". Counting the suppressions per-reason on a
+          night when the evidence was never gathered would report a set of
+          conclusions nothing reached.
+        * the description checks come before the store, so a tag something
+          already defines is never even looked up as a candidate.
+
+        A tag in ANY cluster is skipped, not only one in a cluster this run
+        proposed, exactly as `_describe` and `_reconcile` skip one -- and here
+        for the sharpest reason of the three: the merge and the deletion are
+        opposite answers to one question about the same name, and a person who
+        approved both would delete a spelling the merge was about to move items
+        onto.
+        """
+        clustered = {m["id"] for cluster in clusters for m in cluster.members}
+        kept, proposed = tag_hygiene.narrowings(self._store, self._folder)
+
+        proposals = []
+        low = withheld = described = sourced = in_cluster = 0
+        reconciled = kept_count = already = 0
+        by_group = {group: 0 for group in tag_hygiene.GROUPS}
+        for tag in tags:
+            group = tag_hygiene.group_of(tag)
+            if group is None:
+                continue
+            low += 1
+            if boxes_unread:
+                withheld += 1
+                continue
+            by_library, by_source = tag_hygiene.evidence_against(tag, indexes)
+            if by_library:
+                described += 1
+                continue
+            if by_source:
+                sourced += 1
+                continue
+            tag_id = str(tag["id"])
+            if tag_id in clustered:
+                in_cluster += 1
+                continue
+            if tag_id in covered:
+                reconciled += 1
+                continue
+            if tag_id in kept:
+                kept_count += 1
+                continue
+            if tag_id in proposed:
+                already += 1
+                continue
+            by_group[group] += 1
+            proposals.append(tag_hygiene.proposal(tag, folder=self._folder))
+        return proposals, tag_hygiene.Counts(
+            low=low, withheld=withheld, described=described, sourced=sourced,
+            clustered=in_cluster, reconciled=reconciled, kept=kept_count,
+            already_proposed=already, outstanding=len(proposals),
+            no_scenes=by_group[tag_hygiene.NO_SCENES],
+            one_scene=by_group[tag_hygiene.ONE_SCENE])
 
     def _reconcile(self, tags, clusters):
         """`(proposals, performer_tags.Counts)` for the performer half of the

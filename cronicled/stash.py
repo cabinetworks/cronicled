@@ -822,6 +822,61 @@ class Stash:
         q = "mutation($in: TagsMergeInput!){ tagsMerge(input:$in){ id name aliases } }"
         return self.gql(q, {"in": inp})["tagsMerge"]
 
+    def tag_scene_count(self, tag_id):
+        """How many scenes carry this tag RIGHT NOW.
+
+        The counting sibling of `tag_description`, and here for the same
+        reason: it is read immediately before a write so the write can be
+        checked against what is actually there rather than against what a pass
+        saw hours or days earlier.
+
+        A tag id the server does not know answers `None`, which `delete_tag`
+        below reports as a mismatch rather than treating as "on no scenes" --
+        the one reading under which a deletion of something already gone would
+        report success.
+        """
+        q = "query($id: ID!){ findTag(id:$id){ id scene_count } }"
+        found = self.gql(q, {"id": str(tag_id)}).get("findTag") or {}
+        return found.get("scene_count")
+
+    def delete_tag(self, tag_id, *, expected_scene_count):
+        """Delete one tag, refusing if it is not on the number of scenes the
+        proposal was made against.
+
+        `expected_scene_count` is REQUIRED and has no default, on exactly the
+        terms `apply_tag_description` requires its `expected`: a caller who
+        forgot it and a caller who meant "delete regardless" must not be able
+        to write the same thing, and the second is not offered here at all.
+
+        The check is the whole reason this method exists rather than the caller
+        issuing the mutation itself. A deletion proposal says "this tag is on
+        nought scenes" or "on exactly one", and it can be days old; a tag that
+        has been put to work since is one whose count has moved, and deleting it
+        on the strength of last week's number would take a working tag off
+        every scene carrying it with nothing recording which. Refusing raises
+        `StashError`, which `web.actions.Actions.approve` records as a failed
+        apply with the reason attached, leaving the proposal live.
+
+        The read happens HERE, one line before the write, rather than in the
+        caller: taking the comparison anywhere else opens a window between it
+        and the write. That is the same ordering `apply_scene`,
+        `apply_tag_description` and `merge_tags` all use.
+
+        Nothing is snapshotted and nothing is returned for an undo. A deletion
+        cannot be taken back -- see `cronicled.tag_hygiene.DELETE_WARNING` for
+        the three separate reasons -- and returning an empty snapshot would let
+        a row offer a button that restores nothing.
+        """
+        current = self.tag_scene_count(tag_id)
+        if current != expected_scene_count:
+            raise StashError(
+                "tag %s is on %r scenes, not the %r this proposal was made "
+                "against; it has changed since the pass ran, so deleting it "
+                "now would remove a tag that is doing work nobody reviewed"
+                % (tag_id, current, expected_scene_count))
+        q = "mutation($id: ID!){ tagDestroy(input:{id:$id}) }"
+        self.gql(q, {"id": str(tag_id)})
+
     def update_tag_aliases(self, tag_id, aliases):
         """Replace a tag's alias list (tagUpdate) — the write for an alias
         top-up: fold in aliases an external source knows about without

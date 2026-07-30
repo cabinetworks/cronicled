@@ -574,8 +574,13 @@ class Producer(unittest.TestCase):
         self.assertEqual(proposals[0]["folder"], FOLDER)
 
     def test_a_library_with_no_duplicate_spellings_yields_nothing(self):
-        self.assertEqual(self.run_pass([tag(1, "Velvet Crane"),
-                                        tag(2, "Copper Kettle")]), [])
+        # Counts of 5 and 3 rather than the helper's default 0: this is a claim
+        # about the MERGE half, and a tag on no scenes is a finding of the
+        # low-count half (see `cronicled.tag_hygiene`), which would make this
+        # assertion about that half instead. Ordinary tags in ordinary use.
+        self.assertEqual(self.run_pass([tag(1, "Velvet Crane", scene_count=5),
+                                        tag(2, "Copper Kettle",
+                                            scene_count=3)]), [])
 
     def test_the_closing_line_distinguishes_suppressed_from_nothing_to_do(self):
         """A finished job keeps ONE message, so it has to carry both facts.
@@ -681,7 +686,11 @@ class DescriptionsInTheSamePass(unittest.TestCase):
         # from the scenes carrying it, not a similar tag's text -- a
         # generated description reads exactly like a written one and cannot
         # be told from it afterwards. The tag stays visibly blank.
-        proposals = self.one_box([tag(7, "Copper Kettle")],
+        # `scene_count=4`, not the helper's default 0: a tag on no scenes is a
+        # finding of the low-count half (`cronicled.tag_hygiene`), so the
+        # default would leave this passing for a reason that has nothing to do
+        # with descriptions -- and failing if that half ever changed.
+        proposals = self.one_box([tag(7, "Copper Kettle", scene_count=4)],
                                  [box_tag("Lantern Work", LANTERN)])
 
         self.assertEqual(proposals, [])
