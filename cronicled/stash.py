@@ -16,6 +16,7 @@ belong to the adapter layer, which is configured per install.
 import json
 import re
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -52,10 +53,43 @@ class StashError(Exception):
 # `apply_scene` drops the performer/studio, marks the scene organized, and
 # nothing ever revisits it, because the scene looks finished. Getting it
 # wrong the other way — retrying forever against a server that is asking
-# for a slower pace — is real too, but nothing here retries yet (see
-# `cronicled.jobs`), so the only question this module answers is the
-# classification, not the retry loop.
+# for a slower pace — is bounded rather than avoided: `gql` retries a
+# transient failure at most `RETRY_ATTEMPTS` times in total and then raises,
+# so "asking for a slower pace" costs one extra request per call and never an
+# unbounded spin. Which calls are eligible at all is `gql`'s `retryable`
+# argument; see its docstring.
 RETRYABLE_STATUSES = frozenset({408, 429})
+
+
+# The whole retry bound, in two numbers.
+#
+# RETRY_ATTEMPTS is a TOTAL, not a count of extra tries: 2 means the original
+# call plus one repeat. It is deliberately the smallest number that fixes the
+# observed fault — an intermittent scraper failure that the identical query
+# answers a moment later — because the evidence for intermittence is a failure
+# to reproduce (16 queries against the same store, all successful), which is
+# weaker than a reproduction. Being wrong about that costs one extra request
+# per failing call; a larger bound would multiply the cost of being wrong by
+# whatever it was raised to, for no evidence anyone has.
+#
+# RETRY_DELAY is why the retry is worth anything against a server asking for a
+# slower pace (429/408): repeating immediately is the one behaviour a
+# rate-limited server is explicitly telling the client not to do. It must be
+# strictly positive for that reason, and small, because it is paid inside a
+# caller's own wall-clock budget.
+#
+# The bound a caller can quote, and the one the deadline machinery below
+# interacts with: one `gql` call can take at most
+#
+#     RETRY_ATTEMPTS * (timeout + HARD_DEADLINE_SLACK)
+#         + (RETRY_ATTEMPTS - 1) * RETRY_DELAY
+#
+# because each attempt carries its OWN unmultiplied hard deadline and the
+# delays fall between them. The per-attempt deadline is what must not grow:
+# an attempt handed a deadline scaled by the attempt number would make a
+# wedged host cost the caller a multiple of the bound it asked for.
+RETRY_ATTEMPTS = 2
+RETRY_DELAY = 1.0
 
 
 # urlopen(timeout=) bounds socket ops but NOT name resolution — resolving a
@@ -70,10 +104,17 @@ HARD_DEADLINE_SLACK = 30
 
 
 class Stash:
-    def __init__(self, url, api_key, transport=None):
+    def __init__(self, url, api_key, transport=None, sleep=None):
+        """`sleep(seconds)` is the wait between retry attempts, injected on
+        the same terms and for the same reason as `transport`: the retry in
+        `gql` is only testable at all if the delay it pays can be observed
+        instead of endured, and a suite that endured it would pay
+        `RETRY_DELAY` for every failure it exercises. Defaults to
+        `time.sleep`."""
         self.url = url.rstrip("/") + "/graphql"
         self.api_key = api_key
         self._transport = transport if transport is not None else self._perform
+        self._sleep = sleep if sleep is not None else time.sleep
 
     def _perform(self, body, timeout):
         """Default transport: HTTP POST to the media server + JSON parse.
@@ -109,7 +150,121 @@ class Stash:
             raise StashError("transport error reaching the media server at %s: %s"
                              % (self.url, e), transient=True)
 
-    def gql(self, query, variables=None, timeout=DEFAULT_TIMEOUT):
+    def gql(self, query, variables=None, timeout=DEFAULT_TIMEOUT,
+            retryable=False):
+        """Run one GraphQL operation and return its `data` block, retrying a
+        transient failure when — and only when — the CALLER declares the
+        operation retryable.
+
+        `retryable` is a claim about the operation, made by the method that
+        builds it, and it means two things at once because they are the same
+        property: this operation is safe to repeat, and a failure of it is
+        evidence about the round trip rather than about the request. Default
+        False, so every call that does not opt in behaves exactly as it did
+        before this argument existed — one attempt, and a GraphQL `errors`
+        array is a permanent no.
+
+        WHY BY OPERATION AND NOT BY MESSAGE TEXT. The fault this exists for is
+        a scraper answering a single object where the schema promises a list;
+        the media server reports it as a GraphQL error carrying the upstream
+        scraper's own wording, down to a Go type name. Matching that wording
+        would be precise about this one fault and would stop matching the day
+        the upstream project rephrases it — and it would stop SILENTLY, because
+        a retry that no longer happens raises nothing at all. What a reader
+        would see is a store that answers slightly less often than it used to,
+        which is not a symptom anyone can trace back to a string literal here.
+        Keying on the operation instead depends on nothing another project
+        controls.
+
+        WHAT THE MESSAGE RULE WOULD HAVE COST, stated because the operation
+        rule is the broader of the two: a scrape that the scraper refuses for a
+        real, repeatable reason is now attempted twice instead of once. That is
+        one extra request against a store that was going to fail anyway, paid
+        only on the failing path, and bounded by `RETRY_ATTEMPTS`. The message
+        rule would have avoided that single request and bought it with a rule
+        that breaks without a symptom. It is the asymmetry this project keeps
+        choosing: a visible cost over a silent one.
+
+        The narrowness is deliberate and lives in the callers. Only the two
+        site-scraper reads pass `retryable=True` — see
+        `scrape_scenes_by_query` and `scrape_scene_url`. Every read whose
+        filter this project builds itself (`_find_scenes`, `all_tags`, the
+        find-or-create lookups) and every mutation keeps the default, the
+        mutations for a second reason: a write whose transport failed may have
+        landed on the server anyway, so repeating `performerCreate` can make
+        two performers where the operator asked for one. A silent duplicate is
+        worse than a visible failure, so nothing that writes opts in.
+
+        WHY THE LOOP IS HERE AND NOT AT THE JOB LAYER. One policy, in the one
+        place that already holds everything it needs:
+
+        - `transient` is decided here. Nothing above this method can see it in
+          a form worth acting on — by the time a store's failure reaches
+          `cronicled.jobs`, `scan.examine_sources` has already folded it into
+          a `store_errors` line, which is text: the store, the query and the
+          variant that failed are gone.
+        - A job-layer retry could therefore only repeat the whole unit of
+          work. That re-searches every HEALTHY store, re-examines every file
+          already examined, and re-yields proposals the runner has already
+          persisted — a cost measured in `files x stores` requests to fix one
+          store's one query, and a correctness problem on top of the cost.
+        - The bound and the wall-clock it multiplies are both defined here
+          (see `RETRY_ATTEMPTS` and `HARD_DEADLINE_SLACK`), so the one place
+          that can state what a caller may be made to wait is the place that
+          decides how many attempts it makes.
+
+        Because this is the only loop, no call can be retried twice: a caller
+        wanting different behaviour changes `retryable`, not a second policy
+        somewhere else.
+
+        A failure that exhausted more than one attempt says so in its message.
+        The bound has to be visible in what gets RECORDED — `store_errors` in
+        `cronicled.scan` is what a person reads afterwards — or a store that
+        failed every attempt is indistinguishable from one that was asked
+        once, and "the retry is not working" is not a conclusion anyone can
+        reach from the original upstream sentence alone.
+        """
+        attempts = RETRY_ATTEMPTS if retryable else 1
+        # ONE bound, in one place: `attempt < attempts` below. This was first
+        # written as `for attempt in range(1, attempts + 1)`, which reads as
+        # safer and is not. The only path that reaches a second iteration is
+        # the `continue` guarded by `attempt < attempts`, so the range's upper
+        # limit is unreachable — and two independent bounds meant NEITHER was
+        # observable. Measured: mutating the range to unlimited changed nothing
+        # any test could see, and mutating the guard away left the loop falling
+        # off the end and RETURNING NONE, a silent wrong answer where the
+        # caller expected a raise. Removing the redundant bound is what makes
+        # the remaining one load-bearing. Termination is still plain: `attempt`
+        # rises by one each pass, every path out of an iteration returns or
+        # raises, and the only path that loops requires `attempt < attempts`.
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return self._attempt(query, variables, timeout, retryable)
+            except StashError as e:
+                if e.transient and attempt < attempts:
+                    self._sleep(RETRY_DELAY)
+                    continue
+                if attempt > 1:
+                    # Re-raised rather than mutated in place: `e` is whatever
+                    # the transport or the errors branch built, and the
+                    # `transient` flag is carried across unchanged because it
+                    # describes the fault, not this loop's verdict on it.
+                    raise StashError(
+                        "%s — gave up after %d attempts" % (e, attempt),
+                        transient=e.transient)
+                raise
+
+    def _attempt(self, query, variables, timeout, retryable):
+        """ONE attempt: the request, its own hard deadline, and the
+        interpretation of what came back. Split out from `gql` so the retry
+        loop wraps a whole attempt — deadline included — which is what keeps
+        each attempt's deadline the one the caller asked for rather than a
+        multiple of it.
+
+        `retryable` reaches this far for one reason: it is what the GraphQL
+        `errors` branch below classifies on. See `gql`'s docstring."""
         body = {"query": query, "variables": variables or {}}
         # Bound the ENTIRE request (incl. name resolution) with a hard
         # wall-clock deadline; abandon the worker thread if it overruns so a
@@ -138,8 +293,17 @@ class Stash:
                              % (self.url, exc), transient=True)
         payload = box["payload"]
         if payload.get("errors"):
-            # the server answered and said no — a rejection of this input, not a blip.
-            raise StashError("; ".join(x.get("message", str(x)) for x in payload["errors"]))
+            # The server answered and said no. For an operation this project
+            # builds the whole of — a filter, an update input — that is a
+            # rejection of this input and will be repeated verbatim, so it is
+            # permanent. For an operation whose server-side work is delegated
+            # to a third-party scraper (`retryable`), the same array is the
+            # scraper misbehaving on a request that carried nothing but free
+            # text: there is no malformed input to reject, and the identical
+            # query answers next time. See `gql`'s docstring.
+            raise StashError(
+                "; ".join(x.get("message", str(x)) for x in payload["errors"]),
+                transient=retryable)
         return payload["data"]
 
     # -- reads ----------------------------------------------------------- #
@@ -1136,13 +1300,24 @@ class Stash:
         `apply_scene`'s docstring. That is a decision already taken, not a
         gap in this method — selecting `image` is deliberate, and nothing
         here undoes it.
+
+        RETRYABLE (`gql(retryable=True)`), and this is the call the argument
+        was added for. A scraper answering a single object where the schema
+        promises a list has been observed twice, on different files, against a
+        store whose identical queries succeeded sixteen times out of sixteen
+        when they were retried by hand. The request carries no structure this
+        project could get wrong — one free-text `query` string — so a GraphQL
+        error here is the scraper's own fault, not a rejection of the input,
+        and repeating a read costs nothing but the request. See `gql`'s
+        docstring for why the rule is the operation and not the wording of the
+        error.
         """
         q = """
         query($source: ScraperSourceInput!, $input: ScrapeSingleSceneInput!){
           scrapeSingleScene(source:$source, input:$input){%s}
         }""" % self._SCRAPED_SCENE_SELECTION
         data = self.gql(q, {"source": {"scraper_id": scraper_id},
-                            "input": {"query": query}})
+                            "input": {"query": query}}, retryable=True)
         return data["scrapeSingleScene"] or []
 
     def scrape_scene_url(self, url):
@@ -1178,12 +1353,33 @@ class Stash:
         URL, not as the payload an update accepts), so there is nothing to
         restore it from. Selecting `image` here is deliberate, not a gap,
         and nothing here undoes it — see `apply_scene`'s docstring.
+
+        RETRYABLE (`gql(retryable=True)`), on the same terms as
+        `scrape_scenes_by_query`: it drives the SAME third-party scraper code,
+        over a request carrying nothing but a URL, and it is a read. Its
+        caller's treatment of failure is what makes including it worth the
+        request rather than merely harmless — `scan.examine`'s enrichment step
+        swallows the exception and keeps its thin candidate, so a blip here
+        does not surface as an error at all; it surfaces as a proposal whose
+        payload silently lacks the creator, studio and date the fuller record
+        would have carried. That is the quiet degradation a bounded retry
+        exists for.
+
+        The one scraping call that is deliberately NOT retryable is
+        `scrape_scenes_by_fingerprint`. It asks a stash-box's own database
+        which scene a set of hashes belongs to rather than running a scraper
+        plugin's code, no fault of this shape has been seen from it, and its
+        own misalignment guard raises a permanent error on purpose — retrying
+        a reply that could not be matched to the scenes it was asked about
+        would repeat a request whose answer was already unusable. Extending
+        the carve-out to it needs evidence about it, not consistency with a
+        different failure.
         """
         q = """
         query($url: String!){
           scrapeSceneURL(url:$url){%s}
         }""" % self._SCRAPED_SCENE_SELECTION
-        data = self.gql(q, {"url": url})
+        data = self.gql(q, {"url": url}, retryable=True)
         return data.get("scrapeSceneURL")
 
     # The one field the fingerprint lookup selects that
