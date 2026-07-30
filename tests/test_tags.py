@@ -52,7 +52,7 @@ class FakeCtx:
 
 
 class FakeStash:
-    """The two reads a tag pass makes, and nothing else.
+    """The four reads a tag pass makes, and nothing else.
 
     Any other attribute refuses: this pass proposes and never writes, and a
     write introduced here is meant to show up as a failure rather than as a
@@ -63,11 +63,20 @@ class FakeStash:
     preference, so a double that handed back something whose order was
     incidental would let an order test pass against a property production
     does not have.
+
+    `performers_with_aliases` and `tagged_scenes` are the performer half's two
+    reads. Both default to "this library has none", which is what the merge and
+    description tests below want: no tag can match a performer, so that half
+    proposes nothing and their assertions are about the halves they name.
+    `tagged_scenes` answers the `(count, scenes)` PAIR the real one does, and
+    the counts it reports are the pages' own -- see `scenes_for`.
     """
 
-    def __init__(self, tags, boxes=()):
+    def __init__(self, tags, boxes=(), performers=(), scenes=None):
         self._tags = list(tags)
         self._boxes = list(boxes)
+        self._performers = list(performers)
+        self._scenes = dict(scenes or {})
         self.calls = []
 
     def all_tags(self):
@@ -77,6 +86,15 @@ class FakeStash:
     def stash_box_credentials(self):
         self.calls.append("stash_box_credentials")
         return list(self._boxes)
+
+    def performers_with_aliases(self):
+        self.calls.append("performers_with_aliases")
+        return list(self._performers)
+
+    def tagged_scenes(self, tag_id, limit):
+        self.calls.append(("tagged_scenes", tag_id, limit))
+        rows = self._scenes.get(tag_id, [])
+        return len(rows), list(rows)
 
     def __getattr__(self, name):
         def refuse(*args, **kwargs):

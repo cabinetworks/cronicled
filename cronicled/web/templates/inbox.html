@@ -405,6 +405,71 @@
 </div>
 {% endmacro %}
 
+{# A tag that is really a performer. Not a scene proposal, not a merge: what a
+   person is judging is whether this tag IS that person, and how many scenes
+   the reconciliation would write to. So the blast radius sits in the score
+   slot and is labelled, exactly as a merge's is, and the match is spelled out
+   -- the performer's name, and the alias it was matched through when it was
+   not the name itself.
+
+   Undo IS offered here, unlike on a merge, and it is offered on a FAILED row
+   as well as an applied one: a run that stopped partway really did change the
+   scenes it reached, and the snapshot behind that button is the only record of
+   which. When it is offered, Approve is not -- see `web.rows.ReconcileRow`. #}
+{% macro reconcile_block(row) %}
+<div class="proposal">
+  <div class="head">
+    <div class="what">
+      <p class="file">{{ identifier("tag " ~ row.subject_id, row.tag_url) }}</p>
+      {% if row.performer %}
+      <p class="title">Attach <b>{{ identifier(row.performer, row.performer_url) }}</b> and remove the tag <b>{{ row.tag_name }}</b></p>
+      {% else %}
+      <p class="title">{{ row.matches | length }} performers answer to the tag <b>{{ row.tag_name }}</b></p>
+      {% endif %}
+      <div class="meta">
+        {% if row.performer %}
+          {% if row.alias %}matched through their alias <b>{{ row.alias }}</b>{% else %}matched on their name{% endif %}
+        {% else %}
+          {% for m in row.matches %}<b>{{ identifier(m.name, m.url) }}</b>{% if m.alias %} (alias <b>{{ m.alias }}</b>){% endif %}{% if not loop.last %} &middot; {% endif %}{% endfor %}
+        {% endif %}
+      </div>
+    </div>
+    {# The blast radius, LABELLED, in the slot a scene row's score occupies. A
+       bare number there reads as a confidence, and this is how many scenes a
+       person is about to write to. #}
+    <div class="score">{{ row.total_scenes }}<div class="note">{{ row.counts_cover }}</div></div>
+    <div class="acts">
+      {% if row.undoable %}
+      <form method="post" action="/undo"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Undo</button></form>
+      {% endif %}
+      {% if row.appliable %}
+      <form method="post" action="/approve"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>{% if row.error %}Try again{% else %}Reconcile{% endif %}</button></form>
+      {% endif %}
+      {% if row.actionable %}
+      <form method="post" action="/dismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Dismiss</button></form>
+      <form method="post" action="/mute"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Mute</button></form>
+      {% endif %}
+      {% if row.undismissable %}
+      <form method="post" action="/undismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Undismiss</button></form>
+      {% endif %}
+      {% if row.unmutable %}
+      <form method="post" action="/unmute"><input type="hidden" name="subject_type" value="{{ row.subject_type }}"><input type="hidden" name="subject_id" value="{{ row.subject_id }}"><button>Unmute</button></form>
+      {% endif %}
+    </div>
+  </div>
+  {% if row.error %}
+  <div class="warn">The last attempt to apply this failed: {{ row.error }}</div>
+  {% endif %}
+  {% if row.ambiguous %}
+  <div class="warn">Nothing here can say which performer these scenes belong to: {{ row.ambiguous }}</div>
+  {% endif %}
+  {# Said on every row in every state. A name match is evidence and not proof,
+     and the reviewer is the only thing standing between a shared name and a
+     write to every scene carrying it. #}
+  <div class="warn">A tag and a performer sharing a name is evidence, not proof -- a studio and its owner, or a series named after its creator, share one legitimately. Approving writes to {{ row.total_scenes }} {{ row.counts_cover }}: the performer is attached and the tag is removed from each. The tag itself is kept, and deleting it is a separate decision.</div>
+</div>
+{% endmacro %}
+
 {% macro section(name, entries, empty_text, open=False) %}
 <details class="section"{% if open %} open{% endif %}>
   <summary>{{ name }} ({{ entries | length }})</summary>
@@ -431,6 +496,13 @@
 {% call section("Tag merges", merges, "No duplicate tag spellings found.") %}
   {% for row in merges %}
   {{ merge_block(row) }}
+  {% endfor %}
+{% endcall %}
+
+{% set reconciles = reconciles | default([]) %}
+{% call section("Tags that are a performer", reconciles, "No tag matches a performer's name.") %}
+  {% for row in reconciles %}
+  {{ reconcile_block(row) }}
   {% endfor %}
 {% endcall %}
 

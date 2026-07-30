@@ -746,6 +746,137 @@ def to_merge_rows(items):
     return [to_merge_row(i) for i in items]
 
 
+@dataclass(frozen=True)
+class ReconcileRow:
+    """One tag-is-really-a-performer proposal -> what its section shows.
+
+    Deliberately NOT a `Row`, a `TagDescriptionRow` or a `MergeRow`, on the
+    same terms `MergeRow` is not a `Row`: the question here is neither a
+    filename against a candidate title nor two versions of a paragraph. It is
+    "is this tag that person, and how many scenes am I about to write to",
+    and the two fields that make it judgeable -- what the match was, and the
+    blast radius -- have no home on any of the three.
+
+    `performer` is the name of the one performer this tag resolves to, or
+    `None` when two or more answer to it. `matches` lists EVERY one of them,
+    always, including the single-match case: the row shows what it matched, and
+    a field that only appeared in the ambiguous case would mean the ordinary
+    row had to say it a second way.
+
+    `alias` is the alias surface the match came through, or `None` on a name
+    match. Shown because "this tag is that performer's name" and "this tag is
+    one of the aliases recorded for them" are different strengths of evidence.
+
+    `undoable` is NOT the `state == "applied"` rule the other rows use, and the
+    difference is the whole reason this row exists in a `failed` state at all.
+    A reconciliation writes to many scenes one at a time; a run that failed
+    partway through really did change the scenes it got to, and the snapshot
+    recording them is the only way back. So the Undo is offered whenever a
+    snapshot exists -- and `appliable` is withheld while one does, because a
+    second attempt would record a snapshot covering only ITS scenes and the
+    first batch would become unrecorded. Undo first, then approve again.
+    """
+    fingerprint: str
+    state: str
+    subject_type: str
+    subject_id: str
+    tag_name: str
+    # The media server's own page for the tag, or `None` with no server
+    # configured -- see `tag_url`.
+    tag_url: str | None
+    performer: str | None
+    performer_url: str | None
+    alias: str | None
+    # Every performer answering to this tag's name, as
+    # `{"id", "name", "alias", "url"}`, in the payload's own order
+    # (`performer_tags.index_performers` sorts by name and id).
+    matches: tuple
+    ambiguous: str | None
+    # The blast radius, derived from the recorded scene set rather than stored
+    # beside it, so the number shown and the set it describes cannot disagree.
+    total_scenes: int
+    counts_cover: str
+    appliable: bool
+    actionable: bool
+    undoable: bool
+    undismissable: bool
+    unmutable: bool
+    error: str | None
+
+
+# States in which a reconciliation has no decision left to offer. The same
+# four `_CLOSED_MERGE_STATES` names and for the same reasons -- `applied` is
+# done (and has Undo instead), `dismissed` and `muted` are standing rejections
+# with their own reversal controls, `superseded` has been retired. `failed` is
+# NOT here: nothing was written, or only part was, and either way the row still
+# has a decision in it.
+_CLOSED_RECONCILE_STATES = ("applied", "dismissed", "muted", "superseded")
+
+
+def _match_view(entry, base_url):
+    """One performer answering to a tag's name, as the section shows it.
+
+    Every field INDEXED: `performer_tags.proposal` writes all of them on every
+    proposal it makes. `alias` being `None` is an ordinary answer (the
+    performer's own name matched); the KEY being absent is a payload from
+    somewhere that never asked, and reading the two the same way would report
+    an alias match as a name match -- the stronger of the two claims, made on
+    the weaker of the two matches.
+    """
+    performer = entry["performer"]
+    return {"id": performer["id"], "name": performer["name"],
+            "alias": entry["alias"],
+            "url": performer_url(base_url, performer["id"])}
+
+
+def to_reconcile_row(item, base_url=None):
+    """One stored reconciliation `item` -> its `ReconcileRow`.
+
+    Everything is INDEXED, never `.get`: `cronicled.performer_tags.proposal`
+    writes every field read here on every proposal it makes. The expensive
+    direction is specific and it is `scenes` -- a missing list read back as
+    empty would put a blast radius of nothing in front of a reviewer for a
+    write that might touch thousands of scenes, which is precisely the reading
+    that gets a large write approved without a second thought.
+
+    `prior_state` is the one field read with `.get`, because the store itself
+    leaves it null until something is applied.
+    """
+    payload = item["payload"]
+    performer = payload["performer"]
+    state = item["state"]
+    open_state = state not in _CLOSED_RECONCILE_STATES
+    snapshot = bool(item.get("prior_state"))
+    return ReconcileRow(
+        fingerprint=item["fingerprint"],
+        state=state,
+        subject_type=item["subject_type"],
+        subject_id=item["subject_id"],
+        tag_name=payload["tag"]["name"],
+        # From `subject_id`, which is also what the page labels the row with --
+        # one id, so the link and the label cannot point at different tags.
+        tag_url=tag_url(base_url, item["subject_id"]),
+        performer=performer["name"] if performer else None,
+        performer_url=(performer_url(base_url, performer["id"])
+                       if performer else None),
+        alias=payload["alias"],
+        matches=tuple(_match_view(m, base_url) for m in payload["matches"]),
+        ambiguous=payload["ambiguous"],
+        total_scenes=len(payload["scenes"]),
+        counts_cover=payload["counts_cover"],
+        appliable=open_state and performer is not None and not snapshot,
+        actionable=open_state,
+        undoable=snapshot and state in ("applied", "failed"),
+        undismissable=state == "dismissed",
+        unmutable=state == "muted",
+        error=item.get("error"),
+    )
+
+
+def to_reconcile_rows(items, base_url=None):
+    return [to_reconcile_row(i, base_url=base_url) for i in items]
+
+
 def _refused_store_view(entry):
     """One searched store's line in the Refused section.
 

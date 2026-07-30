@@ -15,6 +15,8 @@ from cronicled.artist import Aliases
 from cronicled.config import CONFIG_DIR_ENV_VAR
 from cronicled.descriptions import PRODUCER_NAME as DESCRIPTION_PRODUCER_NAME
 from cronicled.jobs import JobRunner
+from cronicled.performer_tags import index_performers, match_tag
+from cronicled.performer_tags import proposal as reconcile_proposal
 from cronicled.runscan import SCHEDULED_SCAN_NAME, build_producer
 from cronicled.scan import ScanProducer
 from cronicled.schedule import Entry, resolve
@@ -107,6 +109,14 @@ class _ReadOnlyStash:
         self.calls.append(("stash_box_credentials",))
         return []
 
+    def performers_with_aliases(self):
+        # The tag pass's third read, for the half that looks for tags which are
+        # really a performer filed as one. An empty library holds no performers
+        # either, so no tag can match one and the pass still runs to a real
+        # finish rather than falling through to the refusal below.
+        self.calls.append(("performers_with_aliases",))
+        return []
+
     def scrape_scene_url(self, url):
         self.calls.append(("scrape_scene_url", url))
         return None
@@ -188,6 +198,36 @@ class _Base(unittest.TestCase):
         store.close()
         return fp
 
+    def _seed_reconcile(self, state=None, prior=None):
+        """A real tag/performer reconciliation, built through
+        `cronicled.performer_tags`' own proposal path, in whichever `state` a
+        person's decision would leave it. Opened and closed before `main()`
+        runs its own `Store`."""
+        store = Store(self.db_path)
+        index = index_performers(
+            [{"id": "p-1", "name": "Marlowe Quill",
+              "alias_list": ["Delia Ashgrove"]}])
+        tag_row = {"id": "44", "name": "Delia Ashgrove", "aliases": [],
+                   "description": None, "scene_count": 3}
+        built = reconcile_proposal(tag_row, match_tag(tag_row, index),
+                                   ["sc-1", "sc-2", "sc-3"], folder="library")
+        fp = store.record(folder=built["folder"],
+                          subject_type=built["subject_type"],
+                          subject_id=built["subject_id"],
+                          summary=built["summary"], payload=built["payload"],
+                          producer="tag-merge")
+        if state == "dismissed":
+            store.dismiss(fp)
+        elif state == "muted":
+            store.mute(built["subject_type"], built["subject_id"])
+        elif state == "applied":
+            store.mark_applied(fp, prior_state=prior)
+        elif state == "failed":
+            store.mark_applied(fp, prior_state=prior)
+            store.mark_failed(fp, "wrote 1 of 3 scenes and then stopped")
+        store.close()
+        return fp
+
 
 class MergeSectionWiring(_Base):
     """Where a tag-merge proposal is rendered, and -- just as much -- where
@@ -255,6 +295,77 @@ class MergeSectionWiring(_Base):
 
         self.assertEqual([r.state for r in rows], ["applied"])
         self.assertIn("cannot be undone", rows[0].warning)
+
+
+class ReconcileSectionWiring(_Base):
+    """Where a tag/performer reconciliation is rendered, and -- just as much
+    -- where it must NOT be.
+
+    `to_row` INDEXES `payload["path"]` and `payload["candidate"]`, and a
+    reconciliation payload has neither. So one reaching any scene list is not
+    an odd-looking row: it is a `KeyError` that takes the whole page down, and
+    with it the inbox, the merge section and every control on them. Each
+    assertion here calls the section's callable, which is the only way to see
+    that -- `serve` receives functions, and a wiring mistake is invisible until
+    one is invoked.
+    """
+
+    def _served(self):
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path])
+        return captured.kwargs
+
+    def test_it_reaches_its_own_section_and_no_other(self):
+        self._seed()             # one ordinary scene proposal
+        self._seed_merge()       # and one tag merge
+        self._seed_reconcile()
+        kwargs = self._served()
+
+        self.assertEqual([r.tag_name for r in kwargs["reconciles"]()],
+                         ["Delia Ashgrove"])
+        self.assertEqual([r.filename for r in kwargs["rows"]()], ["reel.mp4"])
+        self.assertEqual([r.key for r in kwargs["merges"]()], ["velvetcrane"])
+
+    def test_every_scene_section_survives_one_in_the_store(self):
+        for state in ("dismissed", "muted", "applied"):
+            with self.subTest(state=state):
+                self.setUp()
+                self._seed_reconcile(state=state)
+                kwargs = self._served()
+                for section in ("rows", "muted", "dismissed", "superseded",
+                                "applied"):
+                    self.assertEqual(kwargs[section](), [], section)
+
+    def test_a_dismissed_one_keeps_its_reversal_on_the_page(self):
+        self._seed_reconcile(state="dismissed")
+
+        rows = self._served()["reconciles"]()
+
+        self.assertEqual([r.state for r in rows], ["dismissed"])
+        self.assertTrue(rows[0].undismissable)
+
+    def test_a_muted_one_keeps_its_reversal_on_the_page(self):
+        self._seed_reconcile(state="muted")
+
+        rows = self._served()["reconciles"]()
+
+        self.assertEqual([r.state for r in rows], ["muted"])
+        self.assertTrue(rows[0].unmutable)
+
+    def test_a_partly_applied_one_keeps_its_undo_on_the_page(self):
+        # HARM: the scenes a partial run changed have no other way back from
+        # the page at all, and the row has to be BUILT for the button to exist.
+        self._seed_reconcile(state="failed",
+                             prior={"tag_id": "44", "performer_id": "p-1",
+                                    "attached": ["sc-1"],
+                                    "untagged": ["sc-1"]})
+
+        rows = self._served()["reconciles"]()
+
+        self.assertEqual([r.state for r in rows], ["failed"])
+        self.assertTrue(rows[0].undoable)
+        self.assertFalse(rows[0].appliable)
 
 
 class NoServerConfigured(_Base):

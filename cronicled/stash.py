@@ -231,6 +231,51 @@ class Stash:
                 return out
             page += 1
 
+    def performers_with_aliases(self):
+        """Every performer this server holds, with just enough to recognise
+        one of their NAMES: `id`, `name`, and `alias_list` -- the field Stash
+        records a performer's other spellings in, and the same field name
+        `_FIELDS["performer"]` below already selects when it resolves a single
+        name against the server. Spelled that way here rather than as
+        `aliases`, which is the field a TAG and a STUDIO carry; the three
+        types do not share it.
+
+        `alias_list` is `[String!]!`, a SCALAR list, so it takes no selection
+        set -- unlike `stash_ids` in `performers_with_stash_ids` above, which
+        is an object list and is rejected outright written bare. A performer
+        nobody has recorded another spelling for answers `[]`; that is a
+        normal answer, not a gap to raise on.
+
+        The aliases are the point of this read rather than a bonus on top of
+        it. Measured against a real library, matching tags against performer
+        NAMES alone found far fewer than matching against names plus aliases,
+        which is the same result `cronicled.tag_descriptions` measured for a
+        stash-box's tag catalogue -- a person's other spellings are where most
+        of the mis-filed tags actually sit.
+
+        Paged exactly as `performers_with_stash_ids` and
+        `performers_with_descriptions` page, and for the same reason: a
+        whole-library, no-filter read is the point. `cronicled
+        .performer_tags.index_performers` turns the whole list into one index
+        and every tag is looked up in it, because a search per tag would be
+        one request per tag against an answer one read already holds.
+        """
+        q = """
+        query($f: FindFilterType){
+          findPerformers(filter:$f){
+            count performers{ id name alias_list }
+          }
+        }"""
+        out, page = [], 1
+        while True:
+            data = self.gql(q, {"f": {"per_page": 500, "page": page,
+                                      "sort": "name", "direction": "ASC"}})
+            rows = data["findPerformers"]["performers"]
+            out.extend(rows)
+            if len(rows) < 500 or len(out) >= data["findPerformers"]["count"]:
+                return out
+            page += 1
+
     def performer_description(self, performer_id):
         """One performer's description as it stands RIGHT NOW.
 
@@ -412,6 +457,12 @@ class Stash:
                     % (scene_id, endpoint, ", ".join(disagreeing), stash_id))
         return merged
 
+    # The one write every scene-level path here makes. Spelled ONCE, for the
+    # reason `_SCRAPED_SCENE_SELECTION` below is: four callers send this same
+    # mutation, and a copy per caller is four strings free to drift into
+    # different mutations with nothing noticing which one a given path used.
+    _SCENE_UPDATE = "mutation($in: SceneUpdateInput!){ sceneUpdate(input:$in){ id } }"
+
     def apply_scene(self, scene_id, match, overwrite_studio=False, drop_tag_ids=()):
         """Write resolved metadata onto a scene. The server's sceneUpdate
         REPLACES the performer/tag arrays, so we read the scene's current
@@ -535,7 +586,7 @@ class Stash:
         if match.get("image"):
             inp["cover_image"] = match["image"]
 
-        self.gql("mutation($in: SceneUpdateInput!){ sceneUpdate(input:$in){ id } }", {"in": inp})
+        self.gql(self._SCENE_UPDATE, {"in": inp})
         return {"studio_id": write_studio or existing_studio_id,
                 "performers": len(merged_pids), "tags": len(merged_tids),
                 "skipped": skipped, "prior": prior}
@@ -564,8 +615,7 @@ class Stash:
                 "cannot revert scene %s: snapshot is missing or empty" % scene_id)
         inp = {"id": scene_id}
         inp.update(prior)
-        self.gql("mutation($in: SceneUpdateInput!){ sceneUpdate(input:$in){ id } }",
-                 {"in": inp})
+        self.gql(self._SCENE_UPDATE, {"in": inp})
         return {"studio_id": prior.get("studio_id"),
                 "performers": len(prior.get("performer_ids") or []),
                 "tags": len(prior.get("tag_ids") or [])}
@@ -778,6 +828,170 @@ class Stash:
         merging or deleting anything."""
         q = "mutation($in: TagUpdateInput!){ tagUpdate(input:$in){ id aliases } }"
         self.gql(q, {"in": {"id": str(tag_id), "aliases": list(aliases)}})
+
+    # -- tags that are a performer ---------------------------------------- #
+
+    def _scene_links(self, scene_id):
+        """`(performer_ids, tag_ids)` for one scene, read RIGHT NOW.
+
+        Read through `scene_existing`, the same fresh read `apply_scene`
+        takes one line before its own write, rather than off the worklist a
+        reconciliation started from. `sceneUpdate` REPLACES both arrays, so
+        writing a list assembled from a read taken minutes and hundreds of
+        scenes ago would delete a performer or a tag somebody attached in the
+        meantime -- silently, and on a path that touches thousands of scenes.
+        """
+        existing = self.scene_existing(scene_id)
+        return ([p["id"] for p in (existing.get("performers") or ())],
+                [t["id"] for t in (existing.get("tags") or ())])
+
+    def reconcile_tag_to_performer(self, tag_id, performer_id):
+        """Attach `performer_id` to every scene carrying `tag_id`, and take
+        the tag off those scenes.
+
+        THE TAG IS NOT DELETED, and nothing here can delete it. Deleting it is
+        a separate decision (see `cronicled.performer_tags`): a tag may
+        legitimately share a name with a performer, and this is the half of
+        the work that can be taken back.
+
+        The worklist is read HERE, fresh, and never taken from the proposal:
+        a proposal can be days old, and a scene tagged or untagged since is
+        exactly what a proposal-time list gets wrong in both directions.
+
+        ONE `sceneUpdate` per scene, carrying ONLY `performer_ids` and
+        `tag_ids`. No `organized`, no title, no rating, nothing else this
+        input accepts -- `apply_scene` sets `organized: True` on everything it
+        writes, which is right for a scene whose metadata a person just
+        approved and would be a second, unasked-for write to thousands of
+        scenes here. Both arrays go out in one mutation per scene, so no scene
+        is ever left carrying the performer AND the tag, or neither.
+
+        A scene that no longer carries the tag at write time is SKIPPED and
+        reported, not written to. It has already moved on since the worklist
+        was read, and writing its performer list back would be this method
+        deciding something it was not asked to decide.
+
+        On a per-scene failure the loop STOPS and the failure is returned
+        rather than raised. Returned, because everything already written is
+        what the undo snapshot has to cover: raising would discard the record
+        of the scenes this call really did change, which is the one thing that
+        makes a partial run recoverable. Stopping rather than continuing,
+        because a server refusing one write is evidence about the server, and
+        the remaining scenes are still exactly where they were.
+
+        The returned `prior` is the undo snapshot, and it distinguishes the
+        two halves: `untagged` is every scene the tag was taken off, `attached`
+        is the subset that did not ALREADY carry the performer. A scene that
+        had them both would be left without a performer somebody else attached
+        if the undo detached from everything it untagged.
+        """
+        tag_id, performer_id = str(tag_id), str(performer_id)
+        _, worklist = self.tagged_scenes(tag_id, None)
+        attached, untagged, skipped, failures = [], [], [], []
+        for scene in worklist:
+            scene_id = str(scene["id"])
+            performer_ids, tag_ids = self._scene_links(scene_id)
+            if tag_id not in tag_ids:
+                skipped.append(scene_id)
+                continue
+            already = performer_id in performer_ids
+            write_pids = (performer_ids if already
+                          else performer_ids + [performer_id])
+            write_tids = [t for t in tag_ids if t != tag_id]
+            try:
+                self.gql(self._SCENE_UPDATE,
+                         {"in": {"id": scene_id,
+                                 "performer_ids": write_pids,
+                                 "tag_ids": write_tids}})
+            except Exception as exc:
+                failures.append({"scene": scene_id,
+                                 "error": "%s: %s" % (type(exc).__name__, exc)})
+                break
+            # Recorded only AFTER the write returns, so a snapshot never
+            # claims a scene the server refused.
+            if not already:
+                attached.append(scene_id)
+            untagged.append(scene_id)
+        return {
+            "prior": {"tag_id": tag_id, "performer_id": performer_id,
+                      "attached": attached, "untagged": untagged},
+            "skipped": skipped,
+            # At most one entry, because the loop above stops at the first
+            # failure. A list rather than a single field so a caller reads
+            # "were there failures" the same way whether or not that ever
+            # changes.
+            "failures": failures,
+            "worklist": [str(scene["id"]) for scene in worklist],
+        }
+
+    _RECONCILE_SNAPSHOT_FIELDS = ("tag_id", "performer_id", "attached",
+                                  "untagged")
+
+    def revert_reconcile(self, tag_id, prior):
+        """Undo one `reconcile_tag_to_performer`: put the tag back on the
+        scenes it was taken off, and detach the performer from the scenes it
+        was attached to.
+
+        BOTH halves, and only where each one applies. `prior["untagged"]` gets
+        the tag back; `prior["attached"]` -- the subset that did not already
+        carry the performer -- gets it detached. A revert that detached from
+        everything it re-tagged would remove a performer somebody else had
+        attached before the reconciliation ever ran.
+
+        Raises `ValueError` on a snapshot that is missing, empty, or does not
+        carry all four fields, on the same terms `revert_scene` and
+        `revert_tag_description` refuse one: a revert that no-ops is
+        indistinguishable from one that worked, which is the single ambiguity
+        undo cannot afford. A snapshot naming a DIFFERENT tag is refused for a
+        sharper reason -- it would write another tag onto these scenes.
+
+        Each scene is read fresh and written only if something actually
+        changes, which makes this idempotent: a revert that fails partway can
+        be pressed again, and the scenes it already restored are no-ops the
+        second time. That matters because a failure here raises, and the
+        proposal stays `applied` with its snapshot intact.
+        """
+        if not prior or not all(field in prior
+                                for field in self._RECONCILE_SNAPSHOT_FIELDS):
+            raise ValueError(
+                "cannot revert the reconciliation of tag %s: snapshot is "
+                "missing, empty, or does not name the tag, the performer and "
+                "both halves of what changed" % (tag_id,))
+        if str(prior["tag_id"]) != str(tag_id):
+            raise ValueError(
+                "cannot revert the reconciliation of tag %s: this snapshot "
+                "belongs to tag %s, and applying it would put that tag onto "
+                "these scenes" % (tag_id, prior["tag_id"]))
+        tag_id = str(tag_id)
+        performer_id = str(prior["performer_id"])
+        untagged = [str(scene) for scene in prior["untagged"]]
+        attached = {str(scene) for scene in prior["attached"]}
+        # Every scene either half names, each visited ONCE -- two loops would
+        # write twice to a scene in both halves, and the second write would be
+        # assembled from a read taken before the first. Ordered by the
+        # snapshot's own `untagged` order, with any scene named only by
+        # `attached` after it in sorted order, so the sequence is a function
+        # of the snapshot and not of a set's iteration.
+        wanted = set(untagged)
+        order = untagged + sorted(attached - wanted)
+        detached, retagged = [], []
+        for scene_id in order:
+            performer_ids, tag_ids = self._scene_links(scene_id)
+            write_pids = ([p for p in performer_ids if p != performer_id]
+                          if scene_id in attached else performer_ids)
+            write_tids = (tag_ids + [tag_id]
+                          if scene_id in wanted and tag_id not in tag_ids
+                          else tag_ids)
+            if write_pids == performer_ids and write_tids == tag_ids:
+                continue
+            self.gql(self._SCENE_UPDATE,
+                     {"in": {"id": scene_id, "performer_ids": write_pids,
+                             "tag_ids": write_tids}})
+            if write_pids != performer_ids:
+                detached.append(scene_id)
+            if write_tids != tag_ids:
+                retagged.append(scene_id)
+        return {"detached": detached, "retagged": retagged}
 
     # -- scraping ---------------------------------------------------------- #
 
