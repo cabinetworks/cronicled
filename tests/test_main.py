@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 from cronicled.__main__ import build_scheduler, main
 from cronicled.adapters.declarative import DeclarativeAdapter
 from cronicled.artist import Aliases
-from cronicled.config import CONFIG_DIR_ENV_VAR, ZONE_ENV_VAR
+from cronicled.config import CONFIG_DIR_ENV_VAR, RENAMED_JOBS, ZONE_ENV_VAR
 from cronicled.descriptions import PRODUCER_NAME as DESCRIPTION_PRODUCER_NAME
 from cronicled.jobs import JobRunner
 from cronicled.performer_tags import index_performers, match_tag
@@ -2241,6 +2241,29 @@ class TheScheduledJobsAreNamedForWhatTheyCover(unittest.TestCase):
                   encoding="utf-8") as fh:
             example = json.load(fh)
         self.assertEqual(sorted(example), ALL_PRODUCERS)
+
+    def test_the_migration_translates_old_names_into_jobs_that_exist(self):
+        """HARM: `load_schedule` exists so an operator's existing file does
+        not crash-loop the process on the release that renames a job. A map
+        entry pointing at a name nothing registers translates one refusal
+        into another and reports it as a successful migration, which is worse
+        than not migrating at all -- the operator is told to stop worrying
+        about the very name that is still stopping the process.
+
+        The whole set, and equality rather than "each of these is
+        registered": every scheduled job here was renamed, so the map's
+        targets are exactly the registry. A job added later that never had an
+        old name fails this on purpose -- adding one is the moment to decide
+        whether it needs carrying, and this is the only place that question
+        gets asked.
+
+        Derived on both sides deliberately, unlike
+        `test_the_three_scheduled_jobs_have_the_names_a_schedule_file_uses`
+        above: that one pins the names as literals, and the literal OLD names
+        are pinned in tests/test_config.py. What is left for this to check is
+        that the two sets agree, which neither literal can see.
+        """
+        self.assertEqual(sorted(set(RENAMED_JOBS.values())), ALL_PRODUCERS)
 
 
 if __name__ == "__main__":

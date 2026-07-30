@@ -97,6 +97,96 @@ def default_schedule_path(env=None):
     return os.path.join(config_dir(env), "schedule.json")
 
 
+# Jobs renamed for what they cover rather than what they did at the time,
+# keyed by the name an existing schedule file may still hold.
+#
+# Accepted for one release, and only these exact names. `cronicled.schedule.
+# resolve` refuses an override naming a producer that does not exist, and that
+# refusal is a START-UP failure — before there is a page on which to read it,
+# so the symptom of a rename landing on a configured deployment is a crash
+# loop rather than a message. This map is what closes that window.
+#
+# It translates names this project itself changed; it does not make an unknown
+# name acceptable. Anything not listed here is handed on exactly as written, so
+# `resolve` still refuses it — a typo must stay a start-up stack trace rather
+# than becoming a job that quietly never runs.
+RENAMED_JOBS = {
+    "nightly-library-scan": "scene-scan",
+    "performer-descriptions": "performer-scan",
+    "tag-merge": "tag-scan",
+}
+
+
+def _refuse_duplicate_keys(pairs, path):
+    """`json.load` hook: a repeated key is an error, not the last one winning.
+
+    A file whose earlier half is discarded without a word is a file whose
+    author believes something untrue about their own configuration. Observed
+    on a real deployment: every job named twice, so three interval entries
+    were dead and three passes shared one appointment, and nothing said so.
+
+    This is an `object_pairs_hook`, so it fires for EVERY object in the file,
+    at every depth — a job named twice at the top level and a setting named
+    twice inside one job's own settings are the same mistake with the same
+    consequence, and are refused by the same rule at the same moment.
+
+    Both values are named, because which one is live is the whole question:
+    a message saying only that the key repeats leaves the reader to work out
+    which half of their file the parser threw away.
+    """
+    seen = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(
+                "%s names %r twice, as %r and then %r. JSON keeps only the "
+                "last, so the first is silently discarded — delete one."
+                % (path, key, seen[key], value))
+        seen[key] = value
+    return seen
+
+
+def _migrate_renamed_jobs(overrides, path):
+    """`overrides` with any old job name replaced by its current one.
+
+    Every translation is reported, once each. A migration nobody is told
+    about is a file that keeps working until the release that stops accepting
+    the old name, at which point it stops the process starting — the operator
+    has to be told now, while there is still an easy edit to make.
+
+    Two entries that end up naming the SAME job are refused, naming both, for
+    the reason a duplicate key is: it is one job scheduled twice, and there is
+    no way to tell which entry was meant. Keeping either by iteration order
+    would leave the other doing nothing and say so nowhere. The reachable
+    shape is an operator part-way through the rename, whose file names a job
+    by its old name and its new one at once — the two keys differ, so JSON
+    sees nothing wrong and `_refuse_duplicate_keys` cannot see it either.
+    """
+    claimed = {}
+    for written, settings in overrides.items():
+        current = RENAMED_JOBS.get(written, written)
+        claimed.setdefault(current, []).append((written, settings))
+
+    migrated = {}
+    for current, entries in claimed.items():
+        if len(entries) > 1:
+            raise ValueError(
+                "%s schedules the job now called %r more than once: %s. Those "
+                "are one job under two names, so one of them would silently "
+                "do nothing — delete one."
+                % (path, current,
+                   " and ".join("%r as %r" % pair for pair in entries)))
+        written, settings = entries[0]
+        if written != current:
+            print("WARNING: %s names %r, which is now called %r, and has been "
+                  "read as the new name for this run. Edit the file: the old "
+                  "name is accepted for one release so that the rename does "
+                  "not stop a configured deployment starting, and after that "
+                  "an override naming it is refused at start-up."
+                  % (path, written, current))
+        migrated[current] = settings
+    return migrated
+
+
 def load_schedule(path=None, env=None):
     """Schedule overrides, as `{producer_name: {"every": …, "enabled": …}}`.
 
@@ -117,19 +207,29 @@ def load_schedule(path=None, env=None):
     `resolve` receives that as `dict(overrides)` and a JSON list or string
     would fail there as a `TypeError` or a name nobody wrote — a message
     about this file, naming this file, is what an operator can act on.
+
+    It also refuses a key written twice, and it does the ONE thing `resolve`
+    cannot: translate a job's old name to its current one. Both are here
+    rather than there because both are facts about the FILE — the text an
+    operator typed — and `resolve` is only ever handed the mapping that text
+    parsed to, by which point a repeated key has already been thrown away and
+    an old name is indistinguishable from a typo. See `_refuse_duplicate_keys`
+    and `RENAMED_JOBS`.
     """
     if path is None:
         path = default_schedule_path(env)
     if not os.path.exists(path):
         return {}
     with open(path) as fh:
-        overrides = json.load(fh)
+        overrides = json.load(
+            fh, object_pairs_hook=lambda pairs: _refuse_duplicate_keys(
+                pairs, path))
     if not isinstance(overrides, dict):
         raise ValueError(
             "%s must hold a JSON object keyed by producer name, for example "
-            '{"nightly-library-scan": {"every": 3600}}, but it holds %s'
+            '{"scene-scan": {"every": 3600}}, but it holds %s'
             % (path, type(overrides).__name__))
-    return overrides
+    return _migrate_renamed_jobs(overrides, path)
 
 
 ZONE_ENV_VAR = "CRONICLED_ZONE"
