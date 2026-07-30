@@ -66,10 +66,16 @@ docker run --rm \
 ```
 
 This is THE documented way to run it. `-e CRONICLED_SERVER`/`-e
-CRONICLED_API_KEY` are optional: without them the inbox still starts and a
-person can browse, dismiss and mute what a scan already produced, but Approve
-and Undo refuse until a media server is configured (see
-`cronicled/__main__.py`).
+CRONICLED_API_KEY` are optional in two different ways. A mounted `/config`
+holding a `server.json` with a `url` and an `api_key` configures the media
+server on its own — that file is asked last, after the flags and after these
+two variables, so passing either here still wins and adding the file changes
+nothing for a deployment that already does. With none of the three, the inbox
+still starts and a person can browse, dismiss and mute what a scan already
+produced, but Approve and Undo refuse until a media server is configured (see
+`cronicled/__main__.py`). A `server.json` that is present and incomplete is a
+third state: it stops the start with a message naming what is missing, rather
+than being reported as an absent one.
 
 `-e CRONICLED_ZONE=Europe/Lisbon` is worth adding in a container, and this is
 the deployment it exists for. It names the zone the overnight passes run in AND
@@ -156,7 +162,9 @@ varies between installs is mounted, not copied in:
   `$CRONICLED_CONFIG_DIR=/config`, which both `server.json` and `adapters.json`
   are read from by default (see `cronicled/config.py`'s `config_dir`); a local
   checkout with no such directory set falls back to a `config/` directory
-  relative to the working directory instead.
+  relative to the working directory instead. The service reads `server.json`
+  out of it only when nothing else named a media server — see the run command
+  above for the order.
 
     This is deliberately a separate mechanism from `$STASH_URL`/`$STASH_API_KEY`:
     those two name the *media server* being managed, not this project, and an
