@@ -7,8 +7,8 @@ import unittest
 import urllib.error
 from unittest import mock
 
-from cronicled.stash import (DEFAULT_TIMEOUT, HARD_DEADLINE_SLACK, Stash,
-                             StashError)
+from cronicled.stash import (DEFAULT_TIMEOUT, HARD_DEADLINE_SLACK,
+                             RETRY_ATTEMPTS, RETRY_DELAY, Stash, StashError)
 
 
 def _transport(responses):
@@ -4441,3 +4441,458 @@ class PerformerDescription(unittest.TestCase):
         got = Stash("http://example.test", "k",
                     transport=t).performer_description("7")
         self.assertIsNone(got)
+
+
+# -- retrying a store fault that looks transient ---------------------------- #
+#
+# THE DEFECT: a store answered a name search with a GraphQL error twice, on
+# different files, and nothing retried. The error was the media server
+# reporting that its configured scraper had handed back a single object where
+# the schema promises a list — a fault in the scraper, upstream of this
+# project. The identical queries succeeded when they were repeated by hand
+# (sixteen out of sixteen), so the failure is intermittent and one repeat
+# recovers the file.
+#
+# Two rules are under test here and they are pinned separately, because each
+# fails a different way round:
+#
+#   the CLASSIFICATION — which failures are worth repeating. Too narrow and
+#   the fault above stays unretried; too wide and a request the server will
+#   refuse verbatim is sent again, and a genuinely rejected input reads as a
+#   flaky network.
+#
+#   the LOOP — how many times. Unbounded, a permanently-broken store spins
+#   forever inside one file's examination and the run never terminates;
+#   absent, the classification buys nothing at all.
+#
+# Every fixture below is invented. `_SCRAPER_FAULT` reproduces the SHAPE of
+# the observed message — an upstream Go type name a reader of this project
+# cannot act on — under an invented scraper name, because what the tests
+# assert is that the recorded text is readable WITHOUT that tail.
+#
+# No test here sleeps: the delay between attempts is an injected collaborator,
+# recorded rather than paid, on the same seam `transport` already uses.
+
+_SCRAPER_FAULT = (
+    "error while name scraping with scraper Bramblewick: could not unmarshal "
+    "json from script output: json: cannot unmarshal object into Go value of "
+    "type []models.ScrapedScene")
+
+
+def _graphql_error(message):
+    """A payload the media server answers with when the operation failed
+    server-side: no `data`, an `errors` array. Returned by the transport, not
+    raised by it — that is the real path, and `_attempt`'s errors branch is
+    the code under test."""
+    return {"errors": [{"message": message}]}
+
+
+def _scripted_transport(script):
+    """A fake transport that plays `script` IN ORDER — an exception instance
+    is raised, a dict is returned — and refuses to run off the end.
+
+    Deliberately not `_transport`'s "repeat the last entry forever" behaviour.
+    A bound-under-test needs a script LONGER than the bound, so that a loop
+    mutated to unlimited terminates with the wrong answer and fails an
+    assertion instead of hanging the suite — a hang is not a failing test.
+    Running off the end raising is the fake reporting the opposite mistake:
+    more calls than the test was written to describe."""
+    calls = []
+
+    def send(body, timeout):
+        calls.append((body, timeout))
+        if len(calls) > len(script):
+            raise AssertionError(
+                "the client made call %d against a transport scripted for %d"
+                % (len(calls), len(script)))
+        item = script[len(calls) - 1]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    send.calls = calls
+    return send
+
+
+def _retrying_stash(script):
+    """(client, transport, sleeps) — a client whose retry delay is recorded on
+    `sleeps` instead of waited out."""
+    sleeps = []
+    transport = _scripted_transport(script)
+    return (Stash(SERVER_URL, API_KEY, transport=transport,
+                  sleep=sleeps.append),
+            transport, sleeps)
+
+
+_SCRAPED = _scraped_scene(title="Copper Kettle")
+_SCRAPE_ANSWER = {"data": {"scrapeSingleScene": [_SCRAPED]}}
+
+
+class TheRetryBound(unittest.TestCase):
+    """`RETRY_ATTEMPTS` / `RETRY_DELAY` — the two numbers that decide what a
+    caller can be made to wait. Pinned as values because everything else in
+    this section is measured against them."""
+
+    def test_the_bound_is_a_total_of_two_attempts(self):
+        # HARM in either direction: 1 is no retry at all, and the defect this
+        # exists for stays unfixed silently — a store simply answers less
+        # often than it could. A larger number multiplies the cost of the
+        # evidence being wrong: intermittence rests on a failure to
+        # reproduce, which is weaker than a reproduction, so the smallest
+        # number that fixes the fault is the one the evidence supports.
+        self.assertEqual(RETRY_ATTEMPTS, 2)
+
+    def test_the_delay_between_attempts_is_positive(self):
+        # HARM: a zero delay makes the retry actively harmful against the one
+        # server that says so explicitly — 429 means "come back later", and
+        # coming back immediately is what it asked the client not to do.
+        self.assertGreater(RETRY_DELAY, 0)
+
+    def test_the_delay_is_small_enough_to_sit_inside_a_callers_budget(self):
+        # HARM: the delay is paid inside the caller's own wall clock, on top
+        # of a hard deadline it already has to allow for. A delay of minutes
+        # would make a failing store look like a wedged one to everything
+        # upstream, which is the confusion the deadline machinery exists to
+        # remove.
+        self.assertLessEqual(RETRY_DELAY, 5)
+
+
+class ATransientScrapeFailureIsRetried(unittest.TestCase):
+    def test_a_scrape_that_fails_once_then_succeeds_returns_the_real_answer(self):
+        # HARM: this is the defect. Treating the first failure as final loses
+        # a file the store could identify — and loses it as a REFUSAL, so
+        # nothing distinguishes it from a file the catalogue genuinely has
+        # nothing for.
+        stash, t, sleeps = _retrying_stash(
+            [_graphql_error(_SCRAPER_FAULT), _SCRAPE_ANSWER])
+
+        got = stash.scrape_scenes_by_query(SCRAPER_ID, SCRAPE_QUERY_TEXT)
+
+        self.assertEqual(got, [_SCRAPED])
+        self.assertEqual(len(t.calls), 2, "the second attempt never happened")
+        self.assertEqual(sleeps, [RETRY_DELAY],
+                         "one gap, between the two attempts")
+
+    def test_scraping_a_clip_page_by_url_is_retried_too(self):
+        # HARM: the SAME scraper code runs behind this call, and its caller
+        # (`scan.examine`'s enrichment) swallows the failure — so a blip here
+        # never surfaces as an error at all. It surfaces as a proposal whose
+        # payload silently lacks the creator, studio and date the fuller
+        # record would have carried.
+        stash, t, _ = _retrying_stash(
+            [_graphql_error(_SCRAPER_FAULT),
+             {"data": {"scrapeSceneURL": _SCRAPED}}])
+
+        got = stash.scrape_scene_url(SCRAPE_URL)
+
+        self.assertEqual(got, _SCRAPED)
+        self.assertEqual(len(t.calls), 2)
+
+    def test_no_delay_is_paid_when_the_first_attempt_answers(self):
+        # HARM: a delay paid before the first attempt, or after a success,
+        # taxes every healthy call in the run — thousands of them — for a
+        # failure that did not happen.
+        stash, t, sleeps = _retrying_stash([_SCRAPE_ANSWER])
+
+        stash.scrape_scenes_by_query(SCRAPER_ID, SCRAPE_QUERY_TEXT)
+
+        self.assertEqual(sleeps, [])
+        self.assertEqual(len(t.calls), 1)
+
+    def test_the_default_delay_is_taken_from_the_clock_when_none_is_injected(self):
+        # HARM: an injected `sleep` is what keeps the suite from paying the
+        # delay, so a default that silently did nothing would look identical
+        # in every test here and remove the pause in production — the one
+        # place it matters. Patched rather than endured, so this test does
+        # not sleep either.
+        transport = _scripted_transport(
+            [_graphql_error(_SCRAPER_FAULT), _SCRAPE_ANSWER])
+
+        # Built inside the patch: the default is resolved once, at
+        # construction, the same way the default transport is.
+        with mock.patch("time.sleep") as slept:
+            Stash(SERVER_URL, API_KEY,
+                  transport=transport).scrape_scenes_by_query(
+                      SCRAPER_ID, SCRAPE_QUERY_TEXT)
+
+        self.assertEqual(slept.call_args_list, [mock.call(RETRY_DELAY)])
+
+
+class TheRetryIsBounded(unittest.TestCase):
+    """A store failing every attempt must end VISIBLY failing — bounded,
+    recorded, and never as an answer."""
+
+    # Longer than any bound under test, and ending in a success: a loop
+    # mutated to unlimited would reach that success and return it, failing
+    # the assertions below rather than hanging the suite.
+    FIVE_FAILURES_THEN_AN_ANSWER = (
+        [_graphql_error(_SCRAPER_FAULT)] * 5 + [_SCRAPE_ANSWER])
+
+    def test_a_store_failing_every_attempt_stops_at_the_bound(self):
+        # HARM: unbounded, one permanently-broken store spins inside one
+        # file's examination forever and the run never terminates — no
+        # proposals, no error, nothing to look at.
+        stash, t, _ = _retrying_stash(self.FIVE_FAILURES_THEN_AN_ANSWER)
+
+        with self.assertRaises(StashError):
+            stash.scrape_scenes_by_query(SCRAPER_ID, SCRAPE_QUERY_TEXT)
+
+        self.assertEqual(len(t.calls), RETRY_ATTEMPTS)
+
+    def test_a_store_failing_every_attempt_raises_rather_than_answering_empty(self):
+        # HARM: the distinction the whole scan rests on. An empty list is
+        # "this catalogue has nothing for this creator", which is what earns
+        # a MUTE — a verdict that stops the file ever being looked at again.
+        # An error is evidence about the round trip and must never be
+        # convertible into one.
+        stash, _, _ = _retrying_stash(self.FIVE_FAILURES_THEN_AN_ANSWER)
+
+        with self.assertRaises(StashError) as ctx:
+            stash.scrape_scenes_by_query(SCRAPER_ID, SCRAPE_QUERY_TEXT)
+
+        self.assertTrue(ctx.exception.transient,
+                        "the fault was transient and stays so after the bound "
+                        "— giving up is this loop's verdict, not a "
+                        "reclassification of the failure")
+
+    def test_the_exhausted_failure_says_how_many_attempts_it_took(self):
+        # HARM: this is the whole message a person reads afterwards, via
+        # `scan`'s `store_errors` line. Without the bound in it, a store that
+        # failed twice is indistinguishable from one asked once, so "the
+        # retry is not working" is not a conclusion anybody can reach — and
+        # the upstream sentence alone is a Go type name, which says nothing
+        # about this project at all. Asserted WHOLE: a test checking the
+        # original text is merely present would pass on the behaviour that
+        # shipped before this ticket.
+        stash, _, _ = _retrying_stash(self.FIVE_FAILURES_THEN_AN_ANSWER)
+
+        with self.assertRaises(StashError) as ctx:
+            stash.scrape_scenes_by_query(SCRAPER_ID, SCRAPE_QUERY_TEXT)
+
+        self.assertEqual(str(ctx.exception),
+                         _SCRAPER_FAULT + " — gave up after 2 attempts")
+
+    def test_the_attempts_reported_are_counted_not_assumed(self):
+        # HARM: a fixture of one repeat cannot tell a counter that
+        # ACCUMULATES from a constant that happens to equal it, and a message
+        # claiming two attempts after three would be a false record of what
+        # the client actually spent. Three is the smallest bound that
+        # separates the two.
+        stash, t, sleeps = _retrying_stash(self.FIVE_FAILURES_THEN_AN_ANSWER)
+
+        with mock.patch("cronicled.stash.RETRY_ATTEMPTS", 3):
+            with self.assertRaises(StashError) as ctx:
+                stash.scrape_scenes_by_query(SCRAPER_ID, SCRAPE_QUERY_TEXT)
+
+        self.assertEqual(len(t.calls), 3)
+        self.assertEqual(len(sleeps), 2, "the gaps fall BETWEEN the attempts")
+        self.assertEqual(str(ctx.exception),
+                         _SCRAPER_FAULT + " — gave up after 3 attempts")
+
+    def test_a_failure_that_turned_permanent_reports_only_what_was_spent(self):
+        # The BOUND and what was SPENT are different numbers, and they coincide
+        # everywhere else in this file — every other case exhausts the bound.
+        # They part company only here: a transient failure followed by a
+        # permanent one stops the loop early.
+        #
+        # HARM, both halves. A message built from the bound claims requests
+        # that were never made, and it is the record a person uses to decide
+        # whether the retry is working at all. And the failure that ENDED the
+        # call was a refusal, so reporting it as transient would tell every
+        # caller that reads the flag to try the same rejected input again —
+        # which is the failure mode the classification exists to prevent.
+        permanent = StashError("HTTP 400 from the media server: no",
+                               transient=False)
+        stash, t, sleeps = _retrying_stash(
+            [_graphql_error(_SCRAPER_FAULT), permanent, _SCRAPE_ANSWER])
+
+        with mock.patch("cronicled.stash.RETRY_ATTEMPTS", 3):
+            with self.assertRaises(StashError) as ctx:
+                stash.scrape_scenes_by_query(SCRAPER_ID, SCRAPE_QUERY_TEXT)
+
+        self.assertEqual(len(t.calls), 2,
+                         "a refusal ends the loop; the third attempt the bound "
+                         "allowed must not be spent")
+        self.assertEqual(sleeps, [RETRY_DELAY])
+        self.assertEqual(str(ctx.exception),
+                         "HTTP 400 from the media server: no "
+                         "— gave up after 2 attempts")
+        self.assertFalse(ctx.exception.transient,
+                         "the failure that ended the call was a refusal and "
+                         "stays one")
+
+
+class WhatIsNotRetried(unittest.TestCase):
+    """The restrictive half. Pinned separately from the permissive half
+    because a loop that retried everything passes every test above."""
+
+    PERMANENT_HTTP = StashError("HTTP 400 from the media server: no",
+                                transient=False)
+    UNREACHABLE = StashError("cannot reach the media server: no route",
+                             transient=True)
+
+    def test_a_permanent_failure_of_a_retryable_call_is_not_retried(self):
+        # HARM: the operation opting in is not the whole rule — the failure
+        # still has to be one worth repeating. A scrape whose request the
+        # server refused outright (a 4xx) would otherwise be sent again, and
+        # a rule that retries a refusal is the rule that retries a rejected
+        # input forever the moment the bound is ever raised.
+        stash, t, sleeps = _retrying_stash([self.PERMANENT_HTTP, _SCRAPE_ANSWER])
+
+        with self.assertRaises(StashError) as ctx:
+            stash.scrape_scenes_by_query(SCRAPER_ID, SCRAPE_QUERY_TEXT)
+
+        self.assertEqual(len(t.calls), 1)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(str(ctx.exception), str(self.PERMANENT_HTTP),
+                         "a failure that was never repeated must not claim to "
+                         "have been")
+
+    def test_a_read_this_project_builds_itself_is_not_retried(self):
+        # HARM: `findScenes` takes a filter this project constructs. An
+        # `errors` array from it is the server rejecting THAT FILTER and it
+        # will reject it identically next time — retrying buys nothing and
+        # reclassifying it as transient would make a malformed query look
+        # like a flaky network for as long as nobody fixes the query.
+        stash, t, _ = _retrying_stash(
+            [_graphql_error("unknown field organised on SceneFilterType"),
+             {"data": {"findScenes": {"count": 0, "scenes": []}}}])
+
+        with self.assertRaises(StashError) as ctx:
+            stash.unorganized_scenes(None)
+
+        self.assertEqual(len(t.calls), 1)
+        self.assertFalse(ctx.exception.transient)
+        self.assertEqual(str(ctx.exception),
+                         "unknown field organised on SceneFilterType")
+
+    def test_a_transient_failure_of_a_call_that_did_not_opt_in_is_not_retried(self):
+        # HARM: the flag alone must not buy a retry, or every write in this
+        # client gets one. A `performerCreate` whose transport failed may
+        # have LANDED on the server anyway, so repeating it makes two
+        # performers where the operator asked for one — a silent duplicate,
+        # which is worse than the visible failure it replaces.
+        stash, t, sleeps = _retrying_stash(
+            [self.UNREACHABLE, {"data": {"findScenes": {"count": 0,
+                                                        "scenes": []}}}])
+
+        with self.assertRaises(StashError):
+            stash.unorganized_scenes(None)
+
+        self.assertEqual(len(t.calls), 1)
+        self.assertEqual(sleeps, [])
+
+    def test_the_fingerprint_batch_is_not_retried(self):
+        # The deliberate edge of the carve-out, pinned so it cannot widen by
+        # accident. HARM of widening it: this call asks a stash-box's own
+        # database rather than running a scraper plugin, no fault of the
+        # observed shape has come from it, and its misalignment guard raises
+        # a PERMANENT error on purpose — repeating a reply that could not be
+        # matched to the scenes it was asked about re-sends a request whose
+        # answer was already unusable.
+        stash, t, _ = _retrying_stash(
+            [_graphql_error("box unavailable"),
+             {"data": {"scrapeMultiScenes": [[]]}}])
+
+        with self.assertRaises(StashError):
+            stash.scrape_scenes_by_fingerprint("https://box.invalid/graphql",
+                                               ["7"])
+
+        self.assertEqual(len(t.calls), 1)
+
+
+class TheRetryDoesNotMultiplyTheDeadline(unittest.TestCase):
+    """What a caller can be made to wait, in total, for one `gql` call.
+
+    The bound is
+
+        RETRY_ATTEMPTS * (timeout + HARD_DEADLINE_SLACK)
+            + (RETRY_ATTEMPTS - 1) * RETRY_DELAY
+
+    and both factors are read off the client's own behaviour below rather
+    than restated: the deadlines it actually asked to wait for, and the
+    delays it actually asked to sleep for."""
+
+    TIMEOUT = 7  # not the default, so a call ignoring the caller's bound shows
+
+    class _BoundedDeadlines:
+        """`_FakeThreading` narrowed by one thing: it reports "not finished"
+        only a fixed number of times and then REFUSES.
+
+        `_FakeThreading` reports it forever, which is what makes it readable —
+        but every one of those waits ends in a transient failure, so a retry
+        loop mutated to unlimited would spin here and HANG the suite. A hang is
+        not a failing test. Refusing past the limit turns the same mutation
+        into an exception the assertions below cannot absorb: it is not a
+        `StashError`, so the loop cannot catch it and `assertRaises` cannot
+        accept it."""
+
+        Thread = threading.Thread
+
+        def __init__(self, limit):
+            self.waits = []
+            recorder = self
+
+            class _Event:
+                def set(self):
+                    pass
+
+                def wait(self, timeout=None):
+                    if len(recorder.waits) >= limit:
+                        raise AssertionError(
+                            "the client waited on a %d-th deadline; this test "
+                            "describes at most %d" % (len(recorder.waits) + 1,
+                                                      limit))
+                    recorder.waits.append(timeout)
+                    return False
+
+            self.Event = _Event
+
+    def test_each_attempt_hands_the_transport_the_timeout_the_caller_asked_for(self):
+        # HARM: a per-attempt deadline scaled by the attempt number makes a
+        # wedged host cost a multiple of the bound the caller asked for, and
+        # the caller has no way to see it — the number it passed in is the
+        # only one it knows.
+        # Padded past the bound with an answer, for the reason
+        # `TheRetryIsBounded`'s script is: a script that ran out would raise on
+        # the worker thread, be reclassified as transient, and be retried
+        # forever by an unbounded loop — hanging this test instead of failing
+        # it.
+        stash, t, _ = _retrying_stash(
+            [_graphql_error(_SCRAPER_FAULT)] * 5 + [{"data": {}}])
+
+        with self.assertRaises(StashError):
+            stash.gql("query{x}", timeout=self.TIMEOUT, retryable=True)
+
+        self.assertEqual([timeout for _body, timeout in t.calls],
+                         [self.TIMEOUT, self.TIMEOUT])
+
+    def test_the_total_wait_is_one_deadline_per_attempt_plus_the_gaps(self):
+        # HARM: the retry wraps a whole attempt, deadline included, so the
+        # worst case is additive. A retry INSIDE the deadline's own wait, or
+        # a deadline recomputed to cover all attempts at once, would make a
+        # wedged host hold the caller for a multiple of `timeout + slack`
+        # with nothing observable saying so.
+        #
+        # Every wait is reported as unfinished, so each attempt ends by the
+        # deadline firing — the most expensive attempt there is — and records
+        # the deadline it was given. Nothing here waits.
+        fake = self._BoundedDeadlines(RETRY_ATTEMPTS + 2)
+        sleeps = []
+        stash = Stash(SERVER_URL, API_KEY,
+                      transport=_scripted_transport([{"data": {}}] * 4),
+                      sleep=sleeps.append)
+
+        with mock.patch("cronicled.stash.threading", fake):
+            with self.assertRaises(StashError) as ctx:
+                stash.gql("query{x}", timeout=self.TIMEOUT, retryable=True)
+
+        one_deadline = self.TIMEOUT + HARD_DEADLINE_SLACK
+        self.assertEqual(fake.waits, [one_deadline, one_deadline],
+                         "one unmultiplied deadline per attempt, and exactly "
+                         "as many attempts as the bound allows")
+        self.assertEqual(sleeps, [RETRY_DELAY])
+        self.assertEqual(sum(fake.waits) + sum(sleeps),
+                         2 * one_deadline + RETRY_DELAY)
+        self.assertIn("hard deadline", str(ctx.exception))
+        self.assertIn("gave up after 2 attempts", str(ctx.exception))
