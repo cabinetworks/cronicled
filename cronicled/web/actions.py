@@ -341,11 +341,14 @@ class Actions:
         prior = result["prior"]
         if result["failures"]:
             failure = result["failures"][0]
-            reason = ("wrote %d of %d scenes and then stopped at scene %s (%s); "
-                      "the scenes already written carry the performer and no "
-                      "longer carry the tag, and Undo restores exactly those"
+            reason = ("wrote %d of %d scenes and then stopped on a batch of %d "
+                      "beginning at scene %s (%s); the scenes already written "
+                      "carry the performer and no longer carry the tag, and "
+                      "Undo restores exactly those -- the batch it stopped on "
+                      "is not among them and may have been partly written"
                       % (len(prior["untagged"]), len(result["worklist"]),
-                         failure["scene"], failure["error"]))
+                         len(failure["scenes"]), failure["scenes"][0],
+                         failure["error"]))
             if prior["untagged"] or prior["attached"]:
                 self._store.mark_applied(fp, prior_state=prior)
             self._store.mark_failed(fp, reason)

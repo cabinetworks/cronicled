@@ -1099,19 +1099,67 @@ class Stash:
 
     # -- tags that are a performer ---------------------------------------- #
 
-    def _scene_links(self, scene_id):
-        """`(performer_ids, tag_ids)` for one scene, read RIGHT NOW.
+    # The write both paths below make, and the ONLY modes it may carry.
+    #
+    # `bulkSceneUpdate` takes a list of scene ids plus, per list field, a
+    # `BulkUpdateIds` of `{ids, mode}` -- so "add this performer and remove
+    # this tag, on these scenes" is one request rather than a read and a write
+    # per scene. `sceneUpdate` (`_SCENE_UPDATE`) REPLACES the arrays it
+    # carries, which is why every caller of that one reads the scene first;
+    # ADD and REMOVE are relative, so they need no read and cannot delete
+    # something a read taken minutes ago did not know about.
+    #
+    # `BulkUpdateIdMode` offers a third mode, `SET`, and it is the reason the
+    # check below exists rather than a comment saying "we never pass SET".
+    # `SET` replaces the whole list: sent one performer id it strips every
+    # OTHER performer from every scene in the batch, and sent one tag id every
+    # other tag -- thousands of records, in one request, with nothing reading
+    # them back. "The two call sites do not pass it" is a fact about today's
+    # callers; refusing it here is a fact about the method.
+    _BULK_SCENE_UPDATE = ("mutation($in: BulkSceneUpdateInput!)"
+                          "{ bulkSceneUpdate(input:$in){ id } }")
+    _BULK_MODES = ("ADD", "REMOVE")
 
-        Read through `scene_existing`, the same fresh read `apply_scene`
-        takes one line before its own write, rather than off the worklist a
-        reconciliation started from. `sceneUpdate` REPLACES both arrays, so
-        writing a list assembled from a read taken minutes and hundreds of
-        scenes ago would delete a performer or a tag somebody attached in the
-        meantime -- silently, and on a path that touches thousands of scenes.
+    # How many scene ids go in one request. CHOSEN, not measured: no limit was
+    # found on a running server, and a number that came from a guess is one
+    # nobody can revisit unless it says so. Two things pull against each other
+    # here. Larger chunks mean fewer requests -- the whole point of the ticket,
+    # which starts from roughly 8000 requests for one reconciliation. Smaller
+    # chunks mean less of the library in an unknown state when a request fails:
+    # a refused chunk is not recorded in the undo snapshot (see
+    # `reconcile_tag_to_performer`), so its scenes are exactly the ones an undo
+    # cannot speak for. 200 takes that 8000 down to ~40 requests while capping
+    # the unrecorded window at 200 scenes. Raise it on evidence -- a measured
+    # server limit, or a measured request cost -- not on taste.
+    _BULK_SCENE_CHUNK = 200
+
+    def _scene_chunks(self, scene_ids):
+        """`scene_ids` split into request-sized runs, in the order given."""
+        for start in range(0, len(scene_ids), self._BULK_SCENE_CHUNK):
+            yield scene_ids[start:start + self._BULK_SCENE_CHUNK]
+
+    def _bulk_scene_write(self, scene_ids, fields):
+        """One `bulkSceneUpdate` over `scene_ids`, carrying `fields`.
+
+        `fields` maps a `BulkSceneUpdateInput` list field (`performer_ids`,
+        `tag_ids`) to its `{"ids": [...], "mode": ...}`. Every field must carry
+        a mode and it must be one of `_BULK_MODES`; a missing mode raises
+        rather than defaulting, because the default that would be convenient
+        here is a value that skips the check.
         """
-        existing = self.scene_existing(scene_id)
-        return ([p["id"] for p in (existing.get("performers") or ())],
-                [t["id"] for t in (existing.get("tags") or ())])
+        for name, value in fields.items():
+            mode = value.get("mode")
+            if mode not in self._BULK_MODES:
+                raise ValueError(
+                    "refusing to bulk-update %s on %d scenes with mode %r: "
+                    "only %s may be sent from here. SET replaces the whole "
+                    "list, so it would strip every other id from every scene "
+                    "in the batch."
+                    % (name, len(scene_ids), mode,
+                       " and ".join(self._BULK_MODES)))
+        inp = {"ids": [str(scene_id) for scene_id in scene_ids]}
+        inp.update(fields)
+        self.gql(self._BULK_SCENE_UPDATE, {"in": inp})
 
     def reconcile_tag_to_performer(self, tag_id, performer_id):
         """Attach `performer_id` to every scene carrying `tag_id`, and take
@@ -1126,26 +1174,48 @@ class Stash:
         a proposal can be days old, and a scene tagged or untagged since is
         exactly what a proposal-time list gets wrong in both directions.
 
-        ONE `sceneUpdate` per scene, carrying ONLY `performer_ids` and
-        `tag_ids`. No `organized`, no title, no rating, nothing else this
-        input accepts -- `apply_scene` sets `organized: True` on everything it
-        writes, which is right for a scene whose metadata a person just
-        approved and would be a second, unasked-for write to thousands of
-        scenes here. Both arrays go out in one mutation per scene, so no scene
-        is ever left carrying the performer AND the tag, or neither.
+        ONE bulk write per chunk of scenes, carrying ONLY `performer_ids` with
+        mode ADD and `tag_ids` with mode REMOVE. No `organized`, no title, no
+        rating, nothing else this input accepts -- `apply_scene` sets
+        `organized: True` on everything it writes, which is right for a scene
+        whose metadata a person just approved and would be a second,
+        unasked-for write to thousands of scenes here. Both fields go out in
+        one mutation, so no scene is ever left carrying the performer AND the
+        tag, or neither.
 
-        A scene that no longer carries the tag at write time is SKIPPED and
-        reported, not written to. It has already moved on since the worklist
-        was read, and writing its performer list back would be this method
-        deciding something it was not asked to decide.
+        ONE READ, not one per scene. The worklist read already selects each
+        scene's performers and tags, and those are the only two facts the write
+        and the snapshot need -- so the per-scene read the loop used to take is
+        not a fresher answer, it is the same answer bought once per scene.
+        `sceneUpdate` needed it because it REPLACES both arrays; ADD and REMOVE
+        are relative and cannot delete what they were never told about.
 
-        On a per-scene failure the loop STOPS and the failure is returned
-        rather than raised. Returned, because everything already written is
-        what the undo snapshot has to cover: raising would discard the record
-        of the scenes this call really did change, which is the one thing that
-        makes a partial run recoverable. Stopping rather than continuing,
-        because a server refusing one write is evidence about the server, and
-        the remaining scenes are still exactly where they were.
+        A scene the read does not report as carrying the tag is SKIPPED and
+        reported, not written to. The server's own filter should not return
+        one, and this does not trust it to: REMOVE of a tag a scene lacks is a
+        no-op, but ADD of the performer is not, so a row that came back for any
+        other reason would have the performer attached to it on the strength of
+        a filter nobody checked.
+
+        The residual, named rather than hidden: a scene untagged between the
+        read and its chunk's write still gets the performer. That window used
+        to be one request wide and is now one chunk wide, and closing it costs
+        the per-scene read this exists to remove. It is bounded by
+        `_BULK_SCENE_CHUNK` and by the seconds between two requests.
+
+        On a failed chunk the run STOPS and the failure is returned rather than
+        raised. Returned, because everything already written is what the undo
+        snapshot has to cover: raising would discard the record of the scenes
+        this call really did change, which is the one thing that makes a
+        partial run recoverable. Stopping rather than continuing, because a
+        server refusing one write is evidence about the server, and the
+        remaining scenes are still exactly where they were.
+
+        The failed chunk itself is recorded in NEITHER half of the snapshot and
+        its scene ids are returned with the failure. Whether the server wrote
+        some of them before it refused is not knowable from here, and a
+        snapshot that claimed them would have an undo detach a performer from
+        scenes that never got one.
 
         The returned `prior` is the undo snapshot, and it distinguishes the
         two halves: `untagged` is every scene the tag was taken off, `attached`
@@ -1156,30 +1226,35 @@ class Stash:
         tag_id, performer_id = str(tag_id), str(performer_id)
         _, worklist = self.tagged_scenes(tag_id, None)
         attached, untagged, skipped, failures = [], [], [], []
+        # `(scene_id, already)` for every scene that is really to be written,
+        # decided entirely from the one read above.
+        todo = []
         for scene in worklist:
             scene_id = str(scene["id"])
-            performer_ids, tag_ids = self._scene_links(scene_id)
+            tag_ids = [str(t["id"]) for t in (scene.get("tags") or ())]
             if tag_id not in tag_ids:
                 skipped.append(scene_id)
                 continue
-            already = performer_id in performer_ids
-            write_pids = (performer_ids if already
-                          else performer_ids + [performer_id])
-            write_tids = [t for t in tag_ids if t != tag_id]
+            performer_ids = [str(p["id"])
+                             for p in (scene.get("performers") or ())]
+            todo.append((scene_id, performer_id in performer_ids))
+        for chunk in self._scene_chunks(todo):
+            scene_ids = [scene_id for scene_id, _ in chunk]
             try:
-                self.gql(self._SCENE_UPDATE,
-                         {"in": {"id": scene_id,
-                                 "performer_ids": write_pids,
-                                 "tag_ids": write_tids}})
+                self._bulk_scene_write(
+                    scene_ids,
+                    {"performer_ids": {"ids": [performer_id], "mode": "ADD"},
+                     "tag_ids": {"ids": [tag_id], "mode": "REMOVE"}})
             except Exception as exc:
-                failures.append({"scene": scene_id,
+                failures.append({"scenes": scene_ids,
                                  "error": "%s: %s" % (type(exc).__name__, exc)})
                 break
             # Recorded only AFTER the write returns, so a snapshot never
             # claims a scene the server refused.
-            if not already:
-                attached.append(scene_id)
-            untagged.append(scene_id)
+            for scene_id, already in chunk:
+                if not already:
+                    attached.append(scene_id)
+                untagged.append(scene_id)
         return {
             "prior": {"tag_id": tag_id, "performer_id": performer_id,
                       "attached": attached, "untagged": untagged},
@@ -1213,11 +1288,31 @@ class Stash:
         undo cannot afford. A snapshot naming a DIFFERENT tag is refused for a
         sharper reason -- it would write another tag onto these scenes.
 
-        Each scene is read fresh and written only if something actually
-        changes, which makes this idempotent: a revert that fails partway can
-        be pressed again, and the scenes it already restored are no-ops the
-        second time. That matters because a failure here raises, and the
+        Over EXACTLY the recorded ids, never over the tag's current scenes.
+        The tag has moved on -- the reconciliation took it off these scenes,
+        and anything carrying it now is either a scene this run failed to reach
+        or one somebody tagged since. Re-reading the tag would restore a
+        performer onto neither.
+
+        Two bulk writes, not one: the two halves cover different sets, and one
+        request over their union would detach the performer from every scene
+        that already carried it -- the exact harm the snapshot's two halves
+        exist to prevent. The tag goes back FIRST, so at no point between the
+        two is a scene left with neither the tag nor the performer; the
+        overlap simply carries both for the moment in between, which is the
+        state it was in before the reconciliation ran.
+
+        Idempotent by the modes themselves rather than by reading first: ADD of
+        a tag a scene already carries and REMOVE of a performer it no longer
+        has are both no-ops on the server. So a revert that fails partway can
+        be pressed again and the scenes it already restored cost one request's
+        share of a no-op. That matters because a failure here raises, and the
         proposal stays `applied` with its snapshot intact.
+
+        What that costs, said plainly: the returned lists are the scenes each
+        half was WRITTEN OVER, not the scenes that were found to need it. With
+        no read there is nothing to compare against, and a count of "actually
+        changed" would be invented here.
         """
         if not prior or not all(field in prior
                                 for field in self._RECONCILE_SNAPSHOT_FIELDS):
@@ -1232,34 +1327,19 @@ class Stash:
                 "these scenes" % (tag_id, prior["tag_id"]))
         tag_id = str(tag_id)
         performer_id = str(prior["performer_id"])
+        # Both halves in the snapshot's own order. No set is iterated on the
+        # way to a request, so the sequence written is a function of the
+        # snapshot and not of a hash.
         untagged = [str(scene) for scene in prior["untagged"]]
-        attached = {str(scene) for scene in prior["attached"]}
-        # Every scene either half names, each visited ONCE -- two loops would
-        # write twice to a scene in both halves, and the second write would be
-        # assembled from a read taken before the first. Ordered by the
-        # snapshot's own `untagged` order, with any scene named only by
-        # `attached` after it in sorted order, so the sequence is a function
-        # of the snapshot and not of a set's iteration.
-        wanted = set(untagged)
-        order = untagged + sorted(attached - wanted)
-        detached, retagged = [], []
-        for scene_id in order:
-            performer_ids, tag_ids = self._scene_links(scene_id)
-            write_pids = ([p for p in performer_ids if p != performer_id]
-                          if scene_id in attached else performer_ids)
-            write_tids = (tag_ids + [tag_id]
-                          if scene_id in wanted and tag_id not in tag_ids
-                          else tag_ids)
-            if write_pids == performer_ids and write_tids == tag_ids:
-                continue
-            self.gql(self._SCENE_UPDATE,
-                     {"in": {"id": scene_id, "performer_ids": write_pids,
-                             "tag_ids": write_tids}})
-            if write_pids != performer_ids:
-                detached.append(scene_id)
-            if write_tids != tag_ids:
-                retagged.append(scene_id)
-        return {"detached": detached, "retagged": retagged}
+        attached = [str(scene) for scene in prior["attached"]]
+        for chunk in self._scene_chunks(untagged):
+            self._bulk_scene_write(
+                chunk, {"tag_ids": {"ids": [tag_id], "mode": "ADD"}})
+        for chunk in self._scene_chunks(attached):
+            self._bulk_scene_write(
+                chunk,
+                {"performer_ids": {"ids": [performer_id], "mode": "REMOVE"}})
+        return {"detached": attached, "retagged": untagged}
 
     # -- scraping ---------------------------------------------------------- #
 
