@@ -5,7 +5,8 @@ from unittest import mock
 
 import cronicled.artist
 from cronicled.artist import (Aliases, CONTAINER_NAMES, MAX_NAME_WORDS,
-                              MIN_NAME_CHARS, creator_folder, resolve)
+                              MIN_NAME_CHARS, Resolution, creator_folder,
+                              resolve)
 
 
 class CreatorFolder(unittest.TestCase):
@@ -86,6 +87,24 @@ class CreatorFolder(unittest.TestCase):
         self.assertIn("clips", CONTAINER_NAMES)
         self.assertIn("videos", CONTAINER_NAMES)
 
+    def test_a_bare_encode_marker_is_stripped_at_the_boundary(self):
+        # the same tag as above with the brackets left off, which is how it is
+        # actually filed most of the time
+        self.assertEqual(creator_folder("/lib/Velvet Crane x265/clip01.mp4"),
+                         "Velvet Crane")
+
+    def test_a_bare_marker_only_directory_is_walked_past(self):
+        # it cleans away to nothing exactly as "(h265)" does, so it names no
+        # creator and the walk continues rather than handing back ""
+        self.assertEqual(creator_folder("/lib/Velvet Crane/x265/clip01.mp4"),
+                         "Velvet Crane")
+
+    def test_a_trailing_token_that_is_no_marker_stays_on_the_folder(self):
+        # the direction that costs names: "3" belongs to this creator's folder
+        # and a shortened name would still read as a name
+        self.assertEqual(creator_folder("/lib/Velvet Crane 3/clip01.mp4"),
+                         "Velvet Crane 3")
+
 
 class Resolving(unittest.TestCase):
     def test_a_dash_split_names_the_creator(self):
@@ -117,6 +136,33 @@ class Resolving(unittest.TestCase):
         r = resolve("clip01.mp4", "")
         self.assertIsNone(r.name)
         self.assertIsNone(r.source)
+
+
+class EncodeMarkersOnTheFolder(unittest.TestCase):
+    """A bare marker passes every guard `_is_name` enforces -- it is long
+    enough, it is one word, it is not a date, it leads with no article and it
+    is no container -- so before it was stripped it was returned as the
+    creator's name. Measured on one library: six folders, 3384 of 6288 scenes,
+    attributed to a person who does not exist. The search that name produces
+    scores no worse, which is exactly why nothing caught it."""
+
+    def test_a_bare_marker_is_not_part_of_the_creators_name(self):
+        r = resolve("clip01.mp4", "Velvet Crane x265")
+        self.assertEqual(r, Resolution("Velvet Crane", "folder", None, None))
+
+    def test_a_folder_that_is_only_a_bare_marker_resolves_to_nobody(self):
+        # It must not become "" and then be read as a name, and it must not be
+        # read as one under its own spelling either. Asserted whole: a sampled
+        # check would not notice the empty string arriving in `name` or in
+        # `rejected_folder`.
+        self.assertEqual(resolve("clip01.mp4", "x265"), Resolution())
+
+    def test_a_folder_ending_in_an_unclaimed_token_resolves_to_all_of_it(self):
+        # The silent direction. Nothing about "3" says encode marker, so the
+        # creator keeps it -- a name shortened by one token still reads as a
+        # name and no report ever questions it.
+        r = resolve("clip01.mp4", "Velvet Crane 3")
+        self.assertEqual(r, Resolution("Velvet Crane 3", "folder", None, None))
 
 
 class RejectedFolder(unittest.TestCase):
