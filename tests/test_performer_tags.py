@@ -780,21 +780,24 @@ class TheNarrowings(unittest.TestCase):
 class _ReconcileTransport:
     """Fake transport for the reconciliation write paths. Opens no socket.
 
-    Answers the two reads the client makes -- `findScenes` for the worklist and
-    `findScene` for each scene's own links, read fresh one line before its
-    write -- and records every request verbatim. Recording the whole
-    `sceneUpdate` input is the point: a scene update REPLACES the arrays it
-    carries, so an added or dropped key here is a silent write to thousands of
-    scenes, and by the time it is visible in the results it has happened.
+    Answers the ONE read the client makes -- `findScenes` for the worklist,
+    whose rows carry each scene's performers and tags -- and records every
+    request verbatim. It deliberately does NOT answer `findScene`: a return to
+    a read per scene is the defect this path was rewritten to remove, and here
+    it raises rather than quietly costing two requests a scene again.
 
-    `fail_on` is the scene id whose write is refused, so a partial run can be
-    driven rather than assumed.
+    Recording the whole bulk input is the point. `BulkUpdateIdMode` offers
+    `SET` beside `ADD` and `REMOVE`, and a `SET` carrying one performer id
+    strips every OTHER performer from every scene in the batch. A test that
+    asserted only that a bulk update happened would pass on it.
+
+    `fail_on` is a scene id whose whole batch is refused, so a partial run can
+    be driven rather than assumed.
     """
 
-    def __init__(self, worklist=(), links=None, fail_on=None):
+    def __init__(self, worklist=(), fail_on=None):
         self.calls = []
         self.worklist = list(worklist)
-        self.links = dict(links or {})
         self.fail_on = fail_on
 
     def __call__(self, body, timeout):
@@ -803,24 +806,19 @@ class _ReconcileTransport:
         if "findScenes(" in q:
             return {"data": {"findScenes": {"count": len(self.worklist),
                                             "scenes": self.worklist}}}
-        if "findScene(" in q:
-            performers, tags = self.links[variables["id"]]
-            return {"data": {"findScene": {
-                "id": variables["id"], "title": None, "details": None,
-                "date": None, "urls": [], "organized": False,
-                "rating100": None, "code": None, "director": None,
-                "stash_ids": [], "studio": None,
-                "performers": [{"id": p, "name": "p-" + p} for p in performers],
-                "tags": [{"id": t, "name": "t-" + t} for t in tags]}}}
-        if "sceneUpdate(" in q:
-            if variables["in"]["id"] == self.fail_on:
+        if "bulkSceneUpdate(" in q:
+            ids = variables["in"]["ids"]
+            if self.fail_on is not None and self.fail_on in ids:
                 return {"errors": [{"message": "the server said no"}]}
-            return {"data": {"sceneUpdate": {"id": variables["in"]["id"]}}}
+            return {"data": {"bulkSceneUpdate": [{"id": i} for i in ids]}}
         raise AssertionError("test transport does not recognize query: %s" % q)
 
     def updates(self):
-        """Every scene update sent, as its whole input dictionary."""
-        return [v["in"] for q, v in self.calls if "sceneUpdate(" in q]
+        """Every bulk update sent, as its whole input dictionary."""
+        return [v["in"] for q, v in self.calls if "bulkSceneUpdate(" in q]
+
+    def reads(self):
+        return [v for q, v in self.calls if "findScenes(" in q]
 
     def mutations(self):
         return [q for q, _ in self.calls if q.lstrip().startswith("mutation")]
@@ -830,178 +828,321 @@ def _stash(transport):
     return Stash("http://example.test", "k", transport=transport)
 
 
+# Enough scenes to cross a chunk boundary twice and leave a short tail, so a
+# fixture cannot pass by accident on an implementation that happens to send one
+# request, and the last chunk is visibly a different size from the first two.
+_MANY = 450
+
+
+def _many_rows(already=()):
+    """`_MANY` worklist rows carrying the tag, `already` of them also carrying
+    the performer already."""
+    return [scene_row("sc-%03d" % n, performers=(["p-1"] if n in already
+                                                 else []), tags=["t-7"])
+            for n in range(_MANY)]
+
+
 class TheWrite(unittest.TestCase):
-    def test_each_scene_gets_the_performer_and_loses_the_tag(self):
+    def test_one_read_and_one_write_carry_the_whole_reconciliation(self):
         t = _ReconcileTransport(
-            worklist=[scene_row("sc-1"), scene_row("sc-2")],
-            links={"sc-1": (["p-9"], ["t-7", "t-4"]),
-                   "sc-2": ([], ["t-7"])})
+            worklist=[scene_row("sc-1", performers=["p-9"],
+                                tags=["t-7", "t-4"]),
+                      scene_row("sc-2", tags=["t-7"])])
 
         got = _stash(t).reconcile_tag_to_performer("t-7", "p-1")
 
-        # The WHOLE input for each write, so an added key -- `organized`, a
-        # rating, a title -- fails here. `apply_scene` sets `organized: True`
-        # on everything it writes, which would be a second, unasked-for write
-        # to every scene this touches.
+        # The WHOLE input, so an added key -- `organized`, a rating, a title --
+        # fails here, and so does either mode drifting to `SET`. `apply_scene`
+        # sets `organized: True` on everything it writes, which would be a
+        # second, unasked-for write to every scene this touches; `SET` on
+        # either field would empty the other one on all of them.
         self.assertEqual(t.updates(), [
-            {"id": "sc-1", "performer_ids": ["p-9", "p-1"],
-             "tag_ids": ["t-4"]},
-            {"id": "sc-2", "performer_ids": ["p-1"], "tag_ids": []},
+            {"ids": ["sc-1", "sc-2"],
+             "performer_ids": {"ids": ["p-1"], "mode": "ADD"},
+             "tag_ids": {"ids": ["t-7"], "mode": "REMOVE"}},
         ])
         self.assertEqual(got["prior"], {
             "tag_id": "t-7", "performer_id": "p-1",
             "attached": ["sc-1", "sc-2"], "untagged": ["sc-1", "sc-2"]})
         self.assertEqual(got["failures"], [])
+        self.assertEqual(got["skipped"], [])
+
+    def test_the_requests_do_not_grow_with_the_number_of_scenes(self):
+        # HARM: the loop this replaced issued a read and a write per scene --
+        # roughly 8000 requests on the library that motivated the feature. A
+        # test asserting "some bulk call happened" passes with the per-scene
+        # path still there beside it.
+        for count in (1, 3, 6):
+            with self.subTest(scenes=count):
+                t = _ReconcileTransport(
+                    worklist=[scene_row("sc-%d" % n, tags=["t-7"])
+                              for n in range(count)])
+
+                _stash(t).reconcile_tag_to_performer("t-7", "p-1")
+
+                self.assertEqual(len(t.calls), 2)
 
     def test_the_tag_itself_is_not_deleted(self):
         # HARM: a tag may legitimately share a name with a performer -- a
         # studio and its owner, a series named after its creator -- and
         # deleting on a name match destroys a distinction nothing here can see.
         # It is also the only half of this write that cannot be taken back.
-        t = _ReconcileTransport(worklist=[scene_row("sc-1")],
-                                links={"sc-1": ([], ["t-7"])})
+        t = _ReconcileTransport(worklist=[scene_row("sc-1", tags=["t-7"])])
 
         _stash(t).reconcile_tag_to_performer("t-7", "p-1")
 
-        self.assertEqual(t.mutations(), [Stash._SCENE_UPDATE])
+        self.assertEqual(len(t.mutations()), 1)
+        self.assertIn("bulkSceneUpdate(", t.mutations()[0])
         for query, _ in t.calls:
             self.assertNotIn("tagDestroy", query)
             self.assertNotIn("tagsMerge", query)
-
-    def test_each_scenes_links_are_read_fresh_immediately_before_its_write(self):
-        # HARM: a scene update REPLACES both arrays. Writing a list assembled
-        # from the worklist read -- minutes and hundreds of scenes earlier --
-        # deletes any performer or tag somebody attached in the meantime.
-        t = _ReconcileTransport(
-            worklist=[scene_row("sc-1"), scene_row("sc-2")],
-            links={"sc-1": ([], ["t-7"]), "sc-2": ([], ["t-7"])})
-
-        _stash(t).reconcile_tag_to_performer("t-7", "p-1")
-
-        shapes = []
-        for query, variables in t.calls:
-            if "findScene(" in query:
-                shapes.append(("read", variables["id"]))
-            elif "sceneUpdate(" in query:
-                shapes.append(("write", variables["in"]["id"]))
-        self.assertEqual(shapes, [("read", "sc-1"), ("write", "sc-1"),
-                                  ("read", "sc-2"), ("write", "sc-2")])
 
     def test_a_scene_already_carrying_the_performer_is_untagged_not_attached(self):
         # HARM: the snapshot's two halves are what make the undo exact. A scene
         # that already had the performer, recorded as attached, would have that
         # performer removed by an undo -- taking away somebody else's work.
         t = _ReconcileTransport(
-            worklist=[scene_row("sc-1"), scene_row("sc-2")],
-            links={"sc-1": (["p-1"], ["t-7"]), "sc-2": ([], ["t-7"])})
+            worklist=[scene_row("sc-1", performers=["p-1"], tags=["t-7"]),
+                      scene_row("sc-2", tags=["t-7"])])
 
         got = _stash(t).reconcile_tag_to_performer("t-7", "p-1")
 
-        self.assertEqual(t.updates(), [
-            {"id": "sc-1", "performer_ids": ["p-1"], "tag_ids": []},
-            {"id": "sc-2", "performer_ids": ["p-1"], "tag_ids": []},
-        ])
+        # Both scenes are still written to: ADD of a performer a scene has is a
+        # no-op, and the tag has to come off both.
+        self.assertEqual([u["ids"] for u in t.updates()], [["sc-1", "sc-2"]])
         self.assertEqual(got["prior"]["attached"], ["sc-2"])
         self.assertEqual(got["prior"]["untagged"], ["sc-1", "sc-2"])
 
-    def test_a_scene_that_no_longer_carries_the_tag_is_skipped_not_written(self):
-        # HARM: it has moved on since the worklist was read. Writing its
-        # performer list back would be this method deciding something nobody
-        # asked it to decide -- and recording it in the snapshot would have an
-        # undo detach a performer from a scene it never touched.
+    def test_a_scene_the_read_does_not_report_as_tagged_is_skipped_not_written(self):
+        # HARM: REMOVE of a tag a scene lacks is a no-op, but ADD of the
+        # performer is not. A row that came back without the tag on it -- a
+        # filter that means something other than what was assumed, a scene
+        # untagged between the query and the reply -- would have the performer
+        # attached on the strength of a filter nobody checked, and the snapshot
+        # would then have an undo detach it again from a scene this never
+        # should have touched.
         t = _ReconcileTransport(
-            worklist=[scene_row("sc-1"), scene_row("sc-2")],
-            links={"sc-1": ([], []), "sc-2": ([], ["t-7"])})
+            worklist=[scene_row("sc-1", tags=["t-4"]),
+                      scene_row("sc-2", tags=["t-7"])])
 
         got = _stash(t).reconcile_tag_to_performer("t-7", "p-1")
 
-        self.assertEqual([u["id"] for u in t.updates()], ["sc-2"])
+        self.assertEqual([u["ids"] for u in t.updates()], [["sc-2"]])
         self.assertEqual(got["skipped"], ["sc-1"])
         self.assertEqual(got["prior"]["untagged"], ["sc-2"])
+        self.assertEqual(got["prior"]["attached"], ["sc-2"])
+        # A skipped scene is still part of what was READ, and the denominator
+        # a partial run is reported against ("wrote 1 of 2 scenes") is that
+        # whole read -- not the subset this decided to write to.
+        self.assertEqual(got["worklist"], ["sc-1", "sc-2"])
 
     def test_the_worklist_is_read_fresh_and_asks_for_every_scene(self):
-        t = _ReconcileTransport(worklist=[], links={})
+        t = _ReconcileTransport(worklist=[])
 
         got = _stash(t).reconcile_tag_to_performer("t-7", "p-1")
 
-        find = [v for q, v in t.calls if "findScenes(" in q]
-        self.assertEqual(len(find), 1)
-        self.assertEqual(find[0]["s"],
+        self.assertEqual(len(t.reads()), 1)
+        self.assertEqual(t.reads()[0]["s"],
                          {"tags": {"value": ["t-7"], "modifier": "INCLUDES"}})
-        self.assertEqual(find[0]["f"]["per_page"], -1)
+        self.assertEqual(t.reads()[0]["f"]["per_page"], -1)
         self.assertEqual(got["prior"]["untagged"], [])
+        # Nothing at all is written for an empty worklist -- not a bulk update
+        # naming no scenes.
+        self.assertEqual(t.updates(), [])
 
-    def test_a_refused_write_stops_the_run_and_keeps_what_landed(self):
+    def test_the_worklist_is_written_in_chunks_that_partition_it_in_order(self):
+        # HARM: one request naming four thousand scenes may be one the server
+        # refuses whole. The sizes are literals rather than derived from
+        # `Stash._BULK_SCENE_CHUNK`, so a change to that constant shows up here
+        # as a failing test rather than as a fixture quietly following it.
+        t = _ReconcileTransport(worklist=_many_rows())
+
+        got = _stash(t).reconcile_tag_to_performer("t-7", "p-1")
+
+        sent = [u["ids"] for u in t.updates()]
+        self.assertEqual([len(ids) for ids in sent], [200, 200, 50])
+        # Every scene in exactly one chunk, in the worklist's own order.
+        self.assertEqual([i for ids in sent for i in ids], got["worklist"])
+        # And every chunk carries both fields with both modes -- not just the
+        # first one.
+        for update in t.updates():
+            self.assertEqual(update["performer_ids"],
+                             {"ids": ["p-1"], "mode": "ADD"})
+            self.assertEqual(update["tag_ids"],
+                             {"ids": ["t-7"], "mode": "REMOVE"})
+        self.assertEqual(got["prior"]["untagged"], got["worklist"])
+
+    def test_scenes_that_already_had_the_performer_are_excluded_across_chunks(self):
+        # HARM: the `attached` half is what an undo detaches from. A chunk
+        # whose bookkeeping was done from the chunk's ids rather than from what
+        # the read said would put every scene in it into `attached`, and the
+        # undo would strip the performer from the ones that came with it.
+        already = {0, 199, 200, 449}
+        t = _ReconcileTransport(worklist=_many_rows(already=already))
+
+        got = _stash(t).reconcile_tag_to_performer("t-7", "p-1")
+
+        expected = ["sc-%03d" % n for n in range(_MANY) if n not in already]
+        self.assertEqual(got["prior"]["attached"], expected)
+        self.assertEqual(got["prior"]["untagged"],
+                         ["sc-%03d" % n for n in range(_MANY)])
+
+    def test_a_refused_batch_stops_the_run_and_keeps_what_landed(self):
         # HARM: raising here would discard the record of the scenes this call
         # really did change, which is the one thing that makes a partial run
         # recoverable. Continuing would hammer a server that has just said no.
-        t = _ReconcileTransport(
-            worklist=[scene_row("sc-1"), scene_row("sc-2"), scene_row("sc-3")],
-            links={"sc-1": ([], ["t-7"]), "sc-2": ([], ["t-7"]),
-                   "sc-3": ([], ["t-7"])},
-            fail_on="sc-2")
+        t = _ReconcileTransport(worklist=_many_rows(), fail_on="sc-250")
 
         got = _stash(t).reconcile_tag_to_performer("t-7", "p-1")
 
-        self.assertEqual([u["id"] for u in t.updates()], ["sc-1", "sc-2"])
-        self.assertEqual(got["prior"]["untagged"], ["sc-1"])
-        self.assertEqual(got["prior"]["attached"], ["sc-1"])
+        first, second = ["sc-%03d" % n for n in range(200)], \
+            ["sc-%03d" % n for n in range(200, 400)]
+        self.assertEqual([u["ids"] for u in t.updates()], [first, second])
+        # The refused batch is in NEITHER half: whether the server wrote any of
+        # it before refusing is not knowable from here, and an undo that
+        # claimed it would detach a performer from scenes that never got one.
+        self.assertEqual(got["prior"]["untagged"], first)
+        self.assertEqual(got["prior"]["attached"], first)
         self.assertEqual(len(got["failures"]), 1)
-        self.assertEqual(got["failures"][0]["scene"], "sc-2")
+        self.assertEqual(got["failures"][0]["scenes"], second)
         self.assertIn("the server said no", got["failures"][0]["error"])
-        self.assertEqual(got["worklist"], ["sc-1", "sc-2", "sc-3"])
+        self.assertEqual(got["worklist"], ["sc-%03d" % n for n in range(_MANY)])
+
+    def test_a_bulk_write_may_only_carry_add_or_remove(self):
+        # HARM: `SET` replaces the whole list. One performer id sent with it
+        # would leave every scene in the batch with that performer and no
+        # other, and one tag id would leave them with that tag and no other --
+        # hundreds of records per request, and nothing reads them back.
+        # Reached directly because no caller passes it: the point is that the
+        # method refuses it, not that today's callers happen not to send it.
+        t = _ReconcileTransport()
+        for mode in ("SET", "set", "add", None, ""):
+            with self.subTest(mode=mode):
+                with self.assertRaises(ValueError) as caught:
+                    _stash(t)._bulk_scene_write(
+                        ["sc-1"], {"tag_ids": {"ids": ["t-7"], "mode": mode}})
+                self.assertIn("SET", str(caught.exception))
+        self.assertEqual(t.calls, [])
+
+    def test_every_field_is_checked_not_just_the_first(self):
+        # HARM: the reconciliation sends two fields in one input. A check that
+        # stopped at the first would let a `SET` on the second through, and the
+        # second is the one that empties a scene's tag list.
+        t = _ReconcileTransport()
+
+        with self.assertRaises(ValueError) as caught:
+            _stash(t)._bulk_scene_write(
+                ["sc-1"],
+                {"performer_ids": {"ids": ["p-1"], "mode": "ADD"},
+                 "tag_ids": {"ids": ["t-7"], "mode": "SET"}})
+
+        self.assertIn("tag_ids", str(caught.exception))
+        self.assertEqual(t.calls, [])
+
+    def test_a_bulk_field_with_no_mode_at_all_is_refused(self):
+        # A missing mode raises rather than defaulting: the default that would
+        # be convenient here is one of the three values the check exists to
+        # constrain.
+        t = _ReconcileTransport()
+
+        with self.assertRaises(ValueError):
+            _stash(t)._bulk_scene_write(["sc-1"], {"tag_ids": {"ids": ["t-7"]}})
+
+        self.assertEqual(t.calls, [])
 
 
 class TakingItBack(unittest.TestCase):
-    def test_both_halves_are_restored_on_exactly_the_scenes_that_changed(self):
-        # HARM: the whole SET, not a count. A revert that put the tag back and
-        # left the performer attached, or one that detached the performer from
-        # a scene that already had them, leaves the library in a third state
-        # that is neither before nor after -- and reports success.
+    def test_both_halves_are_restored_over_exactly_the_recorded_ids(self):
+        # HARM: the whole input, not a count. A revert that put the tag back
+        # and left the performer attached, one that detached the performer from
+        # a scene that already had them, or one that sent `SET` for either
+        # leaves the library in a third state that is neither before nor after
+        # -- and reports success.
         prior = {"tag_id": "t-7", "performer_id": "p-1",
                  "attached": ["sc-2"], "untagged": ["sc-1", "sc-2"]}
-        t = _ReconcileTransport(links={"sc-1": (["p-1"], ["t-4"]),
-                                       "sc-2": (["p-9", "p-1"], [])})
+        t = _ReconcileTransport()
 
         got = _stash(t).revert_reconcile("t-7", prior)
 
         self.assertEqual(t.updates(), [
-            # sc-1 already had the performer before the reconciliation, so only
-            # the tag goes back.
-            {"id": "sc-1", "performer_ids": ["p-1"],
-             "tag_ids": ["t-4", "t-7"]},
-            {"id": "sc-2", "performer_ids": ["p-9"], "tag_ids": ["t-7"]},
+            # The tag first, over everything it came off, so no scene is left
+            # holding neither the tag nor the performer in between.
+            {"ids": ["sc-1", "sc-2"],
+             "tag_ids": {"ids": ["t-7"], "mode": "ADD"}},
+            # The performer only from the scenes that did not already carry it.
+            # sc-1 did, and keeps it.
+            {"ids": ["sc-2"],
+             "performer_ids": {"ids": ["p-1"], "mode": "REMOVE"}},
         ])
         self.assertEqual(got, {"detached": ["sc-2"],
                                "retagged": ["sc-1", "sc-2"]})
 
-    def test_a_scene_visited_by_both_halves_is_written_once(self):
+    def test_nothing_is_detached_when_every_scene_already_had_the_performer(self):
+        # HARM: this is the whole reason the snapshot has two halves. An undo
+        # that detached from everything it re-tagged would take the performer
+        # off scenes somebody else attached them to, before this ever ran.
         prior = {"tag_id": "t-7", "performer_id": "p-1",
-                 "attached": ["sc-1"], "untagged": ["sc-1"]}
-        t = _ReconcileTransport(links={"sc-1": (["p-1"], [])})
-
-        _stash(t).revert_reconcile("t-7", prior)
-
-        self.assertEqual(t.updates(), [
-            {"id": "sc-1", "performer_ids": [], "tag_ids": ["t-7"]}])
-
-    def test_a_scene_needing_nothing_is_not_written_to(self):
-        # Which is what makes this idempotent: a revert that failed partway can
-        # be pressed again and the scenes it already restored are no-ops.
-        prior = {"tag_id": "t-7", "performer_id": "p-1",
-                 "attached": ["sc-1"], "untagged": ["sc-1"]}
-        t = _ReconcileTransport(links={"sc-1": ([], ["t-7"])})
+                 "attached": [], "untagged": ["sc-1", "sc-2"]}
+        t = _ReconcileTransport()
 
         got = _stash(t).revert_reconcile("t-7", prior)
 
-        self.assertEqual(t.updates(), [])
-        self.assertEqual(got, {"detached": [], "retagged": []})
+        self.assertEqual(t.updates(), [
+            {"ids": ["sc-1", "sc-2"],
+             "tag_ids": {"ids": ["t-7"], "mode": "ADD"}}])
+        self.assertEqual(got, {"detached": [], "retagged": ["sc-1", "sc-2"]})
+
+    def test_nothing_is_retagged_when_the_snapshot_untagged_nothing(self):
+        prior = {"tag_id": "t-7", "performer_id": "p-1",
+                 "attached": ["sc-1"], "untagged": []}
+        t = _ReconcileTransport()
+
+        got = _stash(t).revert_reconcile("t-7", prior)
+
+        self.assertEqual(t.updates(), [
+            {"ids": ["sc-1"],
+             "performer_ids": {"ids": ["p-1"], "mode": "REMOVE"}}])
+        self.assertEqual(got, {"detached": ["sc-1"], "retagged": []})
+
+    def test_the_undo_never_asks_which_scenes_carry_the_tag_now(self):
+        # HARM: the tag has moved on -- the reconciliation took it off these
+        # scenes, so what carries it now is either a scene the run failed to
+        # reach or one somebody tagged since. The transport's worklist is a
+        # different scene entirely, so a revert that re-read the tag would name
+        # it here.
+        prior = {"tag_id": "t-7", "performer_id": "p-1",
+                 "attached": ["sc-1"], "untagged": ["sc-1"]}
+        t = _ReconcileTransport(worklist=[scene_row("sc-9", tags=["t-7"])])
+
+        _stash(t).revert_reconcile("t-7", prior)
+
+        self.assertEqual(t.reads(), [])
+        self.assertEqual([u["ids"] for u in t.updates()],
+                         [["sc-1"], ["sc-1"]])
+
+    def test_each_half_is_chunked_the_same_way_the_write_was(self):
+        ids = ["sc-%03d" % n for n in range(_MANY)]
+        prior = {"tag_id": "t-7", "performer_id": "p-1",
+                 "attached": list(ids), "untagged": list(ids)}
+        t = _ReconcileTransport()
+
+        _stash(t).revert_reconcile("t-7", prior)
+
+        shape = [("tag_ids" if "tag_ids" in u else "performer_ids",
+                  len(u["ids"])) for u in t.updates()]
+        self.assertEqual(shape, [("tag_ids", 200), ("tag_ids", 200),
+                                 ("tag_ids", 50), ("performer_ids", 200),
+                                 ("performer_ids", 200), ("performer_ids", 50)])
+        self.assertEqual([i for u in t.updates()
+                          if "tag_ids" in u for i in u["ids"]], ids)
+        self.assertEqual([i for u in t.updates()
+                          if "performer_ids" in u for i in u["ids"]], ids)
 
     def test_a_snapshot_naming_another_tag_is_refused(self):
         # HARM: applying it would put a DIFFERENT tag onto these scenes.
         prior = {"tag_id": "t-99", "performer_id": "p-1",
                  "attached": [], "untagged": ["sc-1"]}
-        t = _ReconcileTransport(links={"sc-1": ([], [])})
+        t = _ReconcileTransport()
 
         with self.assertRaises(ValueError) as caught:
             _stash(t).revert_reconcile("t-7", prior)
@@ -1222,15 +1363,16 @@ class Approving(unittest.TestCase):
         self.assertIn("the server said no", item["error"])
 
     def test_a_partial_run_is_failed_and_still_keeps_its_undo(self):
-        # HARM: this is a write to many scenes one at a time. A run that
-        # stopped partway really did change the scenes it reached, and the
+        # HARM: this is a write to many scenes, a batch at a time. A run that
+        # stopped partway really did change the batches it got through, and the
         # snapshot is the only record of which -- dropping it because the call
         # failed leaves those scenes changed with nothing able to put them
         # back.
         fp = self._record(scenes=("sc-1", "sc-2", "sc-3"))
         stash = _RecordingStash(result=_landed(
             ["sc-1"], worklist=["sc-1", "sc-2", "sc-3"],
-            failures=[{"scene": "sc-2", "error": "StashError: no"}]))
+            failures=[{"scenes": ["sc-2", "sc-3"],
+                       "error": "StashError: no"}]))
         actions = Actions(self.store, stash)
 
         with self.assertRaises(ApplyFailed):
@@ -1240,13 +1382,17 @@ class Approving(unittest.TestCase):
         self.assertEqual(item["state"], "failed")
         self.assertEqual(item["prior_state"]["untagged"], ["sc-1"])
         self.assertIn("wrote 1 of 3 scenes", item["error"])
+        # The batch it stopped on, by size and by where it starts -- and said
+        # to be unrecorded, because it is in neither half of the snapshot.
+        self.assertIn("batch of 2", item["error"])
         self.assertIn("sc-2", item["error"])
+        self.assertIn("partly written", item["error"])
 
     def test_a_run_that_wrote_nothing_at_all_keeps_no_snapshot(self):
         fp = self._record()
         stash = _RecordingStash(result=_landed(
             [], worklist=["sc-1"],
-            failures=[{"scene": "sc-1", "error": "StashError: no"}]))
+            failures=[{"scenes": ["sc-1"], "error": "StashError: no"}]))
         actions = Actions(self.store, stash)
 
         with self.assertRaises(ApplyFailed):
@@ -1263,7 +1409,7 @@ class Approving(unittest.TestCase):
         fp = self._record(scenes=("sc-1", "sc-2"))
         stash = _RecordingStash(result=_landed(
             ["sc-1"], worklist=["sc-1", "sc-2"],
-            failures=[{"scene": "sc-2", "error": "StashError: no"}]))
+            failures=[{"scenes": ["sc-2"], "error": "StashError: no"}]))
         actions = Actions(self.store, stash)
         with self.assertRaises(ApplyFailed):
             actions.approve(fp)
