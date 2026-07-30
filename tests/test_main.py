@@ -1114,6 +1114,235 @@ class AdapterConfigThatCannotLoad(_Base):
                          ["invented"])
 
 
+class ServerJsonFallback(_Base):
+    """`server.json` is the fifth file in the config directory, and the
+    service never read it.
+
+    The two command-line entry points do (`runscan`, `runstashbox`); the one
+    the container runs took its address from `--server`/`$CRONICLED_SERVER`
+    and nothing else. So an operator with a complete config directory started
+    the service, watched it report four things it had found in that directory,
+    and was told no media server was configured -- with the file that
+    configures one sitting in the same directory, unread and unmentioned.
+
+    Every test here passes `--config-dir`, so the value has to travel the whole
+    distance through `main`'s injected `env` to reach the file: a loader called
+    on the ambient environment instead would look for `config/server.json`
+    relative to the working directory, find nothing, and report a legitimate
+    absence.
+
+    Every fixture is invented. `.example` is a reserved name that resolves to
+    nothing, and the key below is not a key.
+    """
+
+    # Distinctive on purpose. The whole-output assertion below searches for
+    # THIS string, and a key that looked like an ordinary word could hide
+    # inside a start-up line while the test read as though it had looked.
+    FILE_API_KEY = "fake-api-key-must-never-be-printed"
+    FILE_URL = "http://media.example"
+
+    def _conf(self, payload=None, text=None):
+        """A config directory holding `server.json`, or -- given neither
+        argument -- holding nothing at all."""
+        conf = os.path.join(self._dir, "conf")
+        os.makedirs(conf, exist_ok=True)
+        if payload is not None or text is not None:
+            with open(self._server_path(conf), "w") as fh:
+                fh.write(json.dumps(payload) if text is None else text)
+        return conf
+
+    def _server_path(self, conf):
+        return os.path.join(conf, "server.json")
+
+    def _environ(self, overrides):
+        """The ambient environment every test here starts from: none of the
+        four variables that could supply an address, and no zone, so what a
+        test does configure is the only thing configuring anything."""
+        for name in ("CRONICLED_SERVER", "CRONICLED_API_KEY", "STASH_URL",
+                     "STASH_API_KEY", CONFIG_DIR_ENV_VAR, ZONE_ENV_VAR):
+            if name not in overrides:
+                os.environ.pop(name, None)
+
+    def _start(self, conf, argv=(), environ_overrides=None):
+        """`main()` over `conf`, returning what it handed `serve` and every
+        line it printed.
+
+        `build_scheduler` is replaced by one that schedules nothing. The real
+        one would start a background loop that reaches for whatever address
+        the fixture named, and no test here may open a socket. The double is
+        not more capable than what it stands in for: `None` -- schedule
+        nothing -- is an answer the real `build_scheduler` returns itself, and
+        it is the answer `main` already handles.
+        """
+        overrides = dict(environ_overrides or {})
+        captured = _CapturedServe()
+        out = io.StringIO()
+        with patch.dict(os.environ, overrides):
+            self._environ(overrides)
+            with patch("cronicled.__main__.serve", captured):
+                with patch("cronicled.__main__.build_scheduler",
+                           return_value=None):
+                    with redirect_stdout(out):
+                        main(["--db", self.db_path, "--config-dir", conf,
+                              *argv])
+        return captured, out.getvalue()
+
+    def _refuse(self, conf):
+        """`main()` over a `conf` that must not start, returning the error the
+        operator gets and the `serve` that was never reached."""
+        captured = _CapturedServe()
+        with patch.dict(os.environ, {}):
+            self._environ({})
+            with patch("cronicled.__main__.serve", captured):
+                with patch("cronicled.__main__.build_scheduler",
+                           return_value=None):
+                    with redirect_stdout(io.StringIO()):
+                        with self.assertRaises(ValueError) as ctx:
+                            main(["--db", self.db_path, "--config-dir", conf])
+        return str(ctx.exception), captured
+
+    def test_the_file_alone_configures_the_media_server(self):
+        # The defect itself: no flag, no environment variable, a complete
+        # server.json, and the service has to reach the media server.
+        conf = self._conf({"url": self.FILE_URL,
+                           "api_key": self.FILE_API_KEY})
+        captured, printed = self._start(conf)
+        stash = captured.kwargs["actions"]._stash
+        self.assertIsInstance(stash, Stash)
+        self.assertEqual(stash.url, "http://media.example/graphql")
+        self.assertEqual(stash.api_key, self.FILE_API_KEY)
+        # And it must not ALSO say none is configured, which is the sentence
+        # the operator was reading while the file sat there.
+        self.assertNotIn("WARNING", printed)
+
+    def test_the_address_from_the_file_reaches_every_rows_scene_url(self):
+        # The second thing the address is for. Left as `args.server`, this is
+        # `None` on exactly the installs this change configures, and every
+        # link on the page silently disappears while the client works.
+        self._seed(subject_id="55")
+        conf = self._conf({"url": self.FILE_URL,
+                           "api_key": self.FILE_API_KEY})
+        captured, _ = self._start(conf)
+        rows = captured.kwargs["rows"]()
+        self.assertEqual(rows[0].scene_url, "http://media.example/scenes/55")
+
+    def test_an_explicit_flag_wins_over_the_file(self):
+        # The precedence that keeps every existing deployment where it is. A
+        # change making the file win would redirect anyone who mounts a
+        # config directory AND passes the flag -- silently, to a server they
+        # did not name in the invocation they are looking at.
+        conf = self._conf({"url": "http://from-file.example",
+                           "api_key": self.FILE_API_KEY})
+        captured, printed = self._start(
+            conf, argv=["--server", "http://from-flag.example",
+                        "--api-key", "fake-key-from-the-flag"])
+        stash = captured.kwargs["actions"]._stash
+        self.assertEqual(stash.url, "http://from-flag.example/graphql")
+        self.assertEqual(stash.api_key, "fake-key-from-the-flag")
+        self.assertNotIn("from-file.example", printed)
+
+    def test_an_environment_variable_wins_over_the_file(self):
+        # The other direction of the same rule, and the one the container
+        # documents: `-e CRONICLED_SERVER` beside a mounted /config. Pinned
+        # separately from the flag because they are two different sources and
+        # a fix could easily leave one of them beneath the file.
+        conf = self._conf({"url": "http://from-file.example",
+                           "api_key": self.FILE_API_KEY})
+        captured, printed = self._start(
+            conf, environ_overrides={
+                "CRONICLED_SERVER": "http://from-environment.example",
+                "CRONICLED_API_KEY": "fake-key-from-the-environment"})
+        stash = captured.kwargs["actions"]._stash
+        self.assertEqual(stash.url, "http://from-environment.example/graphql")
+        self.assertEqual(stash.api_key, "fake-key-from-the-environment")
+        self.assertNotIn("from-file.example", printed)
+
+    def test_an_address_from_a_flag_does_not_take_the_files_key(self):
+        # The fallback is gated on the ADDRESS, and the file is one setting
+        # rather than two halves to be mixed with whatever else is around.
+        # Someone passing `--server` alone today gets a client with no key,
+        # and this change must not quietly hand them one out of a file they
+        # did not ask to be read.
+        conf = self._conf({"url": "http://from-file.example",
+                           "api_key": self.FILE_API_KEY})
+        captured, _ = self._start(
+            conf, argv=["--server", "http://from-flag.example"])
+        stash = captured.kwargs["actions"]._stash
+        self.assertEqual(stash.url, "http://from-flag.example/graphql")
+        self.assertIsNone(stash.api_key)
+
+    def test_a_file_naming_no_api_key_stops_the_start(self):
+        # A present, malformed file is not an absent one. Reported as "none
+        # configured" -- which is what catching this would do -- it sends the
+        # operator to check a file they already have, and this project has
+        # already fixed exactly that defect one file over, in the adapter
+        # loader above.
+        conf = self._conf({"url": self.FILE_URL})
+        message, captured = self._refuse(conf)
+        self.assertIn("api_key", message)
+        self.assertIn(self._server_path(conf), message)
+        # Nothing started: `serve` was never reached, so this is a start-up
+        # failure rather than a service running in a state nobody chose.
+        self.assertIsNone(captured.kwargs)
+
+    def test_a_file_that_is_not_valid_json_stops_the_start_too(self):
+        # The second real cause, and a different code path: this one raises
+        # out of the decoder rather than out of the loader's own check, and
+        # the line number is what an operator opens the file to. A gate that
+        # only asked whether the file existed would start anyway.
+        conf = self._conf(text='{\n  "url": "http://media.example",\n}\n')
+        message, captured = self._refuse(conf)
+        self.assertIn("line 3", message)
+        self.assertIsNone(captured.kwargs)
+
+    def test_an_absent_file_still_starts_and_warns(self):
+        # The permissive half. A fresh install with nothing configured is a
+        # legitimate state: it starts, it browses, and Approve and Undo refuse
+        # with a message. Reading the file unconditionally would turn this
+        # into a start-up failure, since the loader raises when nothing
+        # supplies both halves.
+        conf = self._conf()
+        self.assertFalse(os.path.exists(self._server_path(conf)))
+        captured, printed = self._start(conf)
+        self.assertIsNone(captured.kwargs["actions"]._stash)
+        self.assertIn("WARNING", printed)
+
+    def test_the_refusal_names_the_file_alongside_the_flag_and_the_variables(self):
+        # Three sources now, and the message has to admit to all three. It
+        # listed the flag and the variables and not the file, which is how an
+        # operator reads "no media server is configured" as "my file is
+        # wrong", checks it, finds it correct, and has nowhere to go.
+        conf = self._conf()
+        _, printed = self._start(conf)
+        for source in ("--server", "--api-key", "$CRONICLED_SERVER",
+                       "$CRONICLED_API_KEY", self._server_path(conf)):
+            self.assertIn(source, printed, source)
+
+    def test_the_key_from_the_file_appears_nowhere_in_the_start_up_output(self):
+        # THE WHOLE emitted text, not one line of it. A test asserting that
+        # the media-server line is free of the key cannot see it turn up in
+        # another line, and a secret in a start-up log is worse than the
+        # defect this change fixes: it is invisible until somebody pastes the
+        # log somewhere.
+        #
+        # The expected text is written out here rather than imported from the
+        # module, so that a line added to the start-up report has to be added
+        # here too, by someone who has read what it prints.
+        conf = self._conf({"url": self.FILE_URL,
+                           "api_key": self.FILE_API_KEY})
+        _, printed = self._start(conf)
+        self.assertEqual(printed, "".join(line + "\n" for line in [
+            "config directory: %s (adapters: none)" % conf,
+            "database: %s" % self.db_path,
+            "zone: UTC (the unattended passes run overnight in it, and every "
+            "time on the page is shown in it)",
+            "media server: configured from %s" % self._server_path(conf),
+        ]))
+        # Stated separately as well, so this fails by NAME rather than as a
+        # long diff on the day it matters.
+        self.assertNotIn(self.FILE_API_KEY, printed)
+
+
 class ScanWiring(_Base):
     # The runner a request's `/scan` starts a job on has to outlive that
     # request -- so it must be something `main()` builds once and hands to

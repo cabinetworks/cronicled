@@ -20,9 +20,13 @@ The ordering in `build_scheduler` below is load-bearing and is the one part
 of this file that fails silently when it is wrong. Read it there.
 
 `--server` names a media server; it has no default because there is no safe
-guess for it. Without one, the inbox still starts: a person can browse what a
-scan already produced, and dismiss or mute proposals, with nothing here that
-needs to reach a media server. Approve and Undo are the two actions that
+guess for it. When neither it nor `$CRONICLED_SERVER` supplies an address, the
+`server.json` in this project's own config directory is asked last — the same
+file `runscan` and `runstashbox` have always read, which this entry point used
+to ignore, so a complete config directory started a service that reported no
+media server. Without any of the three, the inbox still starts: a person can
+browse what a scan already produced, and dismiss or mute proposals, with
+nothing here that needs to reach one. Approve and Undo are the two actions that
 write to one. Scan never writes to a media server -- it only reads the
 library and looks candidates up -- but it does need both a media server
 and a configured site adapter to search against, so it refuses with its own
@@ -45,7 +49,8 @@ from datetime import time
 from . import performer_tags, tag_hygiene, tags
 from .adapters.registry import default_adapters_path, load_adapters
 from .config import (CONFIG_DIR_ENV_VAR, ZONE_ENV_VAR, config_dir,
-                     load_marker_tag, load_schedule, load_zone)
+                     default_server_path, load_marker_tag, load_schedule,
+                     load_server, load_zone)
 from .descriptions import DescriptionProducer
 from .jobs import JobRunner
 from .runscan import build_scheduled_producer
@@ -369,24 +374,70 @@ def main(argv=None):
           "time on the page is shown in it)" % zone)
 
     store = Store(args.db)
+    # THREE sources, asked in this order and no other: the flags, then their
+    # environment variables (argparse has already folded that half into
+    # `args.server`), then `server.json` in this project's own config
+    # directory. The file goes LAST so that no existing invocation changes --
+    # anyone passing either flag or either variable today keeps exactly what
+    # they have, and a deployment configured that way is not quietly
+    # redirected by a file that happens to be mounted beside the adapters.
+    #
+    # The file being asked at all is the fix. `runscan` and `runstashbox`
+    # have always read it; this entry point -- the one the container runs --
+    # did not, so an operator with a complete config directory was told no
+    # media server was configured while the fifth file in the directory the
+    # start-up line had just reported sat there unread.
+    #
+    # `base_url` is bound in every branch: the SAME address already resolved
+    # for `stash`, reused for every row's own link to the media server. Never
+    # re-derived from `stash.url`, which has `/graphql` appended for the API
+    # client's own purposes (see `Stash.__init__`), and never a second piece
+    # of configuration of its own -- one address, resolved once, used for both
+    # jobs. Left as `args.server`, it would be `None` on exactly the installs
+    # this change configures, and every link on the page would vanish.
+    server_path = default_server_path(env)
     if args.server:
         stash = Stash(args.server, args.api_key)
+        base_url = args.server
+    elif os.path.exists(server_path):
+        # Gated on the file EXISTING rather than on `load_server` succeeding,
+        # because absent and unreadable are different states and only one of
+        # them is a failure. `load_server` raises when nothing supplied both
+        # halves -- see the rule in `cronicled.config`'s module docstring --
+        # and an absent file is a legitimate fresh install that must still
+        # start. So absence is decided HERE, and everything else is the
+        # loader's own error, reaching the operator unswallowed. Catching it
+        # and falling through to "none configured" would report a broken file
+        # as a missing one, which is precisely the defect the adapter loader
+        # above no longer has, one file over.
+        #
+        # `env=env` for the reason every other loader in this function takes
+        # it: this is the seam where --config-dir either reaches the file or
+        # silently does not.
+        server = load_server(path=server_path, env=env)
+        stash = Stash(server["url"], server["api_key"])
+        base_url = server["url"]
+        # WHERE the address came from, and never WHAT the key is. The api key
+        # is a secret, and a start-up line naming it would put it in whatever
+        # logs this process -- the same reason `Stash.stash_boxes` declines to
+        # select a key it has no use for. The address is already on every row
+        # of the page as a link; the key is on nothing, and must stay that way.
+        print("media server: configured from %s" % server_path)
     else:
         stash = None
-        print("WARNING: no --server configured. Browsing, dismissing and "
+        base_url = None
+        # Names all THREE sources now, the file included. Listing only the
+        # flag and the variables is what sent an operator to check a file this
+        # message did not admit to reading.
+        print("WARNING: no media server configured. Browsing, dismissing and "
               "muting still work; Approve and Undo will refuse until a "
               "media server is set (--server / --api-key, or "
-              "$CRONICLED_SERVER / $CRONICLED_API_KEY).")
+              "$CRONICLED_SERVER / $CRONICLED_API_KEY, or a url and api_key "
+              "in %s -- see config/server.example.json for the shape)."
+              % server_path)
     runner = JobRunner(store)
     actions = Actions(store, stash, runner=runner, adapters=adapters,
                       marker=marker)
-    # The same address already resolved for `stash` above (or `None`,
-    # unconfigured) -- reused here for every row's own link to the media
-    # server (ticket 97). Never re-derived from `stash.url`, which has
-    # `/graphql` appended for the API client's own purposes (see
-    # `Stash.__init__`), and never a second flag of its own: one address,
-    # resolved once, used for both jobs.
-    base_url = args.server
 
     def _inbox_rows():
         # Applied proposals get their own section below (ticket 98) -- the

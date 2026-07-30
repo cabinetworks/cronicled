@@ -108,6 +108,15 @@ form the container image relies on, since a `docker run` argument list and an
 `-e` list are both just ways of setting the same thing. The flag wins if both
 are set.
 
+The media server has a third source, asked last: a `server.json` in the config
+directory holding a `url` and an `api_key` (see `config/server.example.json`
+for the shape) — the same file the command-line entry points read. It is
+consulted only when neither `--server` nor `$CRONICLED_SERVER` supplies an
+address, so adding one changes nothing for an invocation that already passes
+either. A file that is present and incomplete stops the start with a message
+naming what is missing; no file at all is a fresh install, which still starts
+and browses, with Approve and Undo refusing until a server is configured.
+
 That command also registers three unattended passes, each with an overnight
 appointment of its own, and starts the loop that runs them when they are due: a
 library scan with no file limit at 03:00, a pass over performer descriptions
