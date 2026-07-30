@@ -6,7 +6,7 @@ Separated from request handling so the write paths can be tested without a
 socket, and so the handler cannot reach the store, the media server, or the
 job runner directly and grow another kind of write nobody reviewed.
 """
-from cronicled import performer_tags, tags
+from cronicled import performer_tags, tag_hygiene, tags
 from cronicled.descriptions import SUBJECT_TYPE as DESCRIPTION_SUBJECT
 from cronicled.tag_descriptions import SUBJECT_TYPE as TAG_DESCRIPTION_SUBJECT
 from cronicled.runscan import build_producer
@@ -121,6 +121,8 @@ class Actions:
             return self._approve_merge(fp, item)
         if item["subject_type"] == performer_tags.SUBJECT_TYPE:
             return self._approve_reconcile(fp, item)
+        if item["subject_type"] == tag_hygiene.SUBJECT_TYPE:
+            return self._approve_delete(fp, item)
         subject_id = item["subject_id"]
         if self._stash is None:
             # Recorded as failed for the same reason a real apply failure is:
@@ -245,6 +247,43 @@ class Actions:
         self._store.mark_applied(fp)
         return "merged"
 
+    def _approve_delete(self, fp, item):
+        """Delete one tag that classifies nought or one scene.
+
+        ONE tag, the row's own subject, and there is no path here that takes a
+        set. That is the containment this whole finding rests on: the population
+        is assembled by a rule (`cronicled.tag_hygiene`), and a rule nobody
+        checked applied to two hundred and fifty-six irreversible writes on one
+        click is the shape this deliberately does not offer. The page groups the
+        rows so they can be read; it never groups the buttons.
+
+        The recorded count is passed to `Stash.delete_tag` as
+        `expected_scene_count` and the client refuses the deletion if the tag's
+        count has moved since the pass ran. Indexed, never `.get`: a payload
+        without it is malformed, and `.get` would hand `None` to a comparison
+        that then fails against every real count -- turning a missing field into
+        a refusal that looks like the guard firing, which is the one way this
+        check could stop meaning anything without anybody noticing.
+
+        `mark_applied` is called with NO `prior_state`, and that is where this
+        module enforces the irreversibility rather than merely describing it:
+        there is no snapshot, so the store holds none, so no row can ever claim
+        an undo it cannot perform. `undo` refuses this subject type by name, for
+        the reason it refuses a merge.
+        """
+        if self._stash is None:
+            self._store.mark_failed(fp, _NO_STASH)
+            raise ApplyFailed("could not apply: %s" % _NO_STASH)
+        try:
+            self._stash.delete_tag(
+                item["subject_id"],
+                expected_scene_count=item["payload"]["scene_count"])
+        except Exception as exc:
+            self._store.mark_failed(fp, "%s: %s" % (type(exc).__name__, exc))
+            raise ApplyFailed("could not apply: %s" % exc) from exc
+        self._store.mark_applied(fp)
+        return "deleted"
+
     def _approve_reconcile(self, fp, item):
         """Perform one tag/performer reconciliation: attach the performer to
         every scene carrying the tag and take the tag off those scenes.
@@ -340,6 +379,16 @@ class Actions:
             # not come from the page.
             raise ValueError(
                 "cannot undo %s: %s" % (fp, tags.MERGE_IS_IRREVERSIBLE))
+        if item["subject_type"] == tag_hygiene.SUBJECT_TYPE:
+            # Refused with the REASON, for the reason a merge is: a deleted tag
+            # has no snapshot because none can exist (see
+            # `tag_hygiene.DELETE_WARNING`), and the generic "no snapshot was
+            # stored for it" below reads as an omission somebody could go and
+            # fix. `UnusedTagRow` carries no `undoable` field at all, so the
+            # page never offers this and reaching here is a request that did not
+            # come from it.
+            raise ValueError(
+                "cannot undo %s: %s" % (fp, tag_hygiene.DELETE_IS_IRREVERSIBLE))
         if self._stash is None:
             raise RuntimeError("cannot undo %s: %s" % (fp, _NO_STASH))
         prior = item.get("prior_state")

@@ -22,6 +22,8 @@ from cronicled.scan import ScanProducer
 from cronicled.schedule import Entry, resolve
 from cronicled.stash import Stash
 from cronicled.store import Store
+from cronicled.tag_hygiene import NO_SCENES, ONE_SCENE
+from cronicled.tag_hygiene import proposal as unused_proposal
 from cronicled.tags import TagMergeProducer, cluster_tags
 from cronicled.tags import proposal as tag_proposal
 from cronicled.web.actions import Actions
@@ -227,6 +229,123 @@ class _Base(unittest.TestCase):
             store.mark_failed(fp, "wrote 1 of 3 scenes and then stopped")
         store.close()
         return fp
+
+
+    def _seed_unused(self, state=None, subject_id="55", name="Lantern Drift",
+                     scene_count=0):
+        """A real low-count tag proposal, built through
+        `cronicled.tag_hygiene`'s own proposal path, in whichever `state` a
+        person's decision would leave it."""
+        store = Store(self.db_path)
+        built = unused_proposal({"id": subject_id, "name": name,
+                                 "aliases": [], "description": None,
+                                 "scene_count": scene_count},
+                                folder="library")
+        fp = store.record(folder=built["folder"],
+                          subject_type=built["subject_type"],
+                          subject_id=built["subject_id"],
+                          summary=built["summary"], payload=built["payload"],
+                          producer="tag-merge")
+        if state == "dismissed":
+            store.dismiss(fp)
+        elif state == "muted":
+            store.mute(built["subject_type"], built["subject_id"])
+        elif state == "applied":
+            store.mark_applied(fp)
+        store.close()
+        return fp
+
+
+class UnusedTagSectionWiring(_Base):
+    """Where a low-count tag proposal is rendered, and -- just as much -- where
+    it must NOT be.
+
+    `to_row` INDEXES `payload["path"]` and `payload["candidate"]`, and this
+    payload has neither. So one reaching any scene list is not an odd-looking
+    row: it is a `KeyError` that takes the whole page down, and with it the
+    inbox and every control on it. Each assertion calls the section's callable,
+    which is the only way to see that -- `serve` receives functions, and a
+    wiring mistake is invisible until one is invoked.
+    """
+
+    def _served(self):
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path])
+        return captured.kwargs
+
+    def test_it_reaches_its_own_section_and_no_other(self):
+        self._seed()              # one ordinary scene proposal
+        self._seed_merge()        # and one tag merge
+        self._seed_reconcile()    # and one reconciliation
+        self._seed_unused()
+        kwargs = self._served()
+
+        groups = kwargs["unused"]()
+        self.assertEqual([(g.group, g.count) for g in groups],
+                         [(NO_SCENES, 1)])
+        self.assertEqual([r.name for r in groups[0].rows], ["Lantern Drift"])
+        self.assertEqual([r.filename for r in kwargs["rows"]()], ["reel.mp4"])
+        self.assertEqual([r.key for r in kwargs["merges"]()], ["velvetcrane"])
+        self.assertEqual([r.tag_name for r in kwargs["reconciles"]()],
+                         ["Delia Ashgrove"])
+
+    def test_every_scene_section_survives_one_in_the_store(self):
+        for state in ("dismissed", "muted", "applied"):
+            with self.subTest(state=state):
+                self.setUp()
+                self._seed_unused(state=state)
+                kwargs = self._served()
+                for section in ("rows", "muted", "dismissed", "superseded",
+                                "applied"):
+                    self.assertEqual(kwargs[section](), [], section)
+
+    def test_a_dismissed_one_keeps_its_reversal_on_the_page(self):
+        self._seed_unused(state="dismissed")
+
+        groups = self._served()["unused"]()
+
+        self.assertEqual([r.state for r in groups[0].rows], ["dismissed"])
+        self.assertTrue(groups[0].rows[0].undismissable)
+
+    def test_a_tag_somebody_kept_keeps_the_control_that_stops_keeping_it(self):
+        self._seed_unused(state="muted")
+
+        groups = self._served()["unused"]()
+
+        self.assertEqual([r.state for r in groups[0].rows], ["muted"])
+        self.assertTrue(groups[0].rows[0].unmutable)
+
+    def test_an_applied_deletion_stays_visible_with_its_warning(self):
+        self._seed_unused(state="applied")
+
+        rows = self._served()["unused"]()[0].rows
+
+        self.assertEqual([r.state for r in rows], ["applied"])
+        self.assertIn("cannot be undone", rows[0].warning)
+
+    def test_two_populations_reach_the_page_as_two_groups(self):
+        self._seed_unused(subject_id="55", name="Lantern Drift",
+                          scene_count=0)
+        self._seed_unused(subject_id="56", name="Copper Kettle",
+                          scene_count=1)
+        self._seed_unused(subject_id="57", name="Harbour Ferry",
+                          scene_count=1)
+
+        groups = self._served()["unused"]()
+
+        self.assertEqual([(g.group, g.count) for g in groups],
+                         [(NO_SCENES, 1), (ONE_SCENE, 2)])
+
+    def test_the_configured_server_reaches_every_rows_tag_link(self):
+        self._seed_unused()
+
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path, "--server", "http://server.invalid"])
+
+        self.assertEqual(captured.kwargs["unused"]()[0].rows[0].tag_url,
+                         "http://server.invalid/tags/55")
 
 
 class MergeSectionWiring(_Base):

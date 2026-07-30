@@ -8,6 +8,7 @@ proposal without opening anything else. That is worth testing on its own.
 import os
 from dataclasses import dataclass
 
+from cronicled import tag_hygiene
 from cronicled.descriptions import SUBJECT_TYPE as DESCRIPTION_SUBJECT
 from cronicled.scan import candidate_url
 from cronicled.tag_descriptions import SUBJECT_TYPE as TAG_DESCRIPTION_SUBJECT
@@ -25,6 +26,7 @@ from cronicled.text import slug_match, spaceless
 KIND_SCENE = "scene"
 KIND_DESCRIPTION = "performer-description"
 KIND_TAG_DESCRIPTION = "tag-description"
+KIND_UNUSED_TAG = "unused-tag"
 
 # What one store did when it was searched for a refused file, named so the
 # Refused section can pick a line for it without inspecting which of its
@@ -875,6 +877,178 @@ def to_reconcile_row(item, base_url=None):
 
 def to_reconcile_rows(items, base_url=None):
     return [to_reconcile_row(i, base_url=base_url) for i in items]
+
+
+@dataclass(frozen=True)
+class UnusedTagRow:
+    """One "this tag does almost no work" proposal -> what its section shows.
+
+    Deliberately not any of the four rows above, on the same terms `MergeRow` is
+    not a `Row`: the question is neither a filename against a candidate title,
+    nor two versions of a paragraph, nor "is this tag that person". It is "this
+    tag classifies this many scenes -- is it worth keeping", and the two fields
+    that make it judgeable are the count and what deleting it would cost.
+
+    **There is no `undoable` field, and that is the design.** A deletion cannot
+    be reversed (see `cronicled.tag_hygiene.DELETE_IS_IRREVERSIBLE`), so there
+    is no state in which this row may offer an Undo, and the cheapest way to
+    guarantee that is for the template to have nothing to read. `MergeRow` omits
+    it for the same reason.
+
+    `warning` is carried on every row in every state, not only before the click.
+    Afterwards the tag is gone, and a page that stopped saying so would leave a
+    person looking for the Undo that is not there. It is the warning for THIS
+    row's group, because whether a scene changed is the one thing the two groups
+    differ on and the count alone does not say it out loud.
+    """
+    kind: str
+    fingerprint: str
+    state: str
+    subject_type: str
+    subject_id: str
+    name: str
+    # The media server's own page for this tag, or `None` with no server
+    # configured -- see `tag_url`. The one link a person has for checking a
+    # deletion before approving it, which is why it is here even though the
+    # count is meant to be sufficient: the count is what this pass can see, and
+    # the page is where the markers, images and galleries it cannot see are.
+    tag_url: str | None
+    # The count AS MEASURED WHEN THE PASS RAN. Shown rather than turned into a
+    # verdict: the row states how much work the tag does and a person decides.
+    # `Stash.delete_tag` re-reads it before the write, so a stale one refuses
+    # the deletion rather than acting on it.
+    scene_count: int
+    counts_cover: str
+    # Which population this row is in, derived from the count by the one rule
+    # the producer classified with (`tag_hygiene.group_of`) -- never a second
+    # field stored beside the count that could disagree with it.
+    group: str
+    warning: str
+    appliable: bool
+    actionable: bool
+    undismissable: bool
+    unmutable: bool
+    error: str | None
+
+
+@dataclass(frozen=True)
+class UnusedTagGroup:
+    """One population, as the single expandable row that stands for it.
+
+    THIS TYPE IS THE POINT OF THE TICKET. A library measured for this had 256
+    tags on no scenes and 793 on exactly one, and both of the obvious shapes are
+    wrong:
+
+    * **1049 top-level rows** buries every other kind of proposal on the page
+      under one category, and a review queue that has stopped being readable has
+      stopped being read.
+    * **one "delete all unused tags" button** is a single irreversible write over
+      a set assembled by a rule nobody checked, and it cannot be examined before
+      it is pressed.
+
+    So the GROUP is what the page lists and the group is expandable; the
+    DECISIONS stay per-tag inside it. `rows` carries every row, each with its own
+    count and its own controls, and this type carries no fingerprint and no
+    control of its own -- there is nothing for a template to post, which is how
+    "no bulk delete" is guaranteed rather than merely intended.
+
+    `count` is `len(rows)`, derived here rather than carried alongside, so the
+    number a person reads and the set it describes cannot drift apart. The same
+    rule `ReconcileRow.total_scenes` follows.
+    """
+    group: str
+    label: str
+    note: str
+    count: int
+    rows: tuple
+
+
+# States in which a deletion proposal has no decision left to offer. The same
+# four names as `_CLOSED_MERGE_STATES` and `_CLOSED_RECONCILE_STATES`, for the
+# same reasons -- `applied` is done and cannot be undone, `dismissed` and `muted`
+# are standing rejections with their own reversal controls, `superseded` has been
+# retired. `failed` is NOT here: nothing was deleted, so the row is as live as it
+# was before the attempt.
+_CLOSED_UNUSED_STATES = ("applied", "dismissed", "muted", "superseded")
+
+
+def to_unused_row(item, base_url=None):
+    """One stored deletion proposal -> its `UnusedTagRow`.
+
+    Every payload field is INDEXED: `cronicled.tag_hygiene.proposal` writes all
+    three on every proposal it makes. `scene_count` is the expensive one --
+    read with a default it would report 0 for a malformed payload, which is
+    exactly the number that reads as "deleting this changes nothing", for a tag
+    that might be on thousands of scenes.
+
+    A payload whose count belongs to NEITHER population raises rather than
+    rendering. The producer never makes one, so it is a malformed payload; and
+    the alternative -- a row with no group -- would either vanish from the page
+    or land in a group whose note makes a claim about it that nothing checked.
+    """
+    payload = item["payload"]
+    group = tag_hygiene.group_of(payload)
+    if group is None:
+        raise ValueError(
+            "proposal %s says tag %r is on %r scenes, which is neither of the "
+            "two populations this section shows"
+            % (item["fingerprint"], payload["name"], payload["scene_count"]))
+    state = item["state"]
+    open_state = state not in _CLOSED_UNUSED_STATES
+    return UnusedTagRow(
+        kind=KIND_UNUSED_TAG,
+        fingerprint=item["fingerprint"],
+        state=state,
+        subject_type=item["subject_type"],
+        subject_id=item["subject_id"],
+        name=payload["name"],
+        # From `subject_id`, which is also what the write goes against -- one
+        # id, so the link a person checks and the tag that gets deleted cannot
+        # be two different tags.
+        tag_url=tag_url(base_url, item["subject_id"]),
+        scene_count=payload["scene_count"],
+        counts_cover=payload["counts_cover"],
+        group=group,
+        warning=tag_hygiene.DELETE_WARNING[group],
+        appliable=open_state,
+        actionable=open_state,
+        undismissable=state == "dismissed",
+        unmutable=state == "muted",
+        error=item.get("error"),
+    )
+
+
+def to_unused_groups(items, base_url=None):
+    """Every stored deletion proposal, as one expandable group per population.
+
+    In `tag_hygiene.GROUPS` order -- safest population first -- and a population
+    with nothing in it produces NO group at all rather than an empty one: a row
+    saying "0 tags on no scenes" is a line that is always on the page and so
+    stops being read, and the section already says out loud when it is empty
+    altogether.
+
+    Rows inside a group are ordered by `(name, subject_id)` -- CONTENT, never
+    the order the store happened to return them in. Two tags can share a name
+    (that is what the merge half is for), so the id breaks the tie, and the
+    result is a list that reads the same on every visit instead of shifting as
+    proposals are recorded.
+    """
+    built = {group: [] for group in tag_hygiene.GROUPS}
+    for item in items:
+        row = to_unused_row(item, base_url=base_url)
+        built[row.group].append(row)
+    groups = []
+    for group in tag_hygiene.GROUPS:
+        rows = sorted(built[group], key=lambda r: (r.name, r.subject_id))
+        if not rows:
+            continue
+        groups.append(UnusedTagGroup(
+            group=group,
+            label=tag_hygiene.GROUP_LABEL[group],
+            note=tag_hygiene.GROUP_NOTE[group],
+            count=len(rows),
+            rows=tuple(rows)))
+    return tuple(groups)
 
 
 def _refused_store_view(entry):

@@ -8,6 +8,8 @@ proposal will eventually be followed by something that is not a person.
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+from cronicled.tag_hygiene import LOW_COUNT_IS_NOT_PROOF
+
 from .render import render
 
 DEFAULT_HOST = "127.0.0.1"
@@ -57,7 +59,8 @@ def _origin_matches_host(origin, host_header):
 
 def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                   refused=None, superseded=None, applied=None,
-                  schedule_status=None, merges=None, reconciles=None):
+                  schedule_status=None, merges=None, reconciles=None,
+                  unused=None):
     # A separate callable rather than always reaching through `actions`:
     # every existing action-path test builds its own recording double for
     # `actions` and none of them implement `scan_status`, so defaulting it
@@ -82,6 +85,12 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
     # name with a performer has none of these, which is the ordinary state, and
     # an existing test's double has no opinion about them.
     _reconciles = reconciles or (lambda: [])
+    # And again for the low-count tag section. A library where every tag is on
+    # two scenes or more has none of these, and so does one whose configured
+    # source could not be read (see `cronicled.tag_hygiene`) -- both are states
+    # the page has to be able to draw as an empty section rather than as an
+    # error, and an existing test's double has no opinion about either.
+    _unused = unused or (lambda: [])
     # `None` here is not "no information": it is the answer for an install
     # where nothing is scheduled at all, which is a state the page has to be
     # able to say out loud rather than render as an empty section that looks
@@ -130,6 +139,13 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                          applied=_applied(),
                          merges=_merges(),
                          reconciles=_reconciles(),
+                         unused=_unused(),
+                         # Read off the module that owns the claim rather than
+                         # typed into the template, for the reason
+                         # `MergeRow.warning` reads `tags
+                         # .MERGE_IS_IRREVERSIBLE`: a second copy of a sentence
+                         # this important is a second copy free to drift.
+                         low_count_is_not_proof=LOW_COUNT_IS_NOT_PROOF,
                          schedule=_schedule_status(),
                          just_applied=just_applied).encode()
             self._send(200, body,
@@ -267,7 +283,8 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
 
 def serve(rows, actions, scan_status=None, muted=None, dismissed=None,
          refused=None, superseded=None, applied=None, schedule_status=None,
-         merges=None, reconciles=None, host=DEFAULT_HOST, port=DEFAULT_PORT):
+         merges=None, reconciles=None, unused=None, host=DEFAULT_HOST,
+         port=DEFAULT_PORT):
     # `HTTPServer` is single-threaded: one connection wedged on a slow read
     # or a slow downstream call (a media server taking its whole configured
     # timeout to answer an Approve, say) stalls every other request -- an
@@ -314,6 +331,6 @@ def serve(rows, actions, scan_status=None, muted=None, dismissed=None,
         rows, actions, scan_status, muted=muted, dismissed=dismissed,
         refused=refused, superseded=superseded, applied=applied,
         schedule_status=schedule_status, merges=merges,
-        reconciles=reconciles))
+        reconciles=reconciles, unused=unused))
     print("inbox on http://%s:%d/" % (host, port))
     httpd.serve_forever()
