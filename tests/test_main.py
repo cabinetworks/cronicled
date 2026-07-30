@@ -2206,5 +2206,42 @@ class StoredTimestampsStayUtc(_Base):
             store.close()
 
 
+class TheScheduledJobsAreNamedForWhatTheyCover(unittest.TestCase):
+    """The three names are an interface, not an implementation detail.
+
+    They are what an operator writes into a schedule file, and
+    `schedule.resolve` refuses an override naming a producer that is not
+    registered -- at START-UP, before there is a page on which to read the
+    refusal. So renaming one is a breaking change to somebody else's file,
+    and the names are pinned here as literals on purpose.
+
+    `ALL_PRODUCERS` above is deliberately derived from the modules that
+    define these names, so that a rename cannot leave the assertions in this
+    file testing a schedule that no longer has them. That is right for what
+    those assertions are for, and it is exactly why it cannot also pin the
+    names: both sides would move together, and a rename would pass in
+    silence. Literals here, once, and derived everywhere else.
+    """
+
+    def test_the_three_scheduled_jobs_have_the_names_a_schedule_file_uses(self):
+        self.assertEqual(ALL_PRODUCERS,
+                         ["performer-scan", "scene-scan", "tag-scan"])
+
+    def test_the_example_schedule_names_jobs_that_are_actually_registered(self):
+        """HARM: the example is what an operator copies. One naming a job
+        that no longer exists does not degrade -- `resolve` refuses it and
+        the process never comes up, so the first thing the rename does to
+        somebody who followed the documentation is a crash loop.
+
+        Compared as a whole set rather than key by key: a key left behind is
+        the failure, and a check for the keys that should be there cannot
+        see one that should not.
+        """
+        with open(os.path.join("config", "schedule.example.json"),
+                  encoding="utf-8") as fh:
+            example = json.load(fh)
+        self.assertEqual(sorted(example), ALL_PRODUCERS)
+
+
 if __name__ == "__main__":
     unittest.main()

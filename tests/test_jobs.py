@@ -80,14 +80,14 @@ class RunningAJob(_RunnerCase):
         # the whole point: a long scan must not block the caller
         gate = threading.Event()
         self.runner.register(_Producer(gate=gate))
-        job = self.runner.start("test-producer")
+        job = self.runner.start("test-producer", trigger="manual")
         self.assertEqual(job.state, "running")
         gate.set()
         self.runner.wait(job.id, timeout=5)
 
     def test_what_the_producer_yields_is_recorded(self):
         self.runner.register(_Producer(count=3))
-        job = self.runner.start("test-producer")
+        job = self.runner.start("test-producer", trigger="manual")
         self.runner.wait(job.id, timeout=5)
         self.assertEqual(len(self.store.items()), 3)
         self.assertEqual(self.runner.job(job.id).recorded, 3)
@@ -95,14 +95,14 @@ class RunningAJob(_RunnerCase):
     def test_progress_is_the_producers_own_log_line(self):
         gate = threading.Event()
         self.runner.register(_Producer(gate=gate, count=2))
-        job = self.runner.start("test-producer")
+        job = self.runner.start("test-producer", trigger="manual")
         gate.set()
         self.runner.wait(job.id, timeout=5)
         self.assertIn("processing item", self.runner.job(job.id).message)
 
     def test_a_finished_job_reports_done_with_a_finish_time(self):
         self.runner.register(_Producer(count=1))
-        job = self.runner.start("test-producer")
+        job = self.runner.start("test-producer", trigger="manual")
         self.runner.wait(job.id, timeout=5)
         done = self.runner.job(job.id)
         self.assertEqual(done.state, "done")
@@ -110,7 +110,7 @@ class RunningAJob(_RunnerCase):
 
     def test_starting_an_unregistered_producer_raises(self):
         with self.assertRaises(KeyError):
-            self.runner.start("nosuchproducer")
+            self.runner.start("nosuchproducer", trigger="manual")
 
 
 class Duration(_RunnerCase):
@@ -123,7 +123,7 @@ class Duration(_RunnerCase):
     def test_a_running_job_has_no_duration_yet(self):
         gate = threading.Event()
         self.runner.register(_Producer(gate=gate, count=1))
-        job = self.runner.start("test-producer")
+        job = self.runner.start("test-producer", trigger="manual")
         self.assertIsNone(self.runner.job(job.id).duration)
         gate.set()
         self.runner.wait(job.id, timeout=5)
@@ -135,7 +135,7 @@ class Duration(_RunnerCase):
         # assertion is about the actual failure mode, not a value we handed
         # the code back to itself.
         self.runner.register(_Producer(count=1))
-        job = self.runner.start("test-producer")
+        job = self.runner.start("test-producer", trigger="manual")
         self.runner.wait(job.id, timeout=5)
         done = self.runner.job(job.id)
         self.assertEqual(done.started_at, done.finished_at,
@@ -151,13 +151,13 @@ class Duration(_RunnerCase):
         with mock.patch("cronicled.jobs.time.monotonic",
                         side_effect=[100.0, 100.25]):
             self.runner.register(_Producer(count=1))
-            job = self.runner.start("test-producer")
+            job = self.runner.start("test-producer", trigger="manual")
             self.runner.wait(job.id, timeout=5)
         self.assertAlmostEqual(self.runner.job(job.id).duration, 0.25, places=6)
 
     def test_a_failed_job_still_reports_a_duration(self):
         self.runner.register(_Producer(count=1, boom=True))
-        job = self.runner.start("test-producer")
+        job = self.runner.start("test-producer", trigger="manual")
         self.runner.wait(job.id, timeout=5)
         failed = self.runner.job(job.id)
         self.assertEqual(failed.state, "failed")
@@ -168,7 +168,7 @@ class Duration(_RunnerCase):
 class Failure(_RunnerCase):
     def test_a_failing_producer_marks_the_job_failed_with_the_error(self):
         self.runner.register(_Producer(count=2, boom=True))
-        job = self.runner.start("test-producer")
+        job = self.runner.start("test-producer", trigger="manual")
         self.runner.wait(job.id, timeout=5)
         failed = self.runner.job(job.id)
         self.assertEqual(failed.state, "failed")
@@ -178,16 +178,16 @@ class Failure(_RunnerCase):
         # partial progress is the normal outcome of interrupted work, not a
         # corruption to roll back
         self.runner.register(_Producer(count=2, boom=True))
-        job = self.runner.start("test-producer")
+        job = self.runner.start("test-producer", trigger="manual")
         self.runner.wait(job.id, timeout=5)
         self.assertEqual(len(self.store.items()), 2)
 
     def test_a_failure_does_not_stop_later_jobs(self):
         self.runner.register(_Producer(name="bad", count=1, boom=True))
         self.runner.register(_Producer(name="good", count=1))
-        bad = self.runner.start("bad")
+        bad = self.runner.start("bad", trigger="manual")
         self.runner.wait(bad.id, timeout=5)
-        good = self.runner.start("good")
+        good = self.runner.start("good", trigger="manual")
         self.runner.wait(good.id, timeout=5)
         self.assertEqual(self.runner.job(good.id).state, "done")
 
@@ -200,7 +200,7 @@ class BaseExceptions(_RunnerCase):
         self.runner.register(
             _Producer(count=1, boom=True, raises=KeyboardInterrupt)
         )
-        job = self.runner.start("test-producer")
+        job = self.runner.start("test-producer", trigger="manual")
         self.assertTrue(self.runner.wait(job.id, timeout=5))
         failed = self.runner.job(job.id)
         self.assertEqual(failed.state, "failed")
@@ -235,7 +235,7 @@ class Diagnostics(_RunnerCase):
         # the worker swallows the exception and nothing logs it, so an error
         # of "" would leave a failed job that looks like nothing happened
         self.runner.register(_BareFailure())
-        job = self.runner.start("bare")
+        job = self.runner.start("bare", trigger="manual")
         self.assertTrue(self.runner.wait(job.id, timeout=5))
         failed = self.runner.job(job.id)
         self.assertEqual(failed.state, "failed")
@@ -243,7 +243,7 @@ class Diagnostics(_RunnerCase):
 
     def test_a_failure_keeps_the_frames_that_say_where_it_happened(self):
         self.runner.register(_BareFailure())
-        job = self.runner.start("bare")
+        job = self.runner.start("bare", trigger="manual")
         self.assertTrue(self.runner.wait(job.id, timeout=5))
         detail = self.runner.job(job.id).traceback
         self.assertIn("RuntimeError", detail)
@@ -251,7 +251,7 @@ class Diagnostics(_RunnerCase):
 
     def test_a_job_that_succeeds_carries_no_error_or_traceback(self):
         self.runner.register(_Producer(count=1))
-        job = self.runner.start("test-producer")
+        job = self.runner.start("test-producer", trigger="manual")
         self.assertTrue(self.runner.wait(job.id, timeout=5))
         done = self.runner.job(job.id)
         self.assertIsNone(done.error)
@@ -265,7 +265,7 @@ class ProducerContract(_RunnerCase):
         self.runner.register(_Producer(name="scan", cost="scraping"))
         with self.assertRaises(ValueError):
             self.runner.register(_Producer(name="scan", cost="local"))
-        job = self.runner.start("scan")
+        job = self.runner.start("scan", trigger="manual")
         self.assertEqual(job.cost, "scraping")
         self.assertTrue(self.runner.wait(job.id, timeout=5))
 
@@ -275,7 +275,7 @@ class ProducerContract(_RunnerCase):
         # runner's yield-by-yield recording exists to prevent
         self.runner.register(_ReturnsAList())
         with self.assertRaises(TypeError):
-            self.runner.start("listy")
+            self.runner.start("listy", trigger="manual")
         self.assertEqual(self.runner.jobs(), [])
         self.assertEqual(len(self.store.items()), 0)
 
@@ -320,7 +320,7 @@ class Reregistering(_RunnerCase):
         gate = threading.Event()
         old = _Producer(name="scan", cost="local", count=1, gate=gate)
         self.runner.register(old)
-        job = self.runner.start("scan")
+        job = self.runner.start("scan", trigger="manual")
         self.runner.reregister(_Producer(name="scan", cost="local", count=1))
         gate.set()
         self.assertTrue(self.runner.wait(job.id, timeout=5))
@@ -331,7 +331,7 @@ class Reregistering(_RunnerCase):
     def test_starting_after_a_replace_runs_the_new_producer(self):
         self.runner.register(_Producer(name="scan", cost="local", count=1))
         self.runner.reregister(_Producer(name="scan", cost="local", count=5))
-        job = self.runner.start("scan")
+        job = self.runner.start("scan", trigger="manual")
         self.assertTrue(self.runner.wait(job.id, timeout=5))
         self.assertEqual(self.runner.job(job.id).recorded, 5)
 
@@ -364,9 +364,9 @@ class CostClasses(_RunnerCase):
         gate = threading.Event()
         self.runner.register(_Producer(name="scan-a", cost="scraping", gate=gate))
         self.runner.register(_Producer(name="scan-b", cost="scraping"))
-        first = self.runner.start("scan-a")
+        first = self.runner.start("scan-a", trigger="manual")
         with self.assertRaises(JobRejected) as ctx:
-            self.runner.start("scan-b")
+            self.runner.start("scan-b", trigger="manual")
         self.assertIn("scan-a", str(ctx.exception))
         gate.set()
         self.runner.wait(first.id, timeout=5)
@@ -375,8 +375,8 @@ class CostClasses(_RunnerCase):
         gate = threading.Event()
         self.runner.register(_Producer(name="scan", cost="scraping", gate=gate))
         self.runner.register(_Producer(name="tags", cost="local", count=1))
-        scan = self.runner.start("scan")
-        tags = self.runner.start("tags")          # must not be refused
+        scan = self.runner.start("scan", trigger="manual")
+        tags = self.runner.start("tags", trigger="manual")          # must not be refused
         self.runner.wait(tags.id, timeout=5)
         self.assertEqual(self.runner.job(tags.id).state, "done")
         gate.set()
@@ -385,16 +385,16 @@ class CostClasses(_RunnerCase):
     def test_many_local_jobs_run_together(self):
         for i in range(4):
             self.runner.register(_Producer(name="local-%d" % i, cost="local", count=1))
-        started = [self.runner.start("local-%d" % i) for i in range(4)]
+        started = [self.runner.start("local-%d" % i, trigger="manual") for i in range(4)]
         for j in started:
             self.runner.wait(j.id, timeout=5)
         self.assertTrue(all(self.runner.job(j.id).state == "done" for j in started))
 
     def test_the_class_frees_up_when_the_job_finishes(self):
         self.runner.register(_Producer(name="scan", cost="scraping", count=1))
-        first = self.runner.start("scan")
+        first = self.runner.start("scan", trigger="manual")
         self.runner.wait(first.id, timeout=5)
-        second = self.runner.start("scan")        # must not be refused
+        second = self.runner.start("scan", trigger="manual")        # must not be refused
         self.runner.wait(second.id, timeout=5)
         self.assertEqual(self.runner.job(second.id).state, "done")
 
@@ -402,9 +402,9 @@ class CostClasses(_RunnerCase):
         # a crashed scrape that permanently blocks all future scrapes would be a
         # deadlock in slow motion
         self.runner.register(_Producer(name="scan", cost="scraping", count=1, boom=True))
-        first = self.runner.start("scan")
+        first = self.runner.start("scan", trigger="manual")
         self.runner.wait(first.id, timeout=5)
-        second = self.runner.start("scan")        # must not be refused
+        second = self.runner.start("scan", trigger="manual")        # must not be refused
         self.runner.wait(second.id, timeout=5)
         # "scan" always booms, so its second run fails too, same as its
         # first — the property under test is that starting it was allowed
@@ -427,11 +427,11 @@ class CostClasses(_RunnerCase):
             "threading.Thread.start", side_effect=OSError("thread start failed")
         ):
             with self.assertRaises(OSError):
-                self.runner.start("scan")
+                self.runner.start("scan", trigger="manual")
 
         # the class must not be wedged: a following start() must be allowed
         # through and must run to completion, not be refused as saturated.
-        second = self.runner.start("scan")
+        second = self.runner.start("scan", trigger="manual")
         self.assertTrue(self.runner.wait(second.id, timeout=5))
         self.assertEqual(self.runner.job(second.id).state, "done")
 
@@ -466,14 +466,14 @@ class CostClasses(_RunnerCase):
 
         with mock.patch("threading.Thread.start", interrupted_start):
             with self.assertRaises(KeyboardInterrupt):
-                self.runner.start("scan")
+                self.runner.start("scan", trigger="manual")
 
         try:
             # the worker exists, so the slot is its own `finally`'s to
             # release: the class must still be held, and the job must still
             # be visible rather than erased while its thread runs on.
             with self.assertRaises(JobRejected):
-                self.runner.start("scan-2")
+                self.runner.start("scan-2", trigger="manual")
             first = [j for j in self.runner.jobs() if j.producer == "scan"][0]
             self.assertEqual(self.runner.job(first.id).state, "running")
         finally:
@@ -494,7 +494,7 @@ class CostClasses(_RunnerCase):
         n = 20
         for i in range(n):
             self.runner.register(_Producer(name="scan-%d" % i, cost="scraping"))
-        first = self.runner.start("scan-a")
+        first = self.runner.start("scan-a", trigger="manual")
 
         barrier = threading.Barrier(n)
         results = [None] * n
@@ -502,7 +502,7 @@ class CostClasses(_RunnerCase):
         def attempt(i):
             barrier.wait()
             try:
-                job = self.runner.start("scan-%d" % i)
+                job = self.runner.start("scan-%d" % i, trigger="manual")
                 results[i] = ("started", job)
             except JobRejected as exc:
                 results[i] = ("rejected", str(exc))
@@ -522,3 +522,242 @@ class CostClasses(_RunnerCase):
 
         gate.set()
         self.runner.wait(first.id, timeout=5)
+
+
+class _StoreWatchingTheRunner(Store):
+    """A real store that notes, at the moment a run is closed, whether the
+    runner has already released `wait()` for that job.
+
+    A subclass of the real thing rather than a double: the rule under test is
+    an ordering between something the runner does and something the store
+    does, and a stand-in that only looked like a store could not observe it.
+    """
+
+    def __init__(self, path):
+        super().__init__(path)
+        self.runner = None
+        self.job_id = None
+        self.wait_had_returned = None
+
+    def finish_run(self, run_id, **kwargs):
+        self.wait_had_returned = self.runner.wait(self.job_id, timeout=0)
+        return super().finish_run(run_id, **kwargs)
+
+
+class TheRunIsRecorded(_RunnerCase):
+    """Every start opens a row saying how the run began, and every end closes
+    it saying how it went.
+
+    `producer_run` -- what the scheduler reads -- answers "how long ago", and
+    keeps one row per producer for the purpose. This answers "did last
+    night's pass run, and what did it find", which is made of the runs that
+    upsert threw away.
+    """
+
+    def _the_only_run(self):
+        rows = self.store.recent_runs()
+        self.assertEqual(len(rows), 1, rows)
+        return rows[0]
+
+    def test_a_scheduled_start_records_a_scheduled_run(self):
+        self.runner.register(_Producer(count=1))
+        job = self.runner.start("test-producer", trigger="scheduled")
+        self.assertTrue(self.runner.wait(job.id, timeout=5))
+        row = self._the_only_run()
+        self.assertEqual((row["job"], row["trigger"], row["outcome"]),
+                         ("test-producer", "scheduled", "completed"))
+
+    def test_a_manual_start_is_recorded_as_manual(self):
+        """The other value, pinned separately. A trigger that always reported
+        one of the two would satisfy a suite that only ever asserted that one,
+        and "did last night's pass run" is a question about the scheduled
+        run, not about a button somebody pressed at noon."""
+        self.runner.register(_Producer(count=1))
+        job = self.runner.start("test-producer", trigger="manual")
+        self.assertTrue(self.runner.wait(job.id, timeout=5))
+        self.assertEqual(self._the_only_run()["trigger"], "manual")
+
+    def test_the_trigger_is_required_rather_than_defaulted(self):
+        """The same producer runs both ways, so there is no honest default:
+        one would quietly label whichever call site forgot to say, and label
+        it with the value a reader trusts most."""
+        self.runner.register(_Producer(count=1))
+        with self.assertRaises(TypeError):
+            self.runner.start("test-producer")
+        self.assertEqual(self.store.recent_runs(), [])
+
+    def test_an_unrecognised_trigger_is_refused_before_anything_runs(self):
+        self.runner.register(_Producer(count=1))
+        with self.assertRaises(ValueError):
+            self.runner.start("test-producer", trigger="cron")
+        self.assertEqual(self.store.recent_runs(), [])
+        self.assertEqual(self.store.items(), [])
+
+    def test_an_unknown_producer_leaves_no_row_behind(self):
+        with self.assertRaises(KeyError):
+            self.runner.start("nosuchproducer", trigger="manual")
+        self.assertEqual(self.store.recent_runs(), [])
+
+    def test_a_running_job_is_in_the_log_before_it_finishes(self):
+        """What the log is for during a long pass: a scan that takes an hour
+        has to be visible for that hour, not appear once it is over. An
+        operator watching a pass that shows nothing cannot tell it from one
+        that never started."""
+        gate = threading.Event()
+        self.runner.register(_Producer(gate=gate, count=1))
+        job = self.runner.start("test-producer", trigger="scheduled")
+        row = self._the_only_run()
+        self.assertEqual(
+            (row["job"], row["trigger"], row["finished"], row["outcome"],
+             row["counts"], row["error"]),
+            ("test-producer", "scheduled", None, None, {}, None))
+        gate.set()
+        self.assertTrue(self.runner.wait(job.id, timeout=5))
+
+    def test_a_producer_that_raises_is_recorded_as_failed_with_its_error(self):
+        """Closed from a `finally`, so the failure is recorded exactly as a
+        success is. A log of the runs that worked answers the opposite
+        question to the one it exists for: it makes a pass that has failed
+        every night for a week look like one that was never scheduled."""
+        self.runner.register(_Producer(count=1, boom=True))
+        job = self.runner.start("test-producer", trigger="scheduled")
+        self.assertTrue(self.runner.wait(job.id, timeout=5))
+        row = self._the_only_run()
+        self.assertEqual(row["outcome"], "failed")
+        self.assertIsNotNone(row["finished"])
+        self.assertIn("producer failed after yielding", row["error"])
+
+    def test_a_completed_run_carries_no_error(self):
+        """The permissive side of the same branch. An outcome that read
+        "failed" only when asked about a failure would leave a run that
+        worked carrying somebody else's error text."""
+        self.runner.register(_Producer(count=1))
+        job = self.runner.start("test-producer", trigger="manual")
+        self.assertTrue(self.runner.wait(job.id, timeout=5))
+        self.assertIsNone(self._the_only_run()["error"])
+
+    def test_what_the_run_recorded_and_what_it_skipped_are_both_kept(self):
+        """Asymmetric on purpose and neither count is one: equal counts
+        cannot tell the two apart if they were swapped, and a fixture of one
+        cannot tell a count that accumulates from one that assigns.
+
+        Asserted as a whole dict, because a field-by-field check cannot see a
+        counter that should not be there -- and this dict is handed to a page
+        that renders whatever it is given.
+        """
+        self.store.mute("scene", "0")
+        self.store.mute("scene", "1")
+        self.runner.register(_Producer(count=5))
+        job = self.runner.start("test-producer", trigger="manual")
+        self.assertTrue(self.runner.wait(job.id, timeout=5))
+        self.assertEqual(self._the_only_run()["counts"],
+                         {"recorded": 3, "skipped": 2})
+
+    def test_two_runs_of_one_producer_are_two_rows(self):
+        """The property the log exists for, and the one a single run cannot
+        show: `record_run` keeps the latest and this keeps both."""
+        self.runner.register(_Producer(count=1))
+        first = self.runner.start("test-producer", trigger="scheduled")
+        self.assertTrue(self.runner.wait(first.id, timeout=5))
+        second = self.runner.start("test-producer", trigger="manual")
+        self.assertTrue(self.runner.wait(second.id, timeout=5))
+        self.assertEqual([r["trigger"] for r in self.store.recent_runs()],
+                         ["manual", "scheduled"])
+
+    def test_a_start_refused_as_saturated_closes_the_row_it_opened(self):
+        """A refusal is ordinary, not exceptional -- asking for a scan while
+        one is running raises `JobRejected` -- and retention deliberately
+        never evicts an unfinished row. A row left open by a refused start
+        would therefore sit in the log for the life of the deployment, one
+        per click, and be reported as a run still going.
+        """
+        gate = threading.Event()
+        self.runner.register(_Producer(name="scan-a", cost="scraping",
+                                       gate=gate, count=1))
+        self.runner.register(_Producer(name="scan-b", cost="scraping"))
+        first = self.runner.start("scan-a", trigger="manual")
+        with self.assertRaises(JobRejected):
+            self.runner.start("scan-b", trigger="manual")
+        gate.set()
+        self.assertTrue(self.runner.wait(first.id, timeout=5))
+
+        rows = self.store.recent_runs()
+        self.assertEqual([r["finished"] for r in rows if r["finished"] is None],
+                         [])
+        refused = [r for r in rows if r["job"] == "scan-b"]
+        self.assertEqual(len(refused), 1, rows)
+        self.assertEqual(refused[0]["outcome"], "failed")
+        self.assertIn("JobRejected", refused[0]["error"])
+
+    def test_a_spawn_that_fails_closes_the_row_it_opened(self):
+        """The other no-worker path. `Thread.start()` raising an `Exception`
+        is the spawn itself failing, before any child exists -- which is why
+        `start` takes the reservation back there, and why it takes the row
+        back too."""
+        self.runner.register(_Producer(name="scan", cost="scraping", count=1))
+        with mock.patch("threading.Thread.start",
+                        side_effect=OSError("thread start failed")):
+            with self.assertRaises(OSError):
+                self.runner.start("scan", trigger="manual")
+        row = self._the_only_run()
+        self.assertEqual(row["outcome"], "failed")
+        self.assertIsNotNone(row["finished"])
+        self.assertIn("OSError", row["error"])
+
+    def test_an_interrupt_inside_thread_start_leaves_the_row_to_the_worker(self):
+        """The mirror of the slot rule beside it. In that window the child
+        has been spawned but has not yet set the event `Thread.start()` is
+        waiting on, so a worker is already on its way while every test this
+        thread could make says otherwise. Closing the row here would let this
+        thread overwrite a live worker's own verdict with a failure."""
+        self.runner.register(_Producer(name="scan", cost="scraping", count=1))
+        real_start = threading.Thread.start
+        started = _StartedInterrupted()
+
+        def interrupted_start(thread):
+            thread._started = started
+            real_start(thread)
+
+        with mock.patch("threading.Thread.start", interrupted_start):
+            with self.assertRaises(KeyboardInterrupt):
+                self.runner.start("scan", trigger="manual")
+        try:
+            # Still open: this thread left it alone. The worker is parked
+            # inside `_started.set()` and has not reached its `finally` yet.
+            self.assertIsNone(self._the_only_run()["outcome"])
+        finally:
+            started.let_the_worker_run()
+
+        for job in self.runner.jobs():
+            self.runner.wait(job.id, timeout=5)
+        # And the worker closed it, exactly once and as its own run.
+        self.assertEqual(self._the_only_run()["outcome"], "completed")
+
+
+class TheRunIsClosedBeforeTheWaitReturns(unittest.TestCase):
+    """`wait()` returning is the only signal a caller has that a job is over.
+    A close that happened after it would let a page read the log immediately
+    afterwards and show the run it just waited for as still going."""
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self.store = _StoreWatchingTheRunner(os.path.join(self._dir, "s.db"))
+        self.runner = JobRunner(self.store)
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        self.store.close()
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+    def test_the_row_is_closed_before_wait_is_released(self):
+        gate = threading.Event()
+        self.runner.register(_Producer(gate=gate, count=1))
+        job = self.runner.start("test-producer", trigger="manual")
+        # Held until the id is recorded, so the worker cannot reach the store
+        # before this thread knows which job to ask about.
+        self.store.runner, self.store.job_id = self.runner, job.id
+        gate.set()
+        self.assertTrue(self.runner.wait(job.id, timeout=5))
+        # `assertFalse` would pass on the `None` that means the hook never
+        # ran at all, which is the one answer that proves nothing.
+        self.assertEqual(self.store.wait_had_returned, False)

@@ -294,7 +294,7 @@ class BuildProducerWiring(unittest.TestCase):
     def _run_to_completion(self, producer):
         runner = JobRunner(self.store)
         runner.register(producer)
-        job = runner.start(producer.name)
+        job = runner.start(producer.name, trigger="manual")
         self.assertTrue(runner.wait(job.id, WAIT))
         return runner.job(job.id)
 
@@ -456,7 +456,7 @@ class BuildProducerEnrichmentWiring(unittest.TestCase):
     def _run_to_completion(self, producer):
         runner = JobRunner(self.store)
         runner.register(producer)
-        job = runner.start(producer.name)
+        job = runner.start(producer.name, trigger="manual")
         self.assertTrue(runner.wait(job.id, WAIT))
         return runner.job(job.id)
 
@@ -638,7 +638,7 @@ class MainOrchestration(unittest.TestCase):
             self.assertEqual(args[1], configured)
             self.assertEqual(kwargs["limit"], 5)
             runner.register.assert_called_once_with(producer)
-            runner.start.assert_called_once_with("library-scan")
+            runner.start.assert_called_once_with("library-scan", trigger="manual")
             runner.wait.assert_called_once_with("job-1")
             store_instance.close.assert_called_once()
 
@@ -965,7 +965,7 @@ class TheAliasesReachTheResolver(unittest.TestCase):
         runner = JobRunner(self.store)
         self.addCleanup(runner.close)
         runner.register(producer)
-        job = runner.start(producer.name)
+        job = runner.start(producer.name, trigger="manual")
         self.assertTrue(runner.wait(job.id, WAIT))
 
         # The whole set of queries the run spent, not one sampled from it:
@@ -1009,7 +1009,7 @@ class BuildProducerFingerprintWiring(unittest.TestCase):
     def _run_to_completion(self, producer):
         runner = JobRunner(self.store)
         runner.register(producer)
-        job = runner.start(producer.name)
+        job = runner.start(producer.name, trigger="manual")
         self.assertTrue(runner.wait(job.id, WAIT))
         return runner.job(job.id)
 

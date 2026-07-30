@@ -3369,7 +3369,7 @@ class ScanProducerTest(unittest.TestCase):
         producer = self.build(scenes, search, **kwargs)
         runner = JobRunner(self.store)
         runner.register(producer)
-        job = runner.start(producer.name)
+        job = runner.start(producer.name, trigger="manual")
         self.assertTrue(runner.wait(job.id, WAIT))
         return runner.job(job.id)
 
@@ -3575,7 +3575,7 @@ class ScanProducerTest(unittest.TestCase):
         self.store.record = record
         runner = JobRunner(self.store)
         runner.register(producer)
-        job = runner.start(producer.name)
+        job = runner.start(producer.name, trigger="manual")
         self.assertTrue(runner.wait(job.id, WAIT))
 
         finished = runner.job(job.id)
@@ -5316,7 +5316,7 @@ class ScanProducerFingerprintTest(unittest.TestCase):
                                              remote_site_id="r-77")}))
         runner = JobRunner(self.store)
         runner.register(producer)
-        job = runner.start(producer.name)
+        job = runner.start(producer.name, trigger="manual")
         self.assertTrue(runner.wait(job.id, WAIT))
 
         self.assertEqual(runner.job(job.id).state, "done")

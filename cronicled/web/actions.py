@@ -594,7 +594,7 @@ class Actions:
         # below still refuses with `JobRejected` in that case, on the same
         # terms as before.
         self._runner.reregister(producer)
-        return self._runner.start(producer.name)
+        return self._runner.start(producer.name, trigger="manual")
 
     def scan_status(self):
         """The most recently started scan the runner still holds, or None

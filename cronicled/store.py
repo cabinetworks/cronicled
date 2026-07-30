@@ -1500,17 +1500,47 @@ class Store:
             # `NOT IN (the newest N)` rather than a cutoff timestamp: the
             # bound is a row count, and a cutoff would keep however many rows
             # happened to share the boundary second.
+            #
+            # Only a FINISHED row is a candidate, and only finished rows count
+            # towards the bound. An unfinished run is by definition still
+            # happening, and a log that drops the run currently in progress
+            # answers "what has happened" with the one thing that has not.
+            # Without this, a job open long enough for `RUN_HISTORY_LIMIT`
+            # others to complete has its row deleted before it finishes, and
+            # the `UPDATE` above then matches nothing and closes nothing --
+            # silently, because this sits in the worker's `finally` where
+            # raising would replace the producer's own exception with a store
+            # error. The case is removed rather than reported.
+            #
+            # Both halves matter. Filtering only the DELETE would leave open
+            # rows consuming the bound, so a backlog of open rows larger than
+            # the bound would evict every finished row to make room for runs
+            # that have not produced an answer yet.
+            #
+            # The residual: an open row whose process died is never evicted by
+            # this, because nothing here can tell it from one still working.
+            # `start()` closes the rows it opens on every path where no worker
+            # exists, which is what keeps the ordinary refusal from leaking
+            # one; a killed process leaves one behind per interrupted job.
             dropped = self._conn.execute(
-                "DELETE FROM run WHERE id NOT IN ("
-                "  SELECT id FROM run ORDER BY started DESC, rowid DESC "
-                "  LIMIT ?)",
+                "DELETE FROM run WHERE finished IS NOT NULL AND id NOT IN ("
+                "  SELECT id FROM run WHERE finished IS NOT NULL "
+                "  ORDER BY started DESC, rowid DESC LIMIT ?)",
                 (RUN_HISTORY_LIMIT,),
             ).rowcount
             if dropped:
-                # Accumulated, never assigned: one call can drop more than one
-                # row (a restart can leave several rows open, and the first
-                # finish after it closes the backlog in a single pass), and a
-                # later call must add to the total rather than restate it.
+                # Accumulated, never assigned: a later call must add to the
+                # total rather than restate it.
+                #
+                # `dropped` rather than a literal 1, even though the exclusion
+                # above now holds it to 0 or 1: each call makes at most one
+                # more row finished, so it can put the table at most one row
+                # over the bound. That is a consequence of where this is
+                # called from, not a rule this statement enforces -- anything
+                # that finishes several rows between two eviction passes (a
+                # bulk close, a bound lowered against an existing database, a
+                # migration back-filling `finished`) drops several at once,
+                # and a literal would then undercount every one of them.
                 self._conn.execute(
                     "INSERT INTO run_evicted (id, n) VALUES (1, ?) "
                     "ON CONFLICT(id) DO UPDATE SET n = n + excluded.n",

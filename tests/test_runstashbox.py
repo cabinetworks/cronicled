@@ -160,7 +160,7 @@ class MainOrchestration(unittest.TestCase):
             args, _ = mocks["build_producer"].call_args
             self.assertEqual(args[2], {"Velvet Crane": "pf-1"})
             runner.register.assert_called_once_with(producer)
-            runner.start.assert_called_once_with("stashbox-check")
+            runner.start.assert_called_once_with("stashbox-check", trigger="manual")
             runner.wait.assert_called_once_with("job-1")
             store_instance.close.assert_called_once()
 

@@ -1018,10 +1018,14 @@ class _RunLogCase(_StoreCase):
         return "2026-03-01T%02d:%02d:%02d+00:00" % (
             n // 3600, n // 60 % 60, n % 60)
 
-    def _fill(self, count, job="scene-scan"):
-        """Start and finish `count` runs; return their ids, oldest first."""
+    def _fill(self, count, job="scene-scan", first=0):
+        """Start and finish `count` runs; return their ids, oldest first.
+
+        `first` offsets the timestamps, so a test can put rows of its own
+        before or after the block without any of them colliding.
+        """
         ids = []
-        for n in range(count):
+        for n in range(first, first + count):
             run_id = self.store.start_run(job, trigger="scheduled",
                                           at=self._at(n))
             self.store.finish_run(run_id, outcome="completed", at=self._at(n))
@@ -1245,18 +1249,92 @@ class RunRetention(_RunLogCase):
         self._fill(RUN_HISTORY_LIMIT + 3)
         self.assertEqual(self.store.runs_evicted(), 3)
 
-    def test_one_finish_that_drops_several_rows_counts_every_one(self):
-        """The count accumulates; it is not assigned. A fixture that evicts one
-        row per call cannot tell those apart, because both leave 1 behind each
-        time. Several rows open at once is what a restart leaves, and the first
-        finish after it closes the backlog in a single pass."""
-        ids = [self.store.start_run("scene-scan", trigger="scheduled",
-                                    at=self._at(n))
-               for n in range(RUN_HISTORY_LIMIT + 3)]
-        self.store.finish_run(ids[-1], outcome="completed", at=self._at(9000))
-        self.assertEqual(self.store.runs_evicted(), 3)
-        self.assertEqual(len(self.store.recent_runs(limit=10_000)),
-                         RUN_HISTORY_LIMIT)
+    def test_a_run_left_open_is_not_evicted_by_the_ones_that_finish_around_it(self):
+        """The row a worker's `finally` is about to close must still be there
+        when it gets there.
+
+        Reachable, not hypothetical: a job open while `RUN_HISTORY_LIMIT`
+        others complete would have had its row deleted underneath it, and
+        `finish_run` would then have matched nothing and closed nothing --
+        silently, because it is called from the worker's `finally`, where
+        raising would replace the producer's own exception with a store error.
+        The case is removed rather than reported: an unfinished run is by
+        definition still happening, and a log that drops the run in progress
+        answers "what has happened" with the one thing that has not.
+        """
+        open_id = self.store.start_run("scene-scan", trigger="manual",
+                                       at=self._at(0))
+        self._fill(RUN_HISTORY_LIMIT + 3, first=1)
+
+        # Asserted as a whole row rather than by presence alone: what a reader
+        # needs to see is a run visibly still going -- nothing filled in yet --
+        # rather than merely an id that is somewhere in the list.
+        still_open = [r for r in self.store.recent_runs(limit=10_000)
+                      if r["id"] == open_id]
+        self.assertEqual(still_open, [{
+            "id": open_id, "job": "scene-scan", "trigger": "manual",
+            "started": self._at(0), "finished": None, "outcome": None,
+            "counts": {}, "error": None}])
+        # And closing it is a real write, not the silent no-op an already
+        # deleted row would have made of it: the row is there to be closed,
+        # so this call finds it and retention then judges it exactly as it
+        # judges every other finished row -- by age. It is the oldest, and
+        # the log is full, so this is the call that drops it, and the count
+        # says so.
+        before = self.store.runs_evicted()
+        self.store.finish_run(open_id, outcome="completed", at=self._at(9000))
+        self.assertEqual(self.store.runs_evicted(), before + 1)
+
+    def test_a_run_open_across_a_turnover_of_the_whole_log_still_reads_back(self):
+        """The other half: closing it writes what it was given.
+
+        The run above is the oldest row there is, so its own close is the
+        call that retires it and nothing can be read back afterwards. Here it
+        sits inside the surviving window instead, with the log turning over
+        well past its bound around it, so the close can be asserted whole.
+        """
+        self._fill(300)
+        open_id = self.store.start_run("tag-scan", trigger="manual",
+                                       at=self._at(300))
+        self._fill(400, first=301)
+        # The log really did turn over past its bound while that row was open.
+        self.assertGreater(self.store.runs_evicted(), 0)
+
+        self.store.finish_run(open_id, outcome="failed",
+                              counts={"recorded": 2, "skipped": 1},
+                              error="the box refused", at=self._at(9000))
+
+        closed = [r for r in self.store.recent_runs(limit=10_000)
+                  if r["id"] == open_id]
+        self.assertEqual(closed, [{
+            "id": open_id, "job": "tag-scan", "trigger": "manual",
+            "started": self._at(300), "finished": self._at(9000),
+            "outcome": "failed", "counts": {"recorded": 2, "skipped": 1},
+            "error": "the box refused"}])
+
+    def test_open_runs_do_not_spend_the_bound_the_finished_ones_are_kept_under(self):
+        """Open rows are out of the count as well as out of the deletion.
+
+        Excluding them from the DELETE alone would leave them consuming the
+        bound, so a backlog of open runs -- what a restart leaves behind --
+        would evict finished runs to make room for runs that have not
+        produced an answer yet, which is the wrong half to throw away.
+        """
+        finished = self._fill(RUN_HISTORY_LIMIT)
+        open_ids = [self.store.start_run("scene-scan", trigger="manual",
+                                         at=self._at(500 + n))
+                    for n in range(3)]
+        last = self.store.start_run("scene-scan", trigger="scheduled",
+                                    at=self._at(600))
+        self.store.finish_run(last, outcome="completed", at=self._at(600))
+
+        # Exactly one row over the bound, so exactly the oldest FINISHED run
+        # goes and nothing else does -- which is what makes this a claim
+        # about which rows survive rather than only about how many.
+        self.assertEqual(
+            [r["id"] for r in self.store.recent_runs(limit=10_000)],
+            [last] + list(reversed(open_ids)) + list(reversed(finished[1:])))
+        self.assertEqual(self.store.runs_evicted(), 1)
 
     def test_the_boundary_falling_inside_a_tied_second_drops_the_earlier_arrivals(self):
         """`started` has one-second resolution, so the edge of the bound can
@@ -1264,19 +1342,17 @@ class RunRetention(_RunLogCase):
         leaves which of the tied rows survives to SQLite, and SQLite keeps the
         one that arrived FIRST -- dropping two runs that happened after the
         one it kept."""
-        tied = "2026-03-01T00:00:00+00:00"
-        tied_ids = [self.store.start_run("scene-scan", trigger="scheduled",
-                                         at=tied)
-                    for _ in range(3)]
+        tied = self._at(0)
+        tied_ids = []
+        for _ in range(3):
+            run_id = self.store.start_run("scene-scan", trigger="scheduled",
+                                          at=tied)
+            self.store.finish_run(run_id, outcome="completed", at=tied)
+            tied_ids.append(run_id)
         # Two rows over the bound, so exactly two of the three tied rows go
         # and the third stays -- which is what makes "the earlier arrivals"
         # an observable claim rather than "all of them".
-        for n in range(1, RUN_HISTORY_LIMIT - 1):
-            self.store.start_run("scene-scan", trigger="scheduled",
-                                 at=self._at(n))
-        last = self.store.start_run("scene-scan", trigger="scheduled",
-                                    at=self._at(RUN_HISTORY_LIMIT))
-        self.store.finish_run(last, outcome="completed")
+        self._fill(RUN_HISTORY_LIMIT - 1, first=1)
         kept = {r["id"] for r in self.store.recent_runs(limit=10_000)}
         self.assertEqual(len(kept), RUN_HISTORY_LIMIT)
         self.assertEqual(self.store.runs_evicted(), 2)

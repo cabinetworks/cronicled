@@ -399,8 +399,49 @@ class JobRunner:
         """
         return list(self._producers.values())
 
-    def start(self, name):
+    def start(self, name, *, trigger):
+        """Start `name` on a background thread and record the run.
+
+        `trigger` says how this start came about -- "scheduled" or "manual",
+        the values `Store.start_run` accepts. Required rather than defaulted:
+        the same producer runs both ways, and a default would silently label
+        whichever call site forgot to say. A reader asking "did last night's
+        pass run" is asking about the scheduled one, not about a button
+        somebody pressed at noon, and only the caller knows which this is.
+
+        The run row is opened here and closed by `_run`'s `finally`, so a
+        producer that raises still closes its row -- see `_run`. The one thing
+        that must not happen is a row left open by a start that never handed
+        work to a worker: retention deliberately never evicts an unfinished
+        row (see `Store.finish_run`), and a refused start is ordinary rather
+        than exceptional -- pressing Scan while a scan runs raises
+        `JobRejected` -- so a leak here would grow the table for the life of
+        the deployment. Every path below that refuses without a worker behind
+        it therefore closes the row before re-raising.
+        """
         producer = self._producers[name]  # KeyError on an unknown producer
+        # Before anything else that could refuse, so an unknown producer and
+        # an unknown trigger both leave nothing behind to close.
+        run_id = self._store.start_run(producer.name, trigger=trigger)
+        # Flipped at the point the code below stops unwinding its own
+        # reservation, and for exactly the same reason: from there on a worker
+        # may exist, and its `finally` is the sole authority over both the
+        # cost-class slot and this row. Closing the row here as well could
+        # overwrite a live worker's own verdict with this thread's. A list
+        # because the flag is written from inside the nested handlers below.
+        handed_over = []
+        try:
+            return self._begin(producer, run_id, handed_over)
+        except BaseException as exc:
+            if not handed_over:
+                self._store.finish_run(
+                    run_id, outcome="failed",
+                    error=f"did not start -- {type(exc).__name__}: {exc}")
+            raise
+
+    def _begin(self, producer, run_id, handed_over):
+        """The body of `start()`. Appends to `handed_over` at the moment a
+        worker may exist; see `start()`."""
         job_id = str(uuid.uuid4())
         state = _JobState(job_id, producer.name, producer.cost)
         done = threading.Event()
@@ -452,7 +493,7 @@ class JobRunner:
                     f"{blockers}"
                 )
             thread = threading.Thread(
-                target=self._run, args=(producer, stream, state, done),
+                target=self._run, args=(producer, stream, state, done, run_id),
                 daemon=True,
             )
             try:
@@ -470,6 +511,15 @@ class JobRunner:
                 # whatever was raised.
                 self._unreserve(job_id, producer.cost)
                 raise
+            # From here on the run row belongs to the worker, on exactly the
+            # terms the slot does: `Thread.start()` spawns the child and then
+            # waits on an event the child sets, so for the whole of that wait
+            # a worker may already exist while every test the parent could
+            # make says it does not. `start()` therefore stops closing the row
+            # here, and the `except Exception` below takes it back — that
+            # clause is reached only when the spawn itself failed, before any
+            # child existed.
+            handed_over.append(True)
             try:
                 # Started inside the same locked region that made the
                 # reservation above, so reservation and start succeed or
@@ -480,6 +530,7 @@ class JobRunner:
                 # this `with` block.
                 thread.start()
             except Exception:
+                handed_over.clear()
                 # The exception type is the best discriminator the parent
                 # can observe. It is not a proof, and the difference matters:
                 # of the exceptions the interpreter raises on its own behalf,
@@ -541,7 +592,7 @@ class JobRunner:
         self._jobs.pop(job_id, None)
         self._done.pop(job_id, None)
 
-    def _run(self, producer, stream, state, done):
+    def _run(self, producer, stream, state, done, run_id):
         """Drain `stream` — the generator `start()` already got from
         `producer.produce(ctx)` — wrapped so nothing it raises escapes this
         thread. An exception in a background thread does not fail anything
@@ -591,7 +642,31 @@ class JobRunner:
             with self._lock:
                 self._running_by_cost[state.cost].pop(state.id, None)
                 self._retire(state.id)
-            done.set()
+                # Read under the lock, written to the store outside it. The
+                # branches above are the only writers of `error`, and both
+                # took this lock to do it; the store takes a lock of its own
+                # and a commit is not something to hold this one across.
+                #
+                # A failed run is closed exactly as a completed one is, and
+                # the `finally` is why: "did last night's scan run?" is what
+                # the log exists to answer, and a log that records only the
+                # runs that worked answers the opposite question.
+                outcome = "failed" if state.error else "completed"
+                counts = {"recorded": state.recorded, "skipped": state.skipped}
+                error = state.error
+            try:
+                # Before `done.set()`, not after: a caller that waits for the
+                # job and then reads the log must not be shown its own run
+                # still open. `wait()` returning is the only signal there is.
+                self._store.finish_run(run_id, outcome=outcome, counts=counts,
+                                       error=error)
+            finally:
+                # Even if the store refused. A `done` that is never set wedges
+                # every `wait()` for this job forever, with no timeout of its
+                # own to end it; an unclosed row is a visible wrong answer on
+                # one page. The store's exception still propagates to the
+                # thread excepthook rather than being swallowed.
+                done.set()
 
     def _log(self, state, message):
         with self._lock:

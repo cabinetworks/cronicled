@@ -41,7 +41,7 @@ from cronicled.text import spaceless
 # every click. Sharing one name would make a manual scan of 25 files replace
 # the scheduled producer, so the next unattended run would quietly scan 25
 # files instead of the whole set. See `build_scheduled_producer`.
-SCHEDULED_SCAN_NAME = "nightly-library-scan"
+SCHEDULED_SCAN_NAME = "scene-scan"
 
 # A cadence of one day, in seconds — an INTERVAL measured from the last
 # recorded run. No longer what the scheduled scan declares (see
@@ -454,7 +454,7 @@ def main(argv=None):
             workers=args.workers, marker=marker)
         runner.register(producer)
 
-        job = runner.start(producer.name)
+        job = runner.start(producer.name, trigger="manual")
         print("scan %s started against stores %s"
              % (job.id, ", ".join(sorted(adapters))))
         runner.wait(job.id)
