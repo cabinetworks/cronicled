@@ -1320,3 +1320,101 @@ def to_schedule_view(status, *, zone):
                    last_error_at=local(status.last_error_at, zone),
                    last_error=local_times(status.last_error, zone),
                    last_result=result)
+
+
+def local_minute(value, zone):
+    """A stored UTC instant as `YYYY-MM-DD HH:MM` in `zone`.
+
+    AN INSTANT KEEPS ITS DATE. This shortens the seconds and the offset off a
+    recorded moment and nothing else, because "when did the nightly pass run"
+    is a question about a day as much as about an hour: a bare `03:00` beside a
+    run cannot tell last night's from the one three weeks ago, and a reader
+    checking whether a pass ran is asking exactly that. The offset goes because
+    the page states its zone once (see `to_summary_view`) rather than repeating
+    it on every row; the DATE is not the same kind of repetition.
+
+    A STATED APPOINTMENT is the other case and is not this one. "03:00 every
+    night" names no date because it has none, and shortening it loses nothing.
+    That is `to_schedule_view`'s side of the line, and the two must not be
+    confused in either direction -- an appointment carrying a date invents one,
+    and an instant that loses its date destroys one.
+
+    Anything this cannot read as an instant comes back exactly as it went in,
+    `None` included, for the reason `local` gives at length: a stamp with no
+    offset names no instant, and converting it would put an hour on the page
+    that was never recorded. `None` is a real value here -- a run that started
+    and has not finished has no `finished` -- and it renders as the template's
+    own "still running", not as an invented time.
+    """
+    moment = as_utc(value)
+    if moment is None:
+        return value
+    return moment.astimezone(zone).strftime("%Y-%m-%d %H:%M")
+
+
+def to_summary_view(runs, waiting, schedule, *, zone):
+    """The landing page: each job's last run, what is waiting, and the loop.
+
+    `runs` is `Store.recent_runs()` -- NEWEST FIRST -- so the first row naming
+    a job is that job's most recent run and every later one is history. That
+    "newest first" is a guarantee of the store's own `ORDER BY started DESC,
+    rowid DESC` and NOT of this loop: `_utcnow` records to the second, so two
+    runs of one job started in the same second carry an identical `started`,
+    and ordering on that column alone leaves the tie to SQLite -- which returns
+    the OLDER one first. Take the tiebreak away and this page silently reports
+    the earlier of the two as though it were the latest, which is the one
+    reading that makes a stale page look like a healthy one.
+
+    A run still in progress is a first occurrence like any other and takes the
+    slot. That is deliberate: a job running right now IS its latest run, and a
+    page that skipped it to show the last completed one would answer "has
+    tonight's pass started?" with last night's.
+
+    `waiting` is carried through untouched, keys and all. What the sections are
+    called and how they are counted is the caller's decision -- this does not
+    interpret the mapping, so a producer added there appears here without an
+    edit rather than being silently dropped by a builder that knew three names.
+
+    `schedule` is a raw `LoopStatus` and is converted HERE, through
+    `to_schedule_view`, rather than being handed over ready-made. One
+    convention for the whole signature -- everything in is what the store and
+    the loop recorded, everything out is in `zone` -- because the alternative
+    is a parameter that is already converted sitting beside two that are not,
+    and a caller who mixed them up would render the schedule in UTC beside run
+    times in the operator's hour with nothing on the page saying which is
+    which.
+
+    `zone` is named ONCE, in the returned view, because no timestamp above
+    carries an offset any more. A page that shortens its times and then does
+    not say what they are shortened to is worse than one that left them in UTC.
+    """
+    jobs = []
+    seen = set()
+    for run in runs:
+        # Indexed, never `.get`: a row missing `job` is a row nothing can
+        # attribute, and defaulting it would group every such run under one
+        # invented heading that reads on the page as a job that exists.
+        job = run["job"]
+        if job in seen:
+            continue
+        seen.add(job)
+        jobs.append({
+            "id": run["id"],
+            "job": job,
+            "trigger": run["trigger"],
+            "started": local_minute(run["started"], zone),
+            "finished": local_minute(run["finished"], zone),
+            "outcome": run["outcome"],
+            # BOTH, always, and the template picks. A failed run's counts are
+            # whatever it had got to before it stopped, so rendering them as
+            # its result reads as "the pass ran and found this much" -- see
+            # summary.html, which shows the error instead and says why there.
+            "counts": run["counts"],
+            "error": run["error"],
+        })
+    return {
+        "jobs": jobs,
+        "waiting": waiting,
+        "schedule": to_schedule_view(schedule, zone=zone),
+        "zone": str(zone),
+    }

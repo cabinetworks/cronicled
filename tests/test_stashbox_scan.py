@@ -300,7 +300,7 @@ class JobRunnerWiring(unittest.TestCase):
         runner = JobRunner(self.store)
         runner.register(producer)
 
-        job = runner.start(producer.name)
+        job = runner.start(producer.name, trigger="manual")
         self.assertTrue(runner.wait(job.id, WAIT))
         finished = runner.job(job.id)
 
@@ -329,11 +329,11 @@ class JobRunnerWiring(unittest.TestCase):
         runner.register(first)
         runner.register(second)
 
-        job = runner.start(first.name)
+        job = runner.start(first.name, trigger="manual")
         self.assertTrue(entered.wait(WAIT))
         try:
             with self.assertRaises(JobRejected):
-                runner.start(second.name)
+                runner.start(second.name, trigger="manual")
         finally:
             gate_open.set()
             runner.wait(job.id, WAIT)

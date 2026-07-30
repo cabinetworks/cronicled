@@ -26,6 +26,7 @@ import os
 import sqlite3
 import threading
 import unicodedata
+import uuid
 import weakref
 from datetime import datetime, timezone
 
@@ -66,6 +67,53 @@ CREATE TABLE IF NOT EXISTS supersede (
 CREATE TABLE IF NOT EXISTS producer_run (
     producer TEXT PRIMARY KEY,
     at       TEXT NOT NULL);
+
+-- One row per run, never upserted. `producer_run` above answers "how long ago
+-- did this last run" for the scheduler and is deliberately still an upsert;
+-- this answers "what has happened", which needs a history. Two tables because
+-- the two questions have different lifetimes: the scheduler's answer must
+-- never be evicted, and this one is bounded (see `RUN_HISTORY_LIMIT`).
+--
+-- `counts` is a JSON object rather than a column per counter: what a job
+-- reports will change as it grows, and adding a counter must not be a schema
+-- change. The fixed facts -- job, trigger, start, finish, outcome -- stay
+-- columns, because they are what every row has and what a reader filters and
+-- orders by.
+--
+-- Ordered by `started` and then by `rowid`, never by `started` alone.
+-- Timestamps here have one-second resolution (`_utcnow`), so two runs of one
+-- job started inside the same second carry an IDENTICAL `started` and that
+-- column cannot say which came second. `rowid` is insertion order, which is
+-- exactly the missing fact; without it both the newest-first read and the
+-- retention eviction pick among ties arbitrarily, and SQLite's arbitrary
+-- happens to be oldest-first -- the wrong end for both.
+CREATE TABLE IF NOT EXISTS run (
+    id       TEXT PRIMARY KEY,
+    job      TEXT NOT NULL,
+    trigger  TEXT NOT NULL,
+    started  TEXT NOT NULL,
+    finished TEXT,
+    outcome  TEXT,
+    counts   TEXT NOT NULL DEFAULT '{}',
+    error    TEXT);
+
+-- On `started` alone: SQLite will not index `rowid` (it is the table's own
+-- key, not a column), so the tiebreak above is a sort the reader pays for
+-- rather than an index it reads. At `RUN_HISTORY_LIMIT` rows that is nothing,
+-- and the alternative is an ordering that is wrong whenever two runs share a
+-- second.
+CREATE INDEX IF NOT EXISTS run_started ON run (started DESC);
+
+-- How many `run` rows retention has dropped. ONE row, incremented rather than
+-- recomputed: the rows it counts are gone, so nothing can recount them. One
+-- row per eviction would answer the same question while replacing one
+-- unbounded table with another, so the increment is an upsert on a fixed key
+-- (see `finish_run`) and no row is seeded here -- a database that has never
+-- evicted anything has no row, and `runs_evicted` reads that as the zero it
+-- is.
+CREATE TABLE IF NOT EXISTS run_evicted (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    n  INTEGER NOT NULL);
 
 -- A standing, transient record of "examined and refused" -- see the block
 -- above `record_refusal` for why this is its own table, keyed by subject,
@@ -196,6 +244,20 @@ SCHEMA_VERSION = 1
 # were, so what a proposal said, what it wrote and when survive the subject
 # it was about disappearing. See `Store.mark_gone`.
 GONE = "gone"
+
+# How many `run` rows to keep. Bounded because a nightly pass writes a row a
+# night forever and nothing else would ever drop one; NAMED, and paired with
+# `Store.runs_evicted`, because silent truncation reads as "this is
+# everything" when it is not -- a reader who cannot see that the list was cut
+# concludes the missing runs never happened, which is the opposite of what
+# this log exists to tell them.
+RUN_HISTORY_LIMIT = 500
+
+# How a run began. Stored rather than inferred, because the same job runs both
+# ways and a reader asking "did last night's pass run" means the scheduled one,
+# not the button somebody pressed at noon. A closed set, checked on the way in:
+# see `Store.start_run`.
+RUN_TRIGGERS = ("scheduled", "manual")
 
 
 class SchemaVersionError(RuntimeError):
@@ -1359,3 +1421,162 @@ class Store:
             rows = self._conn.execute(
                 "SELECT producer, at FROM producer_run").fetchall()
         return {producer: at for producer, at in rows}
+
+    # What has happened, one row per run
+    # ----------------------------------
+    # The three above answer the scheduler's question -- "how long ago did this
+    # last run" -- and are deliberately an upsert, one row per producer. This
+    # answers a person's question -- "did last night's pass run, and what did
+    # it find" -- which no upsert can answer, because it needs the runs the
+    # last one replaced.
+    #
+    # So: a second table, never upserted, bounded by `RUN_HISTORY_LIMIT` and
+    # reporting what the bound dropped. The scheduler's answer is NOT bounded
+    # and must never be evicted; this one is, and the two lifetimes are why
+    # these are not one table with a flag.
+    #
+    # Same lock discipline as everything else here: each takes `self._lock`
+    # exactly once and calls nothing that takes it.
+
+    def start_run(self, job, *, trigger, at=None):
+        """Open a run row for `job` and return its id.
+
+        `trigger` says how the run began -- one of `RUN_TRIGGERS`. Checked
+        here rather than trusted, because an unrecognised trigger would be
+        stored happily and then read back by the summary as though it meant
+        something; a value nobody can interpret is worse than a refusal at the
+        one point that still knows which call site produced it.
+
+        The id is a fresh UUID per call, which is what makes this a history:
+        an id derived from the job would collide on the second run and the row
+        would be replaced rather than added.
+
+        `at` is stored exactly as given, for the same reason `record_run` does
+        not compare it with what is already there. Omitted, it is the current
+        UTC time in the same format as every other timestamp here.
+        """
+        if trigger not in RUN_TRIGGERS:
+            raise ValueError(
+                "trigger must be one of %s, not %r -- an unrecognised trigger "
+                "would be stored and then read back as though it meant "
+                "something." % (", ".join(repr(t) for t in RUN_TRIGGERS),
+                                trigger))
+        run_id = str(uuid.uuid4())
+        when = at if at is not None else _utcnow()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO run (id, job, trigger, started) "
+                "VALUES (?, ?, ?, ?)",
+                (run_id, job, trigger, when),
+            )
+            self._conn.commit()
+        return run_id
+
+    def finish_run(self, run_id, *, outcome, counts=None, error=None, at=None):
+        """Close the run row `run_id`, then evict beyond the retention bound.
+
+        A FAILED run is closed here exactly as a completed one is. "Did last
+        night's scan run?" is the question this log exists to answer, and a
+        log of successes answers the opposite one -- it makes a job that has
+        been failing every night for a week indistinguishable from one that
+        was never scheduled.
+
+        `counts` defaults to an empty object, not to SQL NULL: `recent_runs`
+        hands back whatever is here, and a caller that has to test for `None`
+        before every lookup will one day not.
+
+        Eviction happens here rather than on a timer because this is the only
+        moment a row is added to the finished history, so it is the only
+        moment the bound can be exceeded. What it drops is counted, never
+        merely dropped -- see `runs_evicted`.
+        """
+        when = at if at is not None else _utcnow()
+        with self._lock:
+            self._conn.execute(
+                "UPDATE run SET finished = ?, outcome = ?, counts = ?, "
+                "error = ? WHERE id = ?",
+                (when, outcome, json.dumps(counts or {}), error, run_id),
+            )
+            # `NOT IN (the newest N)` rather than a cutoff timestamp: the
+            # bound is a row count, and a cutoff would keep however many rows
+            # happened to share the boundary second.
+            #
+            # Only a FINISHED row is a candidate, and only finished rows count
+            # towards the bound. An unfinished run is by definition still
+            # happening, and a log that drops the run currently in progress
+            # answers "what has happened" with the one thing that has not.
+            # Without this, a job open long enough for `RUN_HISTORY_LIMIT`
+            # others to complete has its row deleted before it finishes, and
+            # the `UPDATE` above then matches nothing and closes nothing --
+            # silently, because this sits in the worker's `finally` where
+            # raising would replace the producer's own exception with a store
+            # error. The case is removed rather than reported.
+            #
+            # Both halves matter. Filtering only the DELETE would leave open
+            # rows consuming the bound, so a backlog of open rows larger than
+            # the bound would evict every finished row to make room for runs
+            # that have not produced an answer yet.
+            #
+            # The residual: an open row whose process died is never evicted by
+            # this, because nothing here can tell it from one still working.
+            # `start()` closes the rows it opens on every path where no worker
+            # exists, which is what keeps the ordinary refusal from leaking
+            # one; a killed process leaves one behind per interrupted job.
+            dropped = self._conn.execute(
+                "DELETE FROM run WHERE finished IS NOT NULL AND id NOT IN ("
+                "  SELECT id FROM run WHERE finished IS NOT NULL "
+                "  ORDER BY started DESC, rowid DESC LIMIT ?)",
+                (RUN_HISTORY_LIMIT,),
+            ).rowcount
+            if dropped:
+                # Accumulated, never assigned: a later call must add to the
+                # total rather than restate it.
+                #
+                # `dropped` rather than a literal 1, even though the exclusion
+                # above now holds it to 0 or 1: each call makes at most one
+                # more row finished, so it can put the table at most one row
+                # over the bound. That is a consequence of where this is
+                # called from, not a rule this statement enforces -- anything
+                # that finishes several rows between two eviction passes (a
+                # bulk close, a bound lowered against an existing database, a
+                # migration back-filling `finished`) drops several at once,
+                # and a literal would then undercount every one of them.
+                self._conn.execute(
+                    "INSERT INTO run_evicted (id, n) VALUES (1, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET n = n + excluded.n",
+                    (dropped,),
+                )
+            self._conn.commit()
+
+    def recent_runs(self, limit=20):
+        """The most recent runs, newest first, as a list of dicts.
+
+        Each carries `id job trigger started finished outcome counts error`.
+        A run that has been started and not yet finished is here too, with
+        `finished`, `outcome` and `error` all `None` -- a job that is still
+        going, or one whose process died mid-run, is a thing a reader needs to
+        be able to see rather than an absence they have to infer.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, job, trigger, started, finished, outcome, counts, "
+                "error FROM run ORDER BY started DESC, rowid DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [{"id": r[0], "job": r[1], "trigger": r[2], "started": r[3],
+                 "finished": r[4], "outcome": r[5], "counts": json.loads(r[6]),
+                 "error": r[7]} for r in rows]
+
+    def runs_evicted(self):
+        """How many run rows retention has dropped, over the store's life.
+
+        Reported rather than hidden, for the reason `JobHistory` reports its
+        own evictions: a partial list presented as complete is a list that
+        lies. Zero until something has actually been dropped -- the counter
+        row is written by the first eviction, so `SUM` over no rows is the
+        honest zero and not a missing answer.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(n), 0) FROM run_evicted").fetchone()
+        return row[0]

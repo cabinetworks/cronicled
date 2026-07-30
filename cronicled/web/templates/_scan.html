@@ -1,0 +1,25 @@
+{# The Scan control, and what the last one did.
+
+   ON THE SUMMARY PAGE, not the inbox. A person pressing Scan is asking for
+   work to be produced, and the page that answers "did the passes run, and
+   what did they find" is where that question is already being asked -- the
+   inbox is where its OUTPUT is judged, one proposal at a time. Two controls
+   for one action, one per page, would be two places for a refusal to be
+   reported and only one of them looked at.
+
+   The refresh meta is here rather than at the top of the page because it
+   belongs to the running scan, not to the page: it exists so a scan somebody
+   just started stops looking wedged, and it is emitted only while one is
+   actually running so an idle page does not reload itself forever. #}
+{% if scan and scan.state == 'running' %}
+<meta http-equiv="refresh" content="3">
+{% endif %}
+<h2>Scan</h2>
+<div class="scan">
+{% if scan %}
+<p>Scan {{ scan.id }}: <b>{{ scan.state }}</b> &mdash; {{ scan.message }}</p>
+<p class="note">recorded {{ scan.recorded }}, skipped {{ scan.skipped }}{% if scan.state == 'failed' %} &mdash; FAILED: {{ scan.error }}{% endif %}</p>
+{% endif %}
+<form method="post" action="/scan"><label>Files to look at <input type="number" name="limit" value="{{ scan_default_limit }}" min="0"></label> <button>Scan</button></form>
+<p class="note">Each file spends one lookup against the configured scraper. Files already proposed or muted don't count against this.</p>
+</div>

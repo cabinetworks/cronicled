@@ -544,7 +544,7 @@ class Producer(unittest.TestCase):
     def test_it_satisfies_the_producer_protocol(self):
         producer = self.build([], every=86400)
 
-        self.assertEqual(producer.name, "tag-merge")
+        self.assertEqual(producer.name, "tag-scan")
         self.assertIn(producer.cost, COST_CLASS_LIMITS)
         stream = producer.produce(self.ctx)
         self.assertTrue(inspect.isgenerator(stream))
@@ -603,7 +603,7 @@ class Producer(unittest.TestCase):
         runner = JobRunner(self.store)
         runner.register(producer)
 
-        job = runner.start(producer.name)
+        job = runner.start(producer.name, trigger="manual")
         self.assertTrue(runner.wait(job.id, WAIT))
         finished = runner.job(job.id)
 
@@ -629,7 +629,7 @@ class Producer(unittest.TestCase):
             producer = self.build([tag(1, "Velvet Crane", scene_count=12),
                                    tag(2, "VelvetCrane", scene_count=count)])
             runner.reregister(producer)
-            job = runner.start(producer.name)
+            job = runner.start(producer.name, trigger="manual")
             self.assertTrue(runner.wait(job.id, WAIT))
             recorded.append(runner.job(job.id).recorded)
 

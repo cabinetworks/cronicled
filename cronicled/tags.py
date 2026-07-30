@@ -526,7 +526,7 @@ class TagMergeProducer:
     A pass NEVER writes: this proposes, and a person approves.
     """
 
-    name = "tag-merge"
+    name = "tag-scan"
     cost = "box"
 
     def __init__(self, stash, *, store, folder="library", every=None,

@@ -11,7 +11,7 @@ from cronicled.tags import proposal as tag_proposal
 from cronicled.web.render import environment, render
 from cronicled.web.rows import (
     to_description_row, to_merge_row, to_mute_row, to_refusal_row, to_row,
-    to_schedule_view, to_tag_description_row,
+    to_schedule_view, to_summary_view, to_tag_description_row,
 )
 
 _HOSTILE = '<script>alert("x")</script>'
@@ -379,21 +379,56 @@ class AgreeingStoresOnThePage(unittest.TestCase):
         self.assertIn("&lt;script&gt;", html)
 
 
+def _run(**over):
+    """One row of `Store.recent_runs()`.
+
+    Every key it emits is present here, including the ones a given test does
+    not care about: a fixture thinner than the real shape lets the builder
+    start reading a key nothing supplies, and the symptom of that is a page
+    field that renders empty in production and is never asserted here. The
+    whole-shape assertion in `tests/test_store.py` is what keeps this honest
+    against the store itself.
+    """
+    row = dict(id="r-1", job="scene-scan", trigger="scheduled",
+               started="2026-07-15T00:30:00+00:00",
+               finished="2026-07-15T00:34:00+00:00",
+               outcome="completed", counts={"recorded": 4, "skipped": 9},
+               error=None)
+    row.update(over)
+    return row
+
+
+def _summary_html(runs=(), waiting=None, schedule=None, zone=ZONE, **context):
+    """The summary page as `web.app` renders it.
+
+    The view comes from the REAL `to_summary_view` rather than a hand-written
+    dict of the keys the template reads today -- a literal stand-in would go
+    stale the day the builder grows a key, and the symptom would be a blank on
+    the page with every assertion here still green.
+    """
+    view = to_summary_view(list(runs), {} if waiting is None else waiting,
+                           schedule, zone=zone)
+    fields = dict(scan=None, scan_default_limit=25)
+    fields.update(context)
+    return render("summary.html", summary=view, **fields)
+
+
 class ScanStatusEscaping(unittest.TestCase):
     # A job's `message` carries file names -- attacker-influenceable text,
     # the same reason a row's fields are escaped. This is the same backstop
     # `Autoescaping` runs for row fields, aimed at the one new field this
     # ticket adds to the page.
+    #
+    # On the summary page since the Scan control moved there; the panel's
+    # markup is one included partial, so this is the same block it always was.
 
     def test_the_scan_messages_hostile_content_is_escaped(self):
-        html = render("inbox.html", rows=[], counts={},
-                      scan=_job(message=_HOSTILE))
+        html = _summary_html(scan=_job(message=_HOSTILE))
         self.assertNotIn("<script>", html)
         self.assertIn("&lt;script&gt;", html)
 
     def test_a_failed_scans_error_is_escaped_too(self):
-        html = render("inbox.html", rows=[], counts={},
-                      scan=_job(state="failed", error=_HOSTILE))
+        html = _summary_html(scan=_job(state="failed", error=_HOSTILE))
         self.assertNotIn("<script>", html)
         self.assertIn("&lt;script&gt;", html)
 
@@ -413,8 +448,7 @@ class ScanControlWiring(unittest.TestCase):
         r'</button></form>')
 
     def test_the_scan_control_offers_exactly_one_limited_start_button(self):
-        html = render("inbox.html", rows=[], counts={}, scan=None,
-                      scan_default_limit=25)
+        html = _summary_html()
         matches = self._FORM_RE.findall(html)
         self.assertEqual(len(matches), 1)
         value, label = matches[0]
@@ -426,9 +460,15 @@ class ScanControlWiring(unittest.TestCase):
         # `tests/test_web_app.py`'s `ScanControl`) -- it is not hidden here,
         # so pressing it while one runs is a visible refusal, not a control
         # that silently vanished.
-        html = render("inbox.html", rows=[], counts={},
-                      scan=_job(state="running"), scan_default_limit=25)
+        html = _summary_html(scan=_job(state="running"))
         self.assertEqual(len(self._FORM_RE.findall(html)), 1)
+
+    def test_the_inbox_no_longer_carries_a_second_copy_of_it(self):
+        # One control for one action. Two -- one per page -- would be two
+        # places a refusal is reported and one of them looked at, and the two
+        # would drift the first time either was changed.
+        html = render("inbox.html", rows=[], counts={})
+        self.assertEqual(self._FORM_RE.findall(html), [])
 
 
 class MutedDismissedRefusedSections(unittest.TestCase):
@@ -510,7 +550,7 @@ class MutedDismissedRefusedSections(unittest.TestCase):
                       refused=[{"subject_type": "scene", "subject_id": "9",
                                "filename": "clip.mp4", "reason": "a tie",
                                "at": "t"}])
-        section = html[html.index("Refused (1)"):html.index("<h2>Scan</h2>")]
+        section = html[html.index("Refused (1)"):html.index("<h2>Schedule</h2>")]
         self.assertNotIn("<form", section)
         self.assertIn("clip.mp4", section)
         self.assertIn("a tie", section)
@@ -558,7 +598,7 @@ class ARefusedRowShowsWhatEveryStoreReturned(unittest.TestCase):
              "at": "t", "stores": stores})
         html = render("inbox.html", rows=[], counts={}, muted=[],
                       dismissed=[], refused=[row])
-        return html[html.index("Refused (1)"):html.index("<h2>Scan</h2>")]
+        return html[html.index("Refused (1)"):html.index("<h2>Schedule</h2>")]
 
     def test_each_of_the_three_states_says_its_own_specific_thing(self):
         """Asserted on what each state produces, not on "some text appeared".
@@ -706,7 +746,7 @@ class CandidateLinks(unittest.TestCase):
         inside it rather than over the page, so a link belonging to a
         different section cannot satisfy them."""
         start = html.index('<div class="proposal')
-        return html[start:html.index("<h2>Scan</h2>", start)]
+        return html[start:html.index("<h2>Schedule</h2>", start)]
 
     def test_a_proposed_title_links_to_the_candidates_own_page(self):
         # The WHOLE element, not "the url appears somewhere": a substring
@@ -1025,6 +1065,259 @@ class ApplifiedSectionRendering(unittest.TestCase):
         html = render("inbox.html", rows=[], counts={}, applied=[row],
                       just_applied="fp-other")
         self.assertNotIn(self._HIGHLIGHT_CLASS, html)
+
+
+class TheSummaryViewPicksEachJobsLatestRun(unittest.TestCase):
+    """`to_summary_view` reduces a run log to one row per job.
+
+    The rule is "the FIRST occurrence of each job name in the list wins",
+    which is only the latest run because `Store.recent_runs` is ordered
+    `started DESC, rowid DESC`. Both halves are tested: the reduction here
+    against a hand-ordered list, and the ordering itself against a real store
+    in `tests/test_main.py`, where two runs of one job share a second.
+    """
+
+    def _view(self, runs, **over):
+        fields = dict(waiting={}, schedule=None, zone=ZONE)
+        fields.update(over)
+        return to_summary_view(runs, fields["waiting"], fields["schedule"],
+                               zone=fields["zone"])
+
+    def test_the_first_run_named_for_a_job_is_the_one_shown(self):
+        # Asymmetric on purpose: the two runs differ in every field a reader
+        # would use to tell them apart, so "took the wrong one" cannot be
+        # satisfied by a value both happen to share.
+        view = self._view([
+            _run(id="new", job="scene-scan", trigger="manual",
+                 started="2026-07-15T00:30:00+00:00",
+                 counts={"recorded": 7, "skipped": 0}),
+            _run(id="old", job="scene-scan", trigger="scheduled",
+                 started="2026-07-14T00:30:00+00:00",
+                 counts={"recorded": 1, "skipped": 3}),
+        ])
+        self.assertEqual(
+            [(j["id"], j["trigger"], j["started"], j["counts"])
+             for j in view["jobs"]],
+            [("new", "manual", "2026-07-15 02:30", {"recorded": 7,
+                                                    "skipped": 0})])
+
+    def test_a_job_further_down_the_log_still_gets_a_line(self):
+        # A counting fixture of one cannot see a builder that stops after the
+        # first job it meets, and a summary that reported only the busiest
+        # pass would answer "did the tag pass run?" with silence.
+        view = self._view([
+            _run(id="a", job="scene-scan"),
+            _run(id="b", job="scene-scan"),
+            _run(id="c", job="tag-scan"),
+            _run(id="d", job="performer-scan"),
+            _run(id="e", job="tag-scan"),
+        ])
+        self.assertEqual([(j["job"], j["id"]) for j in view["jobs"]],
+                         [("scene-scan", "a"), ("tag-scan", "c"),
+                          ("performer-scan", "d")])
+
+    def test_a_run_still_in_progress_takes_its_jobs_line(self):
+        # A job running RIGHT NOW is that job's latest run. Skipping it for
+        # the last completed one would answer "has tonight's pass started?"
+        # with last night's, which is the one reading that makes a stalled
+        # install look healthy.
+        view = self._view([
+            _run(id="open", finished=None, outcome=None, counts={},
+                 error=None),
+            _run(id="done", outcome="completed"),
+        ])
+        self.assertEqual([(j["id"], j["outcome"], j["finished"])
+                          for j in view["jobs"]], [("open", None, None)])
+
+    def test_a_row_with_no_job_is_refused_rather_than_given_a_heading(self):
+        # Required fields raise. Defaulting the name would group every
+        # unattributable run under one invented heading, which renders on the
+        # page as a job that exists.
+        with self.assertRaises(KeyError):
+            self._view([{k: v for k, v in _run().items() if k != "job"}])
+
+    def test_what_is_waiting_is_carried_through_exactly_as_given(self):
+        # The builder does not interpret the mapping: a producer added to the
+        # count reaches the page without an edit here, rather than being
+        # dropped by a builder that knew three names.
+        waiting = {"scene": 254, "tag": 675, "performer": 3}
+        view = self._view([], waiting=waiting)
+        self.assertEqual(view["waiting"],
+                         {"scene": 254, "tag": 675, "performer": 3})
+
+    def test_the_loops_own_status_is_converted_on_the_way_through(self):
+        # Handed the RAW status, exactly as the scheduler reports it, and
+        # converted here -- so the run times above and the schedule panel
+        # below them cannot end up in two different zones.
+        view = self._view([], schedule=_loop_status(
+            last_tick_at="2026-07-15T00:30:00+00:00"))
+        self.assertEqual(view["schedule"].last_tick_at,
+                         "2026-07-15T02:30:00+02:00")
+
+    def test_an_install_with_no_schedule_says_so_rather_than_inventing_one(self):
+        self.assertIsNone(self._view([], schedule=None)["schedule"])
+
+
+class ARecordedInstantKeepsItsDate(unittest.TestCase):
+    """The boundary this page turns on.
+
+    A STATED APPOINTMENT -- "03:00 every night" -- has no date and shortens to
+    an hour and a minute. A RECORDED INSTANT has one, and shortening it away
+    destroys the fact a reader is actually after: "did last night's pass run"
+    cannot be answered by a bare `03:00` that might be from three weeks ago.
+
+    Both sides of a daylight-saving transition in every case, because a
+    fixture on one date cannot tell a zone from a constant offset.
+    """
+
+    def _started(self, stamp, zone=ZONE):
+        return to_summary_view([_run(started=stamp)], {}, None,
+                               zone=zone)["jobs"][0]
+
+    def test_the_date_survives_the_shortening(self):
+        job = self._started("2026-07-15T00:30:00+00:00")
+        self.assertEqual(job["started"], "2026-07-15 02:30")
+
+    def test_it_is_the_local_date_when_the_zone_moves_it(self):
+        # 23:30 UTC is already the next day in Madrid. A builder that kept the
+        # STORED date and converted only the clock would put an hour on the
+        # page beside the wrong day -- worse than either half alone, because
+        # the row looks entirely ordinary.
+        job = self._started("2026-07-14T23:30:00+00:00")
+        self.assertEqual(job["started"], "2026-07-15 01:30")
+
+    def test_the_winter_side_of_the_transition_shifts_by_its_own_offset(self):
+        # +01:00 in January against +02:00 in July: a constant offset applied
+        # as though it were a zone passes exactly one of this pair.
+        job = self._started("2026-01-15T00:30:00+00:00")
+        self.assertEqual(job["started"], "2026-01-15 01:30")
+
+    def test_the_finish_is_converted_too_not_only_the_start(self):
+        # Two instants on one row. A test asserting the first would pass while
+        # the second stayed in UTC, which is the failure worth designing
+        # against -- a row half in the operator's hour reads as a run that
+        # took two hours longer than it did.
+        job = to_summary_view(
+            [_run(started="2026-01-15T00:30:00+00:00",
+                  finished="2026-07-15T00:30:00+00:00")],
+            {}, None, zone=ZONE)["jobs"][0]
+        self.assertEqual((job["started"], job["finished"]),
+                         ("2026-01-15 01:30", "2026-07-15 02:30"))
+
+    def test_a_run_that_has_not_finished_keeps_its_absence(self):
+        # `None` is the honest answer and it must not become an invented time.
+        job = self._started("2026-07-15T00:30:00+00:00")
+        self.assertEqual(
+            to_summary_view([_run(finished=None)], {}, None,
+                            zone=ZONE)["jobs"][0]["finished"], None)
+
+    def test_a_stamp_naming_no_instant_comes_back_exactly_as_stored(self):
+        # A naive stamp names no instant, so converting it would invent the
+        # offset it is missing. It reads unlike every row around it, which is
+        # the signal that something upstream wrote a stamp it should not have.
+        self.assertEqual(self._started("2026-07-15 00:30:00")["started"],
+                         "2026-07-15 00:30:00")
+
+    def test_the_page_names_the_zone_once_rather_than_per_row(self):
+        # Nothing above carries an offset any more, so the page has to say
+        # what its times are in -- and say it in one place, not on every row.
+        html = _summary_html(runs=[_run(), _run(job="tag-scan")],
+                             zone=ZoneInfo("America/New_York"))
+        self.assertEqual(html.count("America/New_York"), 1)
+        self.assertIn("Times are shown in America/New_York.", html)
+
+    def test_the_plan_zone_and_hour_land_where_the_spec_says(self):
+        # The worked example the design document states, end to end.
+        view = to_summary_view(
+            runs=[{"id": "r1", "job": "scene-scan", "trigger": "scheduled",
+                   "started": "2026-07-30T07:00:00+00:00",
+                   "finished": "2026-07-30T07:04:00+00:00",
+                   "outcome": "completed",
+                   "counts": {"proposed": 4, "refused": 9}, "error": None}],
+            waiting={"scene": 254, "tag": 675, "performer": 3},
+            schedule=None, zone=ZoneInfo("America/New_York"))
+        job = view["jobs"][0]
+        self.assertEqual(job["job"], "scene-scan")
+        self.assertEqual(job["trigger"], "scheduled")
+        self.assertEqual(job["counts"], {"proposed": 4, "refused": 9})
+        self.assertEqual(job["started"], "2026-07-30 03:00")
+
+
+class AFailedRunShowsItsError(unittest.TestCase):
+    """What a row on the summary page puts in front of a reader.
+
+    A failed run's counters hold whatever it had reached before it stopped, so
+    drawing them as its result says "the pass ran and found this much" about a
+    pass that did not finish -- and the person checking whether last night
+    worked comes away believing it did.
+    """
+
+    def test_a_failed_run_shows_its_error(self):
+        html = _summary_html(runs=[_run(outcome="failed", counts={},
+                                        error="the box refused")])
+        self.assertIn("FAILED &mdash; the box refused", html)
+
+    def test_a_failed_run_does_not_show_the_counts_it_has(self):
+        # Counts it DOES have, so this cannot pass because there were none:
+        # the run got through four before it stopped.
+        html = _summary_html(runs=[_run(outcome="failed",
+                                        counts={"recorded": 4},
+                                        error="the box refused")])
+        self.assertIn("the box refused", html)
+        self.assertNotIn("recorded 4", html)
+
+    def test_a_completed_run_shows_its_counts(self):
+        # The permissive side. A branch that showed the error for every
+        # outcome would leave every successful pass reporting nothing.
+        html = _summary_html(runs=[_run(outcome="completed",
+                                        counts={"recorded": 4, "skipped": 9})])
+        self.assertIn("recorded 4, skipped 9", html)
+
+    def test_a_completed_run_that_found_nothing_says_so(self):
+        # An empty counts map is a real answer -- "it ran and there was
+        # nothing" -- and a blank line is not one.
+        html = _summary_html(runs=[_run(outcome="completed", counts={})])
+        self.assertIn("nothing recorded", html)
+
+    def test_a_run_still_going_is_not_drawn_as_one_that_found_nothing(self):
+        html = _summary_html(runs=[_run(finished=None, outcome=None,
+                                        counts={}, error=None)])
+        self.assertIn("still running", html)
+        self.assertNotIn("nothing recorded", html)
+
+    def test_a_hostile_error_and_job_name_are_escaped(self):
+        # An error carries a media server's own text and a job name reaches
+        # the page from the store; both are escaped for the reason every row
+        # field is.
+        html = _summary_html(runs=[_run(job=_HOSTILE, outcome="failed",
+                                        error=_HOSTILE)])
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+
+class WhatIsWaitingIsALinkToTheInbox(unittest.TestCase):
+    """A count a reader cannot follow is a count they learn to skip."""
+
+    _LINK = re.compile(r'<p><a href="(?P<href>[^"]*)">(?P<name>[^<]*)</a> '
+                       r'&mdash; (?P<count>\d+)</p>')
+
+    def test_each_count_is_a_link_to_the_inbox(self):
+        # The whole element, and all three of them: a test asserting one row's
+        # href would pass while the others pointed anywhere at all.
+        html = _summary_html(waiting={"scenes": 254, "tags": 675,
+                                      "performers": 3})
+        self.assertEqual(self._LINK.findall(html),
+                         [("/inbox", "scenes", "254"),
+                          ("/inbox", "tags", "675"),
+                          ("/inbox", "performers", "3")])
+
+    def test_nothing_waiting_says_so_rather_than_drawing_no_section(self):
+        html = _summary_html(waiting={})
+        self.assertIn("Nothing waiting.", html)
+        self.assertEqual(self._LINK.findall(html), [])
+
+    def test_a_page_with_no_runs_yet_says_that_too(self):
+        self.assertIn("No pass has run yet.", _summary_html())
 
 
 if __name__ == "__main__":

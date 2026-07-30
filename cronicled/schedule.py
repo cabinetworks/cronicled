@@ -955,7 +955,7 @@ class Scheduler:
                     f"job {job_id}" for job_id in live)
                 continue
             try:
-                job = self._runner.start(name)
+                job = self._runner.start(name, trigger="scheduled")
             except JobRejected as exc:
                 skipped[name] = f"cost class saturated: {exc}"
                 continue

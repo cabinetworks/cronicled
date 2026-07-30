@@ -970,7 +970,7 @@ class ClosedRunner:
     def jobs(self):
         return []
 
-    def start(self, name):
+    def start(self, name, *, trigger):
         raise self.Closed(
             f"the runner is closed and is not accepting work; {name!r} was "
             "not started")
@@ -1044,6 +1044,35 @@ class ATickStartsWhatIsDue(SchedulerCase):
         # the producer yielded is in the store.
         self.assertEqual(len(self.store.items()), 1)
         self.assertEqual(self.store.last_run("nightly"), NOW_ISO)
+
+    def test_a_tick_records_the_run_as_scheduled_not_as_a_manual_one(self):
+        """The whole reason `trigger` is stored rather than inferred. A
+        reader asking "did last night's pass run" is asking about the
+        unattended run; a tick that filed its own starts as manual would
+        answer with whichever button was last pressed, and the two are
+        indistinguishable once written."""
+        scheduler = self.scheduler(RunnableProducer("nightly"))
+
+        scheduler.tick(NOW_ISO)
+
+        jobs = self.runner.jobs()
+        self.assertTrue(self.runner.wait(jobs[0].id, timeout=5))
+        rows = self.store.recent_runs()
+        self.assertEqual([(r["job"], r["trigger"], r["outcome"]) for r in rows],
+                         [("nightly", "scheduled", "completed")])
+
+    def test_the_scheduler_still_answers_how_long_ago_from_its_own_table(self):
+        """The run log is beside `producer_run`, not instead of it. The
+        scheduler's next decision is made from `last_run`, and a log that
+        quietly became its source would put the scheduler's answer under a
+        retention bound that was never meant to hold it."""
+        scheduler = self.scheduler(RunnableProducer("nightly"))
+
+        scheduler.tick(NOW_ISO)
+
+        jobs = self.runner.jobs()
+        self.assertTrue(self.runner.wait(jobs[0].id, timeout=5))
+        self.assertEqual(self.store.runs(), {"nightly": NOW_ISO})
 
     def test_the_run_is_stamped_with_the_moment_the_tick_decided(self):
         # Not with a fresh read of the wall clock inside the store. The tick
@@ -1154,8 +1183,8 @@ class ATickDoesNotStartWhatIsAlreadyRunning(SchedulerCase):
         # the other half existed.
         gate = self.gate()
         scheduler = self.scheduler(RunnableProducer("nightly", gate=gate))
-        first = self.runner.start("nightly")
-        second = self.runner.start("nightly")
+        first = self.runner.start("nightly", trigger="manual")
+        second = self.runner.start("nightly", trigger="manual")
 
         result = scheduler.tick(NOW_ISO)
 
@@ -1233,10 +1262,10 @@ class ATickReportsARefusalItCannotRetry(SchedulerCase):
                 super().__init__(producers)
                 self._runner = runner
 
-            def start(self, name):
+            def start(self, name, *, trigger):
                 if name == "broken":
-                    return super().start(name)
-                return self._runner.start(name)
+                    return super().start(name, trigger=trigger)
+                return self._runner.start(name, trigger=trigger)
 
         working = RunnableProducer("working")
         self.runner.register(working)
@@ -1534,10 +1563,10 @@ class RefusesUntilAsked(ClosedRunner):
     def jobs(self):
         return self._runner.jobs()
 
-    def start(self, name):
+    def start(self, name, *, trigger):
         if not self._opened.is_set():
-            return super().start(name)
-        return self._runner.start(name)
+            return super().start(name, trigger=trigger)
+        return self._runner.start(name, trigger=trigger)
 
 
 class TheIntervalBetweenTicks(SchedulerCase):

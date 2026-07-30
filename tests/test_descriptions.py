@@ -421,7 +421,7 @@ class ThroughTheRealRunnerAndStore(unittest.TestCase):
     def _run(self, rows):
         producer = DescriptionProducer(_Performers(rows), every=60)
         self.runner.reregister(producer)
-        job = self.runner.start(producer.name)
+        job = self.runner.start(producer.name, trigger="manual")
         self.assertTrue(self.runner.wait(job.id, 10))
         return self.runner.job(job.id)
 

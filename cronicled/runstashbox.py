@@ -160,7 +160,7 @@ def main(argv=None):
             threshold=args.threshold)
         runner.register(producer)
 
-        job = runner.start(producer.name)
+        job = runner.start(producer.name, trigger="manual")
         print("stash-box check %s started" % job.id)
         runner.wait(job.id)
         finished = runner.job(job.id)

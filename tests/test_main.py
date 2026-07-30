@@ -1,6 +1,8 @@
+import importlib
 import io
 import json
 import os
+import pkgutil
 import shutil
 import sqlite3
 import tempfile
@@ -11,10 +13,14 @@ from datetime import datetime, time, timedelta, timezone
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from cronicled.__main__ import build_scheduler, main
+import cronicled
+from cronicled import (descriptions, performer_tags, scan, tag_descriptions,
+                       tag_hygiene, tags)
+from cronicled.__main__ import (WAITING_SECTIONS, build_scheduler, main,
+                                waiting_counts)
 from cronicled.adapters.declarative import DeclarativeAdapter
 from cronicled.artist import Aliases
-from cronicled.config import CONFIG_DIR_ENV_VAR, ZONE_ENV_VAR
+from cronicled.config import CONFIG_DIR_ENV_VAR, RENAMED_JOBS, ZONE_ENV_VAR
 from cronicled.descriptions import PRODUCER_NAME as DESCRIPTION_PRODUCER_NAME
 from cronicled.jobs import JobRunner
 from cronicled.performer_tags import index_performers, match_tag
@@ -29,6 +35,7 @@ from cronicled.tag_hygiene import proposal as unused_proposal
 from cronicled.tags import TagMergeProducer, cluster_tags
 from cronicled.tags import proposal as tag_proposal
 from cronicled.web.actions import Actions
+from cronicled.web.rows import to_summary_view
 
 WAIT = 10
 
@@ -2204,6 +2211,274 @@ class StoredTimestampsStayUtc(_Base):
             store.mute("scene", "1", reason="never identifiable")
         finally:
             store.close()
+
+
+class TheScheduledJobsAreNamedForWhatTheyCover(unittest.TestCase):
+    """The three names are an interface, not an implementation detail.
+
+    They are what an operator writes into a schedule file, and
+    `schedule.resolve` refuses an override naming a producer that is not
+    registered -- at START-UP, before there is a page on which to read the
+    refusal. So renaming one is a breaking change to somebody else's file,
+    and the names are pinned here as literals on purpose.
+
+    `ALL_PRODUCERS` above is deliberately derived from the modules that
+    define these names, so that a rename cannot leave the assertions in this
+    file testing a schedule that no longer has them. That is right for what
+    those assertions are for, and it is exactly why it cannot also pin the
+    names: both sides would move together, and a rename would pass in
+    silence. Literals here, once, and derived everywhere else.
+    """
+
+    def test_the_three_scheduled_jobs_have_the_names_a_schedule_file_uses(self):
+        self.assertEqual(ALL_PRODUCERS,
+                         ["performer-scan", "scene-scan", "tag-scan"])
+
+    def test_the_example_schedule_names_jobs_that_are_actually_registered(self):
+        """HARM: the example is what an operator copies. One naming a job
+        that no longer exists does not degrade -- `resolve` refuses it and
+        the process never comes up, so the first thing the rename does to
+        somebody who followed the documentation is a crash loop.
+
+        Compared as a whole set rather than key by key: a key left behind is
+        the failure, and a check for the keys that should be there cannot
+        see one that should not.
+        """
+        with open(os.path.join("config", "schedule.example.json"),
+                  encoding="utf-8") as fh:
+            example = json.load(fh)
+        self.assertEqual(sorted(example), ALL_PRODUCERS)
+
+    def test_the_migration_translates_old_names_into_jobs_that_exist(self):
+        """HARM: `load_schedule` exists so an operator's existing file does
+        not crash-loop the process on the release that renames a job. A map
+        entry pointing at a name nothing registers translates one refusal
+        into another and reports it as a successful migration, which is worse
+        than not migrating at all -- the operator is told to stop worrying
+        about the very name that is still stopping the process.
+
+        The whole set, and equality rather than "each of these is
+        registered": every scheduled job here was renamed, so the map's
+        targets are exactly the registry. A job added later that never had an
+        old name fails this on purpose -- adding one is the moment to decide
+        whether it needs carrying, and this is the only place that question
+        gets asked.
+
+        Derived on both sides deliberately, unlike
+        `test_the_three_scheduled_jobs_have_the_names_a_schedule_file_uses`
+        above: that one pins the names as literals, and the literal OLD names
+        are pinned in tests/test_config.py. What is left for this to check is
+        that the two sets agree, which neither literal can see.
+        """
+        self.assertEqual(sorted(set(RENAMED_JOBS.values())), ALL_PRODUCERS)
+
+
+def _item(subject_type, state="proposed"):
+    return {"subject_type": subject_type, "state": state}
+
+
+class WhatIsWaitingIsCountedPerInbox(unittest.TestCase):
+    """`waiting_counts` turns a store's proposals into the numbers beside the
+    links on the summary page."""
+
+    def test_every_subject_type_this_package_declares_has_a_heading(self):
+        """Discovered by IMPORT, not by a list written here.
+
+        A list would be a second copy of `WAITING_SECTIONS` that has to be
+        edited alongside it, so the two would agree by construction and this
+        would prove only that the code agrees with itself. Walking the package
+        makes the two sides independent: a producer added tomorrow declares its
+        `SUBJECT_TYPE` in its own module and turns up here with no edit.
+
+        HARM: an unmapped type lands on the summary under a heading nobody
+        designed, named after the raw type. That fallback is deliberate -- it
+        keeps the page up (see `waiting_counts`) -- and this is the guard that
+        stops it ever being reached in a shipped release.
+        """
+        declared = {}
+        for module in pkgutil.iter_modules(cronicled.__path__):
+            subject = getattr(
+                importlib.import_module("cronicled." + module.name),
+                "SUBJECT_TYPE", None)
+            if isinstance(subject, str):
+                declared[module.name] = subject
+        # A discovery that found nothing would make the rest of this vacuous.
+        self.assertGreaterEqual(len(declared), 6, declared)
+
+        covered = {s for _n, subjects in WAITING_SECTIONS for s in subjects}
+        self.assertEqual(sorted(set(declared.values())), sorted(covered),
+                         "declared by %r" % (declared,))
+
+    def test_no_two_headings_claim_the_same_subject_type(self):
+        # The other direction, and it is not symmetric with the one above: a
+        # type listed twice still passes a set comparison while its proposals
+        # are counted under whichever heading the dict comprehension reached
+        # last -- resolved by iteration order, silently.
+        covered = [s for _n, subjects in WAITING_SECTIONS for s in subjects]
+        self.assertEqual(sorted(covered), sorted(set(covered)))
+
+    def test_six_subject_types_land_under_three_headings(self):
+        # Every producer this project registers, one of each, so a subject
+        # type routed to the wrong heading -- or to none -- is visible as a
+        # number in the wrong place rather than as a total that still adds up.
+        counts = waiting_counts([
+            _item(scan.SUBJECT_TYPE),
+            _item(tags.SUBJECT_TYPE),
+            _item(tag_descriptions.SUBJECT_TYPE),
+            _item(performer_tags.SUBJECT_TYPE),
+            _item(tag_hygiene.SUBJECT_TYPE),
+            _item(descriptions.SUBJECT_TYPE),
+        ])
+        self.assertEqual(counts, {"scenes": 1, "tags": 4, "performers": 1})
+
+    def test_it_accumulates_rather_than_recording_that_there_was_one(self):
+        # Asymmetric and greater than one: `+= 1` and `= 1` agree on a fixture
+        # of one, and the two headings differ so "counted them all into the
+        # first bucket" cannot pass either.
+        counts = waiting_counts([_item(scan.SUBJECT_TYPE)] * 3
+                                + [_item(tags.SUBJECT_TYPE)] * 5)
+        self.assertEqual(counts, {"scenes": 3, "tags": 5, "performers": 0})
+
+    def test_a_decision_already_made_is_not_still_waiting(self):
+        # A number that never comes down is a number a reader stops believing.
+        counts = waiting_counts([_item(scan.SUBJECT_TYPE, state="applied"),
+                                 _item(scan.SUBJECT_TYPE, state="applied"),
+                                 _item(scan.SUBJECT_TYPE)])
+        self.assertEqual(counts, {"scenes": 1, "tags": 0, "performers": 0})
+
+    def test_every_heading_is_reported_even_at_zero(self):
+        # An absent heading and one reading zero are different claims: the
+        # first says nothing about that inbox, the second says it is clear.
+        self.assertEqual(waiting_counts([]),
+                         {"scenes": 0, "tags": 0, "performers": 0})
+
+    def test_a_subject_no_heading_claims_gets_one_of_its_own(self):
+        # HARM: a producer added without an entry here would otherwise be
+        # counted nowhere, and the summary would report an empty install while
+        # a full inbox sat behind the link -- the exact failure this page is
+        # supposed to catch. Ugly and visible beats invisible.
+        counts = waiting_counts([_item("something-new"),
+                                 _item("something-new"),
+                                 _item(scan.SUBJECT_TYPE)])
+        self.assertEqual(counts, {"scenes": 1, "tags": 0, "performers": 0,
+                                  "something-new": 2})
+
+
+class TheSummaryIsWiredToTheStoreAndTheLoop(_Base):
+    """`serve` receives a callable, and a wiring mistake is invisible until
+    something invokes it -- so every assertion here calls it."""
+
+    def _served(self):
+        captured = _CapturedServe()
+        with patch.dict(os.environ, {ZONE_ENV_VAR: ZONE_NAME}):
+            with patch("cronicled.__main__.serve", captured):
+                with redirect_stdout(io.StringIO()):
+                    main(["--db", self.db_path])
+        return captured.kwargs
+
+    def _seed_runs(self, *runs):
+        """`(job, trigger, started, counts)` each, through the real store."""
+        store = Store(self.db_path)
+        try:
+            for job, trigger, started, counts in runs:
+                run_id = store.start_run(job, trigger=trigger, at=started)
+                store.finish_run(run_id, outcome="completed", counts=counts,
+                                 at=started)
+        finally:
+            store.close()
+
+    def test_each_jobs_last_run_reaches_the_page_in_the_configured_zone(self):
+        self._seed_runs(
+            ("tag-scan", "manual", "2026-01-15T00:30:00+00:00",
+             {"recorded": 1}),
+            ("scene-scan", "scheduled", "2026-07-15T00:30:00+00:00",
+             {"recorded": 4}))
+
+        view = self._served()["summary"]()
+
+        # Both sides of a daylight-saving transition in one assertion: an
+        # offset applied as a constant gets exactly one of the two right.
+        self.assertEqual(
+            [(j["job"], j["trigger"], j["started"], j["counts"])
+             for j in view["jobs"]],
+            [("scene-scan", "scheduled", "2026-07-15 02:30", {"recorded": 4}),
+             ("tag-scan", "manual", "2026-01-15 01:30", {"recorded": 1})])
+        self.assertEqual(view["zone"], ZONE_NAME)
+
+    def test_a_quiet_job_is_not_pushed_off_the_end_by_a_busy_one(self):
+        # HARM: `recent_runs`'s own default is twenty rows. An afternoon of
+        # pressing Scan would then push the nightly tag pass out of the read
+        # entirely, and the page would answer "did it run?" with silence --
+        # which reads exactly like a pass that never ran.
+        self._seed_runs(("tag-scan", "scheduled",
+                         "2026-01-15T00:30:00+00:00", {"recorded": 1}))
+        self._seed_runs(*[("scene-scan", "manual",
+                           "2026-07-15T00:%02d:00+00:00" % n, {"recorded": n})
+                          for n in range(30)])
+
+        view = self._served()["summary"]()
+
+        self.assertEqual(sorted(j["job"] for j in view["jobs"]),
+                         ["scene-scan", "tag-scan"])
+
+    def test_what_is_waiting_is_counted_from_the_store_it_was_given(self):
+        self._seed(subject_id="1")
+        self._seed(subject_id="2")
+        self._seed_merge()
+        self._seed_reconcile()
+        self._seed_unused()
+
+        self.assertEqual(self._served()["summary"]()["waiting"],
+                         {"scenes": 2, "tags": 3, "performers": 0})
+
+    def test_an_install_with_nothing_scheduled_still_gets_a_summary(self):
+        # `schedule_status` is `None` without a media server -- the summary is
+        # not, because scans still run by hand and "what did the last one
+        # find" is the question this page exists to answer either way.
+        kwargs = self._served()
+        self.assertIsNone(kwargs["schedule_status"])
+        self.assertIsNone(kwargs["summary"]()["schedule"])
+        self.assertEqual(kwargs["summary"]()["jobs"], [])
+
+
+class TheSummaryShowsTheLaterOfTwoRunsInOneSecond(unittest.TestCase):
+    """The whole chain the "each job's last run" rule rests on.
+
+    `_utcnow` records to the second, so two runs of one job started in the same
+    second carry an identical `started`. `to_summary_view` takes the FIRST row
+    naming each job, which is the latest one only because `recent_runs` breaks
+    that tie by arrival -- ordering on `started` alone leaves it to SQLite,
+    which returns the OLDER row first. Without the tiebreak this page reports
+    the earlier of the two as though it were the latest, and a stale summary
+    looks exactly like a healthy one.
+    """
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._dir, ignore_errors=True)
+        self.store = Store(os.path.join(self._dir, "runs.sqlite3"))
+        self.addCleanup(self.store.close)
+
+    def test_the_second_of_two_runs_in_one_second_is_the_one_shown(self):
+        same = "2026-03-01T04:00:00+00:00"
+        first = self.store.start_run("scene-scan", trigger="scheduled",
+                                     at=same)
+        self.store.finish_run(first, outcome="completed",
+                              counts={"recorded": 1}, at=same)
+        second = self.store.start_run("scene-scan", trigger="manual", at=same)
+        self.store.finish_run(second, outcome="completed",
+                              counts={"recorded": 7}, at=same)
+
+        rows = self.store.recent_runs()
+        # The collision is real rather than assumed: without this the test
+        # would still pass on a clock that happened to tick between the two,
+        # and would then be proving nothing about the tie at all.
+        self.assertEqual([r["started"] for r in rows], [same, same])
+
+        view = to_summary_view(rows, {}, None, zone=ZONE)
+        self.assertEqual(
+            [(j["id"], j["trigger"], j["counts"]) for j in view["jobs"]],
+            [(second, "manual", {"recorded": 7})])
 
 
 if __name__ == "__main__":

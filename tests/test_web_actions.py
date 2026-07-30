@@ -369,8 +369,8 @@ class _RunnerSpy:
     def register(self, producer):
         self.calls.append(("register", producer))
 
-    def start(self, name):
-        self.calls.append(("start", name))
+    def start(self, name, *, trigger):
+        self.calls.append(("start", name, trigger))
         return None
 
 
@@ -600,6 +600,20 @@ class Scan(unittest.TestCase):
         for call in stash.calls:
             self.assertIn(call[0],
                          ("unorganized_scenes", "scrape_scenes_by_query"))
+
+    def test_a_scan_from_the_page_is_recorded_as_a_manual_run(self):
+        # HARM: this control is the button, and the scheduler's pass is the
+        # other caller of the same producer. Filing a click as "scheduled"
+        # would let a scan somebody ran at noon answer "did last night's
+        # pass run" -- the one question the log exists for -- with a yes.
+        stash = _ScanStash([_library_scene(1)])
+        actions = Actions(self.store, stash, runner=self.runner,
+                          adapters={"only": _Adapter()})
+        job = actions.scan(1)
+        self.assertTrue(self.runner.wait(job.id, WAIT))
+        rows = self.store.recent_runs()
+        self.assertEqual([(r["job"], r["trigger"]) for r in rows],
+                         [("library-scan", "manual")])
 
     def test_two_scans_in_turn_both_start(self):
         # HARM: `ScanProducer.name` is a fixed class attribute

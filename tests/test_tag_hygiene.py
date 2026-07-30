@@ -396,7 +396,7 @@ class ThePass(unittest.TestCase):
                 tag(3, FERRY, scene_count=1)]
         producer = self.build(tags)
         runner.register(producer)
-        job = runner.start(producer.name)
+        job = runner.start(producer.name, trigger="manual")
         self.assertTrue(runner.wait(job.id, WAIT))
         first = sorted(i["subject_id"] for i in self.store.items(folder=FOLDER)
                        if i["subject_type"] == SUBJECT_TYPE)
@@ -408,7 +408,7 @@ class ThePass(unittest.TestCase):
 
         second = self.build(tags)
         runner.reregister(second)
-        job = runner.start(second.name)
+        job = runner.start(second.name, trigger="manual")
         self.assertTrue(runner.wait(job.id, WAIT))
 
         self.assertEqual(
@@ -1066,7 +1066,7 @@ class ThePage(unittest.TestCase):
         handler = build_handler(rows=lambda: [], actions=None,
                                 unused=lambda: self._groups())
         instance = object.__new__(handler)
-        instance.path = "/"
+        instance.path = "/inbox"
         sent = {}
         instance._send = lambda status, body=b"", headers=(): sent.update(
             status=status, body=body)

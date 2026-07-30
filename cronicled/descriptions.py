@@ -338,7 +338,7 @@ def assess(description):
 # per-instance: unlike a scan, nothing here is parameterised by a limit a
 # person typed, so there is no second registration for the same work and no
 # way for a manual run to replace a scheduled one.
-PRODUCER_NAME = "performer-descriptions"
+PRODUCER_NAME = "performer-scan"
 
 
 class DescriptionProducer:

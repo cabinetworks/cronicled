@@ -46,7 +46,8 @@ import argparse
 import os
 from datetime import time
 
-from . import performer_tags, tag_hygiene, tags
+from . import (descriptions, performer_tags, scan, tag_descriptions,
+               tag_hygiene, tags)
 from .adapters.registry import default_adapters_path, load_adapters
 from .config import (CONFIG_DIR_ENV_VAR, ZONE_ENV_VAR, config_dir,
                      default_server_path, load_marker_tag, load_schedule,
@@ -55,14 +56,14 @@ from .descriptions import DescriptionProducer
 from .jobs import JobRunner
 from .runscan import build_scheduled_producer
 from .schedule import Scheduler, check_zone
-from .store import GONE, Store
+from .store import GONE, RUN_HISTORY_LIMIT, Store
 from .stash import Stash
 from .tags import TagMergeProducer
 from .web.actions import Actions
 from .web.app import DEFAULT_HOST, DEFAULT_PORT, serve
 from .web.rows import (to_merge_rows, to_mute_rows, to_reconcile_rows,
                         to_refusal_rows, to_rows, to_schedule_view,
-                        to_unused_groups)
+                        to_summary_view, to_unused_groups)
 
 # The subject types the scene/description row builders cannot draw. `to_rows`
 # dispatches between a scene row and a performer-description row and has no
@@ -73,6 +74,81 @@ from .web.rows import (to_merge_rows, to_mute_rows, to_reconcile_rows,
 # rest.
 _OWN_SECTION_SUBJECTS = (tags.SUBJECT_TYPE, performer_tags.SUBJECT_TYPE,
                          tag_hygiene.SUBJECT_TYPE)
+
+# Which heading on the summary page each producer's proposals are counted
+# under, and what that heading is called. SIX subject types across three
+# headings: a reviewer thinks in terms of the thing being changed -- a scene, a
+# tag, a performer -- and not in terms of which pass proposed it, so the four
+# tag-shaped producers are one number.
+#
+# EVERY subject type this package declares must appear here, and
+# `tests/test_main.py::test_every_subject_type_this_package_declares_has_a_heading`
+# discovers them by import rather than by list, so a seventh added later fails
+# the suite instead of arriving on the page under a heading nobody designed.
+# That check is where the coverage rule lives; `waiting_counts` itself still
+# falls back rather than raising, for the reason stated in its docstring.
+#
+# Ordered, and rendered in this order, because a list that reorders itself as
+# the counts change is one a reader has to re-find their place in every time
+# they look.
+WAITING_SECTIONS = (
+    ("scenes", (scan.SUBJECT_TYPE,)),
+    ("tags", (tags.SUBJECT_TYPE, tag_descriptions.SUBJECT_TYPE,
+              performer_tags.SUBJECT_TYPE, tag_hygiene.SUBJECT_TYPE)),
+    ("performers", (descriptions.SUBJECT_TYPE,)),
+)
+
+# How much of the run log the summary reads to find each job's last run.
+# `recent_runs`'s own default is twenty, which is the wrong bound for this
+# question: three jobs share the log, so twenty runs of the scan -- an
+# afternoon of pressing Scan -- would push the nightly tag pass off the end and
+# the page would answer "did it run?" with silence. Reading the whole retained
+# log is what makes the answer depend on the job rather than on how busy its
+# neighbours have been.
+#
+# The residual, stated rather than claimed away: a job whose last run has been
+# EVICTED shows as never having run. That is retention's bound, not this one,
+# and it is 500 runs of everything -- months of nightly passes.
+SUMMARY_RUN_HISTORY = RUN_HISTORY_LIMIT
+
+
+def waiting_counts(items):
+    """How many proposals are still waiting on a person, per summary heading.
+
+    `items` is `Store.items()`: its default view already hides a reviewer's own
+    dismissals and mutes, and `applied` is dropped here for the reason
+    `_inbox_rows` drops it -- an applied proposal is a decision that has been
+    made, and counting it as outstanding work would put a number on the page
+    that never comes down.
+
+    A subject type NO HEADING CLAIMS gets a heading of its own, named after the
+    type itself, and this deliberately does NOT raise. The choice is between
+    two visible failures, not between a visible one and a silent one:
+
+    - falling back puts an undesigned heading on the page, which the operator
+      can read, act on, and which costs one line in `WAITING_SECTIONS` to fix;
+    - raising takes down the landing page on every render -- including the link
+      to the inbox where those proposals are -- because a producer was added.
+      The reader loses the whole front page and gets no way to reach the work.
+
+    So the guard is moved earlier rather than made louder:
+    `tests/test_main.py::test_every_subject_type_this_package_declares_has_a_heading`
+    discovers every `SUBJECT_TYPE` the package declares, by import, and fails
+    if one has no heading. A seventh type is caught before it ships. What must
+    never happen is the count silently omitting it -- a summary reporting
+    nothing waiting while a full inbox sits behind the link is the exact
+    failure this page exists to catch, and that is what the fallback prevents.
+    """
+    counts = {name: 0 for name, _ in WAITING_SECTIONS}
+    heading = {subject: name
+               for name, subjects in WAITING_SECTIONS
+               for subject in subjects}
+    for item in items:
+        if item["state"] == "applied":
+            continue
+        name = heading.get(item["subject_type"], item["subject_type"])
+        counts[name] = counts.get(name, 0) + 1
+    return counts
 
 # How long shutdown waits for the loop to come out of a tick. Bounded rather
 # than `None`: a tick wedged in the store or the media server would otherwise
@@ -577,6 +653,18 @@ def main(argv=None):
               schedule_status=(None if scheduler is None
                                else lambda: to_schedule_view(
                                    scheduler.status(), zone=zone)),
+              # The landing page. Always wired, unlike `schedule_status`
+              # above: an install with no schedule still runs scans by hand,
+              # and "did the pass run, and what did it find" is the question
+              # this page exists to answer whether or not anything is
+              # unattended. The loop's status goes in RAW -- `to_summary_view`
+              # converts it, so the run times and the schedule panel on that
+              # page cannot end up in two different zones.
+              summary=lambda: to_summary_view(
+                  store.recent_runs(limit=SUMMARY_RUN_HISTORY),
+                  waiting_counts(store.items()),
+                  None if scheduler is None else scheduler.status(),
+                  zone=zone),
               host=args.host, port=args.port)
     finally:
         # In a `finally`, so a `serve` that raises still stops the loop

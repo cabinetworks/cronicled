@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import tempfile
@@ -8,6 +10,7 @@ from cronicled.config import (
     default_server_path, default_stashbox_path, load_marker_tag, load_schedule,
     load_server, load_stashbox, load_zone)
 from cronicled.adapters.registry import default_adapters_path, load_adapters
+from cronicled.schedule import resolve
 
 
 class ConfigDir(unittest.TestCase):
@@ -201,7 +204,7 @@ class LoadSchedule(unittest.TestCase):
         # loader that returned only the first entry, or dropped `enabled` in
         # favour of `every`, would leave an operator's explicit "do not run
         # this" doing nothing with nothing raised.
-        overrides = {"nightly-library-scan": {"every": 3600},
+        overrides = {"scene-scan": {"every": 3600},
                      "some-other-producer": {"enabled": False}}
         with tempfile.TemporaryDirectory() as d:
             with open(os.path.join(d, "schedule.json"), "w") as fh:
@@ -234,6 +237,260 @@ class LoadSchedule(unittest.TestCase):
             with self.assertRaises(ValueError) as ctx:
                 load_schedule(env={"CRONICLED_CONFIG_DIR": d})
             self.assertIn(p, str(ctx.exception))
+
+
+class _ProducerThatOnlyDeclaresATiming:
+    """Everything `cronicled.schedule.resolve` is allowed to read off a
+    producer, and nothing else — a name and a declared cadence.
+
+    Deliberately no more capable than the real thing: `resolve` looks a
+    producer up BY THE NAME an override uses, so a stand-in that answered to
+    more than one name, or that ignored a name it did not know, would let a
+    migration that translated to the wrong name pass.
+    """
+
+    def __init__(self, name, every):
+        self.name = name
+        self.every = every
+
+
+class ScheduleFileNamesJobsThatHaveBeenRenamed(unittest.TestCase):
+    """An operator's `schedule.json` outlives the names it was written with.
+
+    `cronicled.schedule.resolve` refuses an override naming a producer that
+    does not exist, and refuses it at START-UP, before there is a page on
+    which to read the refusal — so a rename landing on a deployment that has
+    a schedule file is a crash loop, not a warning. `load_schedule` translates
+    the names this project itself changed, so that window is closed for one
+    release.
+
+    What it must NOT do is make an unknown name acceptable. That refusal is
+    what turns a typo into a stack trace instead of a job that silently never
+    runs, and translating a known old name is not the same act as accepting
+    an unknown one.
+    """
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.path = os.path.join(self._dir.name, "schedule.json")
+        self.env = {"CRONICLED_CONFIG_DIR": self._dir.name}
+
+    def _write_schedule(self, text):
+        # Raw text, never `json.dump`: a duplicate key is exactly what
+        # `json.dump` cannot produce from a dict, and it is half of what this
+        # class exists to test.
+        with open(self.path, "w") as fh:
+            fh.write(text)
+
+    def _load_watching_stdout(self):
+        """`load_schedule`, and every line it printed while running.
+
+        Captured from the real stdout rather than through an injected
+        reporter: the thing an operator reads is a line on a terminal, and a
+        double that collected messages some other way would be agreeing with
+        the test rather than with the deployment.
+        """
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            loaded = load_schedule(env=self.env)
+        return loaded, out.getvalue()
+
+    def _load(self):
+        """`load_schedule`, with the migration notice swallowed.
+
+        Only for the tests that are about the mapping rather than about what
+        an operator is told; the notice itself has its own tests below.
+        """
+        return self._load_watching_stdout()[0]
+
+    # -- the three translations, each pinned by literals on both sides ---- #
+    #
+    # Literal old name, literal new name, one test each. Deriving either side
+    # from the constants the code reads would move both together, and every
+    # entry could then be deleted or repointed under a green suite -- which is
+    # how two of the three renames went unpinned when they were made.
+
+    def test_a_schedule_naming_the_old_scene_job_is_migrated(self):
+        self._write_schedule('{"nightly-library-scan": {"at": "03:00"}}')
+        self.assertEqual(self._load(), {"scene-scan": {"at": "03:00"}})
+
+    def test_a_schedule_naming_the_old_performer_job_is_migrated(self):
+        self._write_schedule('{"performer-descriptions": {"every": 86400}}')
+        self.assertEqual(self._load(), {"performer-scan": {"every": 86400}})
+
+    def test_a_schedule_naming_the_old_tag_job_is_migrated(self):
+        self._write_schedule('{"tag-merge": {"enabled": false}}')
+        self.assertEqual(self._load(), {"tag-scan": {"enabled": False}})
+
+    def test_a_schedule_using_current_names_is_unchanged(self):
+        self._write_schedule('{"tag-scan": {"at": "03:40"}}')
+        self.assertEqual(load_schedule(env=self.env),
+                         {"tag-scan": {"at": "03:40"}})
+
+    def test_the_settings_under_a_migrated_name_are_carried_over_whole(self):
+        # The key moves; the value must not be rebuilt on the way. Whole-shape
+        # equality, with a setting the loader has no reason to know about, so
+        # a migration that copied only the keys it recognised is visible here
+        # rather than at the moment `resolve` refuses the entry it kept.
+        self._write_schedule(
+            '{"nightly-library-scan": {"at": "03:00", "zone": "Europe/Lisbon",'
+            ' "enabled": true}}')
+        self.assertEqual(
+            self._load(),
+            {"scene-scan": {"at": "03:00", "zone": "Europe/Lisbon",
+                            "enabled": True}})
+
+    # -- the refusal the migration works around, still intact -------------- #
+
+    def test_a_name_this_project_never_used_is_handed_on_as_written(self):
+        self._write_schedule('{"scene-scam": {"every": 3600}}')
+        self.assertEqual(load_schedule(env=self.env),
+                         {"scene-scam": {"every": 3600}})
+
+    def test_a_typo_is_still_refused_at_start_up_rather_than_ignored(self):
+        # HARM: the whole value of `resolve`'s refusal is that a mistyped job
+        # name stops the process instead of leaving the real job running on
+        # the cadence the operator believed they had changed. A migration that
+        # smoothed unknown names away -- dropping them, or matching them to
+        # something near enough -- would buy the rename at the cost of that.
+        self._write_schedule('{"scene-scam": {"every": 3600}}')
+        overrides = load_schedule(env=self.env)
+        with self.assertRaises(ValueError) as caught:
+            resolve([_ProducerThatOnlyDeclaresATiming("scene-scan",
+                                                      every=3600)], overrides)
+        self.assertIn("scene-scam", str(caught.exception))
+
+    def test_a_migrated_name_reaches_resolve_as_a_job_that_exists(self):
+        # The other half, end to end: the old name goes in, and the schedule
+        # wires up rather than refusing. Asserting only the refusal above
+        # would be satisfied by a loader that refused everything.
+        self._write_schedule('{"nightly-library-scan": {"every": 3600}}')
+        overrides = self._load()
+        entries = resolve(
+            [_ProducerThatOnlyDeclaresATiming("scene-scan", every=86400)],
+            overrides)
+        self.assertEqual(entries["scene-scan"].every, 3600)
+
+    # -- the operator is told ---------------------------------------------- #
+
+    def test_every_migration_is_reported_naming_the_old_and_the_new(self):
+        # Two of them, not one: a report that named only the first migration
+        # would leave the second old name in the file with nothing said, and
+        # a fixture of one cannot tell "each" from "any".
+        self._write_schedule('{"nightly-library-scan": {"every": 3600},'
+                             ' "tag-merge": {"enabled": false}}')
+        loaded, printed = self._load_watching_stdout()
+        self.assertEqual(loaded, {"scene-scan": {"every": 3600},
+                                  "tag-scan": {"enabled": False}})
+        for name in ("nightly-library-scan", "scene-scan",
+                     "tag-merge", "tag-scan"):
+            self.assertIn(name, printed)
+        self.assertIn(self.path, printed)
+
+    def test_a_file_that_needs_no_migration_is_reported_on_at_all(self):
+        # The permissive side. A loader that announced a migration whatever
+        # the file said would tell every operator to edit a file that is
+        # already correct, and the notice would be ignored by the time it
+        # meant something.
+        self._write_schedule('{"scene-scan": {"every": 3600}}')
+        _, printed = self._load_watching_stdout()
+        self.assertEqual(printed, "")
+
+    # -- one job, two names ------------------------------------------------ #
+
+    def test_naming_one_job_by_both_its_names_is_refused_naming_both(self):
+        # JSON sees two different keys, so nothing upstream can catch this,
+        # and it is the file an operator part-way through the rename writes.
+        # Resolving it by iteration order would leave one of the two entries
+        # doing nothing, silently -- the same defect as a duplicate key,
+        # wearing a different spelling.
+        self._write_schedule('{"nightly-library-scan": {"every": 86400},'
+                             ' "scene-scan": {"at": "03:00"}}')
+        with self.assertRaises(ValueError) as caught:
+            load_schedule(env=self.env)
+        message = str(caught.exception)
+        self.assertIn("nightly-library-scan", message)
+        self.assertIn("scene-scan", message)
+        self.assertIn("86400", message)
+        self.assertIn("03:00", message)
+
+    def test_it_is_refused_whichever_order_the_two_names_come_in(self):
+        # Order-independence, because the file is written by a person: a check
+        # that only looked at names already seen would accept exactly this
+        # file and refuse the one above.
+        self._write_schedule('{"scene-scan": {"at": "03:00"},'
+                             ' "nightly-library-scan": {"every": 86400}}')
+        with self.assertRaises(ValueError) as caught:
+            load_schedule(env=self.env)
+        message = str(caught.exception)
+        self.assertIn("nightly-library-scan", message)
+        self.assertIn("86400", message)
+        self.assertIn("03:00", message)
+
+
+class ScheduleFileNamesAKeyTwice(unittest.TestCase):
+    """JSON keeps the last occurrence of a repeated key and discards the rest
+    without a word.
+
+    Observed on a real deployment: every job named twice, so three interval
+    entries were dead and three passes shared one appointment. Nothing was
+    wrong with the file as far as any parser was concerned, and the operator
+    believed something untrue about their own configuration for as long as it
+    ran.
+    """
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.path = os.path.join(self._dir.name, "schedule.json")
+        self.env = {"CRONICLED_CONFIG_DIR": self._dir.name}
+
+    def _write_schedule(self, text):
+        with open(self.path, "w") as fh:
+            fh.write(text)
+
+    def test_a_duplicate_key_is_refused_naming_both_values(self):
+        # BOTH values, and they are different values on purpose: which half
+        # of the file the parser threw away is the only thing the operator
+        # needs to know, and a message saying merely that the key repeats
+        # leaves them to guess. Two assertions against one catch-all string
+        # would both pass on a message that named neither.
+        self._write_schedule(
+            '{"scene-scan": {"every": 86400}, "scene-scan": {"at": "03:00"}}')
+        with self.assertRaises(ValueError) as caught:
+            load_schedule(env=self.env)
+        message = str(caught.exception)
+        self.assertIn("scene-scan", message)
+        self.assertIn("86400", message)
+        self.assertIn("03:00", message)
+        self.assertIn(self.path, message)
+
+    def test_a_duplicate_inside_one_jobs_settings_is_refused_too(self):
+        # The same mistake one level down, with the same consequence: the
+        # operator's stated cadence is discarded and the pass runs on the
+        # other one. A check that ran only over the top-level keys would see
+        # a file with one job in it and nothing wrong.
+        self._write_schedule(
+            '{"scene-scan": {"every": 86400, "every": 3600}}')
+        with self.assertRaises(ValueError) as caught:
+            load_schedule(env=self.env)
+        message = str(caught.exception)
+        self.assertIn("every", message)
+        self.assertIn("86400", message)
+        self.assertIn("3600", message)
+
+    def test_two_jobs_with_the_same_settings_are_not_a_duplicate(self):
+        # The permissive side of the guard, which is the half a refusal test
+        # cannot see: repeated VALUES are ordinary -- two passes may well run
+        # on the same cadence -- and only a repeated KEY is the mistake. A
+        # guard that drifted to refusing this would stop a correct file from
+        # starting.
+        self._write_schedule('{"scene-scan": {"every": 3600},'
+                             ' "tag-scan": {"every": 3600}}')
+        self.assertEqual(load_schedule(env=self.env),
+                         {"scene-scan": {"every": 3600},
+                          "tag-scan": {"every": 3600}})
 
 
 class LoadMarkerTag(unittest.TestCase):

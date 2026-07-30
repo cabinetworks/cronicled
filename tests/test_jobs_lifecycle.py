@@ -42,7 +42,7 @@ class BoundedHistory(_RunnerCase):
         for i in range(n):
             name = "%s-%d" % (prefix, i)
             runner.register(_Producer(name=name, count=1))
-            job = runner.start(name)
+            job = runner.start(name, trigger="manual")
             self.assertTrue(runner.wait(job.id, timeout=WAIT))
             ids.append(job.id)
         return ids
@@ -84,7 +84,7 @@ class BoundedHistory(_RunnerCase):
         gate = threading.Event()
         runner = self._runner(history=1)
         runner.register(_Producer(name="held", gate=gate, count=1))
-        held = runner.start("held")
+        held = runner.start("held", trigger="manual")
 
         self._finish(runner, 6)
 
@@ -108,8 +108,8 @@ class BoundedHistory(_RunnerCase):
         runner.register(_Producer(name="slow", gate=gate, count=1))
         runner.register(_Producer(name="quick", count=1))
 
-        slow = runner.start("slow")
-        quick = runner.start("quick")
+        slow = runner.start("slow", trigger="manual")
+        quick = runner.start("quick", trigger="manual")
         self.assertTrue(runner.wait(quick.id, timeout=WAIT))
         gate.set()
         self.assertTrue(runner.wait(slow.id, timeout=WAIT))
@@ -206,7 +206,7 @@ class OrderlyShutdown(_RunnerCase):
         runner.register(_Producer(name="scan", cost="scraping", count=1))
         self.assertTrue(runner.close(timeout=WAIT))
         with self.assertRaises(RunnerClosed):
-            runner.start("scan")
+            runner.start("scan", trigger="manual")
         # nothing was recorded and no job record was left behind
         self.assertEqual(list(runner.jobs()), [])
         self.assertEqual(len(self.store.items()), 0)
@@ -219,7 +219,7 @@ class OrderlyShutdown(_RunnerCase):
         runner.register(_Producer(name="tags", cost="local", count=1))
         runner.close(timeout=WAIT)
         with self.assertRaises(RunnerClosed):
-            runner.start("tags")
+            runner.start("tags", trigger="manual")
 
     def test_a_closed_runner_is_not_a_busy_one(self):
         # A caller that catches JobRejected treats it as "try again shortly",
@@ -229,7 +229,7 @@ class OrderlyShutdown(_RunnerCase):
         runner.register(_Producer(name="scan", cost="scraping", count=1))
         runner.close(timeout=WAIT)
         with self.assertRaises(RunnerClosed) as ctx:
-            runner.start("scan")
+            runner.start("scan", trigger="manual")
         self.assertNotIsInstance(ctx.exception, JobRejected)
 
     def test_close_waits_for_every_running_job_not_just_one(self):
@@ -237,8 +237,8 @@ class OrderlyShutdown(_RunnerCase):
         runner = JobRunner(self.store)
         runner.register(_Producer(name="a", gate=gate_a, count=1))
         runner.register(_Producer(name="b", gate=gate_b, count=1))
-        job_a = runner.start("a")
-        job_b = runner.start("b")
+        job_a = runner.start("a", trigger="manual")
+        job_b = runner.start("b", trigger="manual")
 
         out = []
         closer = self._closer(runner, WAIT, out)
@@ -263,7 +263,7 @@ class OrderlyShutdown(_RunnerCase):
         gate = threading.Event()
         runner = JobRunner(self.store)
         runner.register(_Producer(name="scan", gate=gate, count=2))
-        job = runner.start("scan")
+        job = runner.start("scan", trigger="manual")
         gate.set()
         self.assertTrue(runner.close(timeout=WAIT))
         self.assertEqual(runner.job(job.id).state, "done")
@@ -277,7 +277,7 @@ class OrderlyShutdown(_RunnerCase):
         gate = threading.Event()
         runner = JobRunner(self.store)
         runner.register(_Producer(name="scan", gate=gate, count=1))
-        job = runner.start("scan")
+        job = runner.start("scan", trigger="manual")
 
         self.assertFalse(runner.close(timeout=0.1))
 
@@ -297,10 +297,10 @@ class OrderlyShutdown(_RunnerCase):
         runner.register(
             _Producer(name="scan-a", cost="scraping", gate=gate, count=1))
         runner.register(_Producer(name="scan-b", cost="scraping", count=1))
-        job = runner.start("scan-a")
+        job = runner.start("scan-a", trigger="manual")
         self.assertFalse(runner.close(timeout=0.1))
         with self.assertRaises(RunnerClosed):
-            runner.start("scan-b")
+            runner.start("scan-b", trigger="manual")
         gate.set()
         self.assertTrue(runner.wait(job.id, timeout=WAIT))
 
@@ -320,8 +320,8 @@ class OrderlyShutdown(_RunnerCase):
         runner = JobRunner(self.store)
         runner.register(_Producer(name="a", gate=gate, count=1))
         runner.register(_Producer(name="b", gate=gate, count=1))
-        job_a = runner.start("a")
-        job_b = runner.start("b")
+        job_a = runner.start("a", trigger="manual")
+        job_b = runner.start("b", trigger="manual")
 
         caller = threading.current_thread()
         real_wait = threading.Event.wait
@@ -352,7 +352,7 @@ class OrderlyShutdown(_RunnerCase):
         gate = threading.Event()
         runner = JobRunner(self.store)
         runner.register(_Producer(name="scan", gate=gate, count=1))
-        job = runner.start("scan")
+        job = runner.start("scan", trigger="manual")
         self.assertFalse(runner.close(timeout=0.1))
         gate.set()
         self.assertTrue(runner.wait(job.id, timeout=WAIT))
@@ -364,12 +364,12 @@ class OrderlyShutdown(_RunnerCase):
         self.assertTrue(runner.close(timeout=WAIT))
         runner.register(_Producer(name="scan", count=1))
         with self.assertRaises(RunnerClosed):
-            runner.start("scan")
+            runner.start("scan", trigger="manual")
 
     def test_close_with_nothing_running_says_everything_finished(self):
         runner = JobRunner(self.store)
         runner.register(_Producer(name="scan", count=1))
-        job = runner.start("scan")
+        job = runner.start("scan", trigger="manual")
         self.assertTrue(runner.wait(job.id, timeout=WAIT))
         self.assertTrue(runner.close(timeout=WAIT))
 
@@ -379,7 +379,7 @@ class OrderlyShutdown(_RunnerCase):
         # to read the proposals the jobs just recorded.
         runner = JobRunner(self.store)
         runner.register(_Producer(name="scan", count=1))
-        job = runner.start("scan")
+        job = runner.start("scan", trigger="manual")
         self.assertTrue(runner.close(timeout=WAIT))
         self.assertEqual(len(self.store.items()), 1)
         self.assertEqual(runner.job(job.id).recorded, 1)
@@ -388,7 +388,7 @@ class OrderlyShutdown(_RunnerCase):
         # close() stops new work; it does not blind the caller to what ran.
         runner = JobRunner(self.store)
         runner.register(_Producer(name="scan", count=1))
-        job = runner.start("scan")
+        job = runner.start("scan", trigger="manual")
         self.assertTrue(runner.close(timeout=WAIT))
         self.assertEqual([j.id for j in runner.jobs()], [job.id])
         self.assertEqual(runner.job(job.id).state, "done")
@@ -409,7 +409,7 @@ class OrderlyShutdown(_RunnerCase):
         def attempt(i):
             barrier.wait(WAIT)
             try:
-                results[i] = ("started", runner.start("p-%d" % i))
+                results[i] = ("started", runner.start("p-%d" % i, trigger="manual"))
             except RunnerClosed:
                 results[i] = ("refused", None)
 
