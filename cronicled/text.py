@@ -4,7 +4,8 @@ import os
 import re
 import unicodedata
 
-from cronicled.vocab import CONTAINER_EXTS, JUNK_TOKENS, STOPWORDS
+from cronicled.vocab import (CONTAINER_EXTS, ENCODE_MARKERS, JUNK_TOKENS,
+                             STOPWORDS)
 
 
 _BACKSLASH_ESCAPE_RE = re.compile(r"\\(['\"/\\])")
@@ -75,12 +76,69 @@ def strip_ext(name):
 
 _QUALIFIER_RE = re.compile(r"[\(\[\{][^\)\]\}]*[\)\]\}]")
 
+# Separators a marker is spelled with -- "H.265", "web-dl", "10-bit". Folded
+# out before the ENCODE_MARKERS lookup so one entry covers every spelling.
+# Brackets are NOT here: a bracketed marker belongs to `_QUALIFIER_RE`, and
+# folding brackets away would let either rule cover for the other.
+_MARKER_SEPARATORS = str.maketrans({".": "", "-": "", "_": ""})
+
+
+def _is_encode_marker(token):
+    """True when `token` is, whole, a known encode marker -- see
+    ENCODE_MARKERS for what the list claims and why it is closed.
+
+    Membership in a list, never a match against a pattern. The token is
+    lowercased and its separators folded out, and that is the only latitude
+    given: a token merely SHAPED like a marker is not one, because the shape
+    of a marker is also the shape of an initial, a volume number and a
+    one-word handle.
+    """
+    return token.lower().translate(_MARKER_SEPARATORS) in ENCODE_MARKERS
+
+
+def _strip_encode_markers(text):
+    """`text` with any run of trailing encode markers removed.
+
+    Only at the end, and only whole whitespace-separated tokens. A marker in
+    the MIDDLE of a folder name is not a qualifier tacked on -- something put
+    it there between two pieces of the name -- so the run stops at the first
+    token the list does not claim and everything at or before it survives,
+    marker or not. A marker glued to a neighbour ("Velvet Crane-1080p") is not
+    a whole token and is likewise left alone: splitting inside a token is how
+    a hyphenated name loses half of itself.
+    """
+    words = text.split()
+    while words and _is_encode_marker(words[-1]):
+        words.pop()
+    return " ".join(words)
+
 
 def clean_folder(name):
-    """Strip a parenthesised or bracketed qualifier from a folder name, so a
-    quality/encoding tag tacked onto the end doesn't stop the rest of the name
-    from being read as-is ('Velvet Crane (h265)' -> 'Velvet Crane')."""
-    return re.sub(r"\s+", " ", _QUALIFIER_RE.sub(" ", name or "")).strip()
+    """Strip a qualifier from a folder name, so a quality/encoding tag tacked
+    onto the end doesn't stop the rest of the name from being read as-is.
+
+    Two separate rules, each doing its own half:
+
+    * a parenthesised or bracketed qualifier, anywhere in the name
+      ('Velvet Crane (h265)' -> 'Velvet Crane');
+    * a run of trailing tokens that are known encode markers, brackets or no
+      ('Velvet Crane h265' -> 'Velvet Crane'). Bare markers are the far more
+      common filing shape, and until they were stripped the marker rode along
+      into the resolved creator's name -- a name no store has, recorded as
+      the attribution and read as fact by everything downstream.
+
+    The second rule is a CLOSED LIST and not a pattern, deliberately: see
+    ENCODE_MARKERS. An unlisted trailing token is returned untouched, however
+    marker-shaped it looks, because an initial, a volume number and a one-word
+    handle all look exactly like one.
+
+    A name that is nothing BUT a qualifier cleans away to "" -- the same
+    answer the bracketed rule has always given, and what
+    `artist.creator_folder` reads to walk past such a directory instead of
+    attributing files to it.
+    """
+    text = re.sub(r"\s+", " ", _QUALIFIER_RE.sub(" ", name or "")).strip()
+    return _strip_encode_markers(text)
 
 
 def normalize(s):

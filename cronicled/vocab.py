@@ -60,3 +60,50 @@ CONTAINER_EXTS = SCAN_EXTS | frozenset({
     ".divx", ".xvid", ".rm", ".rmvb",
     ".3gp", ".3g2", ".f4v", ".qt", ".dv", ".mxf", ".wtv", ".amv",
 })
+
+# Tokens that describe how a file was ENCODED -- codec, bit depth, resolution,
+# dynamic range, source, audio codec -- and so are confidently not part of
+# anyone's name. `text.clean_folder` drops these from the END of a folder name,
+# one whole token at a time.
+#
+# The same reasoning CONTAINER_EXTS is built on, applied to a bare token rather
+# than a dotted suffix: a KNOWN encode marker is confidently not a name, so
+# strip it; an unknown trailing token might be, so it must survive untouched.
+#
+# CLOSED, and never a pattern. "Strip a trailing alphanumeric token" would eat
+# an initial, a numeral that belongs to a name ("Copper Kettle 3"), and a
+# one-word handle. That is the asymmetry that decides the shape of this list: a
+# marker LEFT on a folder is visibly wrong and someone fixes it, while a name
+# silently shortened still reads as a name and nobody ever looks at it again.
+# So an entry belongs here only when a trailing word of that spelling could not
+# be a name -- and when in doubt it is left out, because leaving it out costs a
+# marker on screen and putting it in costs a name.
+#
+# Matched after lowercasing and dropping `.`, `-` and `_` (see
+# `text._is_encode_marker`), so one entry covers the separator spellings a
+# marker really arrives under: "H.265", "web-dl", "10-Bit", "Blu-Ray". Bracket
+# characters are deliberately NOT folded away -- "(h265)" is the bracketed
+# qualifier's job, and folding it here would make the two rules answer for each
+# other and neither observable on its own.
+#
+# Excluded on purpose, though they are encode-adjacent: "hd" and "sd", which
+# are as often ordinary words in a folder name as they are resolutions; "mp3",
+# "flac" and "opus", which are audio containers or an English word, and which
+# CONTAINER_EXTS already declines to claim for the same reason (see its note on
+# audio being a separate question). Add to this list the way CONTAINER_NAMES
+# grew: from a spelling a real library turned up, not from speculation.
+ENCODE_MARKERS = frozenset({
+    # Video codec.
+    "h264", "h265", "h266", "x264", "x265", "x266", "hevc", "avc",
+    # Bit depth.
+    "8bit", "10bit", "12bit",
+    # Resolution.
+    "240p", "360p", "480p", "576p", "720p", "1080p", "1440p", "2160p",
+    "4k", "8k", "uhd",
+    # Dynamic range.
+    "sdr", "hdr",
+    # Source.
+    "webdl", "bluray", "remux",
+    # Audio codec.
+    "aac", "ac3", "eac3", "dts", "truehd",
+})

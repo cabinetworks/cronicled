@@ -2,7 +2,7 @@ import unittest
 
 from cronicled.text import (normalize, spaceless, strip_html, strip_ext,
                             clean_folder, tokens, slug_match)
-from cronicled.vocab import CONTAINER_EXTS, SCAN_EXTS
+from cronicled.vocab import CONTAINER_EXTS, ENCODE_MARKERS, SCAN_EXTS
 from tests.fixtures.cast import PERFORMERS, TITLES
 
 
@@ -28,6 +28,28 @@ NOT_TITLE_TEXT = WALKED | frozenset({
     ".m2ts", ".mts", ".vob", ".ogv", ".ogm", ".asf",
     ".divx", ".xvid", ".rm", ".rmvb",
     ".3gp", ".3g2", ".f4v", ".qt", ".dv", ".mxf", ".wtv", ".amv",
+})
+
+# -- the encode markers, restated for the same reason and a sharper one ---- #
+#
+# This list decides what gets DELETED from a creator's name, so both directions
+# of an edit have to be deliberate. A loop driven from the constant visits
+# exactly the entries that are in it: one silently dropped stops being tested,
+# and one silently added is never seen at all — and an added entry is a
+# spelling this project now removes from the end of every folder that has it.
+#
+# These are external facts too: the spellings an encode marker arrives under in
+# a real library. What is NOT here is as load-bearing as what is — "hd", "sd",
+# "mp3", "flac" and "opus" are left out because each is also an ordinary word
+# or an audio container, and a name is not worth a marker.
+ENCODE_TOKENS = frozenset({
+    "h264", "h265", "h266", "x264", "x265", "x266", "hevc", "avc",
+    "8bit", "10bit", "12bit",
+    "240p", "360p", "480p", "576p", "720p", "1080p", "1440p", "2160p",
+    "4k", "8k", "uhd",
+    "sdr", "hdr",
+    "webdl", "bluray", "remux",
+    "aac", "ac3", "eac3", "dts", "truehd",
 })
 
 
@@ -189,9 +211,139 @@ class CleanFolder(unittest.TestCase):
         self.assertEqual(clean_folder(PERFORMERS["two_word"]),
                          PERFORMERS["two_word"])
 
+    def test_strips_a_bracketed_qualifier_that_is_no_kind_of_encode_marker(self):
+        # The bracketed rule's own test, using text the marker list does not
+        # claim, so it goes on failing if the brackets stop being read even
+        # once every marker inside brackets is stripped by the other rule.
+        self.assertEqual(clean_folder("%s (Archive)" % PERFORMERS["two_word"]),
+                         PERFORMERS["two_word"])
+
     def test_empty_and_none_are_empty(self):
         self.assertEqual(clean_folder(""), "")
         self.assertEqual(clean_folder(None), "")
+
+
+class CleanFolderStripsBareEncodeMarkers(unittest.TestCase):
+    """The bracketed rule above handles "(h265)". The identical marker with no
+    brackets is the more common filing shape by far, and it used to pass
+    straight through every guard and be recorded as the creator's name — a
+    name no store has, on more than half the scenes of one measured library.
+
+    The other direction is the dangerous one and it is silent. A folder left
+    with a marker on it is visibly wrong; a name quietly shortened by one
+    token still reads as a name, so nothing downstream ever questions it.
+    """
+
+    def test_strips_a_bare_marker(self):
+        self.assertEqual(clean_folder("%s x265" % PERFORMERS["two_word"]),
+                         PERFORMERS["two_word"])
+
+    def test_strips_every_marker_the_list_claims(self):
+        # Driven from the table at the top of this file, not from
+        # ENCODE_MARKERS: a loop over the constant shrinks when the constant
+        # does and can only ever report that the code agrees with itself.
+        for marker in sorted(ENCODE_TOKENS):
+            self.assertEqual(
+                clean_folder("%s %s" % (TITLES["contained"], marker)),
+                TITLES["contained"], marker)
+
+    def test_a_trailing_token_the_list_does_not_claim_survives_untouched(self):
+        # The test this class exists for. Every one of these is a shape a
+        # pattern would eat: an initial, a numeral that belongs to the name, a
+        # token merely SHAPED like a codec, an ordinary word, a one-word
+        # handle standing alone.
+        for folder in ("Velvet Crane J", "Copper Kettle 3", "Velvet Crane x999",
+                       "Copper Kettle Remastered", "Marsh"):
+            self.assertEqual(clean_folder(folder), folder, folder)
+
+    def test_a_marker_leading_the_name_is_not_stripped(self):
+        folder = "1080p %s" % PERFORMERS["two_word"]
+        self.assertEqual(clean_folder(folder), folder)
+
+    def test_a_marker_in_the_middle_of_the_name_is_not_stripped(self):
+        # Something put it between two pieces of the name, so it is not a
+        # qualifier tacked on the end and this leaves it alone.
+        folder = "Velvet 1080p Crane"
+        self.assertEqual(clean_folder(folder), folder)
+
+    def test_strips_a_run_of_trailing_markers(self):
+        # Two markers, and two different ones: a fixture of one cannot tell
+        # "removes the run" from "removes exactly one".
+        self.assertEqual(clean_folder("%s 1080p x265" % PERFORMERS["two_word"]),
+                         PERFORMERS["two_word"])
+
+    def test_the_run_stops_at_the_first_token_the_list_does_not_claim(self):
+        # Three tokens after the name and only the last removable: the run
+        # must not step over the word to reach the marker behind it.
+        self.assertEqual(clean_folder("Copper Kettle x265 Archive 1080p"),
+                         "Copper Kettle x265 Archive")
+
+    def test_a_marker_is_recognised_however_it_is_punctuated_or_cased(self):
+        # One list entry per marker, not one per spelling: the separators a
+        # marker is written with are folded out before the lookup.
+        for folder in ("%s H.265", "%s WEB-DL", "%s 10-Bit", "%s Blu_Ray"):
+            self.assertEqual(clean_folder(folder % PERFORMERS["two_word"]),
+                             PERFORMERS["two_word"], folder)
+
+    def test_a_marker_glued_to_a_neighbour_is_not_a_whole_token(self):
+        # Whole WHITESPACE-separated tokens only. Widening the split to the
+        # separators a name is also written with is how a hyphenated name
+        # loses half of itself and a dot-separated one loses its surname.
+        for template in ("%s-1080p", "%s.1080p", "%s_1080p"):
+            folder = template % PERFORMERS["two_word"]
+            self.assertEqual(clean_folder(folder), folder, folder)
+
+    def test_a_token_carrying_a_stray_bracket_is_not_a_bare_marker(self):
+        # An unbalanced bracket is no qualifier the other rule can read, and
+        # the token it leaves is not the bare marker this one claims. Brackets
+        # are deliberately not folded away here: were they, a marker in
+        # brackets would be strippable by EITHER rule and neither would fail
+        # on its own when the other was removed.
+        folder = "%s (h265" % PERFORMERS["two_word"]
+        self.assertEqual(clean_folder(folder), folder)
+
+    def test_a_bracketed_qualifier_goes_before_the_trailing_run_is_read(self):
+        # A bare marker with a bracketed year after it: the brackets come off
+        # first, which is what puts the marker at the end where this rule can
+        # see it. Reading the run first leaves the marker in the name.
+        self.assertEqual(clean_folder("%s 1080p (2024)" % PERFORMERS["two_word"]),
+                         PERFORMERS["two_word"])
+
+    def test_a_folder_that_is_nothing_but_a_bare_marker_cleans_to_nothing(self):
+        # The same answer the bracketed rule has always given for "(h265)",
+        # and what `artist.creator_folder` reads to walk past such a directory
+        # instead of attributing a creator to it.
+        self.assertEqual(clean_folder("x265"), "")
+        self.assertEqual(clean_folder("2160p HEVC"), "")
+
+
+class TheEncodeMarkerList(unittest.TestCase):
+    """A closed list, for the reason CONTAINER_EXTS is a closed list and with
+    the stakes reversed: an omission here leaves a marker visible on a name,
+    while an addition silently deletes a token from every folder that ends in
+    it. The cheaper mistake is the visible one."""
+
+    def test_it_holds_exactly_what_it_claims(self):
+        # Asserted whole, both directions. Sampling cannot see an entry ADDED,
+        # and an added entry is the one that costs a name.
+        self.assertEqual(ENCODE_MARKERS, ENCODE_TOKENS)
+
+    def test_every_entry_is_a_bare_lowercase_alphanumeric_token(self):
+        # A token is lowercased and has `.`, `-` and `_` folded out before it
+        # is looked up here, so an entry carrying any of those — or a capital,
+        # or a space, or no characters at all — can never match, and reads as
+        # coverage that does not exist.
+        for marker in sorted(ENCODE_TOKENS):
+            self.assertEqual(marker, marker.lower(), marker)
+            self.assertTrue(marker.isalnum(), marker)
+
+    def test_it_claims_nothing_that_could_be_part_of_a_name(self):
+        # The first three are name text. The rest are encode-ADJACENT and left
+        # out on purpose: each is also an ordinary word or an audio container,
+        # and this list may only hold spellings that could not be a name.
+        for token in ("crane", "marsh", "kettle",
+                      "hd", "sd", "mp3", "flac", "opus", "web", "ray", "bit"):
+            self.assertNotIn(token, ENCODE_MARKERS, token)
 
 
 class SlugMatchPolicy(unittest.TestCase):
