@@ -8,7 +8,10 @@ import inspect
 import unittest
 
 from cronicled.jobs import COST_CLASS_LIMITS, JobRunner
+from cronicled.stash import StashError
+from cronicled.stashbox import TagCatalogue
 from cronicled.store import Store
+from cronicled.tag_descriptions import SUBJECT_TYPE as TAG_SUBJECT
 from cronicled.tags import (COUNTS_COVER, SUBJECT_TYPE, UNDECIDED_EVEN,
                             UNDECIDED_MANY, TagMergeProducer, Counts,
                             cluster_tags, proposal, select)
@@ -17,13 +20,19 @@ FOLDER = "library"
 WAIT = 10
 
 
-def tag(id, name, scene_count=0, aliases=()):
+def tag(id, name, scene_count=0, aliases=(), description=None):
     """One row shaped exactly as `Stash.all_tags` returns it -- `id`, `name`,
-    `aliases` and `scene_count`, and nothing else. Written from that method's
-    own selection set rather than from what this module happens to read, so a
-    field the client stops selecting is a failure here."""
+    `aliases`, `description` and `scene_count`, and nothing else. Written from
+    that method's own selection set rather than from what this module happens
+    to read, so a field the client stops selecting is a failure here.
+
+    `description` defaults to `None`, which is what the server really returns
+    for a tag nobody has described -- never `""`. The apply path compares the
+    server's value against the one a proposal recorded, so a fixture that
+    normalised the two would be testing a comparison production never makes.
+    """
     return {"id": str(id), "name": name, "aliases": list(aliases),
-            "scene_count": scene_count}
+            "description": description, "scene_count": scene_count}
 
 
 class FakeCtx:
@@ -43,27 +52,96 @@ class FakeCtx:
 
 
 class FakeStash:
-    """The one read a tag-merge pass makes, and nothing else.
+    """The two reads a tag pass makes, and nothing else.
 
     Any other attribute refuses: this pass proposes and never writes, and a
     write introduced here is meant to show up as a failure rather than as a
     silently tolerated call.
+
+    `stash_box_credentials` answers a LIST, like the real one, and never a
+    mapping. The pass treats its order as the operator's configured
+    preference, so a double that handed back something whose order was
+    incidental would let an order test pass against a property production
+    does not have.
     """
 
-    def __init__(self, tags):
+    def __init__(self, tags, boxes=()):
         self._tags = list(tags)
+        self._boxes = list(boxes)
         self.calls = []
 
     def all_tags(self):
         self.calls.append("all_tags")
         return list(self._tags)
 
+    def stash_box_credentials(self):
+        self.calls.append("stash_box_credentials")
+        return list(self._boxes)
+
     def __getattr__(self, name):
         def refuse(*args, **kwargs):
             raise AssertionError(
-                "the tag-merge pass called %r on the media server; it reads "
-                "the tag list and proposes, it never writes" % (name,))
+                "the tag pass called %r on the media server; it reads the tag "
+                "list and the configured sources and proposes, it never "
+                "writes" % (name,))
         return refuse
+
+
+class FakeBoxClient:
+    """Stands in for `cronicled.stashbox.StashBox` -- the constructor and the
+    ONE call the tag pass makes on it.
+
+    Keyed by the base url the pass built, so a test can see that the
+    `/graphql` a media server stores against a box was trimmed off before the
+    client appended its own. Every answer is a real `TagCatalogue`, never a
+    plain list: the pass reads `complete` off it, and a double that carried
+    only the tags would let a test pass against a shape production never
+    hands back.
+    """
+
+    def __init__(self, catalogues):
+        self._catalogues = dict(catalogues)
+        self.asked = []
+
+    def __call__(self, url, api_key):
+        self.asked.append((url, api_key))
+        return _FakeBox(self._catalogues[url])
+
+
+class _FakeBox:
+    def __init__(self, answer):
+        self._answer = answer
+
+    def all_tags(self):
+        if isinstance(self._answer, Exception):
+            raise self._answer
+        return self._answer
+
+
+def box_credential(name, endpoint=None, api_key=None):
+    """One entry as `Stash.stash_box_credentials` returns it. `.invalid` is
+    the reserved TLD that can never resolve, so nothing here could reach
+    anything even if the fake client were removed by accident."""
+    return {"name": name,
+            "endpoint": endpoint or "https://%s.invalid/graphql" % name,
+            "api_key": api_key or ("key-" + name)}
+
+
+def box_tag(name, description, aliases=()):
+    """One row as `StashBox.all_tags` returns it, with every field the query
+    selects."""
+    return {"id": "b-" + name, "name": name, "description": description,
+            "aliases": list(aliases)}
+
+
+def catalogue(tags, complete=True):
+    return TagCatalogue(tags, complete=complete)
+
+
+# Two visibly different sentences, so no assertion below can pass by
+# comparing a value against itself. Both invented.
+LANTERN = "Scenes lit only by a hand-carried lamp."
+FERRY = "Filmed aboard a working passenger boat."
 
 
 class Clustering(unittest.TestCase):
@@ -129,9 +207,31 @@ class Clustering(unittest.TestCase):
         # the one wrong answer this cannot afford: it puts "this merge moves
         # nothing" in front of somebody about to authorise an irreversible
         # write.
+        #
+        # `description` is PRESENT on both rows so that the only field missing
+        # is the one this test is named for. Left out as well, either indexed
+        # read satisfies the assertion and neither is pinned -- the
+        # over-determined fixture that let the description read drift to a
+        # default with the suite green.
         with self.assertRaises(KeyError):
-            cluster_tags([{"id": "1", "name": "Velvet Crane", "aliases": []},
-                          {"id": "2", "name": "VelvetCrane", "aliases": []}])
+            cluster_tags([{"id": "1", "name": "Velvet Crane", "aliases": [],
+                           "description": None},
+                          {"id": "2", "name": "VelvetCrane", "aliases": [],
+                           "description": None}])
+
+    def test_a_row_with_no_description_raises_rather_than_reading_as_blank(self):
+        # The sibling, and the same reasoning one step further on. A merge
+        # DELETES the losing spellings, so a description living on one of them
+        # exists only until the merge runs. Read with a default, a malformed
+        # row says "this spelling describes nothing", which is precisely the
+        # reading under which the text is destroyed and nothing records that
+        # there was any. Every other field on the row is present, so this can
+        # only be the description raising.
+        with self.assertRaises(KeyError):
+            cluster_tags([{"id": "1", "name": "Velvet Crane", "aliases": [],
+                           "scene_count": 2},
+                          {"id": "2", "name": "VelvetCrane", "aliases": [],
+                           "scene_count": 1}])
 
 
 class WhichSpellingSurvives(unittest.TestCase):
@@ -239,7 +339,7 @@ class ProposalShape(unittest.TestCase):
         cluster = cluster_tags([tag(1, "Velvet Crane", scene_count=12),
                                 tag(9, "VelvetCrane", scene_count=4)])[0]
 
-        self.assertEqual(proposal(cluster, FOLDER), {
+        self.assertEqual(proposal(cluster, FOLDER, []), {
             "folder": FOLDER,
             "subject_type": SUBJECT_TYPE,
             "subject_id": "velvetcrane",
@@ -248,13 +348,17 @@ class ProposalShape(unittest.TestCase):
             "payload": {
                 "key": "velvetcrane",
                 "members": [
-                    {"id": "1", "name": "Velvet Crane", "scene_count": 12},
-                    {"id": "9", "name": "VelvetCrane", "scene_count": 4},
+                    {"id": "1", "name": "Velvet Crane", "scene_count": 12,
+                     "description": None},
+                    {"id": "9", "name": "VelvetCrane", "scene_count": 4,
+                     "description": None},
                 ],
                 "canonical": {"id": "1", "name": "Velvet Crane",
-                              "scene_count": 12},
+                              "scene_count": 12, "description": None},
                 "undecided": None,
                 "counts_cover": COUNTS_COVER,
+                "description": {"text": None, "from_tag": None,
+                                "from_box": None, "conflicting": []},
             },
         })
 
@@ -263,7 +367,7 @@ class ProposalShape(unittest.TestCase):
                                 tag(2, "Ivy MayKingsley", scene_count=2),
                                 tag(3, "Ivy May Kingsley", scene_count=3)])[0]
 
-        self.assertEqual(proposal(cluster, FOLDER), {
+        self.assertEqual(proposal(cluster, FOLDER, []), {
             "folder": FOLDER,
             "subject_type": SUBJECT_TYPE,
             "subject_id": "ivymaykingsley",
@@ -272,13 +376,18 @@ class ProposalShape(unittest.TestCase):
             "payload": {
                 "key": "ivymaykingsley",
                 "members": [
-                    {"id": "3", "name": "Ivy May Kingsley", "scene_count": 3},
-                    {"id": "2", "name": "Ivy MayKingsley", "scene_count": 2},
-                    {"id": "1", "name": "IvyMayKingsley", "scene_count": 1},
+                    {"id": "3", "name": "Ivy May Kingsley", "scene_count": 3,
+                     "description": None},
+                    {"id": "2", "name": "Ivy MayKingsley", "scene_count": 2,
+                     "description": None},
+                    {"id": "1", "name": "IvyMayKingsley", "scene_count": 1,
+                     "description": None},
                 ],
                 "canonical": None,
                 "undecided": UNDECIDED_MANY,
                 "counts_cover": COUNTS_COVER,
+                "description": {"text": None, "from_tag": None,
+                                "from_box": None, "conflicting": []},
             },
         })
 
@@ -287,7 +396,7 @@ class ProposalShape(unittest.TestCase):
         # by is the one that came back with the tag.
         cluster = cluster_tags([tag(1, "Velvet Crane", scene_count=1187),
                                 tag(9, "VelvetCrane", scene_count=2)])[0]
-        payload = proposal(cluster, FOLDER)["payload"]
+        payload = proposal(cluster, FOLDER, [])["payload"]
 
         self.assertEqual([m["scene_count"] for m in payload["members"]],
                          [1187, 2])
@@ -298,7 +407,20 @@ class ProposalShape(unittest.TestCase):
         # certainty nothing computed.
         cluster = cluster_tags([tag(1, "Velvet Crane"), tag(9, "VelvetCrane")])[0]
 
-        self.assertNotIn("confidence", proposal(cluster, FOLDER))
+        self.assertNotIn("confidence", proposal(cluster, FOLDER, []))
+
+    def test_the_sources_are_a_required_argument_with_no_default(self):
+        # A merge is where a description gets destroyed, so what the survivor
+        # should end up with is part of what a person is approving. Given a
+        # default, a caller who simply forgot the argument builds a proposal
+        # whose payload says "no source has anything to carry" about sources it
+        # never asked -- indistinguishable, on the page and in the store, from
+        # a pass that asked every one of them and found nothing. An empty
+        # sequence is a legitimate value saying the opposite: there were none.
+        cluster = cluster_tags([tag(1, "Velvet Crane"), tag(9, "VelvetCrane")])[0]
+
+        with self.assertRaises(TypeError):
+            proposal(cluster, FOLDER)
 
 
 class Selection(unittest.TestCase):
@@ -391,10 +513,12 @@ class Producer(unittest.TestCase):
         self.addCleanup(self.store.close)
         self.ctx = FakeCtx()
 
-    def build(self, tags, **kwargs):
-        self.stash = FakeStash(tags)
+    def build(self, tags, boxes=(), catalogues=None, **kwargs):
+        self.stash = FakeStash(tags, boxes)
+        self.boxes = FakeBoxClient(catalogues or {})
         kwargs.setdefault("folder", FOLDER)
-        return TagMergeProducer(self.stash, store=self.store, **kwargs)
+        return TagMergeProducer(self.stash, store=self.store,
+                                box_client=self.boxes, **kwargs)
 
     def run_pass(self, tags, **kwargs):
         return list(self.build(tags, **kwargs).produce(self.ctx))
@@ -412,12 +536,16 @@ class Producer(unittest.TestCase):
         self.assertEqual(self.stash.calls, [])
         stream.close()
 
-    def test_it_is_not_in_the_rate_limited_cost_class(self):
-        # One paged read of the server's own tag list -- no third-party
-        # scraper. Filed under `scraping` it would serialise behind a
-        # full-library scrape for nothing.
-        self.assertEqual(self.build([]).cost, "local")
-        self.assertIsNone(COST_CLASS_LIMITS["local"])
+    def test_it_is_in_the_cost_class_that_rations_stash_box_reads(self):
+        # It used to be `local`, when the pass read nothing but the media
+        # server's own tag list. It now reads each configured stash-box's
+        # WHOLE tag catalogue, which is the rate-limited resource the `box`
+        # class exists to ration -- the same reads
+        # `StashBoxCheckProducer` is classed for. Under `local` it would page
+        # a public service unlimited and in parallel with the box check,
+        # spending that budget where nothing counts it.
+        self.assertEqual(self.build([]).cost, "box")
+        self.assertEqual(COST_CLASS_LIMITS["box"], 1)
 
     def test_it_yields_one_proposal_per_cluster(self):
         proposals = self.run_pass([tag(1, "Velvet Crane", scene_count=12),
@@ -484,6 +612,377 @@ class Producer(unittest.TestCase):
 
         self.assertEqual(recorded, [1, 0])
         self.assertEqual(len(self.store.items(folder=FOLDER)), 1)
+
+
+class DescriptionsInTheSamePass(unittest.TestCase):
+    """The other half of the one read: a description for every blank tag a
+    configured source already describes, and none for any other."""
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+        self.ctx = FakeCtx()
+
+    def build(self, tags, boxes=(), catalogues=None, **kwargs):
+        self.stash = FakeStash(tags, boxes)
+        self.boxes = FakeBoxClient(catalogues or {})
+        kwargs.setdefault("folder", FOLDER)
+        return TagMergeProducer(self.stash, store=self.store,
+                                box_client=self.boxes, **kwargs)
+
+    def run_pass(self, tags, **kwargs):
+        return list(self.build(tags, **kwargs).produce(self.ctx))
+
+    def one_box(self, tags, box_tags, **kwargs):
+        """One configured source holding `box_tags`, asked about `tags`."""
+        return self.run_pass(
+            tags, boxes=[box_credential("first")],
+            catalogues={"https://first.invalid": catalogue(box_tags)},
+            **kwargs)
+
+    def test_the_whole_proposal_for_a_tag_a_source_describes(self):
+        # The WHOLE dict. A `source_box` that silently defaulted is
+        # indistinguishable from one that was set, and it is the only thing
+        # that tells a reviewer anybody wrote this sentence at all.
+        proposals = self.one_box([tag(7, "Lantern Work")],
+                                 [box_tag("Lantern Work", LANTERN)])
+
+        self.assertEqual(proposals, [{
+            "folder": FOLDER,
+            "subject_type": TAG_SUBJECT,
+            "subject_id": "7",
+            "summary": "Lantern Work: first has a description for this tag",
+            "confidence": None,
+            "payload": {"name": "Lantern Work", "field": "description",
+                        "original": None, "description": LANTERN,
+                        "source_box": "first"},
+        }])
+
+    def test_a_tag_no_source_describes_gets_no_proposal_at_all(self):
+        # THE rule. Not a sentence composed from the name, not one summarised
+        # from the scenes carrying it, not a similar tag's text -- a
+        # generated description reads exactly like a written one and cannot
+        # be told from it afterwards. The tag stays visibly blank.
+        proposals = self.one_box([tag(7, "Copper Kettle")],
+                                 [box_tag("Lantern Work", LANTERN)])
+
+        self.assertEqual(proposals, [])
+
+    def test_a_tag_matched_through_the_sources_alias_is_proposed(self):
+        # Most of the real coverage arrives this way. A suite using only name
+        # fixtures would leave a names-only pass looking correct.
+        proposals = self.one_box(
+            [tag(7, "Lamplight")],
+            [box_tag("Lantern Work", LANTERN, aliases=["Lamplight"])])
+
+        self.assertEqual([p["subject_id"] for p in proposals], ["7"])
+        self.assertEqual(proposals[0]["payload"]["description"], LANTERN)
+
+    def test_a_tag_that_already_has_a_description_is_left_alone(self):
+        # Somebody wrote it. A source's sentence must not displace it.
+        proposals = self.one_box([tag(7, "Lantern Work", description=FERRY)],
+                                 [box_tag("Lantern Work", LANTERN)])
+
+        self.assertEqual(proposals, [])
+
+    def test_a_tag_with_a_duplicate_spelling_is_left_to_its_merge(self):
+        # A merge proposal and a description proposal for one tag reaching a
+        # reviewer as two unrelated rows is how somebody approves both and
+        # gets a result neither described: the merge deletes the tag the
+        # description was written onto.
+        proposals = self.one_box(
+            [tag(7, "Lantern Work"), tag(8, "LanternWork")],
+            [box_tag("Lantern Work", LANTERN)])
+
+        self.assertEqual([p["subject_type"] for p in proposals],
+                         [SUBJECT_TYPE])
+
+    def test_the_merge_carries_what_the_source_holds_for_the_survivor(self):
+        # And it arrives on the merge row rather than as a second row.
+        proposals = self.one_box(
+            [tag(7, "Lantern Work", scene_count=9),
+             tag(8, "LanternWork", scene_count=1)],
+            [box_tag("Lantern Work", LANTERN)])
+
+        self.assertEqual(proposals[0]["payload"]["description"],
+                         {"text": LANTERN, "from_tag": None,
+                          "from_box": "first", "conflicting": []})
+
+    def test_a_tag_in_a_cluster_this_run_did_not_propose_is_still_left_alone(self):
+        # ANY cluster, not only one this run proposed. Here the merge is MUTED,
+        # so no merge row exists and the description proposal would be the only
+        # row for either tag -- which is exactly when it looks harmless. It is
+        # not: the two spellings still have one unsettled identity, and a
+        # description approved now attaches a definition to whichever of them
+        # survives a merge somebody settles later. A mute says nobody wants to
+        # be asked again; it does not say which spelling won.
+        #
+        # Testing this through a SELECTED cluster cannot fail: `selected` and
+        # `clusters` hold the same thing when nothing has been muted or
+        # proposed, so the two readings are indistinguishable there.
+        self.store.mute(SUBJECT_TYPE, "lanternwork")
+
+        proposals = self.one_box(
+            [tag(7, "Lantern Work"), tag(8, "LanternWork")],
+            [box_tag("Lantern Work", LANTERN)])
+
+        self.assertEqual(proposals, [])
+
+    def test_the_closing_line_reports_keys_dropped_as_ambiguous(self):
+        # A source claiming one key with two different descriptions has them
+        # dropped rather than resolved, and the count is the signal that a
+        # source's aliases have stopped being usable as keys. Logged only where
+        # it is found it reaches nobody: `JobRunner._log` keeps ONE field, so
+        # every line written during the read is overwritten before the job
+        # finishes -- which is why the total travels to the closing line.
+        #
+        # ONE collision in the first source and TWO in the second, so the
+        # expected 3 is a number no simpler rule reaches. A total that added
+        # one per source would say 2, and one that assigned rather than
+        # accumulated would say 2 as well -- the second source's count,
+        # overwriting the first. A fixture with a single collision in a single
+        # source cannot separate any of the three.
+        self.run_pass(
+            [tag(7, "Pewter Hinge")],
+            boxes=[box_credential("first"), box_credential("second")],
+            catalogues={
+                "https://first.invalid": catalogue([
+                    box_tag("Lantern Work", LANTERN, aliases=["Brass Ferry"]),
+                    box_tag("Brass Ferry", FERRY)]),
+                "https://second.invalid": catalogue([
+                    box_tag("Copper Kettle", LANTERN,
+                            aliases=["Slate Harbour"]),
+                    box_tag("Slate Harbour", FERRY),
+                    box_tag("Amber Quill", LANTERN, aliases=["Ivory Latch"]),
+                    box_tag("Ivory Latch", FERRY)])})
+
+        self.assertIn("3 source alias key(s) dropped as ambiguous",
+                      self.ctx.message)
+
+    def test_a_source_with_no_colliding_aliases_reports_no_dropped_keys(self):
+        # The other half. A permanent "0 dropped" on every run is noise, and
+        # noise in the one line a finished job keeps is what stops the line
+        # being read at all.
+        self.one_box([tag(7, "Copper Kettle")],
+                     [box_tag("Lantern Work", LANTERN)])
+
+        self.assertNotIn("dropped as ambiguous", self.ctx.message)
+
+    def test_every_tag_is_accounted_for_by_one_of_the_four_reasons(self):
+        # The identity `total == described + clustered + outstanding +
+        # beyond_reach`, asserted against the counts the PASS built from a real
+        # library rather than against a hand-made `Counts`. A dataclass
+        # satisfying the identity for numbers a test chose says nothing about
+        # whether a tag can fall out of the pass for a reason nobody named --
+        # and a tag that vanished silently is the failure no per-field check
+        # can see. All four reasons are represented here, so the sum is not
+        # reachable by accident.
+        tags = [tag(7, "Lantern Work"),                    # outstanding
+                tag(8, "Copper Kettle"),                   # beyond reach
+                tag(9, "Brass Ferry", description=FERRY),  # already described
+                tag(1, "Velvet Crane", scene_count=2),     # clustered
+                tag(2, "VelvetCrane", scene_count=1)]      # clustered
+        producer = self.build(
+            tags, boxes=[box_credential("first")],
+            catalogues={"https://first.invalid":
+                        catalogue([box_tag("Lantern Work", LANTERN)])})
+        indexes, unread, _ = producer._indexes(self.ctx)
+
+        _, counts = producer._describe(tags, cluster_tags(tags), indexes,
+                                       unread)
+
+        self.assertEqual(counts.total, len(tags))
+        self.assertEqual(counts.total,
+                         counts.described + counts.clustered
+                         + counts.outstanding + counts.beyond_reach)
+        self.assertEqual((counts.described, counts.clustered,
+                          counts.outstanding, counts.beyond_reach),
+                         (1, 2, 1, 1))
+
+
+class WhichSourceThePassAsks(unittest.TestCase):
+    """Configured order, first hit wins, read off the media server's own
+    list."""
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+        self.ctx = FakeCtx()
+
+    def run_with(self, credentials):
+        # ASYMMETRIC on purpose: the two sources describe the shared tag
+        # differently, and only the second holds "Slate Harbour". Reversing
+        # them changes both the text and the named source, and changes which
+        # tags are covered at all -- a symmetric fixture could not detect an
+        # order mutation.
+        catalogues = {
+            "https://first.invalid": catalogue(
+                [box_tag("Lantern Work", LANTERN)]),
+            "https://second.invalid": catalogue(
+                [box_tag("Lantern Work", FERRY),
+                 box_tag("Slate Harbour", "Shot on a stone quay.")]),
+        }
+        stash = FakeStash([tag(7, "Lantern Work"), tag(8, "Slate Harbour")],
+                          credentials)
+        producer = TagMergeProducer(stash, store=self.store, folder=FOLDER,
+                                    box_client=FakeBoxClient(catalogues))
+        return {p["subject_id"]: p["payload"] for p in producer.produce(self.ctx)}
+
+    def test_the_first_configured_source_wins(self):
+        payloads = self.run_with([box_credential("first"),
+                                  box_credential("second")])
+
+        self.assertEqual(payloads["7"]["description"], LANTERN)
+        self.assertEqual(payloads["7"]["source_box"], "first")
+
+    def test_reversing_the_configured_order_reverses_the_answer(self):
+        # The other half. Without it, "first wins" and "last wins" both
+        # satisfy the assertion above.
+        payloads = self.run_with([box_credential("second"),
+                                  box_credential("first")])
+
+        self.assertEqual(payloads["7"]["description"], FERRY)
+        self.assertEqual(payloads["7"]["source_box"], "second")
+
+    def test_a_later_source_answers_what_the_first_has_nothing_for(self):
+        payloads = self.run_with([box_credential("first"),
+                                  box_credential("second")])
+
+        self.assertEqual(payloads["8"]["source_box"], "second")
+
+    def test_each_source_is_asked_at_its_own_address_with_its_own_key(self):
+        # The media server stores a box's address as the GraphQL endpoint
+        # itself; the client appends `/graphql` of its own. Handed one
+        # straight to the other, every configured source is asked for
+        # `/graphql/graphql` and silently contributes nothing.
+        stash = FakeStash([], [box_credential("first"),
+                               box_credential("second")])
+        boxes = FakeBoxClient({
+            "https://first.invalid": catalogue([]),
+            "https://second.invalid": catalogue([]),
+        })
+        list(TagMergeProducer(stash, store=self.store, folder=FOLDER,
+                              box_client=boxes).produce(self.ctx))
+
+        self.assertEqual(boxes.asked, [("https://first.invalid", "key-first"),
+                                       ("https://second.invalid", "key-second")])
+
+
+class WhenASourceCannotBeRead(unittest.TestCase):
+    """A source failing is evidence about the network, never about a tag."""
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+        self.ctx = FakeCtx()
+
+    def run_with(self, first_answer, tags=None):
+        catalogues = {
+            "https://first.invalid": first_answer,
+            "https://second.invalid": catalogue(
+                [box_tag("Slate Harbour", "Shot on a stone quay.")]),
+        }
+        if tags is None:
+            tags = [tag(7, "Lantern Work"), tag(8, "Slate Harbour"),
+                    tag(1, "Velvet Crane", scene_count=2),
+                    tag(2, "VelvetCrane", scene_count=1)]
+        stash = FakeStash(tags, [box_credential("first"),
+                                 box_credential("second")])
+        producer = TagMergeProducer(stash, store=self.store, folder=FOLDER,
+                                    box_client=FakeBoxClient(catalogues))
+        return list(producer.produce(self.ctx))
+
+    def test_the_other_sources_answers_survive_it(self):
+        proposals = self.run_with(StashError("host wedged", transient=True))
+
+        self.assertIn("8", [p["subject_id"] for p in proposals
+                            if p["subject_type"] == TAG_SUBJECT])
+
+    def test_the_rest_of_the_pass_survives_it(self):
+        # The merges come from the media server's own read and have nothing
+        # to do with any source; losing them to a box being down would be a
+        # network blip taking out work that never needed the network.
+        proposals = self.run_with(StashError("host wedged", transient=True))
+
+        self.assertEqual([p["subject_id"] for p in proposals
+                          if p["subject_type"] == SUBJECT_TYPE],
+                         ["velvetcrane"])
+
+    def test_it_is_never_reported_as_no_source_describing_the_tag(self):
+        # The harm: a night of network trouble reporting itself as a
+        # permanent backlog, and getting planned around.
+        self.run_with(StashError("host wedged", transient=True))
+
+        self.assertIn("could not be read in full", self.ctx.message)
+        self.assertNotIn("no configured source describes", self.ctx.message)
+
+    def test_every_source_answering_says_so_in_the_other_words(self):
+        # The two wordings are deliberately not one sentence with a number
+        # changed: "no configured source describes them" is a claim about the
+        # sources, and it has been established here and not above.
+        self.run_with(catalogue([box_tag("Lantern Work", LANTERN)]))
+
+        self.assertIn("no configured source describes", self.ctx.message)
+        self.assertNotIn("could not be read in full", self.ctx.message)
+
+    def test_a_partly_read_source_counts_the_same_as_one_that_failed(self):
+        # The page that was not read is exactly where the missing description
+        # would be.
+        self.run_with(catalogue([box_tag("Lantern Work", LANTERN)],
+                                complete=False))
+
+        self.assertIn("could not be read in full", self.ctx.message)
+
+    def test_a_description_found_in_a_partly_read_source_is_still_found(self):
+        # A page that was never fetched cannot un-find a tag already in hand.
+        proposals = self.run_with(
+            catalogue([box_tag("Lantern Work", LANTERN)], complete=False))
+
+        self.assertIn("7", [p["subject_id"] for p in proposals
+                            if p["subject_type"] == TAG_SUBJECT])
+
+
+class TheBacklogFigure(unittest.TestCase):
+    """The count this reports as outstanding, and what it leaves out."""
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+        self.ctx = FakeCtx()
+
+    def run_pass(self, tags, box_tags):
+        stash = FakeStash(tags, [box_credential("first")])
+        boxes = FakeBoxClient({"https://first.invalid": catalogue(box_tags)})
+        return list(TagMergeProducer(stash, store=self.store, folder=FOLDER,
+                                     box_client=boxes).produce(self.ctx))
+
+    def test_it_counts_only_the_tags_a_source_can_actually_describe(self):
+        # Three of the four are undescribed; one of those three is all this
+        # can ever help with. A backlog figure that said 3 would describe
+        # work no amount of running this will clear, and a number that cannot
+        # go down stops being read.
+        self.run_pass([tag(7, "Lantern Work"),
+                       tag(8, "Copper Kettle"),
+                       tag(9, "Slate Harbour"),
+                       tag(10, "Brass Ferry", description=FERRY)],
+                      [box_tag("Lantern Work", LANTERN)])
+
+        self.assertIn("1 descriptions proposed", self.ctx.message)
+        self.assertIn("2 no configured source describes", self.ctx.message)
+        self.assertIn("1 tags already described", self.ctx.message)
+
+    def test_the_closing_line_carries_both_halves_of_the_pass(self):
+        # A finished job keeps ONE message, so the merges and the
+        # descriptions have to be in the same sentence or one of them is lost
+        # the moment the other is logged.
+        self.run_pass([tag(1, "Velvet Crane", scene_count=2),
+                       tag(2, "VelvetCrane", scene_count=1),
+                       tag(7, "Lantern Work")],
+                      [box_tag("Lantern Work", LANTERN)])
+
+        self.assertIn("1 clusters", self.ctx.message)
+        self.assertIn("1 descriptions proposed", self.ctx.message)
+        self.assertIn("2 left to their merge", self.ctx.message)
 
 
 if __name__ == "__main__":

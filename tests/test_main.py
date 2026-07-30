@@ -100,6 +100,13 @@ class _ReadOnlyStash:
         self.calls.append(("all_tags",))
         return []
 
+    def stash_box_credentials(self):
+        # The tag pass's second read. An install with no stash-box configured
+        # is an ordinary state and is what these wiring tests want: the pass
+        # asks nobody for a description and still runs to a real finish.
+        self.calls.append(("stash_box_credentials",))
+        return []
+
     def scrape_scene_url(self, url):
         self.calls.append(("scrape_scene_url", url))
         return None
@@ -163,10 +170,10 @@ class _Base(unittest.TestCase):
         it. Opened and closed before `main()` runs its own `Store`."""
         store = Store(self.db_path)
         built = tag_proposal(cluster_tags([
-            {"id": "1", "name": "Velvet Crane", "aliases": [],
+            {"id": "1", "name": "Velvet Crane", "aliases": [], "description": None,
              "scene_count": 12},
-            {"id": "9", "name": "VelvetCrane", "aliases": [],
-             "scene_count": 4}])[0], "library")
+            {"id": "9", "name": "VelvetCrane", "aliases": [], "description": None,
+             "scene_count": 4}])[0], "library", [])
         fp = store.record(folder=built["folder"],
                           subject_type=built["subject_type"],
                           subject_id=built["subject_id"],
@@ -1184,7 +1191,10 @@ class ScheduledScanWiring(_Base):
         self.assertTrue(self.runner.wait(job_id, WAIT))
         job = self.runner.job(job_id)
         self.assertEqual(job.state, "done", job.traceback)
-        self.assertEqual(job.cost, "local")
+        # `box`, not `local`: the pass reads each configured stash-box's whole
+        # tag catalogue, which is the rate-limited resource that class exists
+        # to ration.
+        self.assertEqual(job.cost, "box")
         self.assertIn(("all_tags",), self.stash.calls)
         self.assertEqual(self.store.last_run(TagMergeProducer.name), result.at)
 

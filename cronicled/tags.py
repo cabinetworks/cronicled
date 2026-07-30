@@ -78,6 +78,8 @@ carries no snapshot and why `cronicled.web.rows.to_merge_row` has no
 """
 from dataclasses import dataclass
 
+from cronicled import tag_descriptions
+from cronicled.stashbox import StashBox, base_url
 from cronicled.text import normalize, spaceless
 
 # This module's subject. Named rather than inlined for the reason
@@ -197,9 +199,17 @@ def _member(tag):
     as zero because a field was missing is the one wrong answer this cannot
     afford, so a missing field raises here, where the malformed row is still
     in hand.
+
+    `description` is carried for the same reason and read the same way. A
+    merge deletes the losing spellings, so a description that lives on one of
+    them is destroyed by the merge unless something notices it first (see
+    `cronicled.tag_descriptions.merge_description`); a missing field read back
+    as "no description" is exactly the reading under which it disappears
+    without anybody being told.
     """
     return {"id": str(tag["id"]), "name": tag["name"],
-            "scene_count": tag["scene_count"]}
+            "scene_count": tag["scene_count"],
+            "description": tag["description"]}
 
 
 def _separation(name):
@@ -335,14 +345,64 @@ def _summary(cluster):
                   for m in cluster.members))
 
 
-def proposal(cluster, folder):
+def _describe_summary(counts, dropped_keys):
+    """The description half of the pass, in one line.
+
+    `dropped_keys` -- alias keys two of one source's own tags claimed with
+    different descriptions -- is reported HERE rather than only where it is
+    found, and that is the whole reason it is threaded this far. `JobRunner
+    ._log` keeps one field: the line `_indexes` writes when it drops a key is
+    overwritten by this one before any operator sees it, so a count logged
+    only there is a count nobody can ever read. Reported only when it is
+    non-zero, because a source with no colliding aliases has nothing to say
+    and a permanent "0 dropped" is noise that stops being read.
+
+    REQUIRED, with no default, on the same terms as `proposal`'s `indexes`: a
+    caller who forgot it would compose a line saying nothing was dropped, and
+    "this pass dropped no ambiguous keys" and "this caller did not pass the
+    count" must not be able to render as the same sentence.
+
+    The `beyond_reach` figure is worded by whether every configured source was
+    actually read, and the two wordings are deliberately not the same sentence
+    with a number changed. "no configured source describes them" is a claim
+    about the sources; when one of them failed or was read only partly, that
+    claim has not been established for a single one of those tags, and the
+    line says what it really knows instead -- otherwise a night of network
+    trouble reports itself as a permanent backlog and gets planned around.
+    """
+    if counts.boxes_unread:
+        reach = ("%d found nothing in the sources that answered, but %d "
+                 "source(s) could not be read in full, so that is not a "
+                 "verdict on them" % (counts.beyond_reach, counts.boxes_unread))
+    else:
+        reach = ("%d no configured source describes" % counts.beyond_reach)
+    dropped = ""
+    if dropped_keys:
+        dropped = (", %d source alias key(s) dropped as ambiguous"
+                   % dropped_keys)
+    return ("%d descriptions proposed (%d tags already described, %d left to "
+            "their merge, %s%s)" % (counts.outstanding, counts.described,
+                                    counts.clustered, reach, dropped))
+
+
+def proposal(cluster, folder, indexes):
     """One cluster as the proposal dict a producer yields.
 
     `confidence` is deliberately absent. The store documents it as a 0-to-1
     score and enforces that range; a merge is not scored, and putting 1.0
     there would state a certainty nothing computed. `cronicled.web.rows
     .to_merge_row` says what this proposal knows in words instead.
+
+    `indexes` -- the configured sources, in order -- is REQUIRED and has no
+    default. A merge is where a description gets destroyed, so what the
+    survivor should end up with is part of what a person is approving, and a
+    caller that forgot the argument must not be able to build a proposal that
+    silently says "no source has anything" about sources it never asked. An
+    empty sequence is a legitimate value and says the opposite: there were no
+    sources.
     """
+    description = tag_descriptions.merge_description(
+        cluster.members, cluster.canonical, indexes)
     return {
         "folder": folder,
         "subject_type": SUBJECT_TYPE,
@@ -354,34 +414,59 @@ def proposal(cluster, folder):
             "canonical": dict(cluster.canonical) if cluster.canonical else None,
             "undecided": cluster.undecided,
             "counts_cover": COUNTS_COVER,
+            "description": description.as_payload(),
         },
     }
 
 
 class TagMergeProducer:
-    """Reads every tag the media server holds and proposes a merge for each
-    cluster of spellings.
+    """Reads every tag the media server holds ONCE and proposes, from that one
+    read, both halves of what is wrong with a library's tag vocabulary: a
+    merge for each cluster of spellings, and a description for each blank tag
+    a configured stash-box already describes.
+
+    ONE PASS, NOT TWO, and that is a decision rather than a convenience. The
+    two findings meet on the same tag constantly -- a merge deletes spellings,
+    and a description proposal attached to a spelling that is about to be
+    deleted is a row pointing the opposite way from the row beside it. Reaching
+    a reviewer as two unrelated rows is how a person approves both and gets a
+    result neither described. So a tag inside a cluster is never offered a
+    description of its own here: what the survivor should end up with is part
+    of the merge proposal (`cronicled.tag_descriptions.merge_description`),
+    where it is judged together with the merge that puts it at risk.
 
     `produce` is a generator for the reason every producer's is (see
     `cronicled.jobs`): the runner records each proposal as it is yielded, so
     a run that dies partway keeps what it already found.
 
-    `cost` is `local`, not `scraping`. The whole run is one paged read
-    against the media server's own tag list -- no third-party scraper, no
-    stash-box -- so it does not belong in the class that rations the
-    rate-limited resource, and serialising it behind a full-library scrape
-    would delay a cheap read for no gain.
+    `cost` IS `box`, and it used to be `local`. Reading each configured
+    stash-box's whole tag catalogue is precisely the rate-limited resource
+    `COST_CLASS_LIMITS["box"]` exists to ration -- the same catalogue reads
+    `cronicled.stashbox_scan.StashBoxCheckProducer` is classed for -- and a
+    pass that pages a public service under the unlimited class would spend
+    that budget where nothing counts it. The cost of being honest about it is
+    that a library with no box configured still queues under a limit of one;
+    that is a pass waiting its turn, which is recoverable, against a rate-limit
+    incident, which is not.
 
-    A scan NEVER writes here either: this proposes, and a person approves.
+    A pass NEVER writes: this proposes, and a person approves.
     """
 
     name = "tag-merge"
-    cost = "local"
+    cost = "box"
 
-    def __init__(self, stash, *, store, folder="library", every=None):
+    def __init__(self, stash, *, store, folder="library", every=None,
+                 box_client=None):
         self._stash = stash
         self._store = store
         self._folder = folder
+        # How a configured box's address and key become something to ask.
+        # Injected so a test can exercise the whole pass without a socket,
+        # exactly as `Stash`'s own transport is; the default is the one real
+        # client (`cronicled.stashbox.StashBox`), never a second hand-rolled
+        # one -- this project has been bitten by two clients for one service
+        # disagreeing.
+        self._box_client = box_client if box_client is not None else StashBox
         # The cadence this producer DECLARES, read off the object by
         # `cronicled.schedule.resolve`, which refuses an enabled producer
         # without one rather than inventing an interval. Set unconditionally,
@@ -389,8 +474,63 @@ class TagMergeProducer:
         # was decided and never an attribute that happens to be missing.
         self.every = every
 
+    def _indexes(self, ctx):
+        """`(indexes, unread, dropped_keys)`: every configured source's tag
+        catalogue in configured order, how many could not be read in full, and
+        how many alias keys were dropped as ambiguous across all of them.
+
+        A LIST, and the order is the media server's own -- which is the
+        operator's configured order, and the order `find_description` treats
+        as the preference. It is never keyed by box name on the way through:
+        the order is the answer, and a mapping would put it at the mercy of a
+        hash.
+
+        A source that raises is skipped and the rest are asked. Its failure is
+        evidence about the network, not about any tag, so it must not be able
+        to turn into "no source describes this" -- which is why it is COUNTED
+        as well as logged, and why the count travels with the answers rather
+        than being logged and forgotten. A source read only partly counts the
+        same way, for the same reason: the page that was not read is exactly
+        where the missing description would be.
+
+        `dropped_keys` travels back for the same reason and not merely for
+        symmetry. `JobRunner._log` keeps only the LAST message a job wrote, so
+        every line logged in this loop is overwritten before the job finishes;
+        a count that stayed here would be a number the code computes, states a
+        reason for, and no operator can ever read. The per-source lines are
+        kept for anyone watching a run live, and the total is returned so the
+        closing line can carry it.
+        """
+        indexes, unread, dropped_keys = [], 0, 0
+        for box in self._stash.stash_box_credentials():
+            name = box["name"]
+            try:
+                catalogue = self._box_client(
+                    base_url(box["endpoint"]), box["api_key"]).all_tags()
+            except Exception as exc:
+                unread += 1
+                ctx.log("%s could not be read (%s: %s); its tags are not in "
+                        "this pass, and nothing here says a tag it might "
+                        "describe has no description"
+                        % (name, type(exc).__name__, exc))
+                continue
+            if not catalogue.complete:
+                unread += 1
+                ctx.log("%s was read only partly (%d tags); what it holds "
+                        "beyond them is unknown, not absent"
+                        % (name, len(catalogue.tags)))
+            index = tag_descriptions.index_box(name, catalogue.tags)
+            if index.ambiguous:
+                dropped_keys += len(index.ambiguous)
+                ctx.log("%s: %d key(s) two of its tags claim with different "
+                        "descriptions, dropped rather than guessed at"
+                        % (name, len(index.ambiguous)))
+            indexes.append(index)
+        return indexes, unread, dropped_keys
+
     def produce(self, ctx):
         tags = self._stash.all_tags()
+        indexes, boxes_unread, dropped_keys = self._indexes(ctx)
         clusters = cluster_tags(tags)
         selected, counts = select(clusters, store=self._store,
                                   folder=self._folder)
@@ -404,5 +544,50 @@ class TagMergeProducer:
                                     counts.already_proposed, counts.muted))
         ctx.log(selection)
         for cluster in selected:
-            yield proposal(cluster, self._folder)
-        ctx.log("finished: %s" % selection)
+            yield proposal(cluster, self._folder, indexes)
+
+        described, counted = self._describe(tags, clusters, indexes,
+                                            boxes_unread)
+        yield from described
+        ctx.log("finished: %s; %s"
+                % (selection, _describe_summary(counted, dropped_keys)))
+
+    def _describe(self, tags, clusters, indexes, boxes_unread):
+        """`(proposals, Counts)` for the description half of the pass.
+
+        Built as a list rather than yielded straight out, so the closing log
+        line can report the whole tally in one message: `JobRunner._log` keeps
+        only the LAST thing a job said, and a count that is written before the
+        proposals it counts would be overwritten by every line after it.
+
+        A tag in ANY cluster is skipped, not only one in a cluster this run
+        proposed. A tag with a duplicate spelling has an unsettled identity --
+        which of two names it is has not been decided -- and describing it
+        before that is settled attaches a definition to whichever half of the
+        pair happens to survive. Muting the merge does not settle it either;
+        it only means nobody wants to be asked again.
+        """
+        clustered = {m["id"] for cluster in clusters for m in cluster.members}
+        proposals = []
+        described = in_cluster = beyond_reach = 0
+        for tag in tags:
+            if tag_descriptions.has_description(tag):
+                described += 1
+                continue
+            if str(tag["id"]) in clustered:
+                in_cluster += 1
+                continue
+            found = tag_descriptions.find_description(tag["name"], indexes)
+            if found is None:
+                # NOT a proposal, and nothing derived from the tag's name, its
+                # scenes or a similar tag's text. See
+                # `cronicled.tag_descriptions`' own docstring: an invented
+                # description cannot be told from a written one afterwards.
+                beyond_reach += 1
+                continue
+            proposals.append(tag_descriptions.proposal(
+                tag, found, folder=self._folder))
+        return proposals, tag_descriptions.Counts(
+            total=len(tags), described=described, clustered=in_cluster,
+            outstanding=len(proposals), beyond_reach=beyond_reach,
+            boxes_unread=boxes_unread)

@@ -7,6 +7,8 @@ from cronicled.jobs import JobRejected, JobRunner
 from cronicled.scan import Identified, fingerprint_outcome
 from cronicled.stash import Stash
 from cronicled.store import Store
+from cronicled.tag_descriptions import Found
+from cronicled.tag_descriptions import proposal as tag_description_proposal
 from cronicled.tags import cluster_tags
 from cronicled.tags import proposal as tag_proposal
 from cronicled.web.actions import Actions, ApplyFailed, UnknownProposal
@@ -805,6 +807,154 @@ def _description_item(**over):
     return item
 
 
+# -- tag-description proposals ---------------------------------------------- #
+#
+# Every tag name and description below is invented.
+
+TAG_DESCRIPTION = "Scenes lit only by a hand-carried lamp."
+OTHER_TAG_DESCRIPTION = "Filmed aboard a working passenger boat."
+
+
+class _FakeTagDescriptionStash:
+    """A media server holding one tag's description.
+
+    It carries the real client's LIMITATIONS: `apply_tag_description` refuses
+    when the current text is not what the caller expected, and
+    `revert_tag_description` refuses a snapshot that is missing or carries no
+    description -- both exactly as `cronicled.stash.Stash` does. A double that
+    wrote regardless would turn a missing guard into a passing test.
+
+    Every other write raises on sight. The dispatch under test is which write
+    a proposal's subject type reaches, and a double that answered them all
+    would be unable to tell a wrong dispatch from a right one.
+    """
+
+    def __init__(self, description=None):
+        self.description = description
+        self.calls = []
+
+    def apply_tag_description(self, tag_id, description, *, expected):
+        if self.description != expected:
+            raise RuntimeError(
+                "tag %s's description is not the text this proposal was made "
+                "against" % tag_id)
+        prior = self.description
+        self.description = description
+        self.calls.append(("apply", tag_id, description))
+        return {"prior": {"description": prior}}
+
+    def revert_tag_description(self, tag_id, prior):
+        if not prior or "description" not in prior:
+            raise ValueError(
+                "cannot revert tag %s: snapshot is missing, empty, or carries "
+                "no description" % tag_id)
+        self.description = prior["description"]
+        self.calls.append(("revert", tag_id, prior))
+        return {"description": prior["description"]}
+
+    def apply_scene(self, *args, **kwargs):
+        raise AssertionError(
+            "a tag-description proposal reached the scene apply path")
+
+    def revert_scene(self, *args, **kwargs):
+        raise AssertionError(
+            "a tag-description proposal reached the scene revert path")
+
+    def apply_performer_description(self, *args, **kwargs):
+        raise AssertionError(
+            "a tag-description proposal reached the performer apply path")
+
+    def revert_performer_description(self, *args, **kwargs):
+        raise AssertionError(
+            "a tag-description proposal reached the performer revert path")
+
+
+def _tag_description_item(**over):
+    """One tag-description item, built through
+    `cronicled.tag_descriptions.proposal` rather than hand-written, so no test
+    here can describe a payload shape nothing ever emits."""
+    built = tag_description_proposal(
+        {"id": "7", "name": "Lantern Work", "aliases": [],
+         "description": None, "scene_count": 3},
+        Found(description=TAG_DESCRIPTION, box="first"), folder="library")
+    item = {"fingerprint": "fp-t", "state": "new",
+            "subject_type": built["subject_type"],
+            "subject_id": built["subject_id"], "prior_state": None,
+            "payload": built["payload"]}
+    item.update(over)
+    return item
+
+
+class ApproveATagDescription(unittest.TestCase):
+    def test_it_writes_the_sources_text_through_the_tag_path(self):
+        store, stash = _FakeStore(_tag_description_item()), \
+            _FakeTagDescriptionStash()
+
+        self.assertEqual(Actions(store, stash).approve("fp-t"), "applied")
+
+        self.assertEqual(stash.calls, [("apply", "7", TAG_DESCRIPTION)])
+        self.assertEqual(stash.description, TAG_DESCRIPTION)
+
+    def test_the_snapshot_stored_is_what_the_write_replaced(self):
+        store, stash = _FakeStore(_tag_description_item()), \
+            _FakeTagDescriptionStash()
+
+        Actions(store, stash).approve("fp-t")
+
+        self.assertEqual(store.calls,
+                         [("applied", "fp-t", {"description": None})])
+
+    def test_a_tag_described_since_the_pass_is_refused_not_overwritten(self):
+        # HARM: a sentence somebody wrote replaced by one lifted from a
+        # third-party index, with nothing recording that it happened. The
+        # `expected` value is the payload's `original` VERBATIM -- normalised
+        # to `""` on the way through, it would fail against `None` and refuse
+        # every legitimate apply instead.
+        store = _FakeStore(_tag_description_item())
+        stash = _FakeTagDescriptionStash(description=OTHER_TAG_DESCRIPTION)
+
+        with self.assertRaises(ApplyFailed):
+            Actions(store, stash).approve("fp-t")
+
+        self.assertEqual(stash.description, OTHER_TAG_DESCRIPTION)
+        self.assertEqual([c[0] for c in store.calls], ["failed"])
+
+
+class UndoATagDescription(unittest.TestCase):
+    def test_it_writes_back_exactly_what_the_snapshot_holds(self):
+        item = _tag_description_item(state="applied",
+                                     prior_state={"description": None})
+        store, stash = _FakeStore(item), \
+            _FakeTagDescriptionStash(description=TAG_DESCRIPTION)
+
+        self.assertEqual(Actions(store, stash).undo("fp-t"), "reverted")
+
+        self.assertEqual(stash.calls,
+                         [("revert", "7", {"description": None})])
+        self.assertIsNone(stash.description)
+
+    def test_it_is_recorded_only_after_the_revert_succeeds(self):
+        item = _tag_description_item(state="applied",
+                                     prior_state={"description": None})
+        store, stash = _FakeStore(item), _FakeTagDescriptionStash()
+
+        Actions(store, stash).undo("fp-t")
+
+        self.assertEqual(store.calls, [("reverted", "fp-t")])
+
+    def test_an_applied_row_with_no_snapshot_refuses(self):
+        # HARM: reaching `revert_tag_description` with an empty snapshot is
+        # still refused, but as a stack trace rather than as a refusal naming
+        # the proposal.
+        item = _tag_description_item(state="applied", prior_state=None)
+        store, stash = _FakeStore(item), _FakeTagDescriptionStash()
+
+        with self.assertRaises(ValueError):
+            Actions(store, stash).undo("fp-t")
+
+        self.assertEqual(stash.calls, [])
+
+
 # -- tag-merge proposals ---------------------------------------------------- #
 
 
@@ -812,11 +962,15 @@ class _MergingStash(_FakeStash):
     """Adds the one write a tag merge makes, and keeps the real client's
     limitations while doing it.
 
-    `Stash.merge_tags` takes `(destination_id, source_ids, aliases=None)` and
-    coerces every id to a string on the way out. Recording the call verbatim
-    is what lets a test assert the WHOLE argument set -- an `aliases` value
-    slipped in would replace the destination's entire alias list on a real
-    server, and a check of only the ids could not see it arrive.
+    `Stash.merge_tags` takes `(destination_id, source_ids, aliases=None,
+    description=None)` and coerces every id to a string on the way out.
+    Recording the call verbatim is what lets a test assert the WHOLE argument
+    set -- an `aliases` value slipped in would replace the destination's whole
+    alias list on a real server, and a check of only the ids could not see it
+    arrive. `description` is recorded for the same reason and is the sharper
+    one: a merge is where the only copy of a description gets deleted, so both
+    "it was carried over" and "it was not" have to be visible here rather than
+    inferred from the merge having happened.
     """
 
     def __init__(self, fail=False):
@@ -824,8 +978,10 @@ class _MergingStash(_FakeStash):
         self._fail_merge = fail
         self.merges = []
 
-    def merge_tags(self, destination_id, source_ids, aliases=None):
-        self.merges.append((destination_id, list(source_ids), aliases))
+    def merge_tags(self, destination_id, source_ids, aliases=None,
+                   description=None):
+        self.merges.append((destination_id, list(source_ids), aliases,
+                            description))
         if self._fail_merge:
             raise RuntimeError("server said no")
         return {"id": destination_id, "name": "x", "aliases": []}
@@ -836,11 +992,11 @@ def _merge_item(tags=None, **over):
     rather than hand-written, so it cannot describe a payload shape nothing
     ever emits."""
     if tags is None:
-        tags = [{"id": "1", "name": "Velvet Crane", "aliases": [],
+        tags = [{"id": "1", "name": "Velvet Crane", "aliases": [], "description": None,
                  "scene_count": 12},
-                {"id": "9", "name": "VelvetCrane", "aliases": [],
+                {"id": "9", "name": "VelvetCrane", "aliases": [], "description": None,
                  "scene_count": 4}]
-    built = tag_proposal(cluster_tags(tags)[0], "library")
+    built = tag_proposal(cluster_tags(tags)[0], "library", [])
     item = {"fingerprint": "fp-m", "state": "new",
             "subject_type": built["subject_type"],
             "subject_id": built["subject_id"], "prior_state": None,
@@ -932,9 +1088,9 @@ class UndoADescription(unittest.TestCase):
 
 
 _THREE_SPELLINGS = [
-    {"id": "1", "name": "IvyMayKingsley", "aliases": [], "scene_count": 1},
-    {"id": "2", "name": "Ivy MayKingsley", "aliases": [], "scene_count": 2},
-    {"id": "3", "name": "Ivy May Kingsley", "aliases": [], "scene_count": 3},
+    {"id": "1", "name": "IvyMayKingsley", "aliases": [], "description": None, "scene_count": 1},
+    {"id": "2", "name": "Ivy MayKingsley", "aliases": [], "description": None, "scene_count": 2},
+    {"id": "3", "name": "Ivy May Kingsley", "aliases": [], "description": None, "scene_count": 3},
 ]
 
 
@@ -949,7 +1105,7 @@ class ApproveAMerge(unittest.TestCase):
 
         self.assertEqual(Actions(store, stash).approve("fp-m"), "merged")
 
-        self.assertEqual(stash.merges, [("1", ["9"], None)])
+        self.assertEqual(stash.merges, [("1", ["9"], None, None)])
 
     def test_it_records_no_undo_snapshot(self):
         # THE enforcement of the irreversibility decision, not a description
@@ -986,6 +1142,46 @@ class ApproveAMerge(unittest.TestCase):
         # Not recorded as failed either: nothing was attempted, so the
         # proposal is still exactly as open as it was.
         self.assertEqual(store.calls, [])
+
+    def test_it_carries_a_description_off_a_spelling_it_is_about_to_delete(self):
+        # HARM: without this the merge deletes the only tag carrying the
+        # text, and nothing anywhere records what it said.
+        item = _merge_item(tags=[
+            {"id": "1", "name": "Lantern Work", "aliases": [],
+             "description": None, "scene_count": 12},
+            {"id": "9", "name": "LanternWork", "aliases": [],
+             "description": TAG_DESCRIPTION, "scene_count": 4}])
+        store, stash = _FakeStore(item), _MergingStash()
+
+        Actions(store, stash).approve("fp-m")
+
+        self.assertEqual(stash.merges,
+                         [("1", ["9"], None, TAG_DESCRIPTION)])
+
+    def test_two_differing_descriptions_carry_neither(self):
+        # Not the destination's, not the longer, not the first. Both are on
+        # the row for a person to read; nothing here picks between them.
+        item = _merge_item(tags=[
+            {"id": "1", "name": "Lantern Work", "aliases": [],
+             "description": TAG_DESCRIPTION, "scene_count": 12},
+            {"id": "9", "name": "LanternWork", "aliases": [],
+             "description": OTHER_TAG_DESCRIPTION, "scene_count": 4}])
+        store, stash = _FakeStore(item), _MergingStash()
+
+        Actions(store, stash).approve("fp-m")
+
+        self.assertEqual(stash.merges, [("1", ["9"], None, None)])
+
+    def test_a_merge_recorded_before_descriptions_existed_still_merges(self):
+        # HARM: those proposals are in the store. Indexed, the missing block
+        # turns every one of them into a failed apply.
+        item = _merge_item()
+        del item["payload"]["description"]
+        store, stash = _FakeStore(item), _MergingStash()
+
+        self.assertEqual(Actions(store, stash).approve("fp-m"), "merged")
+
+        self.assertEqual(stash.merges, [("1", ["9"], None, None)])
 
     def test_a_failed_merge_is_recorded_as_failed_not_applied(self):
         store, stash = _FakeStore(_merge_item()), _MergingStash(fail=True)

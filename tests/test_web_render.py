@@ -3,11 +3,14 @@ import unittest
 
 from cronicled.jobs import Job
 from cronicled.schedule import LoopStatus, TickResult
+from cronicled.tag_descriptions import Found
+from cronicled.tag_descriptions import proposal as tag_description_proposal
 from cronicled.tags import cluster_tags
 from cronicled.tags import proposal as tag_proposal
 from cronicled.web.render import environment, render
 from cronicled.web.rows import (
     to_description_row, to_merge_row, to_mute_row, to_refusal_row, to_row,
+    to_tag_description_row,
 )
 
 _HOSTILE = '<script>alert("x")</script>'
@@ -1258,6 +1261,109 @@ class DescriptionBlock(unittest.TestCase):
         self.assertNotIn('<div class="score">', html)
 
 
+# -- tag-description proposals ---------------------------------------------- #
+#
+# Every tag name and description below is invented.
+
+TAG_DESCRIPTION = "Scenes lit only by a hand-carried lamp."
+
+
+def _tag_description_row(**over):
+    """One `TagDescriptionRow`, built through the real proposal function and
+    the real row builder rather than hand-assembled: Jinja renders a missing
+    attribute as empty text instead of raising, so a hand-written payload
+    would fail by drawing a blank block rather than by saying anything."""
+    base_url = over.pop("base_url", None)
+    built = tag_description_proposal(
+        {"id": "7", "name": "Lantern Work", "aliases": [],
+         "description": None, "scene_count": 3},
+        Found(description=over.pop("description", TAG_DESCRIPTION),
+              box=over.pop("box", "first")),
+        folder="library")
+    item = {"fingerprint": "fp-t", "state": "new",
+            "subject_type": built["subject_type"],
+            "subject_id": built["subject_id"], "summary": built["summary"],
+            "confidence": None, "prior_state": None,
+            "payload": built["payload"]}
+    item.update(over)
+    return to_tag_description_row(item, base_url=base_url)
+
+
+class TagDescriptionBlock(unittest.TestCase):
+    _FORM_RE = re.compile(
+        r'<form method="post" action="(?P<action>[^"]+)">'
+        r'<input type="hidden" name="fp" value="(?P<fp>[^"]*)">'
+        r'<button>(?P<label>[^<]+)</button></form>')
+
+    def _html(self, row, **kwargs):
+        return render("inbox.html", rows=[row], counts={}, **kwargs)
+
+    def test_the_source_is_named_on_the_page(self):
+        # HARM: a reviewer can judge whether a sentence reads well and cannot
+        # judge whether anybody wrote it. The source is the only thing on
+        # this row that answers that, so a page that dropped it would be
+        # asking for approval of an unattributed sentence.
+        html = self._html(_tag_description_row())
+
+        self.assertIn("first", html)
+        self.assertIn(TAG_DESCRIPTION, html)
+
+    def test_the_empty_field_it_would_fill_is_shown_beside_the_text(self):
+        html = self._html(_tag_description_row())
+
+        self.assertIn("Now", html)
+
+    def test_the_tag_is_named_and_linked(self):
+        html = self._html(_tag_description_row(base_url="http://media.example"))
+
+        self.assertIn("Lantern Work", html)
+        self.assertIn("http://media.example/tags/7", html)
+
+    def test_a_new_row_offers_exactly_approve_dismiss_mute_refresh(self):
+        html = self._html(_tag_description_row(state="new"))
+
+        self.assertEqual(
+            [(m.group("action"), m.group("label"), m.group("fp"))
+             for m in self._FORM_RE.finditer(html)],
+            [("/approve", "Approve", "fp-t"),
+             ("/dismiss", "Dismiss", "fp-t"),
+             ("/mute", "Mute", "fp-t"),
+             ("/refresh", "Refresh", "fp-t")])
+
+    def test_an_applied_row_with_a_snapshot_offers_undo_and_refresh(self):
+        html = self._html(_tag_description_row(
+            state="applied", prior_state={"description": None}))
+
+        self.assertEqual(
+            [(m.group("action"), m.group("label"))
+             for m in self._FORM_RE.finditer(html)],
+            [("/undo", "Undo"), ("/refresh", "Refresh")])
+
+    def test_all_three_kinds_of_proposal_render_on_one_page(self):
+        # HARM: the page draws ONE list. A dispatcher missing a branch draws
+        # the row through the scene shape, and Jinja fills every field it
+        # does not have with empty text -- a block a person cannot judge and
+        # can still approve.
+        html = render("inbox.html", counts={},
+                      rows=[_row(), _description_row(),
+                            _tag_description_row()])
+
+        self.assertIn("Wren Alderly", html)
+        self.assertIn("Lantern Work", html)
+        self.assertIn("0.812", html)
+
+    def test_it_carries_no_invented_score(self):
+        html = self._html(_tag_description_row())
+
+        self.assertNotIn('<div class="score">', html)
+
+    def test_a_hostile_tag_description_is_escaped(self):
+        html = self._html(_tag_description_row(description=_HOSTILE,
+                                               box=_HOSTILE))
+
+        self.assertNotIn("<script>", html)
+
+
 # -- tag-merge proposals ---------------------------------------------------- #
 
 
@@ -1268,11 +1374,11 @@ def _merge_row(tags=None, **over):
     Jinja renders a missing attribute as empty text instead of raising.
     """
     if tags is None:
-        tags = [{"id": "1", "name": "Velvet Crane", "aliases": [],
+        tags = [{"id": "1", "name": "Velvet Crane", "aliases": [], "description": None,
                  "scene_count": 12},
-                {"id": "9", "name": "VelvetCrane", "aliases": [],
+                {"id": "9", "name": "VelvetCrane", "aliases": [], "description": None,
                  "scene_count": 4}]
-    built = tag_proposal(cluster_tags(tags)[0], "library")
+    built = tag_proposal(cluster_tags(tags)[0], "library", [])
     item = {"fingerprint": "fp-m", "state": "new",
             "subject_type": built["subject_type"],
             "subject_id": built["subject_id"], "summary": built["summary"],
@@ -1283,9 +1389,9 @@ def _merge_row(tags=None, **over):
 
 
 _THREE_SPELLINGS = [
-    {"id": "1", "name": "IvyMayKingsley", "aliases": [], "scene_count": 1},
-    {"id": "2", "name": "Ivy MayKingsley", "aliases": [], "scene_count": 2},
-    {"id": "3", "name": "Ivy May Kingsley", "aliases": [], "scene_count": 3},
+    {"id": "1", "name": "IvyMayKingsley", "aliases": [], "description": None, "scene_count": 1},
+    {"id": "2", "name": "Ivy MayKingsley", "aliases": [], "description": None, "scene_count": 2},
+    {"id": "3", "name": "Ivy May Kingsley", "aliases": [], "description": None, "scene_count": 3},
 ]
 
 
@@ -1389,9 +1495,50 @@ class TagMergeSection(unittest.TestCase):
 
     def test_a_hostile_tag_name_is_escaped(self):
         rows = [_merge_row(tags=[
-            {"id": "1", "name": _HOSTILE + " x", "aliases": [],
+            {"id": "1", "name": _HOSTILE + " x", "aliases": [], "description": None,
              "scene_count": 1},
-            {"id": "2", "name": _HOSTILE + "x", "aliases": [],
+            {"id": "2", "name": _HOSTILE + "x", "aliases": [], "description": None,
              "scene_count": 2}])]
+
+        self.assertNotIn("<script>", self._render(rows))
+
+    def test_a_description_the_survivor_would_inherit_is_on_the_page(self):
+        # HARM: the merge deletes the only spelling carrying it. A page that
+        # did not show the text asks for an irreversible write without
+        # showing what it moves.
+        rows = [_merge_row(tags=[
+            {"id": "1", "name": "Lantern Work", "aliases": [],
+             "description": None, "scene_count": 12},
+            {"id": "2", "name": "LanternWork", "aliases": [],
+             "description": TAG_DESCRIPTION, "scene_count": 4}])]
+
+        html = self._render(rows)
+
+        self.assertIn(TAG_DESCRIPTION, html)
+        self.assertIn("LanternWork", html)
+
+    def test_two_differing_descriptions_are_both_shown_as_a_warning(self):
+        # HARM: the merge keeps only one of two sentences somebody wrote, and
+        # nothing afterwards records the other. Shown where warnings live,
+        # because approving loses it.
+        other = "Filmed aboard a working passenger boat."
+        rows = [_merge_row(tags=[
+            {"id": "1", "name": "Lantern Work", "aliases": [],
+             "description": TAG_DESCRIPTION, "scene_count": 12},
+            {"id": "2", "name": "LanternWork", "aliases": [],
+             "description": other, "scene_count": 4}])]
+
+        html = self._render(rows)
+
+        self.assertIn(TAG_DESCRIPTION, html)
+        self.assertIn(other, html)
+        self.assertIn("Nothing here picks between them", html)
+
+    def test_a_hostile_description_on_a_merge_row_is_escaped(self):
+        rows = [_merge_row(tags=[
+            {"id": "1", "name": "Lantern Work", "aliases": [],
+             "description": None, "scene_count": 1},
+            {"id": "2", "name": "LanternWork", "aliases": [],
+             "description": _HOSTILE, "scene_count": 2}])]
 
         self.assertNotIn("<script>", self._render(rows))

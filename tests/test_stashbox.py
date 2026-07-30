@@ -5,8 +5,8 @@ from cronicled.artist import Resolution
 from cronicled.scoring import Decision, Match, decide
 from cronicled.stash import StashError
 from cronicled.stashbox import (
-    PERFORMER_SCENES, SCENES_BY_FINGERPRINT, SourceListing, StashBox,
-    check, listing_verdict)
+    BOX_TAGS, PERFORMER_SCENES, SCENES_BY_FINGERPRINT, SourceListing, StashBox,
+    base_url, check, listing_verdict)
 
 
 def _transport(responses):
@@ -34,6 +34,19 @@ def _blocks(blocks):
     """One `findScenesBySceneFingerprints` reply: a list of scene lists,
     positionally aligned with the fingerprint sets that were submitted."""
     return {"data": {"findScenesBySceneFingerprints": [list(b) for b in blocks]}}
+
+
+def _tag_page(count, tags):
+    """One `queryTags` reply, shaped the way stash-box shapes it."""
+    return {"data": {"queryTags": {"count": count, "tags": list(tags)}}}
+
+
+def _box_tag(name, description="a description", aliases=()):
+    """One tag row as `queryTags` returns it -- every field the query selects,
+    always, so a fixture can never answer a question the real reply would
+    leave unanswered."""
+    return {"id": "t-" + name, "name": name, "description": description,
+            "aliases": list(aliases)}
 
 
 # The fields both queries ask for on a scene, stated HERE rather than read off
@@ -533,19 +546,170 @@ class RequestShape(unittest.TestCase):
             _page(3, [{"id": "s1"}, {"id": "s2"}]),
             _page(3, [{"id": "s3"}]),
             _blocks([[{"id": "s4"}]]),
+            _tag_page(1, [_box_tag("velvet crane")]),
         ])
         box = StashBox("https://box.test", "k", transport=t)
 
         surface = sorted(name for name in dir(box)
                          if not name.startswith("_") and callable(getattr(box, name)))
-        self.assertEqual(surface, ["known_by_fingerprint", "performer_listing"],
+        self.assertEqual(surface,
+                         ["all_tags", "known_by_fingerprint", "performer_listing"],
                          "a new call on this client must be exercised here too")
         box.performer_listing("p1", per_page=2)
         box.known_by_fingerprint([("PHASH", "aaaa1111")])
+        box.all_tags(per_page=100)
 
         self.assertTrue(t.calls, "the surface was actually exercised")
         for body, _ in t.calls:
             self.assertNotIn("mutation", body["query"].lower())
+
+
+class TagCatalogueRead(unittest.TestCase):
+    """A source's whole tag catalogue, and whether that was all of it.
+
+    Every tag name and description here is invented.
+    """
+
+    def test_a_catalogue_that_fits_on_one_page_is_complete(self):
+        t = _transport([_tag_page(2, [_box_tag("Lantern Work"),
+                                      _box_tag("Brass Ferry")])])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        got = box.all_tags(per_page=100)
+
+        self.assertEqual([row["name"] for row in got.tags],
+                         ["Lantern Work", "Brass Ferry"])
+        self.assertTrue(got.complete)
+        self.assertEqual(len(t.calls), 1, "did not ask for a second page")
+
+    def test_it_pages_until_the_sources_own_count_is_satisfied(self):
+        t = _transport([_tag_page(3, [_box_tag("Lantern Work"),
+                                      _box_tag("Brass Ferry")]),
+                        _tag_page(3, [_box_tag("Slate Harbour")])])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        got = box.all_tags(per_page=2)
+
+        self.assertEqual(len(got.tags), 3)
+        self.assertTrue(got.complete)
+        self.assertEqual([body["variables"]["input"]["page"]
+                          for body, _ in t.calls], [1, 2])
+
+    def test_a_source_holding_no_tags_is_a_complete_answer(self):
+        t = _transport([_tag_page(0, [])])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        got = box.all_tags()
+
+        self.assertEqual(got.tags, ())
+        self.assertTrue(got.complete)
+        self.assertEqual(len(t.calls), 1, "did not page past an empty reply")
+
+    def test_an_empty_page_the_count_contradicts_is_not_complete(self):
+        # The source promises tags and serves none. Reported as complete, the
+        # pass would count every tag in the library as one nothing describes.
+        # A count of one is the boundary -- the smallest overstatement.
+        for count in (1, 9):
+            with self.subTest(count=count):
+                t = _transport([_tag_page(count, [])])
+                box = StashBox("https://box.test", "k", transport=t)
+
+                got = box.all_tags(per_page=2, max_pages=10)
+
+                self.assertEqual(got.tags, ())
+                self.assertFalse(got.complete)
+                self.assertEqual(len(t.calls), 1, "stopped at the empty page")
+
+    def test_an_empty_page_after_real_ones_is_not_complete_even_at_count_zero(self):
+        # The source's `count` is re-read on every page and can shrink between
+        # them -- tags deleted while the read is in flight. Shrunk all the way
+        # to zero, the empty second page satisfies "count == 0" while two tags
+        # from page one are already in hand, so a flag decided on the count
+        # alone calls this a whole catalogue. It is not one: whatever lay
+        # between what was read and what the source now holds was never
+        # fetched, and "no configured source describes this tag" must not rest
+        # on it. The `and not tags` half of the flag is the only thing
+        # separating this from the genuinely-empty source above.
+        t = _transport([_tag_page(3, [_box_tag("Lantern Work"),
+                                      _box_tag("Brass Ferry")]),
+                        _tag_page(0, [])])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        got = box.all_tags(per_page=2, max_pages=10)
+
+        self.assertEqual(len(got.tags), 2, "kept what it had already read")
+        self.assertFalse(got.complete)
+
+    def test_a_read_that_hits_the_page_cap_keeps_what_it_read_and_says_so(self):
+        # Both halves matter and they are different facts: the tags already
+        # in hand are worth having, and what was not read is unknown rather
+        # than absent.
+        t = _transport([_tag_page(99, [_box_tag("Lantern Work")])])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        got = box.all_tags(per_page=1, max_pages=2)
+
+        self.assertEqual(len(got.tags), 2)
+        self.assertFalse(got.complete)
+        self.assertEqual(len(t.calls), 2, "stopped at the page cap")
+
+    def test_a_transport_failure_raises_rather_than_reading_as_partial(self):
+        # `StashError.transient` says whether a retry is worth it, and
+        # folding it into the flag would make a wedged host indistinguishable
+        # from an honest partial read.
+        t = _transport([StashError("host wedged", transient=True)])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        with self.assertRaises(StashError) as caught:
+            box.all_tags()
+        self.assertTrue(caught.exception.transient)
+
+    def test_the_query_asks_for_the_three_fields_the_index_is_built_from(self):
+        # Stated here rather than read off the constant: reading it off the
+        # query is the defect this pin exists to close, because a field
+        # dropped from the constant would move both sides of the comparison
+        # at once. Without `description` there is nothing to propose; without
+        # `aliases` most of the real coverage disappears and nothing fails.
+        requested = _names_in(BOX_TAGS)
+
+        self.assertIn("queryTags", requested)
+        self.assertIn("TagQueryInput", requested)
+        self.assertIn("count", requested)
+        for field in ("name", "description", "aliases"):
+            self.assertIn(field, requested,
+                          "the index is built from %s and it is not being "
+                          "asked for" % (field,))
+
+
+class BaseUrl(unittest.TestCase):
+    """The seam between two spellings of one address."""
+
+    def test_a_stored_graphql_endpoint_is_reduced_to_its_base(self):
+        # The media server stores the GraphQL endpoint itself; `StashBox`
+        # appends `/graphql` of its own. Left alone, every configured source
+        # is asked for `/graphql/graphql` and silently contributes nothing.
+        self.assertEqual(base_url("https://box.test/graphql"),
+                         "https://box.test")
+
+    def test_a_trailing_slash_does_not_hide_the_suffix(self):
+        self.assertEqual(base_url("https://box.test/graphql/"),
+                         "https://box.test")
+
+    def test_an_address_that_is_already_a_base_is_left_alone(self):
+        self.assertEqual(base_url("https://box.test"), "https://box.test")
+
+    def test_only_the_trailing_suffix_is_removed(self):
+        # A path segment that merely contains the word must survive: trimming
+        # it would point the client at a different host's root.
+        self.assertEqual(base_url("https://box.test/graphql/v2"),
+                         "https://box.test/graphql/v2")
+
+    def test_the_client_built_from_it_asks_the_right_address(self):
+        # The two halves joined, so nothing has to be believed about how
+        # `StashBox` spells its own url.
+        self.assertEqual(
+            StashBox(base_url("https://box.test/graphql"), "k").url,
+            "https://box.test/graphql")
 
 
 PERFORMER = "pf-8821"

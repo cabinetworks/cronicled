@@ -274,7 +274,44 @@
    rather than on whether some field exists: Jinja renders an undefined
    attribute as empty text instead of raising, so a shape test written that
    way fails by drawing a blank block rather than by saying anything. #}
-{% macro row_block(row, highlight=False) %}{% if row.kind == 'performer-description' %}{{ description_block(row, highlight) }}{% else %}{{ proposal_block(row, highlight) }}{% endif %}{% endmacro %}
+{# A description a stash-box holds for a tag this library leaves blank. The
+   SOURCE is rendered as prominently as the text, and that is the whole point
+   of the block: the reviewer can see whether the sentence reads well, and no
+   amount of reading tells them whether anybody wrote it. Naming the index it
+   came from is the only thing that can. The empty "Now" panel is shown rather
+   than skipped, so it is visible that this fills a blank instead of replacing
+   something -- and so the refusal that follows a tag described in the
+   meantime reads as the guard it is. #}
+{% macro tag_description_block(row, highlight=False) %}
+<div class="proposal{% if highlight %} just-applied{% endif %}">
+  <div class="head">
+    <div class="what">
+      <p class="file">{{ identifier("tag " ~ row.subject_id, row.tag_url) }}</p>
+      <p class="title">{{ row.name }}</p>
+      <div class="meta">description from <b>{{ row.source_box }}</b></div>
+    </div>
+    <div class="acts">
+      {% if row.undoable %}
+      <form method="post" action="/undo"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Undo</button></form>
+      {% elif row.actionable %}
+      <form method="post" action="/approve"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>{% if row.error %}Try again{% else %}Approve{% endif %}</button></form>
+      <form method="post" action="/dismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Dismiss</button></form>
+      <form method="post" action="/mute"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Mute</button></form>
+      {% endif %}
+      <form method="post" action="/refresh"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Refresh</button></form>
+    </div>
+  </div>
+  {% if row.error %}
+  <div class="warn">The last attempt to apply this failed, and nothing was written: {{ row.error }}</div>
+  {% endif %}
+  <div class="diff">
+    <div><h3>Now</h3><p class="text">{{ row.original }}</p></div>
+    <div><h3>{{ row.source_box }}</h3><p class="text">{{ row.description }}</p></div>
+  </div>
+</div>
+{% endmacro %}
+
+{% macro row_block(row, highlight=False) %}{% if row.kind == 'performer-description' %}{{ description_block(row, highlight) }}{% elif row.kind == 'tag-description' %}{{ tag_description_block(row, highlight) }}{% else %}{{ proposal_block(row, highlight) }}{% endif %}{% endmacro %}
 
 {# The compact identifying line these two closed sections show for a row.
    Branched on `row.kind` for the same reason `row_block` is: a description
@@ -284,13 +321,17 @@
         <p class="file">{{ identifier("performer " ~ row.subject_id, row.performer_url) }}</p>
         <p class="title">{{ row.name }}</p>
         <div class="meta">description contains <b>{% for f in row.faults %}{{ f }}{% if not loop.last %} and {% endif %}{% endfor %}</b></div>
+{% elif row.kind == 'tag-description' %}
+        <p class="file">{{ identifier("tag " ~ row.subject_id, row.tag_url) }}</p>
+        <p class="title">{{ row.name }}</p>
+        <div class="meta">description from <b>{{ row.source_box }}</b></div>
 {% else %}
         <p class="file">{{ identifier(row.filename, row.scene_url) }}</p>
         <p class="title">{{ identifier(row.proposed_title, row.candidate_url) }}</p>
         <div class="meta">{{ attribution(row) }}</div>
 {% endif %}{% endmacro %}
 
-{% macro compact_score(row) %}{% if row.kind != 'performer-description' %}<div class="score">{{ row.score_text }}</div>{% endif %}{% endmacro %}
+{% macro compact_score(row) %}{% if row.kind != 'performer-description' and row.kind != 'tag-description' %}<div class="score">{{ row.score_text }}</div>{% endif %}{% endmacro %}
 
 {# A tag merge is not a scene proposal and deliberately does not render
    through `proposal_block`. It has no filename, no score and no candidate;
@@ -346,6 +387,18 @@
   <div class="warn">Nothing here can say which spelling wins: {{ row.undecided }}</div>
   {% endif %}
   <div class="warn">{{ row.warning }}</div>
+  {# Two DIFFERENT descriptions of one tag is a disagreement between two
+     people, and the merge keeps only one of them. Both are shown, neither is
+     chosen, and this is a warning rather than a note: approving loses the
+     other, and nothing afterwards records what it said. #}
+  {% if row.conflicting %}
+  <div class="warn">These spellings describe this tag differently, and the merge keeps only the survivor's. Nothing here picks between them:
+    {% for c in row.conflicting %}<div class="text"><b>{{ c.name }}</b>: {{ c.description }}</div>{% endfor %}
+  </div>
+  {% endif %}
+  {% if row.inherit %}
+  <div class="runners">The survivor takes this description{% if row.inherit_from_tag %}, which only <b>{{ row.inherit_from_tag }}</b> carries and the merge would otherwise delete{% elif row.inherit_from_box %}, held by <b>{{ row.inherit_from_box }}</b>{% endif %}: <span class="text">{{ row.inherit }}</span></div>
+  {% endif %}
   {% if row.losing %}
   <div class="runners">Deletes: {% for name in row.losing %}{{ name }}{% if not loop.last %}, {% endif %}{% endfor %}</div>
   {% endif %}

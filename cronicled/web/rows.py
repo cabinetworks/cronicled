@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 from cronicled.descriptions import SUBJECT_TYPE as DESCRIPTION_SUBJECT
 from cronicled.scan import candidate_url
+from cronicled.tag_descriptions import SUBJECT_TYPE as TAG_DESCRIPTION_SUBJECT
 from cronicled.tags import MERGE_IS_IRREVERSIBLE
 from cronicled.text import slug_match, spaceless
 
@@ -23,6 +24,7 @@ from cronicled.text import slug_match, spaceless
 # whose buttons write to a library is the failure mode to design out.
 KIND_SCENE = "scene"
 KIND_DESCRIPTION = "performer-description"
+KIND_TAG_DESCRIPTION = "tag-description"
 
 # What one store did when it was searched for a refused file, named so the
 # Refused section can pick a line for it without inspecting which of its
@@ -177,6 +179,52 @@ class DescriptionRow:
     error: str | None
 
 
+@dataclass(frozen=True)
+class TagDescriptionRow:
+    """What the inbox shows for a description a stash-box holds for a blank
+    tag.
+
+    Deliberately NOT a `DescriptionRow`. That row is a diff: two versions of
+    one paragraph, and the reviewer's question is whether the second is the
+    first with its markup removed. This one is a provenance question -- the
+    field is empty, some other index wrote a sentence about a tag with this
+    name, and the only thing that makes it judgeable is knowing WHICH index.
+    Forcing the two through one shape would put the source in a field named
+    for something else, or drop it.
+
+    `source_box` is therefore carried on every row in every state, and is the
+    field this row exists to show. A description with no source is a sentence
+    with no author, and the only test left to a reviewer is whether it reads
+    plausibly -- which is exactly the test a fabricated description passes.
+
+    `original` is the field as it stands, and it is shown even though it is
+    empty by construction. A reviewer needs to see that they are filling a
+    blank rather than replacing something: the apply refuses if the field has
+    been written in the meantime, and a row that never showed the current
+    value would make that refusal look like a bug instead of the guard it is.
+
+    No score, no `faults`. Nothing here is scored and nothing here is a
+    defect in the text -- the tag simply has no description.
+    """
+
+    kind: str
+    fingerprint: str
+    state: str
+    subject_id: str
+    name: str
+    # The media server's own page for this tag, or `None` when no server is
+    # configured -- see `tag_url`.
+    tag_url: str | None
+    # Which configured source holds this description. Never `None`: a
+    # proposal is only ever made because a named source had one.
+    source_box: str
+    original: str
+    description: str
+    undoable: bool
+    actionable: bool
+    error: str | None
+
+
 def scene_url(base_url, subject_id):
     """The media server's own page for `subject_id`, or `None` when
     `base_url` is falsy.
@@ -217,6 +265,21 @@ def performer_url(base_url, subject_id):
     if not base_url:
         return None
     return "%s/performers/%s" % (base_url.rstrip("/"), subject_id)
+
+
+def tag_url(base_url, subject_id):
+    """The media server's own page for a tag, or `None` when `base_url` is
+    falsy.
+
+    The third of the deliberately-separate `scene_url`/`performer_url` pair,
+    written out rather than folded into a shared helper taking a path
+    segment, for the reason `performer_url` states: a helper parameterised by
+    the segment lets a caller pass one that names no subject kind at all and
+    get back a link to nowhere, which renders as an ordinary working link.
+    """
+    if not base_url:
+        return None
+    return "%s/tags/%s" % (base_url.rstrip("/"), subject_id)
 
 
 def _runner_up_view(entry):
@@ -485,6 +548,44 @@ def to_description_row(item, base_url=None):
     )
 
 
+def to_tag_description_row(item, base_url=None):
+    """One stored tag-description proposal -> what the inbox shows for it.
+
+    Every payload field is INDEXED: `cronicled.tag_descriptions.proposal`
+    writes all five on every proposal it makes, so a payload missing one is
+    malformed rather than a description with (say) no source. `source_box`
+    read with a default would be the expensive one -- a row whose provenance
+    silently rendered as blank looks exactly like a row whose provenance is
+    blank because nobody wrote the sentence, which is the one thing this
+    proposal has to be able to say for itself.
+
+    `original` is normalised to `""` for DISPLAY only, because the field it
+    describes is empty by construction and `None` renders as the word "None".
+    The payload's own value is left exactly as the server gave it, and that is
+    what the apply compares against -- see
+    `cronicled.web.actions.Actions.approve`.
+    """
+    payload = item["payload"]
+    return TagDescriptionRow(
+        kind=KIND_TAG_DESCRIPTION,
+        fingerprint=item["fingerprint"],
+        state=item["state"],
+        subject_id=item["subject_id"],
+        name=payload["name"],
+        tag_url=tag_url(base_url, item["subject_id"]),
+        source_box=payload["source_box"],
+        original=payload["original"] or "",
+        description=payload["description"],
+        # An applied row with no snapshot cannot be reverted --
+        # `revert_tag_description` raises on an empty one. The same rule
+        # `to_row` and `to_description_row` apply, for the same reason.
+        undoable=(item["state"] == "applied"
+                  and bool(item.get("prior_state"))),
+        actionable=item["state"] != "applied",
+        error=item.get("error"),
+    )
+
+
 def to_rows(items, base_url=None):
     """Every stored proposal as the row its own kind of subject needs.
 
@@ -495,10 +596,15 @@ def to_rows(items, base_url=None):
     payload-shape guess that silently picked the wrong builder, would draw a
     row with the wrong controls on it.
     """
-    return [to_description_row(i, base_url=base_url)
-            if i["subject_type"] == DESCRIPTION_SUBJECT
-            else to_row(i, base_url=base_url)
-            for i in items]
+    built = []
+    for item in items:
+        if item["subject_type"] == DESCRIPTION_SUBJECT:
+            built.append(to_description_row(item, base_url=base_url))
+        elif item["subject_type"] == TAG_DESCRIPTION_SUBJECT:
+            built.append(to_tag_description_row(item, base_url=base_url))
+        else:
+            built.append(to_row(item, base_url=base_url))
+    return built
 
 
 @dataclass(frozen=True)
@@ -541,6 +647,21 @@ class MergeRow:
     # nothing is losing, because nothing has been decided.
     losing: tuple
     undecided: str | None
+    # The description the survivor would end up with, and where it comes
+    # from -- `inherit_from_tag` when a losing spelling wrote it (which the
+    # merge would otherwise delete), `inherit_from_box` when a configured
+    # source holds one for a cluster none of whose spellings is described.
+    # All three are `None` when there is nothing to carry.
+    inherit: str | None
+    inherit_from_tag: str | None
+    inherit_from_box: str | None
+    # Every differing description in the cluster, as `{"name", "description"}`,
+    # when two spellings describe the tag two ways. Nothing is chosen in that
+    # case and `inherit` is `None`: the merge keeps the survivor's own text
+    # and the other is deleted, so the row has to say so out loud rather than
+    # let a person approve a write that silently drops one of two sentences
+    # somebody wrote.
+    conflicting: tuple
     # The blast radius, the number that decides whether this merge is safe.
     # `counts_cover` says what it counts, because it is not everything a tag
     # holds -- see `cronicled.tags.COUNTS_COVER`.
@@ -587,6 +708,15 @@ def to_merge_row(item):
                     if m["id"] != canonical["id"]) if canonical else ())
     state = item["state"]
     open_state = state not in _CLOSED_MERGE_STATES
+    # The ONE field here read with a default, and the exception is deliberate.
+    # Merge proposals recorded before this pass knew anything about
+    # descriptions carry no `description` block at all, and they are still in
+    # the store and still on the page. An empty block is the truthful reading
+    # of one: that proposal asked no source anything and found no description
+    # at risk, so the row offers no carry-over and reports no conflict --
+    # exactly the merge it already was. Every other field is indexed, because
+    # for every other field a missing value is a malformed payload.
+    description = payload.get("description") or {}
     return MergeRow(
         fingerprint=item["fingerprint"],
         state=state,
@@ -597,6 +727,10 @@ def to_merge_row(item):
         canonical=canonical_name,
         losing=losing,
         undecided=payload["undecided"],
+        inherit=description.get("text"),
+        inherit_from_tag=description.get("from_tag"),
+        inherit_from_box=description.get("from_box"),
+        conflicting=tuple(dict(c) for c in description.get("conflicting") or ()),
         total_scenes=sum(m["scene_count"] for m in members),
         counts_cover=payload["counts_cover"],
         warning=MERGE_IS_IRREVERSIBLE,

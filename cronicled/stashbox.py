@@ -70,6 +70,26 @@ query($fingerprints: [[FingerprintQueryInput!]!]!) {
 }
 """
 
+# The tag catalogue behind a box's own tag browser. `queryTags` is the only
+# query here that is not about a scene, and it is a WHOLE-CATALOGUE read for
+# the same reason `PERFORMER_SCENES` is a whole-listing read: the question is
+# "what does this source hold?", which a per-tag lookup cannot answer without
+# one request per tag. A library has thousands of tags and a box has thousands
+# more; asking per tag is a rate-limit incident against a public service, and
+# the answers would be identical.
+#
+# `description` is the field this exists for, `aliases` is what makes it
+# findable -- measured against a real library, matching on names alone found
+# far fewer than matching on the alias keys as well.
+BOX_TAGS = """
+query($input: TagQueryInput!) {
+  queryTags(input: $input) {
+    count
+    tags { id name description aliases }
+  }
+}
+"""
+
 # The algorithms stash-box's `FingerprintAlgorithm` enum accepts, spelled its
 # way. Checked here rather than left to the server because the enum is
 # case-sensitive and unknown values are rejected at parse time, which fails
@@ -168,6 +188,31 @@ class SourceListing:
                 "total=%r, pages_read=%r)" % (
                     self.performer_id, len(self.scenes), self.complete,
                     self.total, self.pages_read))
+
+
+class TagCatalogue:
+    """The tags a source holds, and whether that is all of them.
+
+    `complete` is a separate fact from the tags for exactly the reason
+    `SourceListing.complete` is: a read that stopped early and a read that
+    finished look identical from the length of what came back, and the
+    difference decides what may be concluded from a tag NOT being here.
+
+    A description found in a partial read is still found -- a page that was
+    never fetched cannot un-find a tag already in hand. What a partial read
+    may not support is the negative: "no configured source describes this
+    tag" is a claim about the whole catalogue, and a caller that counted an
+    unread page as an absence would report a backlog of tags nothing can
+    help with, when the help was on the page it did not read.
+    """
+
+    def __init__(self, tags, complete):
+        self.tags = tuple(tags)
+        self.complete = complete
+
+    def __repr__(self):
+        return "TagCatalogue(tags=%d, complete=%r)" % (len(self.tags),
+                                                       self.complete)
 
 
 class Verdict:
@@ -434,6 +479,25 @@ def check(box, performer_id, name, folder, resolution, *,
                            attribution_certain=attribution_certain)
 
 
+def base_url(endpoint):
+    """A configured stash-box endpoint, reduced to what `StashBox` takes.
+
+    The media server stores a box's address as the GraphQL endpoint itself
+    (`.../graphql`), because that is what it POSTs to. `StashBox` inherits
+    `Stash`'s constructor, which APPENDS `/graphql` to whatever it is given.
+    Handing one straight to the other asks a box for `/graphql/graphql`,
+    which no box serves — a whole configured source silently contributing
+    nothing, reported as an unreachable host.
+
+    Stated as its own function, with its own test, rather than as a slice
+    inside a caller: it is the seam between two spellings of one address, and
+    a seam nothing names is a seam nothing checks.
+    """
+    trimmed = endpoint.rstrip("/")
+    suffix = "/graphql"
+    return trimmed[:-len(suffix)] if trimmed.endswith(suffix) else trimmed
+
+
 class StashBox:
     def __init__(self, url, api_key, transport=None):
         # The GraphQL plumbing — hard deadline, error mapping, "data"
@@ -516,6 +580,41 @@ class StashBox:
                                      total=total, pages_read=page)
         return SourceListing(performer_id, scenes, complete=False,
                              total=total, pages_read=max_pages)
+
+    def all_tags(self, per_page=PER_PAGE, max_pages=MAX_PAGES,
+                 timeout=DEFAULT_TIMEOUT):
+        """Read this source's whole tag catalogue, and say whether that was
+        all of it.
+
+        Paged on the source's own `count`, and bounded by `max_pages` for the
+        reason `performer_listing` is bounded: a source whose count overstates
+        what it will hand back would otherwise be asked for page after page
+        for ever. Both ways the read can stop short -- the page cap, and an
+        empty page arriving while `count` says there is more -- return what
+        was read with `complete=False` rather than raising. The tags already
+        in hand are worth having; what they cannot support is a claim about
+        what the source does NOT hold.
+
+        A transport failure raises, and is not folded into the flag, on the
+        same terms `performer_listing` states: `StashError.transient` says
+        whether a retry is worth it, and a flag would make a wedged host
+        indistinguishable from an honest partial read.
+
+        A source holding no tags at all is a complete answer, not a failed
+        one -- `count` is what separates it from the read that merely came
+        back empty.
+        """
+        tags = []
+        for page in range(1, max_pages + 1):
+            variables = {"input": {"page": page, "per_page": per_page}}
+            block = self._client.gql(BOX_TAGS, variables,
+                                     timeout=timeout)["queryTags"]
+            if not block["tags"]:
+                return TagCatalogue(tags, complete=block["count"] == 0 and not tags)
+            tags.extend(block["tags"])
+            if len(tags) >= block["count"]:
+                return TagCatalogue(tags, complete=True)
+        return TagCatalogue(tags, complete=False)
 
     def known_by_fingerprint(self, fingerprints, timeout=DEFAULT_TIMEOUT):
         """Ask the source, in **one** request, which scenes carry each of
