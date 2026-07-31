@@ -54,6 +54,61 @@ _NO_ROW_BUILDER = (_MERGE_SUBJECT, _RECONCILE_SUBJECT, _UNUSED_TAG_SUBJECT)
 # inbox that may have plenty.
 _INBOX_STATES = ("applied", "dismissed", "muted")
 
+
+def _sidebar_context(store):
+    """The persistent navigation: one entry per inbox (see `INBOXES`), each
+    carrying the count that `/{name}` itself will show and, only for a
+    terminal state that inbox actually has something in, a link to
+    `/{name}/{state}`.
+
+    Returns `None` when there is no store wired -- the same condition
+    `_serve_inbox_route` itself 404s on (see its own comment) -- because a
+    link into a page that would 404 is worse than no navigation there at all.
+
+    THE COUNT IS DELIBERATELY NARROWED to `INBOXES[name]` minus
+    `_NO_ROW_BUILDER`, exactly the same subject types `_inbox_page` asks the
+    store for. A tag inbox has four subject types but `/tags` can only ever
+    render one of them (see `_NO_ROW_BUILDER`'s own comment for why the other
+    three still take no row on that page); counting the full four here would
+    put a bigger number on this link than the page it points at can ever
+    show, with nothing on either page saying why. This is the cheaper of the
+    two honest fixes named for that gap -- render only what can be rendered,
+    and count only that -- rather than the more thorough one (composing the
+    merge/reconcile/hygiene sections onto every per-inbox page too), because
+    the combined `/inbox` page already carries those three sections in full;
+    nothing here makes them harder to reach, only absent from a NUMBER this
+    narrower page did not previously have at all.
+
+    One `store.counts()` call answers "how many, in every non-hidden state"
+    for the inbox as a whole -- summed here excluding `applied`, the same way
+    `_inbox_page` itself drops an applied row from the working-queue view.
+    `counts()` cannot report `dismissed`/`muted` at all -- both are in
+    `Store._HIDDEN_STATES` and excluded from its query by design, the same
+    design that makes `items()`'s own default view hide them -- so whether
+    each of those two nested links is worth showing is answered with
+    `items(state=..., limit=1)` instead: a real, unpaginated existence check
+    against the store, not a second count invented from the first.
+    """
+    if store is None:
+        return None
+    entries = []
+    for name in INBOXES:
+        types = tuple(t for t in INBOXES[name] if t not in _NO_ROW_BUILDER)
+        counts = store.counts(subject_types=types)
+        waiting = sum(n for state, n in counts.items() if state != "applied")
+        states = []
+        for state in _INBOX_STATES:
+            if state == "applied":
+                present = counts.get("applied", 0) > 0
+            else:
+                present = bool(store.items(subject_types=types, state=state,
+                                           limit=1))
+            if present:
+                states.append(state)
+        entries.append({"name": name, "title": TITLES[name],
+                        "count": waiting, "states": states})
+    return entries
+
 # The two pages. `/` is the summary -- "did the passes run, and what did they
 # find" -- and the inbox, which used to be here, is one click away at `/inbox`.
 #
@@ -219,7 +274,8 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                          # this important is a second copy free to drift.
                          low_count_is_not_proof=LOW_COUNT_IS_NOT_PROOF,
                          schedule=_schedule_status(),
-                         just_applied=just_applied).encode()
+                         just_applied=just_applied,
+                         sidebar=_sidebar_context(_store)).encode()
             self._send(200, body,
                        [("Content-Type", "text/html; charset=utf-8")])
 
@@ -235,7 +291,8 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
             """
             return render("summary.html", summary=_summary(),
                           scan=_scan_status(),
-                          scan_default_limit=DEFAULT_SCAN_LIMIT).encode()
+                          scan_default_limit=DEFAULT_SCAN_LIMIT,
+                          sidebar=_sidebar_context(_store)).encode()
 
         def _serve_inbox_route(self, path):
             """`/{inbox}` and `/{inbox}/{state}` -- everything that is
@@ -307,14 +364,22 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                     for item, row in zip(items, built)]
             else:
                 context[state] = built
+            # `merges`/`reconciles`/`unused` are left OUT of this call
+            # entirely, rather than passed as `[]` -- inbox.html tells the
+            # two states apart (`is defined`) and renders none of those three
+            # sections at all here, rather than rendering each as a false
+            # "nothing found" for subject types this page never asked the
+            # store about. See `_sidebar_context` for the other half of this
+            # same decision: what a per-inbox page cannot show, it does not
+            # count either.
             return render(
                 "inbox.html", title=TITLES[name],
                 rows=context["rows"], applied=context["applied"],
                 dismissed=context["dismissed"], muted=context["muted"],
-                refused=[], superseded=[], gone=[], merges=[], reconciles=[],
-                unused=[], counts={},
+                refused=[], superseded=[], gone=[], counts={},
                 low_count_is_not_proof=LOW_COUNT_IS_NOT_PROOF,
-                schedule=None, just_applied=None)
+                schedule=None, just_applied=None,
+                sidebar=_sidebar_context(_store))
 
         def _cross_origin_write(self):
             """Refuse a write whose own headers say it did not originate

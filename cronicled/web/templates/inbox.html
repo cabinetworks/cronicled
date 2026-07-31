@@ -26,6 +26,7 @@
   each action path, and that guarantee is worth more than tidier markup.
 #}
 {% include "_style.html" %}
+{% include "_sidebar.html" %}
 
 {# `identifier` and `proposal_block` are shared by the live inbox list and
    the Applied section below -- an applied row is not a different SHAPE of
@@ -432,20 +433,42 @@
 {{ row_block(row) }}
 {% endfor %}
 
+{# `merges`/`reconciles`/`unused` are rendered only when the CALLER passed
+   them -- `is defined`, checked before either is coerced with `default([])`
+   below. The combined `/inbox` page always passes all three (see
+   `cronicled.__main__`'s wiring), so they render there exactly as before.
+   A per-inbox page (`/tags`, `/scenes`, `/performers`) does not pass them
+   at all (see `web.app._inbox_page`) because it never asked the store about
+   the three subject types they cover -- rendering an empty section here
+   would say "no duplicate tag spellings" about a page that never looked,
+   which is worse than the section being absent. See `web.app._NO_ROW_BUILDER`
+   and `_sidebar_context` for the rest of this same decision: what this page
+   cannot show, it does not count either. #}
+{% if title == "Tags" %}
+<p class="note">Tag merges, tag/performer matches and low-count tags are
+  proposals about tags too, and are shown on the combined
+  <a href="/inbox">Inbox</a> page for now, not here.</p>
+{% endif %}
+
+{% if merges is defined %}
 {% set merges = merges | default([]) %}
 {% call section("Tag merges", merges, "No duplicate tag spellings found.") %}
   {% for row in merges %}
   {{ merge_block(row) }}
   {% endfor %}
 {% endcall %}
+{% endif %}
 
+{% if reconciles is defined %}
 {% set reconciles = reconciles | default([]) %}
 {% call section("Tags that are a performer", reconciles, "No tag matches a performer's name.") %}
   {% for row in reconciles %}
   {{ reconcile_block(row) }}
   {% endfor %}
 {% endcall %}
+{% endif %}
 
+{% if unused is defined %}
 {% set unused = unused | default([]) %}
 {# The TOTAL number of tags, not the number of groups. See the `section` macro's
    own note: "(2)" over a thousand rows is the one number on that line a person
@@ -460,6 +483,7 @@
   {{ unused_group_block(group) }}
   {% endfor %}
 {% endcall %}
+{% endif %}
 
 {% set muted = muted | default([]) %}
 {% set dismissed = dismissed | default([]) %}
