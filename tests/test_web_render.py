@@ -1923,6 +1923,94 @@ class TagDescriptionBlock(unittest.TestCase):
         self.assertNotIn("<script>", html)
 
 
+# -- ticket bulk179: bulk-applying tag descriptions ------------------------- #
+
+
+class BulkApplyTagDescriptionsForm(unittest.TestCase):
+    """The bulk-apply control the page draws for the `rows` it is about to
+    show. Ticket bulk179's own acceptance: the set this form posts must be
+    EXACTLY the rows the operator was shown -- never a filter re-evaluated
+    at apply time -- so these assert the whole set of hidden fields, not a
+    count and not one sampled field."""
+
+    def _section(self, html):
+        after = html.split('action="/bulk_apply_tag_descriptions"', 1)
+        self.assertEqual(len(after), 2, "no bulk-apply form found")
+        return after[1].split("</form>", 1)[0]
+
+    def test_it_carries_exactly_the_tag_description_rows_own_fingerprints(self):
+        html = render("inbox.html", counts={}, rows=[
+            _tag_description_row(fingerprint="fp-a"),
+            _tag_description_row(fingerprint="fp-b"),
+        ])
+
+        section = self._section(html)
+        self.assertEqual(re.findall(r'name="fp" value="([^"]+)"', section),
+                         ["fp-a", "fp-b"])
+
+    def test_the_stated_count_matches_the_number_of_hidden_fields(self):
+        # The count is read off `bulk_tag_rows | length` at the point of
+        # use, never carried as a second number beside it -- so the text a
+        # person reads before pressing the button and the set the form
+        # actually posts cannot drift apart.
+        html = render("inbox.html", counts={}, rows=[
+            _tag_description_row(fingerprint="fp-a"),
+            _tag_description_row(fingerprint="fp-b"),
+            _tag_description_row(fingerprint="fp-c"),
+        ])
+
+        section = self._section(html)
+        self.assertEqual(len(re.findall(r'name="fp"', section)), 3)
+        self.assertIn("Apply all 3", section)
+
+    def test_a_scene_proposal_never_ends_up_in_the_bulk_form(self):
+        # HARM: this is the "additive-only, tag-description-only" scoping
+        # made visible -- a scene row shown on the SAME page must never
+        # contribute a hidden field to a form whose whole safety rests on
+        # only ever carrying tag-description fingerprints.
+        html = render("inbox.html", counts={},
+                      rows=[_row(), _tag_description_row(fingerprint="fp-t")])
+
+        section = self._section(html)
+        self.assertEqual(re.findall(r'name="fp" value="([^"]+)"', section),
+                         ["fp-t"])
+
+    def test_no_form_at_all_when_no_tag_description_row_is_shown(self):
+        html = render("inbox.html", counts={}, rows=[_row()])
+
+        self.assertNotIn("bulk_apply_tag_descriptions", html)
+
+    def test_no_form_at_all_when_there_are_no_rows(self):
+        html = render("inbox.html", counts={}, rows=[])
+
+        self.assertNotIn("bulk_apply_tag_descriptions", html)
+
+
+class BulkApplyConfirmationBanner(unittest.TestCase):
+    """The banner `/bulk_apply_tag_descriptions`'s own redirect produces
+    (see `web.app`'s `bulk_result` wiring) -- both counts stated, never
+    collapsed into a single flag, so a partial outcome cannot render as the
+    same banner a complete one gets."""
+
+    def test_a_complete_batch_says_all_were_applied(self):
+        html = render("inbox.html", counts={}, rows=[],
+                      bulk_result={"requested": 3, "applied": 3})
+
+        self.assertIn("Applied all 3 tag descriptions", html)
+
+    def test_a_partial_batch_states_both_counts_and_not_completion(self):
+        html = render("inbox.html", counts={}, rows=[],
+                      bulk_result={"requested": 3, "applied": 2})
+
+        self.assertIn("Applied 2 of 3 tag descriptions", html)
+        self.assertNotIn("Applied all", html)
+
+    def test_no_bulk_result_shows_no_banner_at_all(self):
+        html = render("inbox.html", counts={}, rows=[])
+
+        self.assertNotIn("tag descriptions", html)
+
+
 # -- tag-merge proposals ---------------------------------------------------- #
 
 

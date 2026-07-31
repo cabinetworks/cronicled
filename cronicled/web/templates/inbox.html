@@ -457,8 +457,47 @@
 {{ row_block(just_applied_rows[0], highlight=True) }}
 {% endif %}
 
+{# The two counts `/bulk_apply_tag_descriptions` redirected here with (see
+   web/app.py's do_GET) -- both together, never collapsed into one flag, so
+   a batch that only partly applied is stated as a partial outcome rather
+   than read as the same banner a complete one gets. `bulk_result` is
+   `None` whenever the query carried neither or an unparseable value, the
+   same "stale or foreign value shows nothing" rule `just_applied` follows
+   above. #}
+{% set bulk_result = bulk_result | default(None) %}
+{% if bulk_result %}
+{% if bulk_result.applied == bulk_result.requested %}
+<p class="note">Applied all {{ bulk_result.applied }} tag descriptions.</p>
+{% else %}
+<div class="warn">Applied {{ bulk_result.applied }} of {{ bulk_result.requested }} tag descriptions -- the rest were refused or could not be written, and are still waiting below.</div>
+{% endif %}
+{% endif %}
+
 {% if not rows %}
 <p class="empty">Nothing waiting. Proposals appear here after a scan.</p>
+{% endif %}
+
+{# Exactly the tag-description rows THIS render is about to draw, in the
+   same order -- never a separate query. `count` is `bulk_tag_rows |
+   length`, read at the point of use rather than carried as a second
+   number, so the count stated before the action and the set of hidden
+   fields the form actually posts cannot drift apart (the same rule
+   `web.rows.UnusedTagGroup.count` follows for the same reason). Every
+   proposal in `rows` here is already `actionable` -- `_inbox_page` and
+   `_inbox_rows` both exclude `applied` rows from this list before it ever
+   reaches the template -- so nothing further is filtered on state; the
+   safety guard against anything else lives in
+   `Actions.bulk_apply_tag_descriptions` itself, not in what this form
+   happens to submit. #}
+{% set bulk_tag_rows = rows | selectattr("kind", "equalto", "tag-description") | list %}
+{% if bulk_tag_rows %}
+<form method="post" action="/bulk_apply_tag_descriptions">
+  <p class="note">{{ bulk_tag_rows | length }} tag descriptions shown below have no description to overwrite.
+  {% for row in bulk_tag_rows %}
+  <input type="hidden" name="fp" value="{{ row.fingerprint }}">
+  {% endfor %}
+  <button>Apply all {{ bulk_tag_rows | length }}</button></p>
+</form>
 {% endif %}
 
 {% for row in rows %}
