@@ -787,6 +787,47 @@ class EvidenceBackedResolution(unittest.TestCase):
         # not settle on one", which is the fact a refusal needs to report.
         self.assertEqual(r.unconfirmed, ("Amberlight", "Rowantide"))
 
+    def test_two_spellings_of_one_name_are_one_candidate_and_never_compete(self):
+        """No change needed here: `_resolve_by_evidence` cannot read two
+        agreeing sources as a conflict, because the candidate list is
+        deduplicated by `_same_name` -- `spaceless` equality, the SAME
+        equality `_owner_support` counts support with -- before anything is
+        searched. Two survivors are therefore two different names by this
+        module's own definition of sameness, and both being catalogue-
+        confirmed is a real conflict rather than corroboration.
+
+        The fixture spells the one name two visibly different ways, so it
+        fails if that deduplication ever weakens to raw string equality: the
+        folder and the filename would become two candidates, both would be
+        asked of the catalogue, and this file would refuse on the strength
+        of a hyphen. The single-candidate test below cannot see that, because
+        its two spellings are byte-identical.
+        """
+        owners_of = _owners_of({})
+
+        r = resolve("wren-ashcombe - Morning Session.mp4", "Wren Ashcombe",
+                    owners_of=owners_of)
+
+        self.assertEqual(r.name, "Wren Ashcombe")
+        self.assertEqual(r.source, "folder")
+        self.assertIsNone(r.competing)
+        # Not one lookup: there was never a second candidate to check.
+        self.assertEqual(owners_of.calls, [])
+
+    def test_a_composed_and_a_decomposed_accent_do_not_compete_either(self):
+        # The other difference `spaceless` folds, and the one a filesystem
+        # and a scraper routinely disagree about. Same rule, second spelling.
+        folder = "Zo\u0065\u0308 Marchcroft"                   # NFD
+        filename = "Zo\u00eb Marchcroft - Morning Session.mp4"  # NFC
+        self.assertNotEqual(folder, "Zo\u00eb Marchcroft")      # really differ
+        owners_of = _owners_of({})
+
+        r = resolve(filename, folder, owners_of=owners_of)
+
+        self.assertEqual(r.source, "folder")
+        self.assertIsNone(r.competing)
+        self.assertEqual(owners_of.calls, [])
+
     def test_a_single_candidate_never_spends_a_lookup(self):
         # The common, unambiguous file: folder and filename agree, so there
         # is nothing to check. This is the cost bound -- a search-backed

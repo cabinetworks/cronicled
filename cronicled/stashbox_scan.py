@@ -42,11 +42,35 @@ default `cronicled.scan.examine` itself falls back to whenever no
 `owners_of` was given. Its own `competing` field still reports the
 disagreement, so `cronicled.stashbox.check` still downgrades to the weaker
 wording exactly as it would for any other contested file.
+
+`marker`, when given, pools organized scenes carrying that tag alongside the
+unorganized set -- exactly the population `cronicled.scan.ScanProducer`'s own
+`marker` reaches, read through the same `cronicled.scan.pool_scenes` that
+producer uses, rather than a second copy of that selection. `check` (see
+`cronicled.stashbox`'s own docstring) never reads what a file currently
+claims to be, so a scene an earlier tool organized on a guess is exactly as
+good a subject for a second, source-drawn opinion as any other file -- more
+so, in fact: nothing has ever checked it against an index at all.
+
+The honest cost needs stating plainly, because it is easy to overstate in
+the OTHER direction: THIS PRODUCER DOES NOT CACHE A LISTING READ ACROSS
+FILES. `cronicled.stashbox.check` pages a whole listing per CALL, and
+`produce` calls it once per selected file, so two files that resolve to the
+same creator page that creator's listing TWICE, not once -- there is no
+per-run memo here the way `cronicled.scan._SingleFlight` gives the scan for
+its own per-store searches. `produce` still reports how many distinct
+creators the marked population resolves to (`_resolved_creators`), because
+that is the number worth knowing before ever turning a marker on here -- but
+until a cache exists, the listing reads a run actually spends are bounded by
+how many SELECTED files have a known performer id, not by that
+distinct-creator count, whenever more than one selected file shares a
+creator. Reported as a measurement to weigh, not as a claim about what this
+already costs.
 """
 import posixpath
 
 from cronicled.artist import Aliases, creator_folder, resolve
-from cronicled.scan import select
+from cronicled.scan import pool_scenes, select
 from cronicled.scoring import DEFAULT_THRESHOLD
 from cronicled.stashbox import check as stashbox_check
 
@@ -65,6 +89,35 @@ def _first_path(scene):
         raise ValueError(
             "scene %r has no file to identify it by" % (scene.get("id"),))
     return files[0]["path"]
+
+
+def _resolved_creators(scenes, aliases):
+    """The distinct creator names `scenes` resolve to, on the same plain
+    folder-wins default `StashBoxCheckProducer.produce`'s own loop uses.
+
+    No catalogue is consulted -- `resolve` with no `owners_of` is a pure
+    function of a name and a folder -- so this spends no lookup and costs
+    nothing to compute, which is the whole point: it exists to tell an
+    operator what enabling a marker would cost BEFORE any listing is read,
+    including at `limit=0`, where `produce`'s own loop never runs at all.
+
+    A scene this cannot even read a path from is skipped, the same way
+    `produce`'s own loop isolates a malformed scene from the rest of a
+    batch -- one unreadable entry says nothing about how many creators are
+    behind everything else.
+    """
+    creators = set()
+    for scene in scenes:
+        try:
+            path = _first_path(scene)
+        except ValueError:
+            continue
+        directory = creator_folder(path)
+        name = posixpath.basename(path)
+        resolution = resolve(name, directory, aliases)
+        if resolution.name is not None:
+            creators.add(resolution.name)
+    return creators
 
 
 class StashBoxCheckProducer:
@@ -86,7 +139,7 @@ class StashBoxCheckProducer:
 
     def __init__(self, stash, box, performer_ids, *, store, folder="library",
                 limit=None, name_filter=None, threshold=DEFAULT_THRESHOLD,
-                aliases=None, censorship=None):
+                aliases=None, censorship=None, marker=None):
         self._stash = stash
         self._box = box
         # A plain, possibly-empty mapping -- not `Aliases`, which validates
@@ -102,6 +155,15 @@ class StashBoxCheckProducer:
         self._threshold = threshold
         self._censorship = censorship or {}
         self._aliases = aliases if isinstance(aliases, Aliases) else Aliases(aliases)
+        # The tag NAME, kept exactly as `cronicled.scan.ScanProducer` keeps
+        # its own -- read against the server inside `produce`, not here, for
+        # the same reason: ids are installation-specific, and a run built at
+        # start-up and started later must ask about the tag as it stands at
+        # each run. There is deliberately no separate configuration key for
+        # this -- see this module's own docstring -- so a caller wires this
+        # from the SAME setting `cronicled.config.load_marker_tag` reads for
+        # the scan, never a second one of its own.
+        self._marker = marker
 
     def produce(self, ctx):
         """Yield nothing, ever -- see this module's own docstring for why:
@@ -109,12 +171,30 @@ class StashBoxCheckProducer:
         about whether a source lists a file at all, and the whole of that
         goes to `ctx.log`.
         """
-        _, scenes = self._stash.unorganized_scenes(None)
+        scenes, marked = pool_scenes(self._stash, self._marker)
         selected, counts = select(
             scenes, store=self._store, folder=self._folder,
-            name_filter=self._name_filter, limit=self._limit)
-        ctx.log("selected %d of %d files for a stash-box check" %
-               (len(selected), counts.total))
+            name_filter=self._name_filter, limit=self._limit, marked=marked)
+        selection = ("selected %d of %d files for a stash-box check" %
+                    (len(selected), counts.total))
+        # Appended only when a marker is actually configured -- the same rule
+        # `cronicled.scan.ScanProducer.produce` follows for its own line --
+        # so an absent clause means "no marker was configured" rather than
+        # "the marker matched nothing". The distinct-creator count is
+        # computed over the WHOLE marked population, not just what the limit
+        # let through, so it stays meaningful even at `limit=0`: this pages a
+        # listing per resolved creator, and that count is what the read
+        # actually costs -- see `_resolved_creators` and this module's own
+        # docstring.
+        if self._marker is not None:
+            marked_scenes = [scene for scene in scenes
+                             if str(scene.get("id")) in marked]
+            creators = _resolved_creators(marked_scenes, self._aliases)
+            selection += (
+                "; %d of the %d offered only because they carry the marker "
+                "tag %r, resolving to %d distinct creator(s)"
+                % (counts.marked, counts.total, self._marker, len(creators)))
+        ctx.log(selection)
 
         checked = unlisted = present = inconclusive = skipped = 0
         for done, scene in enumerate(selected, start=1):

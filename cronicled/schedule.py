@@ -765,6 +765,39 @@ class LoopStatus:
       holding the last good one: a tick that did not finish decided nothing,
       and blanking the last real answer would lose the record at the moment
       there is most to explain.
+
+    `appointments` IS NOT ONE OF THOSE FIELDS, AND SAYING SO IS THE POINT
+    --------------------------------------------------------------------
+    Every field above is an OBSERVATION about ticks that have happened, and
+    each earns its place by telling a dead loop from an idle one. `appointments`
+    is a DECLARATION: the resolved schedule itself, `{producer: Entry}`, which
+    is true before the first tick and unchanged by every one of them. Carrying
+    it here widens what this type means, from "what the loop has been doing" to
+    "what the loop is FOR, and what it has been doing", and that widening is
+    deliberate rather than a field slipped in beside the diagnostics.
+
+    The alternative was a second accessor beside `status()`, and it loses on
+    the seam rather than on the typing. This is the only schedule data a page
+    can reach, and the reason it must stay the only one is that the page would
+    otherwise read the loop's record and the loop's schedule through two calls
+    made at two moments — free to disagree about which producers exist, with
+    nothing on the page saying that they had. One call, one answer, one moment.
+
+    It is `Entry` rather than a rendered string because the rules here are
+    arithmetic over UTC and a stated time in its own zone; how an hour looks to
+    a reader is the view layer's decision, exactly as the wording of a reason
+    is (see `cronicled.web.rows.local_times`). What this owes the page is the
+    statement, not a formatting of it.
+
+    A copy of the mapping, for the reason `failing_to_start` is copied: a
+    caller holding the answer must not be able to edit the schedule the loop
+    goes on ticking against. `Entry` is frozen, so the copy needs to be no
+    deeper than the mapping itself.
+
+    An INTERVAL entry appears here too, and so does a disabled one. A producer
+    that dropped out of this mapping because it has no hour to show would be a
+    producer the page has stopped mentioning — which reads as one that is not
+    scheduled at all, the exact confusion the whole type exists to prevent.
     """
 
     running: bool
@@ -776,6 +809,13 @@ class LoopStatus:
     last_error: Optional[str]
     last_error_at: Optional[str]
     last_traceback: Optional[str]
+    # No default, unlike the two below. Both of those have one because an
+    # honest empty value exists for them before the first tick; this one is
+    # resolved before a loop can start at all, so a `LoopStatus` that did not
+    # state it would be one whose schedule went missing, and an empty mapping
+    # defaulted in reads on the page exactly like a deployment with nothing
+    # scheduled.
+    appointments: dict
     failing_to_start: dict = field(default_factory=dict)
     last_result: Optional[TickResult] = None
 
@@ -1068,6 +1108,12 @@ class Scheduler:
         Safe to call from any thread, and from before `start()` — the answer
         for a scheduler that never started and one whose loop died differ in
         `closed`, which is exactly the distinction worth having.
+
+        The resolved schedule comes back with the record of what the loop has
+        done, through this one call, because it is the only route a page has to
+        either — see `LoopStatus.appointments` for why that is a deliberate
+        widening of this type rather than a convenience, and why nothing
+        outside this class reads `_entries`.
         """
         with self._lock:
             thread = self._thread
@@ -1081,6 +1127,11 @@ class Scheduler:
                 last_error=self._last_error,
                 last_error_at=self._last_error_at,
                 last_traceback=self._last_traceback,
+                # A copy, for the reason `failing_to_start` below is copied:
+                # a caller holding the answer must not be able to edit the
+                # schedule this loop goes on ticking against. Shallow is
+                # enough — `Entry` is frozen.
+                appointments=dict(self._entries),
                 # A copy: a caller holding the answer must not be able to
                 # edit the loop's own counts by mutating it.
                 failing_to_start=dict(self._failing_to_start),

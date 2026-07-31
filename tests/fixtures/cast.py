@@ -21,6 +21,11 @@ TITLES = {
     "generic_token": "My Session",
     # No token overlap with any of the above: the true-negative case.
     "unrelated": "Harbour Lights",
+    # Same title, spelled two ways: exercises `normalize`'s "&" -> "and"
+    # expansion, which exists so a filename spelling one out and a store
+    # title using the symbol (or the reverse) still normalise alike.
+    "ampersand_form": "Salt & Anchor",
+    "expanded_form": "Salt and Anchor",
 }
 
 # Stand-in for a platform's word substitutions. Invented words, real shape:

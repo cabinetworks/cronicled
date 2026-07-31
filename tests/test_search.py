@@ -11,6 +11,7 @@ depends on it, not just `tests/test_censorship.py`'s.
 """
 import unittest
 
+from cronicled.scoring import decide, score
 from cronicled.search import catalog_search
 from tests.fixtures.cast import CENSORSHIP
 
@@ -181,6 +182,45 @@ class CatalogSearchDeduplication(unittest.TestCase):
 
         self.assertEqual(results, [a, b])
 
+    def _untraceable(self, title):
+        """A row from a source supplying NEITHER `urls` NOR `code` — the one
+        shape in which the title is the only thing identifying it."""
+        return dict(row(title, ""), url=None, urls=None, code=None)
+
+    def test_two_rows_with_no_id_at_all_are_told_apart_by_their_titles(self):
+        # `urls` and `code` each independently pin a row to one real scene.
+        # A source supplying neither leaves the title carrying the whole of
+        # the identity, and a key that stopped reading it would fold every
+        # such row onto every other -- discarding a genuinely different
+        # candidate, which is the OPPOSITE failure to the one dedup exists
+        # for and every bit as quiet. Every other fixture here gives both
+        # rows a url, so nothing else can see this.
+        adapter = _Adapter("scraper-alpha", CENSORSHIP)
+        a = self._untraceable("Nightfall Errand")
+        b = self._untraceable("Morning Ledger")
+        stash = _SpyStash({
+            ("scraper-alpha", CREATOR): [a],
+            ("scraper-alpha", "k3strel hollow"): [b],
+        })
+
+        results = catalog_search(stash, adapter)(CREATOR)
+
+        self.assertEqual(results, [a, b])
+
+    def test_two_rows_with_no_id_and_one_title_are_still_one_candidate(self):
+        # The other direction, so the test above cannot be satisfied by a key
+        # that simply stopped folding anything.
+        adapter = _Adapter("scraper-alpha", CENSORSHIP)
+        first = self._untraceable("Nightfall Errand")
+        stash = _SpyStash({
+            ("scraper-alpha", CREATOR): [first],
+            ("scraper-alpha", "k3strel hollow"): [dict(first)],
+        })
+
+        results = catalog_search(stash, adapter)(CREATOR)
+
+        self.assertEqual(results, [first])
+
     def test_a_second_call_does_not_share_the_first_calls_list(self):
         adapter = _Adapter("scraper-alpha")
         stash = _SpyStash({("scraper-alpha", CREATOR): [row("A", "u1")]})
@@ -191,6 +231,65 @@ class CatalogSearchDeduplication(unittest.TestCase):
         first.append("mutated by the first caller")
 
         self.assertNotIn("mutated by the first caller", second)
+
+
+class DeduplicationIsWhatKeepsAgreementOutOfTheVERDICT(unittest.TestCase):
+    """The dedup carried through to the answer it actually protects.
+
+    `scoring.decide` is handed `Match(value, contained, meaningful_count)`
+    and nothing that identifies a candidate, so it cannot tell one scene
+    listed twice from two scenes that happened to score alike. The second is
+    a real choice and refusing it is right; the first is one answer named
+    twice and refusing it is the "ambiguous: X vs X" defect. Since `decide`
+    has no way to separate them, THIS dedup is the whole of the separation --
+    and the tests above stop at the candidate list, one layer short of the
+    verdict that was actually wrong.
+    """
+
+    FILENAME = "Nightfall Errand.mp4"
+
+    def _verdict(self, results):
+        return decide([score(self.FILENAME, "", r["title"]) for r in results])
+
+    def test_one_scene_returned_twice_is_chosen_rather_than_refused(self):
+        # The permissive direction, end to end. Undeduplicated, these two
+        # rows reach `decide` as two candidates carrying one title, score
+        # identically, and refuse each other -- a file with exactly one good
+        # answer turned into a review nobody can act on by which cover
+        # encoding a re-scrape happened to return.
+        adapter = _Adapter("scraper-alpha", CENSORSHIP)
+        first = row("Nightfall Errand", "https://example.invalid/clip/x")
+        first["image"] = "data:image/jpeg;base64,AAAA"
+        second = dict(first, image="data:image/jpeg;base64,ZZZZ")
+        stash = _SpyStash({
+            ("scraper-alpha", CREATOR): [first],
+            ("scraper-alpha", "k3strel hollow"): [second],
+        })
+
+        verdict = self._verdict(catalog_search(stash, adapter)(CREATOR))
+
+        self.assertIsNotNone(verdict.match)
+        self.assertEqual(verdict.contenders, 1)
+
+    def test_two_scenes_that_score_alike_are_still_refused(self):
+        # The direction that must not be weakened along with it. Two rows
+        # this dedup correctly keeps apart still refuse each other, so the
+        # test above cannot be satisfied by a `decide` that stopped calling
+        # anything ambiguous.
+        adapter = _Adapter("scraper-alpha", CENSORSHIP)
+        a = row("Nightfall Errand At Dawn", "https://example.invalid/clip/a")
+        b = row("Nightfall Errand In Winter Light Extended",
+                "https://example.invalid/clip/b")
+        stash = _SpyStash({
+            ("scraper-alpha", CREATOR): [a],
+            ("scraper-alpha", "k3strel hollow"): [b],
+        })
+
+        verdict = self._verdict(catalog_search(stash, adapter)(CREATOR))
+
+        self.assertIsNone(verdict.match)
+        self.assertEqual(verdict.contenders, 2)
+        self.assertIn("ambiguous", verdict.reason)
 
 
 class CatalogSearchFailure(unittest.TestCase):

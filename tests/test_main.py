@@ -29,7 +29,7 @@ from cronicled.runscan import SCHEDULED_SCAN_NAME, build_producer
 from cronicled.scan import ScanProducer
 from cronicled.schedule import Entry, as_utc, due, resolve
 from cronicled.stash import Stash, StashError
-from cronicled.store import Store
+from cronicled.store import RUN_OUTCOME_INTERRUPTED, Store
 from cronicled.tag_hygiene import NO_SCENES, ONE_SCENE
 from cronicled.tag_hygiene import proposal as unused_proposal
 from cronicled.tags import TagMergeProducer, cluster_tags
@@ -586,6 +586,68 @@ class NoServerConfigured(_Base):
         self.assertIsInstance(captured.kwargs["actions"]._stash, Stash)
 
 
+class AnInterruptedRunIsReconciledAtStartup(_Base):
+    """The observed incident: a container stops mid-run and leaves an open
+    row nothing else will ever close. `main()` must close it, as the very
+    first thing it does with the store -- see `Store.close_interrupted_runs`
+    and the comment above where `__main__.py` calls it.
+    """
+
+    def _seed_open_run(self, at="2026-03-01T01:06:40+00:00"):
+        """Open a run and walk away -- opened and closed before `main()`
+        runs its own `Store` on the same path, exactly as `_seed` does for a
+        proposal, and never finished, standing in for the process that
+        stopped existing mid-pass."""
+        store = Store(self.db_path)
+        run_id = store.start_run("scene-scan", trigger="scheduled", at=at)
+        store.close()
+        return run_id
+
+    def test_a_row_left_open_by_an_earlier_process_is_closed(self):
+        orphan = self._seed_open_run()
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path])
+        row = [r for r in captured.kwargs["actions"]._store.recent_runs()
+              if r["id"] == orphan][0]
+        self.assertIsNotNone(row["finished"])
+        self.assertEqual(row["outcome"], RUN_OUTCOME_INTERRUPTED)
+
+    def test_startup_reports_how_many_it_closed(self):
+        self._seed_open_run()
+        self._seed_open_run(at="2026-03-01T01:06:41+00:00")
+        captured = _CapturedServe()
+        out = io.StringIO()
+        with patch("cronicled.__main__.serve", captured):
+            with redirect_stdout(out):
+                main(["--db", self.db_path])
+        self.assertIn("closed 2", out.getvalue())
+
+    def test_a_fresh_install_with_nothing_open_says_nothing_about_it(self):
+        captured = _CapturedServe()
+        out = io.StringIO()
+        with patch("cronicled.__main__.serve", captured):
+            with redirect_stdout(out):
+                main(["--db", self.db_path])
+        self.assertNotIn("run log", out.getvalue())
+
+    def test_a_finished_run_from_before_the_restart_is_untouched(self):
+        store = Store(self.db_path)
+        run_id = store.start_run("scene-scan", trigger="scheduled",
+                                 at="2026-03-01T01:00:00+00:00")
+        store.finish_run(run_id, outcome="completed",
+                         counts={"proposed": 3},
+                         at="2026-03-01T01:04:00+00:00")
+        store.close()
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path])
+        row = [r for r in captured.kwargs["actions"]._store.recent_runs()
+              if r["id"] == run_id][0]
+        self.assertEqual(row["outcome"], "completed")
+        self.assertEqual(row["counts"], {"proposed": 3})
+
+
 class MainWiring(_Base):
     # Four mutations reported as surviving with the suite green: the host
     # argument being dropped in favour of a hardcoded "0.0.0.0", the two
@@ -785,6 +847,42 @@ class SceneUrlWiring(_Base):
         muted = captured.kwargs["muted"]()
         self.assertEqual(muted[0]["subject_url"],
                          "http://media.example/scenes/9")
+
+
+class PerInboxRouteWiring(_Base):
+    """`/{inbox}` and `/{inbox}/{state}` narrow by subject type through
+    `Store.items(subject_types=)` directly (see `web.app._serve_inbox_route`)
+    rather than through a pre-built callable the way every other section is
+    wired -- so what reaches `serve()` is the store itself and the same
+    `base_url` every other row's link is built from, not a section-shaped
+    function.
+    """
+
+    def test_the_store_reaches_serve(self):
+        self._seed()
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path])
+        # The SAME store `actions` was wired with, not a second handle on the
+        # same file: two connections would each hold their own view of
+        # in-flight writes, and a per-inbox page reading one while an approve
+        # commits through the other is exactly the kind of split this project
+        # avoids elsewhere by threading one object through.
+        self.assertIs(captured.kwargs["store"], captured.kwargs["actions"]._store)
+
+    def test_a_configured_server_reaches_the_per_inbox_base_url(self):
+        self._seed()
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path, "--server", "http://media.example"])
+        self.assertEqual(captured.kwargs["base_url"], "http://media.example")
+
+    def test_no_configured_server_leaves_the_per_inbox_base_url_none(self):
+        self._seed()
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path])
+        self.assertIsNone(captured.kwargs["base_url"])
 
 
 class HostAndPortEnvironmentDefaults(_Base):

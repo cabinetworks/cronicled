@@ -1,9 +1,11 @@
 import re
 import unittest
+from datetime import time
 from zoneinfo import ZoneInfo
 
 from cronicled.jobs import Job
-from cronicled.schedule import LoopStatus, TickResult
+from cronicled.schedule import LoopStatus, TickResult, resolve
+from cronicled.store import RUN_OUTCOME_INTERRUPTED
 from cronicled.tag_descriptions import Found
 from cronicled.tag_descriptions import proposal as tag_description_proposal
 from cronicled.tags import cluster_tags
@@ -15,6 +17,17 @@ from cronicled.web.rows import (
 )
 
 _HOSTILE = '<script>alert("x")</script>'
+
+
+class _Producer:
+    """A producer as `resolve` reads one, for the fixtures that need a real
+    resolved schedule to hand a `LoopStatus`."""
+
+    def __init__(self, name, every=None, at=None, zone=None):
+        self.name = name
+        self.every = every
+        self.at = at
+        self.zone = zone
 
 # A real zone that observes daylight saving, and whose offset differs from UTC
 # on both sides of every transition -- see tests/test_web_rows.py for why both
@@ -1346,6 +1359,41 @@ class AFailedRunShowsItsError(unittest.TestCase):
         self.assertIn("&lt;script&gt;", html)
 
 
+class AnInterruptedRunReadsAsNeitherAFailureNorASuccess(unittest.TestCase):
+    """A run `Store.close_interrupted_runs` closed -- the process running it
+    stopped existing before it could record an outcome of its own.
+
+    Neither existing branch may draw it: the "still running" branch would
+    report a restart-ago process as working right now, and the counts branch
+    would report a partial, possibly-empty tally as the pass's actual result
+    -- both of which are exactly the misleading reads this outcome exists to
+    replace.
+    """
+
+    def test_an_interrupted_run_does_not_read_as_still_running(self):
+        html = _summary_html(runs=[_run(outcome=RUN_OUTCOME_INTERRUPTED,
+                                        counts={}, error=None)])
+        self.assertNotIn("still running", html)
+
+    def test_an_interrupted_run_does_not_read_as_failed(self):
+        html = _summary_html(runs=[_run(outcome=RUN_OUTCOME_INTERRUPTED,
+                                        counts={}, error=None)])
+        self.assertNotIn("FAILED", html)
+
+    def test_an_interrupted_run_with_partial_counts_does_not_show_them_as_its_result(
+            self):
+        # Counts it DOES have -- whatever it reached before the process
+        # disappeared -- so this cannot pass merely because there were none.
+        html = _summary_html(runs=[_run(outcome=RUN_OUTCOME_INTERRUPTED,
+                                        counts={"recorded": 4}, error=None)])
+        self.assertNotIn("recorded 4", html)
+
+    def test_an_interrupted_run_says_so(self):
+        html = _summary_html(runs=[_run(outcome=RUN_OUTCOME_INTERRUPTED,
+                                        counts={}, error=None)])
+        self.assertIn("interrupted", html)
+
+
 class WhatIsWaitingIsALinkToTheInbox(unittest.TestCase):
     """A count a reader cannot follow is a count they learn to skip."""
 
@@ -1442,6 +1490,11 @@ def _loop_status(**over):
                   consecutive_failures=0,
                   last_tick_at="2026-07-27T03:00:00+00:00",
                   last_error=None, last_error_at=None, last_traceback=None,
+                  # Resolved by the REAL `resolve`, so this fixture cannot
+                  # hold a schedule the loop could never be holding -- see
+                  # `_entries` in tests/test_web_rows.py for the whole reason.
+                  appointments=resolve([_Producer("nightly-library-scan",
+                                                  at=time(3, 0), zone=ZONE)]),
                   failing_to_start={}, last_result=None)
     fields.update(over)
     return LoopStatus(**fields)
@@ -1528,6 +1581,107 @@ class TheSchedulePanel(unittest.TestCase):
         html = render("inbox.html", rows=[], counts={}, schedule=status)
         self.assertNotIn("<script>", html)
         self.assertIn("&lt;script&gt;", html)
+
+
+class ThePanelStatesWhenEachPassIsDue(unittest.TestCase):
+    """The declaration, drawn.
+
+    The panel already answered "is the loop alive" and "why did this not
+    run". Neither answers "when is it MEANT to run", and an operator who has
+    not seen a pass in two days is asking that one first.
+
+    Every render here goes through `to_schedule_view`, because that is how the
+    page is handed a status in `cronicled.__main__` -- a fixture that skipped
+    the conversion would be drawing a shape production never draws.
+    """
+
+    def html(self, *producers, **over):
+        if not producers:
+            producers = (_Producer("nightly-library-scan", at=time(3, 0),
+                                   zone=ZONE),
+                         _Producer("performer-descriptions", at=time(3, 20),
+                                   zone=ZONE),
+                         _Producer("tag-merge", at=time(3, 40), zone=ZONE))
+        status = _loop_status(appointments=resolve(producers), **over)
+        return render("inbox.html", rows=[], counts={},
+                      schedule=to_schedule_view(status, zone=ZONE))
+
+    def test_every_producer_gets_a_line_naming_the_hour_it_is_due(self):
+        # All three, and the hours written out here rather than derived: a
+        # panel that listed one producer would be a panel an operator reads to
+        # conclude the other two are not scheduled.
+        html = self.html()
+        self.assertIn("nightly-library-scan &mdash; 03:00", html)
+        self.assertIn("performer-descriptions &mdash; 03:20", html)
+        self.assertIn("tag-merge &mdash; 03:40", html)
+
+    def test_the_zone_is_stated_once_however_many_producers_there_are(self):
+        # THREE appointments, ONE mention. A zone repeated on every line is
+        # the shape this is designed against: it is one setting for the whole
+        # deployment, and a page that says so three times invites the reading
+        # that they could differ.
+        html = self.html()
+        self.assertEqual(html.count("Europe/Madrid"), 1)
+        self.assertIn("Stated times are in Europe/Madrid.", html)
+
+    def test_a_producer_on_an_interval_gets_a_cadence_and_no_hour(self):
+        # And NO zone line: nothing here states a time, so there is nothing
+        # for a zone to qualify, and naming one would suggest the cadence was
+        # read in it.
+        html = self.html(_Producer("hourly", every=3600))
+        self.assertIn("hourly &mdash; every 3600s", html)
+        self.assertNotIn("Stated times are in", html)
+
+    def test_a_producer_name_from_the_schedule_is_escaped_like_the_rest(self):
+        html = self.html(_Producer(_HOSTILE, at=time(3, 0), zone=ZONE))
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+    def test_nothing_scheduled_draws_no_appointment_lines_at_all(self):
+        # The panel's own "nothing is scheduled" branch still owns this case,
+        # and it must not grow an empty zone heading above it.
+        html = render("inbox.html", rows=[], counts={}, schedule=None)
+        self.assertIn("Nothing is scheduled", html)
+        self.assertNotIn("Stated times are in", html)
+
+
+class TheTwoKindsOfTimeSitOnOnePageWithoutBorrowingFromEachOther(
+        unittest.TestCase):
+    """The boundary, asserted from BOTH sides at once, on one rendered page.
+
+    A test covering only the appointment cannot see this change shortening a
+    recorded instant, and that is the direction that destroys information: a
+    bare `03:00` beside a run cannot tell last night's from the one three
+    weeks ago. So the run's date and the appointment's absence of one are
+    asserted together, against a page that carries both.
+    """
+
+    def html(self, started, at):
+        return _summary_html(
+            runs=[_run(started=started)],
+            schedule=_loop_status(appointments=resolve(
+                [_Producer("nightly-library-scan", at=at, zone=ZONE)])))
+
+    def test_the_run_keeps_its_date_while_the_appointment_has_none(self):
+        html = self.html("2026-07-15T00:30:00+00:00", time(3, 0))
+        # The whole line, not the time alone: a builder that shortened the run
+        # to a bare hour would still satisfy an assertion looking for "02:30".
+        self.assertIn(
+            "<p><b>scene-scan</b> &mdash; 2026-07-15 02:30, scheduled</p>",
+            html)
+        self.assertIn(
+            '<p class="note">nightly-library-scan &mdash; 03:00</p>', html)
+
+    def test_it_holds_on_the_other_side_of_a_transition(self):
+        # January: the run's instant moves by +01:00 rather than +02:00, and
+        # the appointment does not move at all. A constant offset applied to
+        # either would fail exactly one of this pair.
+        html = self.html("2026-01-15T00:30:00+00:00", time(3, 0))
+        self.assertIn(
+            "<p><b>scene-scan</b> &mdash; 2026-01-15 01:30, scheduled</p>",
+            html)
+        self.assertIn(
+            '<p class="note">nightly-library-scan &mdash; 03:00</p>', html)
 
 
 # -- description proposals ------------------------------------------------- #
