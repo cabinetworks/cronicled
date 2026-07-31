@@ -37,8 +37,12 @@
 
    `section` is the shape ticket 97 and 98 both ask to share across what is
    now five collapsed sections: a count visible while collapsed, and what an
-   empty one says. Only Applied ever opens itself (see below); the other
-   four stay exactly as collapsed-by-default as before. #}
+   empty one says. None of them ever opens itself -- a reversal (`/unmute`,
+   `/undismiss`) can reopen the ONE section it just acted in (`opened=`, see
+   web/app.py's `_REOPEN_SECTION`), and Applied's own confirmation renders
+   above the fold instead of forcing its drawer open (see the banner above
+   `<h1>Inbox</h1>`) -- but the operator's own collapse/expand choice is
+   never overridden by a render nobody asked for. #}
 {# A row says how its candidate was arrived at, and the two ways are not
    interchangeable: a scored proposal names the creator it was searched
    under and where that name was read from, while a fingerprint-identified
@@ -424,6 +428,34 @@
 {% endmacro %}
 
 <h1>Inbox</h1>
+
+{% set applied = applied | default([]) %}
+{# The fingerprint a successful `/approve` redirected here with (see
+   web/app.py's do_POST) -- read-only, and only ever used to find the SAME
+   row again in `applied`, never trusted past that. #}
+{% set just_applied = just_applied | default(None) %}
+{# A stale or foreign `?applied=` value (a bookmarked link, another tab's
+   old redirect) must not produce a confirmation for a row that either was
+   never applied or is no longer sitting in `applied` -- so this is empty
+   whenever the fingerprint does not actually match a current row, and the
+   banner below renders nothing in that case. #}
+{% set just_applied_rows = (applied | selectattr("fingerprint", "equalto", just_applied) | list) if just_applied else [] %}
+
+{# Ticket: the Applied section is collapsed like every other one and NOTHING
+   here forces it open -- an approve used to spring it open on every single
+   request, which is the layout override this replaces. The confirmation an
+   open drawer used to provide moves here instead: the row `/approve` just
+   produced, shown once, above the fold, with whatever Undo it already
+   offers -- reachable without opening anything. It reuses `row_block`
+   rather than a hand-written summary line because `applied` can hold a
+   scene proposal, a performer-description or a tag-description proposal
+   (see `cronicled.web.rows.to_rows`), and only `row_block`'s own dispatch on
+   `row.kind` knows which fields each one actually has. #}
+{% if just_applied_rows %}
+<p class="note">Just applied:</p>
+{{ row_block(just_applied_rows[0], highlight=True) }}
+{% endif %}
+
 {% if not rows %}
 <p class="empty">Nothing waiting. Proposals appear here after a scan.</p>
 {% endif %}
@@ -466,21 +498,15 @@
 {% set refused = refused | default([]) %}
 {% set superseded = superseded | default([]) %}
 {% set gone = gone | default([]) %}
-{% set applied = applied | default([]) %}
-{% set just_applied = just_applied | default(None) %}
 {% set opened = opened | default(None) %}
-{# The one case that gets the section open on load: an approve made THIS
-   redirect just produced (see web/app.py's do_POST), and only when the
-   fingerprint it names is actually still sitting in `applied` -- a stale or
-   foreign `?applied=` query value must not force the section open on
-   nothing. Undo staying reachable for "the approve you just made and
-   immediately regretted" is ticket 98's stated bar; opening automatically
-   for exactly that one row, rather than always or never, is how this meets
-   it without leaving the section expanded by default for everyone reading
-   a link days later. #}
-{% set just_applied_rows = (applied | selectattr("fingerprint", "equalto", just_applied) | list) if just_applied else [] %}
 
-{% call section("Applied", applied, "Nothing applied yet.", open=(just_applied_rows | length > 0)) %}
+{# Applied's own open state is the operator's, exactly like every other
+   section here -- see the confirmation banner above `<h1>Inbox</h1>` for
+   how "an approve just landed" is said WITHOUT touching this attribute.
+   `applied`/`just_applied`/`just_applied_rows` are set once, above the
+   main row loop, because the banner needs them before this point in the
+   page. #}
+{% call section("Applied", applied, "Nothing applied yet.") %}
   {% for row in applied %}
   {{ row_block(row, highlight=(row.fingerprint == just_applied)) }}
   {% endfor %}
@@ -502,8 +528,8 @@
    redirected back from (see web/app.py's `_REOPEN_SECTION`), so reversing
    several mutes in one sitting does not mean re-opening this section after
    every single one. Never forced open any other way -- a page loaded
-   without that query value keeps this collapsed, the same as every section
-   but Applied. #}
+   without that query value keeps this collapsed, the same as every other
+   section. #}
 {% call section("Muted", muted, "Nothing muted.", open=(opened == "muted")) %}
   {% for m in muted %}
   <div class="proposal">
