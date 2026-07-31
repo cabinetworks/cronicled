@@ -721,5 +721,214 @@ class TheScanControlOnItsNewPageStillRefusesCrossOrigin(unittest.TestCase):
         self.assertEqual(sent["actions"].calls, [("scan", 25)])
 
 
+class _FakeStore:
+    """A minimal stand-in for `Store.items`, filtering an in-memory list the
+    same way the real one filters SQL rows: `subject_types` is checked with
+    `is not None`, never truthiness (an empty tuple is a real "select
+    nothing", not "no filter given"), and a `state=None` call excludes the
+    same four states `Store._HIDDEN_STATES` names -- everything else asks
+    for exactly one state.
+    """
+
+    _HIDDEN_STATES = ("dismissed", "muted", "superseded", "gone")
+
+    def __init__(self, items):
+        self._items = items
+
+    def items(self, folder=None, state=None, limit=None, offset=0,
+             subject_types=None):
+        result = self._items
+        if subject_types is not None:
+            result = [i for i in result if i["subject_type"] in subject_types]
+        if state is not None:
+            result = [i for i in result if i["state"] == state]
+        else:
+            result = [i for i in result
+                     if i["state"] not in self._HIDDEN_STATES]
+        return result
+
+
+# Three invented fixtures, one per inbox, each carrying its own fingerprint
+# inside a field its own row builder actually renders -- a scene's filename,
+# a tag description's name, a performer description's name -- so a test can
+# tell whether ITS row reached the page without depending on the fingerprint
+# appearing anywhere in the markup (it does not, in the Muted section: see
+# `web/templates/inbox.html`'s Unmute form, which posts `subject_type`/
+# `subject_id` and never `fp`).
+
+def _scene_item(fp, state="new"):
+    return {
+        "fingerprint": fp, "state": state, "subject_type": "scene",
+        "subject_id": "scene-%s" % fp,
+        "payload": {
+            "path": "/invented/library/%s.mp4" % fp,
+            "identified_by": "invented-box", "box": "invented-box",
+            "candidate": {"title": "An Invented Title", "image": None,
+                          "performers": [], "studio": None},
+        },
+    }
+
+
+def _tag_item(fp, state="new"):
+    return {
+        "fingerprint": fp, "state": state, "subject_type": "tag",
+        "subject_id": "tag-%s" % fp,
+        "payload": {
+            "name": "%s-invented-tag" % fp, "source_box": "invented-box",
+            "original": "", "description": "an invented description",
+        },
+    }
+
+
+def _performer_item(fp, state="new"):
+    return {
+        "fingerprint": fp, "state": state, "subject_type": "performer",
+        "subject_id": "performer-%s" % fp,
+        "payload": {
+            "name": "%s Invented Performer" % fp, "faults": ("markup",),
+            "original": "<b>before</b>", "cleaned": "before",
+        },
+    }
+
+
+class EachInboxRouteServesOnlyItsOwnSubjectTypes(unittest.TestCase):
+    """`/scenes`, `/tags` and `/performers` -- narrowed by `inboxes.INBOXES`
+    through `Store.items(subject_types=)`, reusing `to_rows` unchanged."""
+
+    def test_each_inbox_route_serves_only_its_own_subject_types(self):
+        store = _FakeStore([_scene_item("s1"), _tag_item("t1")])
+        scenes = _drive("GET", "/scenes", store=store)
+        tags = _drive("GET", "/tags", store=store)
+        self.assertEqual(scenes["status"], 200)
+        self.assertIn(b"s1", scenes["body"])
+        self.assertNotIn(b"t1", scenes["body"])
+        self.assertEqual(tags["status"], 200)
+        self.assertIn(b"t1", tags["body"])
+        self.assertNotIn(b"s1", tags["body"])
+
+    def test_the_performers_inbox_is_served_too(self):
+        store = _FakeStore([_performer_item("p1"), _scene_item("s1")])
+        sent = _drive("GET", "/performers", store=store)
+        self.assertEqual(sent["status"], 200)
+        self.assertIn(b"p1", sent["body"])
+        self.assertNotIn(b"s1", sent["body"])
+
+    def test_each_inbox_shows_its_own_title(self):
+        store = _FakeStore([])
+        for name, title in (("scenes", "Scenes"), ("tags", "Tags"),
+                            ("performers", "Performers")):
+            with self.subTest(name):
+                sent = _drive("GET", "/" + name, store=store)
+                self.assertIn(("<h1>%s</h1>" % title).encode(), sent["body"])
+
+    def test_a_tag_cluster_candidate_does_not_reach_the_tags_page_yet(self):
+        # `to_rows` cannot build a row for a merge candidate (it dispatches
+        # only on the description/tag-description subject types and treats
+        # everything else as scene-shaped -- see `web.app._NO_ROW_BUILDER`),
+        # so it is excluded from what `/tags` asks the store for at all,
+        # rather than reaching `to_rows` and raising `KeyError` on
+        # `payload["path"]`.
+        store = _FakeStore([_tag_item("t1"),
+                            {"fingerprint": "cluster-1", "state": "new",
+                             "subject_type": "tag-cluster",
+                             "subject_id": "1", "payload": {}}])
+        sent = _drive("GET", "/tags", store=store)
+        self.assertEqual(sent["status"], 200)
+        self.assertIn(b"t1", sent["body"])
+        self.assertNotIn(b"cluster-1", sent["body"])
+
+
+class UnknownInboxesAndStatesAre404(unittest.TestCase):
+    def test_an_unknown_inbox_is_404_not_an_empty_page(self):
+        # A typo that rendered an empty page would read as "nothing to
+        # review", the same silent-wrong-answer failure this project refuses
+        # elsewhere.
+        sent = _drive("GET", "/scene", store=_FakeStore([]))  # singular typo
+        self.assertEqual(sent["status"], 404)
+
+    def test_an_unknown_state_is_404_not_an_empty_page(self):
+        sent = _drive("GET", "/scenes/pending", store=_FakeStore([]))
+        self.assertEqual(sent["status"], 404)
+
+    def test_refused_is_404_not_an_empty_page(self):
+        # `refused` is not a state an `item` row ever carries (see
+        # `Store._HIDDEN_STATES` and `items()`'s own docstring) -- it lives in
+        # a wholly separate `refusal` table, keyed by subject, and
+        # `Store.refusals()` takes no `subject_types` argument to narrow it
+        # by. There is no honest way to serve it through
+        # `Store.items(subject_types=)`, the one interface these routes
+        # consume, so it 404s rather than rendering an empty page that would
+        # read as "nothing refused" for an inbox that may have plenty.
+        sent = _drive("GET", "/scenes/refused", store=_FakeStore([]))
+        self.assertEqual(sent["status"], 404)
+
+    def test_a_third_path_segment_is_404(self):
+        sent = _drive("GET", "/scenes/applied/extra", store=_FakeStore([]))
+        self.assertEqual(sent["status"], 404)
+
+    def test_with_no_store_wired_a_per_inbox_route_is_404_not_a_crash(self):
+        # Every existing test's double supplies no store at all -- a
+        # per-inbox route with nothing to ask 404s rather than raising
+        # `AttributeError` on `None.items`.
+        sent = _drive("GET", "/scenes")
+        self.assertEqual(sent["status"], 404)
+
+
+class TheNewRoutesDoNotAcceptPosts(unittest.TestCase):
+    def test_the_new_routes_do_not_accept_posts(self):
+        sent = _drive("POST", "/scenes", b"", store=_FakeStore([]))
+        self.assertEqual(sent["status"], 404)
+
+    def test_a_terminal_state_route_does_not_accept_posts_either(self):
+        sent = _drive("POST", "/scenes/applied", b"", store=_FakeStore([]))
+        self.assertEqual(sent["status"], 404)
+
+
+class TerminalStatePagesShowOnlyTheirOwnState(unittest.TestCase):
+    """`/{inbox}/{state}` for `applied`, `dismissed` and `muted`."""
+
+    def test_an_applied_row_does_not_reach_the_working_queue_page(self):
+        # `items()`'s own default excludes dismissed/muted/superseded/gone
+        # but NOT applied (see `Store._HIDDEN_STATES`) -- an applied
+        # proposal is a decision already made, and the working queue must
+        # still filter it out itself, the same way
+        # `cronicled.__main__._inbox_rows` does for the combined inbox.
+        store = _FakeStore([_scene_item("open-1", state="new"),
+                            _scene_item("closed-1", state="applied")])
+        sent = _drive("GET", "/scenes", store=store)
+        self.assertIn(b"open-1", sent["body"])
+        self.assertNotIn(b"closed-1", sent["body"])
+
+    def test_the_applied_state_page_shows_only_applied_rows(self):
+        store = _FakeStore([_scene_item("open-1", state="new"),
+                            _scene_item("closed-1", state="applied")])
+        sent = _drive("GET", "/scenes/applied", store=store)
+        self.assertIn(b"closed-1", sent["body"])
+        self.assertNotIn(b"open-1", sent["body"])
+
+    def test_the_dismissed_state_page_shows_only_dismissed_rows(self):
+        store = _FakeStore([_scene_item("open-1", state="new"),
+                            _scene_item("hidden-1", state="dismissed")])
+        sent = _drive("GET", "/scenes/dismissed", store=store)
+        self.assertIn(b"hidden-1", sent["body"])
+        self.assertNotIn(b"open-1", sent["body"])
+
+    def test_the_muted_state_page_shows_only_muted_rows_and_offers_unmute(self):
+        store = _FakeStore([_scene_item("open-1", state="new"),
+                            _scene_item("hidden-1", state="muted")])
+        sent = _drive("GET", "/scenes/muted", store=store)
+        body = sent["body"].decode()
+        self.assertIn("hidden-1", body)
+        self.assertNotIn("open-1", body)
+        self.assertIn('action="/unmute"', body)
+        # Not just THAT an Unmute control is offered -- it has to post the
+        # RIGHT subject. `Row` carries no `subject_type`/`subject_id` of its
+        # own (see `_inbox_page`'s own comment on the `muted` branch), so
+        # this is the one guard against those two being read from the wrong
+        # place, or not at all.
+        self.assertIn('name="subject_type" value="scene"', body)
+        self.assertIn('name="subject_id" value="scene-hidden-1"', body)
+
+
 if __name__ == "__main__":
     unittest.main()

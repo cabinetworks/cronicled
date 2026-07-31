@@ -423,7 +423,7 @@
 </details>
 {% endmacro %}
 
-<h1>Inbox</h1>
+<h1>{{ title | default("Inbox") }}</h1>
 {% if not rows %}
 <p class="empty">Nothing waiting. Proposals appear here after a scan.</p>
 {% endif %}

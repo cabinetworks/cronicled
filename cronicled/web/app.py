@@ -9,13 +9,50 @@ import urllib.parse
 from datetime import timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+from cronicled.performer_tags import SUBJECT_TYPE as _RECONCILE_SUBJECT
 from cronicled.tag_hygiene import LOW_COUNT_IS_NOT_PROOF
+from cronicled.tag_hygiene import SUBJECT_TYPE as _UNUSED_TAG_SUBJECT
+from cronicled.tags import SUBJECT_TYPE as _MERGE_SUBJECT
 
+from .inboxes import INBOXES, TITLES
 from .render import render
-from .rows import to_summary_view
+from .rows import to_rows, to_summary_view
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8571
+
+# The three subject types `rows.to_rows` cannot build a row for. It dispatches
+# only on `rows.DESCRIPTION_SUBJECT`/`rows.TAG_DESCRIPTION_SUBJECT` and treats
+# everything else as scene-shaped (see `to_rows`), so a tag-cluster,
+# tag-performer or tag-unused item forced through it KeyErrors on
+# `payload["path"]` — the same reason `cronicled.__main__`'s own
+# `_OWN_SECTION_SUBJECTS` excludes these three before calling `to_rows` for
+# the combined inbox. Named again here, independently, because a per-inbox
+# page filters its OWN group down to what it can safely show rather than
+# filtering one shared list down to what is left over.
+#
+# THE RESIDUAL, NAMED RATHER THAN HIDDEN: a working merge, reconciliation or
+# low-count-tag proposal still reaches the combined `/inbox` page exactly as
+# it does today (`cronicled.__main__` still wires it there); it simply does
+# not yet appear on the narrower `/tags` page, which does not yet carry the
+# three other row shapes (`to_merge_rows`, `to_reconcile_rows`,
+# `to_unused_groups`) these subject types need. That is a real gap in what
+# `/tags` shows today, not a hidden one.
+_NO_ROW_BUILDER = (_MERGE_SUBJECT, _RECONCILE_SUBJECT, _UNUSED_TAG_SUBJECT)
+
+# The terminal states a per-inbox page can be asked for at `/{inbox}/{state}`.
+#
+# The states named for this stage were `applied, refused, dismissed, muted`,
+# and `refused` is left out on purpose: it is not a state an `item` row ever
+# carries (see `Store._HIDDEN_STATES` and `Store.items()`'s own docstring) --
+# a refusal is recorded in a wholly separate `refusal` table, keyed by
+# SUBJECT rather than fingerprint, and `Store.refusals()` takes no
+# `subject_types` argument to narrow it by. There is no way to serve a
+# per-inbox refused page through `Store.items(subject_types=)`, which is the
+# one interface this stage consumes -- so `/{inbox}/refused` 404s rather than
+# silently serving an empty page that reads as "nothing refused" for an
+# inbox that may have plenty.
+_INBOX_STATES = ("applied", "dismissed", "muted")
 
 # The two pages. `/` is the summary -- "did the passes run, and what did they
 # find" -- and the inbox, which used to be here, is one click away at `/inbox`.
@@ -72,7 +109,8 @@ def _origin_matches_host(origin, host_header):
 def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                   refused=None, superseded=None, applied=None,
                   schedule_status=None, merges=None, reconciles=None,
-                  unused=None, gone=None, summary=None):
+                  unused=None, gone=None, summary=None, store=None,
+                  base_url=None):
     # A separate callable rather than always reaching through `actions`:
     # every existing action-path test builds its own recording double for
     # `actions` and none of them implement `scan_status`, so defaulting it
@@ -122,6 +160,12 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
     # (a fresh one), so this is the honest empty page rather than a fixture.
     _summary = summary or (lambda: to_summary_view([], {}, None,
                                                    zone=timezone.utc))
+    # Neither defaults to a callable the way every section above does: there
+    # is no honest empty stand-in for a store, and a per-inbox route with
+    # none wired 404s rather than rendering an inbox that looks empty because
+    # nothing can be asked. See `_serve_inbox_route`.
+    _store = store
+    _base_url = base_url
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, status, body=b"", headers=()):
@@ -146,7 +190,7 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                            [("Content-Type", "text/html; charset=utf-8")])
                 return
             if path != INBOX_PATH:
-                self._send(404, b"not found")
+                self._serve_inbox_route(path)
                 return
             # `applied` in the query string names the fingerprint a
             # successful /approve just redirected here with (see
@@ -192,6 +236,85 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
             return render("summary.html", summary=_summary(),
                           scan=_scan_status(),
                           scan_default_limit=DEFAULT_SCAN_LIMIT).encode()
+
+        def _serve_inbox_route(self, path):
+            """`/{inbox}` and `/{inbox}/{state}` -- everything that is
+            neither the summary nor the combined inbox.
+
+            Parsed into AT MOST two segments and resolved against `INBOXES`
+            and `_INBOX_STATES` before anything is queried: an inbox name
+            this map does not know, or a second segment that is not one of
+            the three terminal states served here, is a 404 -- never a fall
+            through to the combined inbox, which would make a typo read as
+            "nothing to review" rather than as the wrong address it is.
+            """
+            segments = [s for s in path.split("/") if s]
+            if not (1 <= len(segments) <= 2) or segments[0] not in INBOXES:
+                self._send(404, b"not found")
+                return
+            state = None
+            if len(segments) == 2:
+                if segments[1] not in _INBOX_STATES:
+                    self._send(404, b"not found")
+                    return
+                state = segments[1]
+            if _store is None:
+                self._send(404, b"not found")
+                return
+            body = self._inbox_page(segments[0], state).encode()
+            self._send(200, body, [("Content-Type", "text/html; charset=utf-8")])
+
+        def _inbox_page(self, name, state):
+            """The body of `/{name}` (`state` is `None`) or `/{name}/{state}`.
+
+            Narrowed to `name`'s own subject types via `Store.items
+            (subject_types=)` -- see `inboxes.INBOXES` -- and, for a
+            terminal-state page, further to `state`. `_NO_ROW_BUILDER`'s
+            three subject types are excluded from what is asked for at
+            all: see its own comment for why forcing one of them through
+            `to_rows` is not survivable, and for what is NOT yet shown here
+            because of it.
+            """
+            types = tuple(t for t in INBOXES[name] if t not in _NO_ROW_BUILDER)
+            items = _store.items(subject_types=types, state=state)
+            if state is None:
+                # `items()`'s own default excludes `dismissed`/`muted`/
+                # `superseded`/`gone` (see `Store._HIDDEN_STATES`) but NOT
+                # `applied` -- an applied proposal is a decision already
+                # made, and the working queue is not where it belongs.
+                # `cronicled.__main__._inbox_rows` filters the same way,
+                # for the same reason, against the combined inbox.
+                items = [item for item in items if item["state"] != "applied"]
+            built = to_rows(items, base_url=_base_url)
+            context = {"rows": [], "applied": [], "dismissed": [], "muted": []}
+            if state is None:
+                context["rows"] = built
+            elif state == "muted":
+                # `Row`/`DescriptionRow`/`TagDescriptionRow` carry no
+                # `subject_type`/`subject_id` of their own -- `to_mute_row`'s
+                # dict shape carries both alongside the row precisely so
+                # Unmute has something to post, and that shape needs
+                # `Store.mutes()`, not `Store.items()`. Rebuilt here from the
+                # raw item instead, which is where `subject_type`/
+                # `subject_id` still are at this point. `reason` and `at`
+                # are NOT rebuilt -- that provenance lives only in the
+                # `mute` table `Store.mutes()` reads, so this page shows the
+                # identity and the Unmute control and leaves those two
+                # blank rather than inventing them.
+                context["muted"] = [
+                    {"subject_type": item["subject_type"],
+                     "subject_id": item["subject_id"], "row": row}
+                    for item, row in zip(items, built)]
+            else:
+                context[state] = built
+            return render(
+                "inbox.html", title=TITLES[name],
+                rows=context["rows"], applied=context["applied"],
+                dismissed=context["dismissed"], muted=context["muted"],
+                refused=[], superseded=[], gone=[], merges=[], reconciles=[],
+                unused=[], counts={},
+                low_count_is_not_proof=LOW_COUNT_IS_NOT_PROOF,
+                schedule=None, just_applied=None)
 
         def _cross_origin_write(self):
             """Refuse a write whose own headers say it did not originate
@@ -335,7 +458,7 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
 def serve(rows, actions, scan_status=None, muted=None, dismissed=None,
          refused=None, superseded=None, applied=None, schedule_status=None,
          merges=None, reconciles=None, unused=None, gone=None, summary=None,
-         host=DEFAULT_HOST, port=DEFAULT_PORT):
+         store=None, base_url=None, host=DEFAULT_HOST, port=DEFAULT_PORT):
     # `HTTPServer` is single-threaded: one connection wedged on a slow read
     # or a slow downstream call (a media server taking its whole configured
     # timeout to answer an Approve, say) stalls every other request -- an
@@ -382,7 +505,8 @@ def serve(rows, actions, scan_status=None, muted=None, dismissed=None,
         rows, actions, scan_status, muted=muted, dismissed=dismissed,
         refused=refused, superseded=superseded, applied=applied,
         schedule_status=schedule_status, merges=merges,
-        reconciles=reconciles, unused=unused, gone=gone, summary=summary))
+        reconciles=reconciles, unused=unused, gone=gone, summary=summary,
+        store=store, base_url=base_url))
     # Names what is actually at that address. It said "inbox" when the inbox
     # was the landing page; a start-up line that keeps naming the page that
     # used to be there sends the one person reading it to the wrong place.
