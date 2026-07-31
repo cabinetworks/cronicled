@@ -1370,6 +1370,24 @@ class Check(unittest.TestCase):
         self.assertIs(lenient.unlisted, False)
         self.assertIsNot(strict.unlisted, False)
 
+    def test_two_scenes_in_one_listing_agreeing_on_title_is_not_an_absence(self):
+        # The same listing carrying the same clip twice (a resubmission, or
+        # two contributors entering the same scene) used to reach
+        # `scoring.decide` as an unresolved tie and come back here as
+        # `contenders > 0` -- correctly not an absence, but also not the
+        # decided match this actually is. `decide` now recognises the
+        # agreement, the same rule `cronicled.scan._choose_winner` already
+        # applies between stores, one level down to two entries of ONE
+        # store's own listing.
+        t = _transport([_page(1, [{"id": "s1", "title": "Morning Ritual Dawn"},
+                                  {"id": "s2", "title": "morning ritual dawn!"}])])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        verdict = check(box, "pf-performer", "Morning Ritual.mp4",
+                        "Velvet Crane", Resolution(name="Velvet Crane"))
+
+        self.assertIs(verdict.unlisted, False)
+
 
 if __name__ == "__main__":
     unittest.main()
