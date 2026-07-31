@@ -29,6 +29,14 @@
    ran and found this much" about a pass that did not finish -- and a reader
    checking whether last night worked would come away believing it did. #}
 <p class="note">FAILED &mdash; {{ j.error }}</p>
+{% elif j.outcome == "interrupted" %}
+{# The process running it stopped existing before it finished -- neither a
+   success nor a failure. Its counts are exactly as partial as a failed run's
+   for the same reason (see above), and it did not fail, so it gets neither
+   branch: its own note, and nothing implying either counts or an error.
+   Silent on whether it recurs on its own: true of a scheduled trigger, not
+   of a manual one, and this line does not know which brought the pass on. #}
+<p class="note">interrupted by a restart</p>
 {% else %}
 <p class="note">{% for name, n in j.counts.items() %}{{ name }} {{ n }}{% if not loop.last %}, {% endif %}{% else %}nothing recorded{% endfor %}</p>
 {% endif %}
