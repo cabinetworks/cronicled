@@ -715,6 +715,9 @@ class EvidenceBackedResolution(unittest.TestCase):
 
         self.assertEqual(r.name, "Wren Ashcombe")
         self.assertEqual(r.source, "filename")
+        # A resolved winner is not an unresolved candidate -- `unconfirmed`
+        # is reserved for the refusal path and must stay empty here.
+        self.assertEqual(r.unconfirmed, ())
 
     def test_the_losing_candidate_is_reported_not_dropped(self):
         owners_of = _owners_of({
@@ -754,6 +757,13 @@ class EvidenceBackedResolution(unittest.TestCase):
         # both candidates were actually checked -- neither was skipped nor
         # was a decision made without asking
         self.assertEqual(set(owners_of.calls), {"Amberlight", "Wren Ashcombe"})
+        # HARM this specifically guards against: without `unconfirmed`, a
+        # caller sees `name=None, rejected_folder=None` -- indistinguishable
+        # from "nothing in the folder or filename even looked like a name" --
+        # when in fact TWO plausible names were found and checked. Folder
+        # first, matching the order they were built and asked in.
+        self.assertEqual(r.unconfirmed, ("Amberlight", "Wren Ashcombe"))
+        self.assertIsNone(r.rejected_folder)
 
     def test_two_supported_candidates_is_unresolved_not_picked_by_order(self):
         # Ambiguity is reported, never resolved by iteration order: two
@@ -770,6 +780,12 @@ class EvidenceBackedResolution(unittest.TestCase):
 
         self.assertIsNone(r.name)
         self.assertIsNone(r.source)
+        # Both were actually confirmed, not merely offered -- a different
+        # reason from the zero-supported case above, and `unconfirmed`
+        # deliberately does not distinguish them (see
+        # `_resolve_by_evidence`'s own docstring): both are "this run could
+        # not settle on one", which is the fact a refusal needs to report.
+        self.assertEqual(r.unconfirmed, ("Amberlight", "Rowantide"))
 
     def test_two_spellings_of_one_name_are_one_candidate_and_never_compete(self):
         """No change needed here: `_resolve_by_evidence` cannot read two
@@ -861,3 +877,4 @@ class EvidenceBackedResolution(unittest.TestCase):
         self.assertEqual(r.name, "Amberlight")
         self.assertEqual(r.source, "folder")
         self.assertIsNone(r.competing)
+        self.assertEqual(r.unconfirmed, ())

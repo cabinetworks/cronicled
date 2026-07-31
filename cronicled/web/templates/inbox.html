@@ -492,6 +492,7 @@
 {% set gone = gone | default([]) %}
 {% set applied = applied | default([]) %}
 {% set just_applied = just_applied | default(None) %}
+{% set opened = opened | default(None) %}
 {# The one case that gets the section open on load: an approve made THIS
    redirect just produced (see web/app.py's do_POST), and only when the
    fingerprint it names is actually still sitting in `applied` -- a stale or
@@ -519,8 +520,15 @@
    `m.row` is `None` only for a subject muted before anything was ever found
    for it. That row still says so plainly rather than drawing the rich shape
    with four blank fields -- blank reads as a page that failed to render,
-   which is the one thing this exception must not look like. #}
-{% call section("Muted", muted, "Nothing muted.") %}
+   which is the one thing this exception must not look like.
+
+   `open=(opened == "muted")`: the section a successful `/unmute` just
+   redirected back from (see web/app.py's `_REOPEN_SECTION`), so reversing
+   several mutes in one sitting does not mean re-opening this section after
+   every single one. Never forced open any other way -- a page loaded
+   without that query value keeps this collapsed, the same as every section
+   but Applied. #}
+{% call section("Muted", muted, "Nothing muted.", open=(opened == "muted")) %}
   {% for m in muted %}
   <div class="proposal">
     <div class="head">
@@ -537,7 +545,9 @@
   {% endfor %}
 {% endcall %}
 
-{% call section("Dismissed", dismissed, "Nothing dismissed.") %}
+{# `open=(opened == "dismissed")`: the same reopening `/unmute` gets above,
+   for a successful `/undismiss` -- see web/app.py's `_REOPEN_SECTION`. #}
+{% call section("Dismissed", dismissed, "Nothing dismissed.", open=(opened == "dismissed")) %}
   {% for row in dismissed %}
   <div class="proposal">
     <div class="head">

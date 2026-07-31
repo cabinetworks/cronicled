@@ -1080,6 +1080,57 @@ class ApplifiedSectionRendering(unittest.TestCase):
         self.assertNotIn(self._HIGHLIGHT_CLASS, html)
 
 
+class ReversalReopensItsOwnSection(unittest.TestCase):
+    """A reversal (`/unmute`, `/undismiss`) redirects carrying `opened=`
+    naming the section it acted in (see `cronicled.web.app._REOPEN_SECTION`),
+    so reversing a backlog of mutes does not mean re-opening "Muted" by hand
+    after every single one. Collapsed by default, the same as every section
+    but Applied; only the ONE section named gets forced open, never both and
+    never every section on the page.
+    """
+
+    def _muted(self):
+        return [{"subject_type": "scene", "subject_id": "1",
+                "reason": "never identifiable", "at": "t"}]
+
+    def _dismissed(self):
+        return [_row(state="dismissed")]
+
+    def test_no_opened_value_leaves_both_sections_collapsed(self):
+        html = render("inbox.html", rows=[], counts={},
+                      muted=self._muted(), dismissed=self._dismissed())
+        self.assertNotIn('<details class="section" open', html)
+
+    def test_opened_muted_opens_only_the_muted_section(self):
+        html = render("inbox.html", rows=[], counts={},
+                      muted=self._muted(), dismissed=self._dismissed(),
+                      opened="muted")
+        # Exactly one section is forced open on the whole page, and its
+        # `<details ...open>` tag is immediately followed by the Muted
+        # section's own summary, not Dismissed's.
+        self.assertEqual(html.count('<details class="section" open'), 1)
+        open_at = html.index('<details class="section" open')
+        self.assertIn("Muted (", html[open_at:open_at + 200])
+
+    def test_opened_dismissed_opens_only_the_dismissed_section(self):
+        html = render("inbox.html", rows=[], counts={},
+                      muted=self._muted(), dismissed=self._dismissed(),
+                      opened="dismissed")
+        self.assertEqual(html.count('<details class="section" open'), 1)
+        open_at = html.index('<details class="section" open')
+        self.assertIn("Dismissed (", html[open_at:open_at + 200])
+
+    def test_an_unrecognised_opened_value_opens_nothing(self):
+        # A stray or foreign query value (`web/app.py`'s own whitelist would
+        # already have dropped this before it reaches `render()` -- this
+        # pins the template's own equality check as an independent second
+        # guard, not merely the one upstream of it).
+        html = render("inbox.html", rows=[], counts={},
+                      muted=self._muted(), dismissed=self._dismissed(),
+                      opened="applied")
+        self.assertNotIn('<details class="section" open', html)
+
+
 class TheSummaryViewPicksEachJobsLatestRun(unittest.TestCase):
     """`to_summary_view` reduces a run log to one row per job.
 

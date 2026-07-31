@@ -179,10 +179,11 @@ class ApproveRedirectCarriesTheFingerprint(unittest.TestCase):
 
     def test_other_actions_redirect_to_the_plain_index(self):
         # Only approve moves a row into Applied -- every other action must
-        # not carry this query param at all.
+        # not carry this query param at all. `undismiss` is excluded here --
+        # see `ReversalRedirectReopensItsSection` -- it carries `opened=`
+        # instead, for the same reopening reason `approve` carries `applied=`.
         for path, name in (("/dismiss", "dismiss"), ("/mute", "mute"),
-                           ("/undo", "undo"), ("/undismiss", "undismiss"),
-                           ("/refresh", "refresh")):
+                           ("/undo", "undo"), ("/refresh", "refresh")):
             with _Server() as s:
                 r = s.request("POST", path, "fp=fp-7")
                 self.assertEqual(r.getheader("Location"), "/inbox", name)
@@ -384,6 +385,27 @@ class MutedDismissedRefusedRendering(unittest.TestCase):
             {"fingerprint": "fp-1", "state": "applied",
              "filename": "clip.mp4", "proposed_title": "T", "creator": "N",
              "creator_source": "folder", "score_text": "0.900"}])
+        self.assertNotIn('<details class="section" open', html)
+
+    def test_the_opened_query_param_opens_the_muted_section(self):
+        # The GET half of a reversal's redirect (see
+        # `ReversalRedirectReopensItsSection` in this same module for the
+        # POST half): `?opened=muted`, exactly what a successful `/unmute`
+        # now redirects with, must reach the template and reopen the
+        # section it names.
+        html = self._get(path="/inbox?opened=muted", muted=lambda: [
+            {"subject_type": "scene", "subject_id": "1",
+             "reason": "never identifiable", "at": "t"}])
+        self.assertIn('<details class="section" open', html)
+
+    def test_an_unrecognised_opened_value_is_dropped_before_it_reaches_the_page(self):
+        # `do_GET`'s own whitelist (`_OPENABLE_SECTIONS`) is the first guard;
+        # the template's `open=(opened == ...)` comparison would already
+        # neutralise this too (see `tests/test_web_render.py`), but this
+        # pins the whitelist itself, not only its backstop.
+        html = self._get(path="/inbox?opened=applied", muted=lambda: [
+            {"subject_type": "scene", "subject_id": "1",
+             "reason": "never identifiable", "at": "t"}])
         self.assertNotIn('<details class="section" open', html)
 
 
@@ -693,7 +715,10 @@ class WhereAWriteReturnsTo(unittest.TestCase):
     """
 
     def test_a_judgement_returns_to_the_inbox(self):
-        for name in ("dismiss", "mute", "undo", "undismiss", "refresh"):
+        # `undismiss` is covered separately in `ReversalRedirectReopensItsSection`
+        # -- it is a judgement too, but its redirect carries `opened=` so its
+        # own collapsed section reopens rather than closing again.
+        for name in ("dismiss", "mute", "undo", "refresh"):
             with self.subTest(name):
                 sent = _drive("POST", "/" + name, b"fp=fp-7")
                 self.assertEqual(sent["status"], 303)
@@ -703,15 +728,50 @@ class WhereAWriteReturnsTo(unittest.TestCase):
         sent = _drive("POST", "/approve", b"fp=fp-7")
         self.assertEqual(sent["headers"]["Location"], "/inbox?applied=fp-7")
 
-    def test_an_unmute_returns_to_the_inbox_too(self):
-        sent = _drive("POST", "/unmute", b"subject_type=scene&subject_id=42")
-        self.assertEqual(sent["headers"]["Location"], "/inbox")
-
     def test_a_scan_returns_to_the_page_its_button_is_on(self):
         sent = _drive("POST", "/scan", b"limit=25")
         self.assertEqual(sent["status"], 303)
         self.assertEqual(sent["headers"]["Location"], "/")
         self.assertEqual(sent["actions"].calls, [("scan", 25)])
+
+
+class ReversalRedirectReopensItsSection(unittest.TestCase):
+    """A reversal (`/unmute`, `/undismiss`) undoes a verdict recorded against
+    a collapsed section, and every write redirects to the plain inbox --
+    which renders every `<details>` closed again. Reversing several mutes in
+    one sitting used to mean opening "Muted" after every single one, and
+    losing the scroll position each time.
+
+    The redirect now names which section it acted in, so `do_GET` can
+    reopen exactly that one -- see `cronicled.web.app._REOPEN_SECTION` and
+    `inbox.html`'s own `open=(opened == ...)` on the Muted and Dismissed
+    sections.
+    """
+
+    def test_an_unmute_redirects_naming_the_muted_section(self):
+        sent = _drive("POST", "/unmute", b"subject_type=scene&subject_id=42")
+        self.assertEqual(sent["status"], 303)
+        self.assertEqual(sent["headers"]["Location"], "/inbox?opened=muted")
+
+    def test_an_undismiss_redirects_naming_the_dismissed_section(self):
+        sent = _drive("POST", "/undismiss", b"fp=fp-7")
+        self.assertEqual(sent["status"], 303)
+        self.assertEqual(sent["headers"]["Location"],
+                         "/inbox?opened=dismissed")
+
+    def test_a_failed_unmute_does_not_redirect_at_all(self):
+        # Nothing to reopen a section over -- see `ExceptionBranch`'s own
+        # reasoning for every other action's failure.
+        sent = _drive("POST", "/unmute", b"subject_type=scene&subject_id=42",
+                      actions=_RecordingActions(
+                          fail={"unmute": UnknownProposal(("scene", "42"))}))
+        self.assertEqual(sent["status"], 400)
+
+    def test_a_failed_undismiss_does_not_redirect_at_all(self):
+        sent = _drive("POST", "/undismiss", b"fp=fp-7",
+                      actions=_RecordingActions(
+                          fail={"undismiss": UnknownProposal("fp-7")}))
+        self.assertEqual(sent["status"], 400)
 
 
 class TheScanControlOnItsNewPageStillRefusesCrossOrigin(unittest.TestCase):
