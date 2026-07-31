@@ -1266,6 +1266,125 @@ def to_mute_rows(entries, base_url=None, *, zone):
     return [to_mute_row(e, base_url=base_url, zone=zone) for e in entries]
 
 
+@dataclass(frozen=True)
+class ScheduledProducer:
+    """One producer's line in the Schedule panel: its name, and when it is
+    declared to run.
+
+    `when` is a finished phrase rather than the fields behind it, because the
+    three cases read differently ON PURPOSE and deciding which is which is an
+    editorial job, not a template one -- a stated appointment ("03:20"), a
+    cadence ("every 3600s"), and a producer somebody switched off. A template
+    branching on `at is defined` renders an empty line for the case nobody
+    thought about, which on this panel means a producer that silently stopped
+    being listed. See KIND_SCENE for the same reasoning about row shapes.
+    """
+
+    name: str
+    when: str
+
+
+@dataclass(frozen=True)
+class Appointments:
+    """The declared schedule, as the panel shows it: the zone said ONCE, and a
+    line per producer.
+
+    `zone` is the name every stated appointment is read in, or `None` when
+    there is no single answer -- either because nothing states a time at all
+    (every producer is on a cadence, or disabled), or because two producers
+    state theirs in DIFFERENT zones, which an operator's per-producer override
+    can do. In that second case each stated line names its own zone instead,
+    and this stays `None`: one zone claimed for appointments kept in two would
+    be a page saying 3am about a pass that runs at a different 3am, which is
+    the disagreement the single configured zone exists to remove. Picking one
+    of the two by iteration order would hide it instead of reporting it.
+
+    `producers` is ordered by name -- content, never the order the registry
+    happened to be built in -- so the panel reads the same on every visit.
+    """
+
+    zone: str | None
+    producers: tuple
+
+
+def _cadence(seconds):
+    """A producer's interval, as a phrase. Whole seconds lose the `.0` a float
+    cadence would otherwise put on the page; nothing is rounded, because a
+    cadence rounded for display is a cadence the page and the scheduler
+    disagree about."""
+    return "every %ss" % (int(seconds) if float(seconds).is_integer()
+                          else seconds)
+
+
+def _when(entry, name_the_zone):
+    """What one resolved `Entry` says about when its producer runs.
+
+    A STATED TIME SHORTENS TO AN HOUR AND A MINUTE and nothing else. It carries
+    no date -- "03:20 every night" has none -- so there is none to show, and it
+    is NOT converted into any other zone: a wall-clock time is only a wall-clock
+    time in the zone it was stated in, and converting it would need a date this
+    does not have and must not invent. Built by arithmetic on `hour` and
+    `minute` rather than by `strftime`, so no platform's `%H` decides whether a
+    3am appointment reads as `03:00` or `3:00`.
+
+    AN INTERVAL HAS NO APPOINTMENT, and one is not manufactured out of the last
+    run plus the cadence: that would be a prediction printed in the same place,
+    in the same words, as a statement -- and wrong the first night a run is
+    late. It says what it is instead.
+
+    `name_the_zone` appends the zone to a stated time, for the case
+    `Appointments` documents: two producers stating their times in two zones,
+    where one line at the top of the panel cannot be true of both.
+
+    Everything `resolve` refuses is refused again here, because a page must not
+    state a schedule the scheduler would decline to keep -- the same reasoning
+    `due` gives for re-checking entries it could not itself have produced. An
+    enabled entry naming both a cadence and a time, or neither, or a time with
+    no zone, raises rather than rendering: a blank line, or a cadence shown for
+    a producer the loop will raise on every tick over, would put the one panel
+    an operator reads to find out why nothing ran among the things hiding it.
+    """
+    if not entry.enabled:
+        return "disabled"
+    if (entry.every is None) == (entry.at is None):
+        raise ValueError(
+            "the schedule entry for producer %r is enabled but names %s, so "
+            "there is nothing to show and nothing would run it either"
+            % (entry.producer,
+               "both a cadence and a stated time" if entry.at is not None
+               else "neither a cadence nor a stated time"))
+    if entry.at is None:
+        return _cadence(entry.every)
+    if entry.zone is None:
+        raise ValueError(
+            "the schedule entry for producer %r states a time but no zone to "
+            "read it in, so there is no hour to show: the host's zone is a "
+            "property of the deployment rather than of the schedule"
+            % entry.producer)
+    stated = "%02d:%02d" % (entry.at.hour, entry.at.minute)
+    return "%s (%s)" % (stated, entry.zone) if name_the_zone else stated
+
+
+def _appointments(entries):
+    """`{producer: Entry}` -> what the Schedule panel lists.
+
+    The zone is worked out from the STATED appointments only. A producer on a
+    cadence names no zone (`resolve` refuses a zone without a time), and a
+    disabled one may name nothing at all, so neither can contribute to the
+    answer or take it away.
+    """
+    zones = {str(entry.zone) for entry in entries.values()
+             if entry.enabled and entry.at is not None
+             and entry.zone is not None}
+    one_zone = zones.pop() if len(zones) == 1 else None
+    return Appointments(
+        zone=one_zone,
+        producers=tuple(
+            ScheduledProducer(name=name,
+                              when=_when(entries[name], one_zone is None))
+            for name in sorted(entries)))
+
+
 def to_schedule_view(status, *, zone):
     """A `cronicled.schedule.LoopStatus` with every timestamp on it shown in
     `zone`. `None` in, `None` out -- the answer for an install where nothing is
@@ -1297,6 +1416,21 @@ def to_schedule_view(status, *, zone):
     recorded rather than a sentence for a person -- if it is ever put on the
     page, it comes through `local_times` like the rest.
 
+    `appointments` IS THE ONE FIELD WHOSE PAGE SHAPE IS A DIFFERENT TYPE from
+    the shape the loop records, and the reason is that it is the one field
+    carrying no instant. The other five hold moments, which are RELABELLED --
+    same value, another zone. An appointment is a STATEMENT ("03:20 in
+    Europe/Madrid"), so there is nothing to relabel and everything to phrase:
+    what comes back is `Appointments`, built from the resolved entries the loop
+    handed over. Converting it into the page's zone is exactly what must not
+    happen -- see `_when`.
+
+    The entries reach here through `LoopStatus` and nowhere else. Nothing in
+    this module, or in any other outside `cronicled.schedule`, reads
+    `Scheduler._entries`: rendering that reached into the scheduler's own
+    structure would break on the next change to how a schedule is resolved,
+    with no test standing between the two.
+
     The counts, the names and the job ids are passed through untouched. What is
     NOT touched anywhere is the loop's own bookkeeping: this builds a copy for
     the page, and `LoopStatus` is frozen, so the values the scheduler goes on
@@ -1319,6 +1453,7 @@ def to_schedule_view(status, *, zone):
                    last_tick_at=local(status.last_tick_at, zone),
                    last_error_at=local(status.last_error_at, zone),
                    last_error=local_times(status.last_error, zone),
+                   appointments=_appointments(status.appointments),
                    last_result=result)
 
 

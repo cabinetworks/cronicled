@@ -1006,6 +1006,188 @@ class ProducerRunsSurviveARestart(unittest.TestCase):
                              {"nightly-scrape": "2026-07-26T02:00:00+00:00"})
 
 
+class RenamedProducerRunsSurviveTheRename(unittest.TestCase):
+    """A run recorded under a job's OLD name must answer `last_run`/`runs` for
+    its current one, so a rename cannot make the scheduler read a producer
+    that has genuinely run for years as never-run.
+
+    Every fixture here writes `producer_run` directly with a raw connection,
+    the same way `RunTableAddedOnAnExistingDatabase` and
+    `SchemaAdditionOnAnExistingDatabase` emulate a database an earlier build
+    left behind — `Store` itself never writes the old name, so seeding it any
+    other way would not be testing what a real upgraded deployment has on
+    disk.
+
+    Literal old name, literal new name, one test each for the three real
+    renames — deriving either side from `RENAMED_JOBS` would move both halves
+    together, and a map emptied to `{}` or repointed would stay green.
+    """
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self.path = os.path.join(self._dir, "s.db")
+        self.addCleanup(shutil.rmtree, self._dir, True)
+
+    def _seed(self, producer, at):
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS producer_run "
+            "(producer TEXT PRIMARY KEY, at TEXT NOT NULL)")
+        connection.execute(
+            "INSERT INTO producer_run VALUES (?, ?)", (producer, at))
+        connection.commit()
+        connection.close()
+
+    def _seed_both(self, old, current, old_at, current_at):
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS producer_run "
+            "(producer TEXT PRIMARY KEY, at TEXT NOT NULL)")
+        connection.execute(
+            "INSERT INTO producer_run VALUES (?, ?)", (old, old_at))
+        connection.execute(
+            "INSERT INTO producer_run VALUES (?, ?)", (current, current_at))
+        connection.commit()
+        connection.close()
+
+    def _raw_producer_runs(self):
+        connection = sqlite3.connect(self.path)
+        rows = connection.execute(
+            "SELECT producer, at, rowid FROM producer_run").fetchall()
+        connection.close()
+        return rows
+
+    # -- the three real renames, each pinned by literals on both sides ---- #
+
+    def test_a_run_under_the_old_scene_name_is_read_under_the_new_one(self):
+        self._seed("nightly-library-scan", "2026-07-26T02:00:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.last_run("scene-scan"),
+                             "2026-07-26T02:00:00+00:00")
+            self.assertEqual(store.runs(),
+                             {"scene-scan": "2026-07-26T02:00:00+00:00"})
+
+    def test_a_run_under_the_old_performer_name_is_read_under_the_new_one(self):
+        self._seed("performer-descriptions", "2026-07-26T02:00:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.last_run("performer-scan"),
+                             "2026-07-26T02:00:00+00:00")
+            self.assertEqual(store.runs(),
+                             {"performer-scan": "2026-07-26T02:00:00+00:00"})
+
+    def test_a_run_under_the_old_tag_name_is_read_under_the_new_one(self):
+        self._seed("tag-merge", "2026-07-26T02:00:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.last_run("tag-scan"),
+                             "2026-07-26T02:00:00+00:00")
+            self.assertEqual(store.runs(),
+                             {"tag-scan": "2026-07-26T02:00:00+00:00"})
+
+    # -- the ordinary cases the migration must not disturb ----------------- #
+
+    def test_a_run_already_under_the_current_name_is_unchanged(self):
+        self._seed("scene-scan", "2026-07-26T02:00:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.runs(),
+                             {"scene-scan": "2026-07-26T02:00:00+00:00"})
+
+    def test_a_producer_with_no_history_under_either_name_stays_never_run(self):
+        # Guards the direction opposite the main fix: the migration must not
+        # invent a row for a renamed producer that has genuinely never run,
+        # which would make it look like it HAS and defeat the "still due
+        # immediately" guarantee `cronicled.schedule.due` provides.
+        with Store(self.path) as store:
+            self.assertIsNone(store.last_run("scene-scan"))
+            self.assertIsNone(store.last_run("performer-scan"))
+            self.assertIsNone(store.last_run("tag-scan"))
+            self.assertEqual(store.runs(), {})
+
+    # -- a history recorded under both names, e.g. an upgrade then a
+    # rollback then a second upgrade ---------------------------------------
+
+    def test_when_the_old_name_ran_more_recently_it_wins(self):
+        self._seed_both("nightly-library-scan", "scene-scan",
+                        old_at="2026-07-27T09:00:00+00:00",
+                        current_at="2026-07-20T03:00:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.runs(),
+                             {"scene-scan": "2026-07-27T09:00:00+00:00"})
+
+    def test_when_the_current_name_ran_more_recently_it_wins(self):
+        # The reverse direction, pinned separately: a fixture whose winner is
+        # always the same side cannot tell "later wins" from "old always
+        # wins" or "new always wins".
+        self._seed_both("nightly-library-scan", "scene-scan",
+                        old_at="2026-07-20T03:00:00+00:00",
+                        current_at="2026-07-27T09:00:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.runs(),
+                             {"scene-scan": "2026-07-27T09:00:00+00:00"})
+
+    def test_the_collision_leaves_exactly_one_row_not_two(self):
+        self._seed_both("nightly-library-scan", "scene-scan",
+                        old_at="2026-07-27T09:00:00+00:00",
+                        current_at="2026-07-20T03:00:00+00:00")
+        with Store(self.path):
+            pass
+        rows = self._raw_producer_runs()
+        self.assertEqual([r[0] for r in rows], ["scene-scan"])
+
+    # -- a reading on one side that cannot be read as a moment at all ------- #
+    #
+    # `record_run` stores whatever it is given, so either side of a collision
+    # could hold something that is not a usable timestamp -- see
+    # `cronicled.schedule.due`'s own tolerance for this. Recency cannot be
+    # compared against nothing, so the side that DOES parse is kept, rather
+    # than losing real information to a value that is not a moment at all.
+
+    def test_an_unreadable_old_reading_loses_to_a_readable_current_one(self):
+        self._seed_both("nightly-library-scan", "scene-scan",
+                        old_at="not-a-timestamp",
+                        current_at="2026-07-20T03:00:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.runs(),
+                             {"scene-scan": "2026-07-20T03:00:00+00:00"})
+
+    def test_an_unreadable_current_reading_loses_to_a_readable_old_one(self):
+        self._seed_both("nightly-library-scan", "scene-scan",
+                        old_at="2026-07-20T03:00:00+00:00",
+                        current_at="not-a-timestamp")
+        with Store(self.path) as store:
+            self.assertEqual(store.runs(),
+                             {"scene-scan": "2026-07-20T03:00:00+00:00"})
+
+    # -- idempotence: opening a second time must rewrite nothing ------------ #
+
+    def test_migrating_a_second_time_changes_nothing(self):
+        self._seed("nightly-library-scan", "2026-07-26T02:00:00+00:00")
+        with Store(self.path):
+            pass
+        first = self._raw_producer_runs()
+        with Store(self.path):
+            pass
+        second = self._raw_producer_runs()
+        # Whole rows, including `rowid`: identical `at` values with a
+        # different `rowid` would mean the row was deleted and reinserted on
+        # the second pass -- unobservable through `last_run` alone, since the
+        # value did not change, but exactly the "rewrites anything" this must
+        # not do.
+        self.assertEqual(second, first)
+        self.assertEqual([r[0] for r in first], ["scene-scan"])
+
+    def test_migrating_a_collision_a_second_time_changes_nothing_either(self):
+        self._seed_both("nightly-library-scan", "scene-scan",
+                        old_at="2026-07-27T09:00:00+00:00",
+                        current_at="2026-07-20T03:00:00+00:00")
+        with Store(self.path):
+            pass
+        first = self._raw_producer_runs()
+        with Store(self.path):
+            pass
+        second = self._raw_producer_runs()
+        self.assertEqual(second, first)
+
+
 class _RunLogCase(_StoreCase):
     """Shared fixture for the run log: distinct, increasing start times.
 
@@ -2403,3 +2585,78 @@ class UnmuteBringsTheRowBack(unittest.TestCase):
         self.store.mute("scene", "9")
         self.store.unmute("scene", "9")
         self.assertEqual(len(self.store.items()), 0)
+
+
+class SubjectTypeFiltering(_StoreCase):
+    """`items()` and `counts()` narrowing to a caller-given tuple of subject
+    types -- how an inbox page (see `cronicled.web.inboxes`) asks the store
+    for only the rows it owns, instead of every subject type in the
+    database.
+    """
+
+    def _tag(self, subject_id):
+        return self.store.record(folder="tag-matches", subject_type="tag",
+                                 subject_id=subject_id, summary="a tag",
+                                 payload={"key": "kettle"}, producer="tags")
+
+    def _cluster(self, subject_id):
+        return self.store.record(folder="tag-matches",
+                                 subject_type="tag-cluster",
+                                 subject_id=subject_id, summary="a cluster",
+                                 payload={"key": "kettle"}, producer="tags")
+
+    def test_items_filters_to_the_given_subject_types(self):
+        self._tag("t1")
+        self._cluster("c1")
+        self._record(subject_id="s1")  # subject_type="scene"
+        got = {(i["subject_type"], i["subject_id"])
+               for i in self.store.items(subject_types=("tag", "tag-cluster"))}
+        self.assertEqual(got, {("tag", "t1"), ("tag-cluster", "c1")})
+
+    def test_items_with_no_subject_types_is_unchanged(self):
+        # The existing callers pass nothing and must keep seeing everything.
+        self._tag("t1")
+        self._record(subject_id="s1")
+        self.assertEqual(len(self.store.items()), 2)
+
+    def test_an_empty_subject_type_tuple_selects_nothing_in_items(self):
+        # An empty tuple is a real, distinct request -- "select nothing" --
+        # not "no filter given". Falling through to truthiness here would
+        # make an inbox with no subject types (a bug elsewhere) silently see
+        # every row instead of none.
+        self._tag("t1")
+        self.assertEqual(self.store.items(subject_types=()), [])
+
+    def test_counts_filters_to_the_given_subject_types(self):
+        self._tag("t1")
+        self._record(subject_id="s1")  # subject_type="scene"
+        self.assertEqual(self.store.counts(subject_types=("tag",)),
+                         {"new": 1})
+
+    def test_counts_with_no_subject_types_is_unchanged(self):
+        self._tag("t1")
+        self._record(subject_id="s1")
+        self.assertEqual(self.store.counts(), {"new": 2})
+
+    def test_an_empty_subject_type_tuple_selects_nothing_in_counts(self):
+        self._tag("t1")
+        self.assertEqual(self.store.counts(subject_types=()), {})
+
+    def test_subject_type_filter_combines_with_folder(self):
+        # Both narrowings apply at once, not one silently overriding the
+        # other. A scene sharing the tag's own folder makes the folder
+        # filter alone insufficient to produce the expected set, so this
+        # can only pass if the subject_type filter is doing real work too --
+        # a fixture where the folder filter alone gave the same answer would
+        # let a dropped subject_type clause hide behind it.
+        self._tag("t1")
+        self.store.record(folder="tag-matches", subject_type="scene",
+                          subject_id="s-same-folder", summary="a scene",
+                          payload={"title": "invented placeholder title"},
+                          producer="scan")
+        self.store.record(folder="scene-matches", subject_type="tag",
+                          subject_id="t2", summary="a tag",
+                          payload={"key": "other"}, producer="tags")
+        got = {i["subject_id"] for i in
+               self.store.items(folder="tag-matches", subject_types=("tag",))}
+        self.assertEqual(got, {"t1"})

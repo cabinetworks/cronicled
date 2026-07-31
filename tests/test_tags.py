@@ -342,6 +342,29 @@ class WhichSpellingSurvives(unittest.TestCase):
         self.assertIsNone(clusters[0].canonical)
         self.assertEqual(clusters[0].undecided, UNDECIDED_EVEN)
 
+    def test_two_tags_spelled_identically_are_reported_too(self):
+        """No change needed, and the reason is worth writing down: this is
+        the one place in this audit where two sources DO agree and are still,
+        correctly, refused.
+
+        They agree about the SPELLING, which is not what `_decide` answers.
+        It answers with a MEMBER -- one of two tag rows carrying different
+        ids, different scene counts and possibly different descriptions --
+        and about that the two spellings say nothing whatever. Taking the
+        agreement would leave which tag id survives to be settled by sort
+        order, and `sorted` being stable means that is arrival order. So this
+        is not agreement misread as conflict; it is agreement about one
+        question offered as an answer to a different one.
+        """
+        clusters = cluster_tags([tag(1, "Ivy Kingsley", scene_count=12),
+                                 tag(2, "Ivy Kingsley", scene_count=4)])
+
+        self.assertIsNone(clusters[0].canonical)
+        self.assertEqual(clusters[0].undecided, UNDECIDED_EVEN)
+        # Both still reported, so a reviewer sees the pair they are being
+        # asked about rather than one of them.
+        self.assertEqual([m["id"] for m in clusters[0].members], ["1", "2"])
+
     def test_the_two_undecided_reasons_are_different_answers(self):
         # Collapsing both into one catch-all string would satisfy every
         # assertion of the form "there is a reason" while losing the

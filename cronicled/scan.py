@@ -629,7 +629,11 @@ def examine(scene, *, search, folder, threshold=DEFAULT_THRESHOLD, aliases=None,
     matches = [score(name, directory, decensor(c["title"], censorship or {}),
                      artist=resolution.name)
                for c in candidates]
-    decision = decide(matches, threshold)
+    # The RAW title, never decensored, travels to `decide` alongside the
+    # matches it produced -- see `decide`'s docstring for why the text
+    # scored is the wrong text to hand it here.
+    decision = decide(matches, threshold,
+                      titles=[c["title"] for c in candidates])
     if decision.match is None:
         # A tie, a near miss, or evidence that was nothing but the creator's
         # own name. All three are refusals a person can act on — by looking,
@@ -822,13 +826,23 @@ def _judge(source, candidates, *, name, directory, artist, threshold):
     subtraction, the store's own censorship map, or the threshold, and a
     fallback candidate judged by different arithmetic than the pass it is
     meant to rescue is exactly the drift this ticket exists to avoid.
+
+    The RAW candidate title, never decensored, travels to `decide` alongside
+    the matches it produced, so two of THIS store's own candidates naming
+    the same title -- the ordinary shape of a clip a store lists more than
+    once -- can be told apart from a real choice between two different
+    ones. See `decide`'s docstring for the rule, which is the same one
+    `_choose_winner` below applies between stores rather than within one,
+    and for why the RAW text is what travels here rather than the
+    decensored form `matches` was scored against.
     """
     matches = [score(name, directory,
                      decensor(c["title"], source.censorship or {}),
                      artist=artist)
                for c in candidates]
     return _StoreDecision(source, candidates, matches,
-                          decide(matches, threshold))
+                          decide(matches, threshold,
+                                titles=[c["title"] for c in candidates]))
 
 
 def _combined_owners_of(sources):
@@ -1967,6 +1981,74 @@ class _SingleFlight:
         return list(flight.result)
 
 
+def pool_scenes(stash, marker):
+    """Everything a scan-shaped pass is offered, and which of it a marker
+    tag added -- the unorganized set, plus, with a marker configured, the
+    organized scenes that carry it.
+
+    Returns `(scenes, marked)`, `marked` being the subject ids of the ones
+    the marker contributed (see `select`'s own `marked` parameter for what
+    that is for). With no marker configured this is the unorganized set and
+    nothing else, exactly as every caller here always read.
+
+    This is `ScanProducer`'s own selection, factored out so a SECOND caller
+    that needs "the same population the scan reaches" -- see
+    `cronicled.stashbox_scan.StashBoxCheckProducer` -- asks this rather than
+    writing its own copy. A selection implemented twice is a selection that
+    drifts: the scan and anything else meant to agree with it would each
+    change their own copy on their own schedule, and the two would quietly
+    stop meaning the same "marked".
+
+    With one configured, the scenes carrying that tag are added --
+    `Stash.tagged_scenes` does not constrain `organized`, which is the whole
+    point: a file an earlier tool identified by guesswork is ordinarily
+    marked organized, so the unorganized read is precisely the read that
+    cannot see it. What is NOT done is pooling every organized file: the
+    marker is the evidence that this particular file was organized
+    provisionally, and without it a nightly pass would carry a whole library
+    (6275 files in the one measured) instead of the population somebody
+    actually wants looked at again.
+
+    APPENDED to the unorganized set, never placed in front of it -- a caller
+    that also takes a `limit` (see `select`) takes the first survivors, so a
+    marked population many times the size of the unorganized one, put
+    first, would spend the whole budget on files that were not waiting.
+
+    A scene the unorganized read already returned is not added twice, and
+    does not count as marked -- it cost this run nothing new and was always
+    in the pool.
+
+    A CONFIGURED MARKER THE SERVER HAS NO TAG FOR RAISES, and that is the one
+    thing this refuses to do quietly. Tag ids are installation-specific, so
+    the name is resolved here, per call, against the server as it stands.
+    `Stash.tag_id_by_name` answers `None` for a name no tag has -- a typo, a
+    tag renamed, a config copied from another install -- and taking that as
+    "no marked files" would produce an empty addition indistinguishable from
+    a marker that is working and matching nothing. That is the exact state
+    the configuration exists to change, so it must be impossible to sit in
+    unnoticed.
+
+    Nothing here writes: both calls are reads, and the marker itself is left
+    on every scene that carries it.
+    """
+    _, scenes = stash.unorganized_scenes(None)
+    if marker is None:
+        return scenes, frozenset()
+    tag_id = stash.tag_id_by_name(marker)
+    if tag_id is None:
+        raise ValueError(
+            "the configured marker tag %r does not exist on the media "
+            "server, so this run would silently pool nothing extra and "
+            "read as though no file were marked. Correct the name to the "
+            "tag your library actually uses, or remove the setting."
+            % (marker,))
+    _, tagged = stash.tagged_scenes(tag_id, None)
+    already = {str(scene["id"]) for scene in scenes}
+    added = [scene for scene in tagged if str(scene["id"]) not in already]
+    return (scenes + added,
+            frozenset(str(scene["id"]) for scene in added))
+
+
 class ScanProducer:
     """Reads a batch of the library, works out what each file is, and yields
     a proposal for every file it could decide.
@@ -2376,11 +2458,10 @@ class ScanProducer:
 
     def _pool(self):
         """Everything this run is offered, and which of it the marker tag
-        added.
-
-        Returns `(scenes, marked)` — the scene dicts in the order they will be
-        narrowed, and the subject ids of the ones the marker contributed,
-        which is what `Counts.marked` reports.
+        added -- see the module-level `pool_scenes`, which does the actual
+        work and carries the full docstring. Kept as a thin instance method
+        so callers inside this class do not have to thread `self._stash` and
+        `self._marker` through by hand.
 
         Fetched WHOLE, deliberately: `limit` belongs to `select`, which
         applies it after the narrowings. Passing it to either read would limit
@@ -2388,67 +2469,8 @@ class ScanProducer:
         and the muted and already-proposed ones among them would eat the
         budget. The accepted cost is one query for each set rather than a page
         of it.
-
-        With no marker configured this is the unorganized set and nothing
-        else, exactly as it always was.
-
-        With one, the scenes carrying that tag are added — `Stash.tagged_scenes`
-        does not constrain `organized`, which is the whole point: a file an
-        earlier tool identified by guesswork is ordinarily marked organized,
-        so the unorganized read is precisely the read that cannot see it.
-        What is NOT done is pooling every organized file: the marker is the
-        evidence that this particular file was organized provisionally, and
-        without it a nightly pass would carry a whole library (6275 files in
-        the one measured) instead of the population somebody actually wants
-        looked at again.
-
-        APPENDED to the unorganized set, never placed in front of it. Order
-        decides nothing about WHETHER a file is selected, but it decides what
-        a LIMIT reaches: `select` takes the first survivors, so a marked
-        population nine times the size of the unorganized one, put first,
-        would spend every run's budget on files that were not waiting and
-        defer the ones a scan would already have taken. The addition waits.
-
-        A scene the unorganized read already returned is not added twice, and
-        does not count as marked. It cost this run nothing new — it was always
-        in the pool — and counting it would overstate what the marker is
-        responsible for, while offering it twice would spend two lookups and
-        propose the same file to the same folder twice in one run.
-
-        A CONFIGURED MARKER THE SERVER HAS NO TAG FOR RAISES, and that is the
-        one thing this method refuses to do quietly. Tag ids are
-        installation-specific, so the name is resolved here, per run, against
-        the server as it stands. `Stash.tag_id_by_name` answers `None` for a
-        name no tag has — a typo, a tag renamed, a config copied from another
-        install — and taking that as "no marked files" would produce an empty
-        addition indistinguishable from a marker that is working and matching
-        nothing. That is the exact state the configuration exists to change,
-        so it must be impossible to sit in unnoticed. Raising fails THIS run,
-        visibly, with the name that could not be found in the message; the
-        service stays up, every other producer keeps running, and the operator
-        reads the failure on the page rather than losing the page to a
-        start-up crash.
-
-        Nothing here writes: both calls are reads, and the marker itself is
-        left on every scene that carries it (see this class's docstring for
-        why removing it is neither this code's job nor a fix).
         """
-        _, scenes = self._stash.unorganized_scenes(None)
-        if self._marker is None:
-            return scenes, frozenset()
-        tag_id = self._stash.tag_id_by_name(self._marker)
-        if tag_id is None:
-            raise ValueError(
-                "the configured marker tag %r does not exist on the media "
-                "server, so this scan would silently pool nothing extra and "
-                "read as though no file were marked. Correct the name to the "
-                "tag your library actually uses, or remove the setting."
-                % (self._marker,))
-        _, tagged = self._stash.tagged_scenes(tag_id, None)
-        already = {str(scene["id"]) for scene in scenes}
-        added = [scene for scene in tagged if str(scene["id"]) not in already]
-        return (scenes + added,
-                frozenset(str(scene["id"]) for scene in added))
+        return pool_scenes(self._stash, self._marker)
 
     def _identify_batch(self, selected):
         """Ask the configured boxes about the whole batch, and never let that

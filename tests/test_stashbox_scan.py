@@ -24,19 +24,42 @@ from cronicled.store import Store
 WAIT = 10
 
 
-def scene(scene_id, path):
-    return {"id": str(scene_id), "files": [{"path": path}]}
+def scene(scene_id, path, tags=()):
+    return {"id": str(scene_id), "files": [{"path": path}], "tags": list(tags)}
 
 
 class _FakeStash:
-    def __init__(self, scenes):
+    """`organized` and `tag_ids` let a test build the population
+    `cronicled.scan.pool_scenes` reaches: `unorganized_scenes` filters out
+    anything in `organized`, exactly as the real media server does, and
+    `tagged_scenes`/`tag_id_by_name` answer the marker reads `pool_scenes`
+    makes when a marker is configured. A double that ignored `organized`
+    could not tell a check that reaches only marked files from one that
+    pools the whole library.
+    """
+
+    def __init__(self, scenes, organized=(), tag_ids=None):
         self._scenes = list(scenes)
+        self._organized = {str(scene_id) for scene_id in organized}
+        self._tag_ids = dict(tag_ids or {})
         self.calls = []
 
     def unorganized_scenes(self, limit):
         self.calls.append(("unorganized_scenes", limit))
-        scenes = self._scenes if limit is None else self._scenes[:limit]
-        return len(self._scenes), list(scenes)
+        scenes = [s for s in self._scenes if s["id"] not in self._organized]
+        scenes = scenes if limit is None else scenes[:limit]
+        return len(scenes), list(scenes)
+
+    def tagged_scenes(self, tag_id, limit):
+        self.calls.append(("tagged_scenes", tag_id, limit))
+        scenes = [s for s in self._scenes
+                 if any(tag["id"] == tag_id for tag in s.get("tags", ()))]
+        scenes = scenes if limit is None else scenes[:limit]
+        return len(scenes), list(scenes)
+
+    def tag_id_by_name(self, name):
+        self.calls.append(("tag_id_by_name", name))
+        return self._tag_ids.get(name)
 
 
 class _FakeBox:
@@ -91,6 +114,162 @@ class Selection(unittest.TestCase):
 
         self.assertEqual(box.calls, [])
         self.assertTrue(any("selected 0 of 1" in line for line in ctx.lines))
+
+
+class MarkerSelection(unittest.TestCase):
+    """The population this check reaches when a marker tag is configured --
+    the same one `cronicled.scan.ScanProducer`'s own `marker` reaches, read
+    through the shared `cronicled.scan.pool_scenes` rather than a second
+    copy of that selection (see `tests/test_scan.py`'s own marker section
+    for the scan's half of this).
+
+    Every assertion below is against the WHOLE set of performer ids actually
+    queried (`box.calls`), never a count or a single expected id alone: a
+    change that pooled every organized scene, not just the marked ones,
+    would still put the marked scene's id in a count-only or
+    contains-only assertion and pass regardless.
+    """
+
+    MARKER = "inferred-metadata"
+    MARKER_TAG = {"id": "t-7", "name": MARKER}
+    MARKER_TAG_IDS = {MARKER: "t-7"}
+    OTHER_TAG = {"id": "t-3", "name": "shortlist"}
+
+    ALPHA_PATH = "/library/Alpha Vale/Morning.mp4"
+    BETA_PATH = "/library/Beta Wren/Evening.mp4"
+    GAMMA_PATH = "/library/Gamma Kite/Night.mp4"
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+
+    def _listing_for(self, *performer_ids):
+        return _FakeBox({pid: _listing(scenes=[], complete=True)
+                         for pid in performer_ids})
+
+    def test_an_organized_scene_carrying_the_marker_is_checked(self):
+        # The third scene is organized and carries a DIFFERENT tag, so
+        # passing this test cannot be done by pooling everything organized.
+        stash = _FakeStash(
+            [scene(1, self.ALPHA_PATH),
+             scene(2, self.BETA_PATH, tags=[self.MARKER_TAG]),
+             scene(3, self.GAMMA_PATH, tags=[self.OTHER_TAG])],
+            organized=("2", "3"), tag_ids=self.MARKER_TAG_IDS)
+        box = self._listing_for("pf-1", "pf-2")
+        producer = StashBoxCheckProducer(
+            stash, box,
+            {"Alpha Vale": "pf-1", "Beta Wren": "pf-2", "Gamma Kite": "pf-3"},
+            store=self.store, marker=self.MARKER)
+
+        list(producer.produce(_Ctx()))
+
+        self.assertEqual(box.calls, ["pf-1", "pf-2"])
+
+    def test_an_organized_scene_without_the_marker_is_not_checked(self):
+        # The guard, on its own fixture: a marker is configured and
+        # resolves, and the organized file that does not carry it is still
+        # never offered. Without this, pooling all organized scenes passes
+        # the test above too.
+        stash = _FakeStash(
+            [scene(1, self.ALPHA_PATH), scene(2, self.BETA_PATH)],
+            organized=("2",), tag_ids=self.MARKER_TAG_IDS)
+        box = self._listing_for("pf-1")
+        producer = StashBoxCheckProducer(
+            stash, box, {"Alpha Vale": "pf-1", "Beta Wren": "pf-2"},
+            store=self.store, marker=self.MARKER)
+        ctx = _Ctx()
+
+        list(producer.produce(ctx))
+
+        self.assertEqual(box.calls, ["pf-1"])
+        self.assertEqual(
+            ctx.lines[0],
+            "selected 1 of 1 files for a stash-box check; 0 of the 1 "
+            "offered only because they carry the marker tag "
+            "'inferred-metadata', resolving to 0 distinct creator(s)")
+
+    def test_with_no_marker_configured_the_marked_scene_stays_invisible(self):
+        # Absent configuration is a legitimate state and behaves exactly as
+        # it did before this ticket: the marked organized file is invisible
+        # and the opening line carries no marker clause at all.
+        stash = _FakeStash(
+            [scene(1, self.ALPHA_PATH),
+             scene(2, self.BETA_PATH, tags=[self.MARKER_TAG])],
+            organized=("2",), tag_ids=self.MARKER_TAG_IDS)
+        box = self._listing_for("pf-1")
+        producer = StashBoxCheckProducer(
+            stash, box, {"Alpha Vale": "pf-1", "Beta Wren": "pf-2"},
+            store=self.store)
+        ctx = _Ctx()
+
+        list(producer.produce(ctx))
+
+        self.assertEqual(box.calls, ["pf-1"])
+        self.assertEqual(ctx.lines[0],
+                         "selected 1 of 1 files for a stash-box check")
+
+    def test_the_marked_population_is_reported_with_its_distinct_creators(self):
+        # Two of the three marked files share a creator, so the distinct
+        # count must be 2, not 3 -- a file count would mislead about what
+        # this actually costs (see the module docstring on why the count
+        # of listing reads is not the same thing).
+        stash = _FakeStash(
+            [scene(1, self.ALPHA_PATH),
+             scene(2, self.BETA_PATH, tags=[self.MARKER_TAG]),
+             scene(3, "/library/Beta Wren/Noon.mp4", tags=[self.MARKER_TAG]),
+             scene(4, self.GAMMA_PATH, tags=[self.MARKER_TAG])],
+            organized=("2", "3", "4"), tag_ids=self.MARKER_TAG_IDS)
+        box = self._listing_for("pf-1", "pf-2", "pf-3")
+        producer = StashBoxCheckProducer(
+            stash, box,
+            {"Alpha Vale": "pf-1", "Beta Wren": "pf-2", "Gamma Kite": "pf-3"},
+            store=self.store, marker=self.MARKER)
+        ctx = _Ctx()
+
+        list(producer.produce(ctx))
+
+        self.assertEqual(
+            ctx.lines[0],
+            "selected 4 of 4 files for a stash-box check; 3 of the 4 "
+            "offered only because they carry the marker tag "
+            "'inferred-metadata', resolving to 2 distinct creator(s)")
+
+    def test_an_unresolvable_marked_scene_is_not_counted_as_a_creator(self):
+        # A date-shaped folder resolves to no creator at all (see
+        # `CreatorResolution.test_an_unresolved_creator_is_skipped_and_logged`
+        # below for the same fixture shape) -- it must not inflate the
+        # distinct-creator count the way counting `None` as a "creator"
+        # would.
+        stash = _FakeStash(
+            [scene(1, self.ALPHA_PATH),
+             scene(2, self.BETA_PATH, tags=[self.MARKER_TAG]),
+             scene(3, "/2023 September 11/clip.mp4", tags=[self.MARKER_TAG])],
+            organized=("2", "3"), tag_ids=self.MARKER_TAG_IDS)
+        box = self._listing_for("pf-1", "pf-2")
+        producer = StashBoxCheckProducer(
+            stash, box, {"Alpha Vale": "pf-1", "Beta Wren": "pf-2"},
+            store=self.store, marker=self.MARKER)
+        ctx = _Ctx()
+
+        list(producer.produce(ctx))
+
+        self.assertEqual(
+            ctx.lines[0],
+            "selected 3 of 3 files for a stash-box check; 2 of the 3 "
+            "offered only because they carry the marker tag "
+            "'inferred-metadata', resolving to 1 distinct creator(s)")
+
+    def test_a_marker_naming_no_tag_on_this_server_refuses(self):
+        # `pool_scenes` (shared with the scan) raises for a marker naming no
+        # tag rather than silently pooling nothing extra -- this producer
+        # must not swallow that.
+        stash = _FakeStash([scene(1, self.ALPHA_PATH)])
+        producer = StashBoxCheckProducer(
+            stash, _FakeBox({}), {"Alpha Vale": "pf-1"}, store=self.store,
+            marker="no-such-tag")
+
+        with self.assertRaises(ValueError):
+            list(producer.produce(_Ctx()))
 
 
 class CreatorResolution(unittest.TestCase):
