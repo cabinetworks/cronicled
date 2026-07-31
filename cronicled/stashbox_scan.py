@@ -52,25 +52,50 @@ claims to be, so a scene an earlier tool organized on a guess is exactly as
 good a subject for a second, source-drawn opinion as any other file -- more
 so, in fact: nothing has ever checked it against an index at all.
 
-The honest cost needs stating plainly, because it is easy to overstate in
-the OTHER direction: THIS PRODUCER DOES NOT CACHE A LISTING READ ACROSS
-FILES. `cronicled.stashbox.check` pages a whole listing per CALL, and
-`produce` calls it once per selected file, so two files that resolve to the
-same creator page that creator's listing TWICE, not once -- there is no
-per-run memo here the way `cronicled.scan._SingleFlight` gives the scan for
-its own per-store searches. `produce` still reports how many distinct
-creators the marked population resolves to (`_resolved_creators`), because
-that is the number worth knowing before ever turning a marker on here -- but
-until a cache exists, the listing reads a run actually spends are bounded by
-how many SELECTED files have a known performer id, not by that
-distinct-creator count, whenever more than one selected file shares a
-creator. Reported as a measurement to weigh, not as a claim about what this
-already costs.
+`produce` now memoises a listing read for the length of one run:
+`cronicled.stashbox.check` still pages a whole listing per CALL, but two
+selected files that resolve to the same creator now share ONE such call
+between them, through `_CachedListings` -- reusing
+`cronicled.scan._SingleFlight`, the scan's own per-run collapse for its own
+per-store searches, rather than a second hand-rolled cache that would be
+free to drift from it.
+
+This is not only a cost saving, and the cost is not the stronger reason for
+it. A listing read is PAGED, so reading it twice can return two different
+views of the same source if it is updated in between -- and, before this,
+two files by one creator really were read separately, so they could be
+judged against two different views of what is nominally "the same"
+listing, with nothing anywhere saying so. The memo removes that
+inconsistency along with the redundant reads: every file that shares a
+creator within one run is now judged against the identical `SourceListing`
+object, not merely an equal-looking one.
+
+Built fresh inside `produce`, never held on `self`, on the same terms
+`cronicled.scan.ScanProducer`'s own per-store flights are: the cache must
+not outlive the run, or a later run would judge a file against a listing
+the source may no longer hold. A failed read is cached too, and re-raised
+to every file waiting on it, exactly as `_SingleFlight` already does for
+the scan -- a transient failure is one fact about the run, never a licence
+to hand back an empty listing, and therefore a confident "unlisted", to
+every file that happens to share its creator.
+
+`produce` still reports how many distinct creators the marked population
+resolves to (`_resolved_creators`), and that number now means something
+closer to its plain reading than it used to. Before the memo, it was
+worth knowing in spite of being decoupled from what a run actually spent,
+because nothing here reused an answer across files. Now, the listing reads
+a run actually spends really are bounded by how many DISTINCT resolved
+creators its selected files carry a known performer id for, not by how
+many selected files there are. `_resolved_creators` still only counts the
+population the marker itself contributed, though, so it undercounts the
+true bound whenever a marked file shares a creator with an unmarked one --
+that pair now costs one read rather than two, which this count has no way
+to know to subtract.
 """
 import posixpath
 
 from cronicled.artist import Aliases, creator_folder, resolve
-from cronicled.scan import pool_scenes, select
+from cronicled.scan import _SingleFlight, pool_scenes, select
 from cronicled.scoring import DEFAULT_THRESHOLD
 from cronicled.stashbox import check as stashbox_check
 
@@ -118,6 +143,65 @@ def _resolved_creators(scenes, aliases):
         if resolution.name is not None:
             creators.add(resolution.name)
     return creators
+
+
+class _CachedListings:
+    """A `box`-shaped facade whose `performer_listing` answers a whole
+    listing read AT MOST ONCE per performer id for the life of one run,
+    reusing `cronicled.scan._SingleFlight` -- the scan's own per-run
+    collapse for its per-store searches -- rather than a second, hand-rolled
+    cache that would be free to behave differently from it.
+
+    An instance is built FRESH inside `StashBoxCheckProducer.produce`, never
+    held on `self`: the same scoping rule `cronicled.scan.ScanProducer.produce`
+    applies to its own per-store flights, for the identical reason -- a memo
+    that outlives a run answers a LATER run from a listing the source may no
+    longer hold, which is exactly the staleness this exists to avoid, not
+    merely the redundant reads.
+
+    Keyed on the performer id ALONE (`key=lambda call: call[0]`, `call`
+    being the `(performer_id, per_page, max_pages, timeout)` tuple
+    `performer_listing` below packages up), never on `_SingleFlight`'s
+    default case/whitespace-folding key: that folding is a judgement about
+    two spellings of one person's NAME, and would be the wrong judgement
+    applied to an opaque stash-box id, which is already exact.
+
+    `wrap=lambda listing: listing` is the other departure from
+    `_SingleFlight`'s default (`list`, which assumes a search returns an
+    iterable of candidate rows and hands every caller a fresh copy of it). A
+    whole-listing read returns ONE `SourceListing` object, not an iterable of
+    rows, and every file that shares a creator sharing that SAME object --
+    never a copy of one -- is the whole point: two files by one creator must
+    be judged against the identical paged read, not against two reads of a
+    listing that may have changed underneath between them.
+
+    `per_page`/`max_pages`/`timeout` still reach the underlying `box`
+    exactly as `cronicled.stashbox.check` passed them -- forwarded, never
+    dropped, because the real client is entitled to see the same call shape
+    whether or not a memo sits in front of it. Only the CACHE KEY leaves
+    them out, keying on the performer id alone: this producer has no way to
+    ask for two different ones within one run, so nothing is lost by not
+    keying on them, and keying on them anyway would buy nothing.
+    """
+
+    def __init__(self, box):
+        # Kept alongside the flight, rather than only closed over inside it,
+        # so a caller (or a test) can confirm which box this wraps without
+        # reaching through `_SingleFlight`'s own internals to find out.
+        self._box = box
+        self._flight = _SingleFlight(
+            self._read, key=lambda call: call[0],
+            wrap=lambda listing: listing)
+
+    def _read(self, call):
+        performer_id, per_page, max_pages, timeout = call
+        return self._box.performer_listing(
+            performer_id, per_page=per_page, max_pages=max_pages,
+            timeout=timeout)
+
+    def performer_listing(self, performer_id, per_page=None, max_pages=None,
+                          timeout=None):
+        return self._flight((performer_id, per_page, max_pages, timeout))
 
 
 class StashBoxCheckProducer:
@@ -196,6 +280,14 @@ class StashBoxCheckProducer:
                 % (counts.marked, counts.total, self._marker, len(creators)))
         ctx.log(selection)
 
+        # One `_CachedListings` for the whole run, built HERE rather than at
+        # `__init__`, on the same terms `cronicled.scan.ScanProducer.produce`
+        # builds its own per-store `_SingleFlight`s: the memo must not
+        # outlive this one run, or a later run would judge a file against a
+        # listing the source may no longer hold. See this module's own
+        # docstring and `_CachedListings` for the whole reasoning.
+        cached_box = _CachedListings(self._box)
+
         checked = unlisted = present = inconclusive = skipped = 0
         for done, scene in enumerate(selected, start=1):
             subject_id = str(scene.get("id"))
@@ -220,7 +312,7 @@ class StashBoxCheckProducer:
                            "%r" % (done, len(selected), subject_id, resolution.name))
                     continue
                 verdict = stashbox_check(
-                    self._box, performer_id, name, directory, resolution,
+                    cached_box, performer_id, name, directory, resolution,
                     threshold=self._threshold, censorship=self._censorship)
             except Exception as exc:
                 # A malformed scene or a transport failure is evidence about

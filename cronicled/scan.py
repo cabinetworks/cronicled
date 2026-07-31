@@ -1983,16 +1983,36 @@ class _SingleFlight:
     `ScanProducer`'s own docstring). Incremented under the same lock that
     decides `mine`, so two workers racing to create the same entry can never
     both count it.
+
+    `key` and `wrap` are overridable, and exist so a SECOND caller with a
+    different shape of query and answer can reuse this mechanism rather than
+    writing a second one — see `cronicled.stashbox_scan._CachedListings`,
+    which collapses a whole-listing read per resolved performer id for the
+    length of a run, the same problem this class solves for the scan's own
+    per-creator searches. Both default to this class's ORIGINAL behaviour,
+    so nothing about `ScanProducer`'s own use of it changes: `key` defaults
+    to `_query_key`'s case/whitespace folding, a judgement about two
+    spellings of one person's NAME, which would be the wrong judgement
+    applied to an opaque id that is already exact; `wrap` defaults to
+    `list`, which assumes the search returns an iterable of candidate rows
+    and hands every caller — the one that ran it and every one that waited
+    — a fresh copy, so one file's list is never the object another file is
+    iterating. A whole-listing read returns ONE object, not an iterable of
+    rows, and the caller there wants every file to share that SAME object
+    rather than a copy of it — `key=lambda x: x` and `wrap=lambda x: x` are
+    how it asks for plain identity on both.
     """
 
-    def __init__(self, search):
+    def __init__(self, search, *, key=_query_key, wrap=list):
         self._search = search
+        self._key = key
+        self._wrap = wrap
         self._lock = threading.Lock()
         self._flights = {}
         self.calls = 0
 
     def __call__(self, query):
-        key = _query_key(query)
+        key = self._key(query)
         with self._lock:
             flight = self._flights.get(key)
             mine = flight is None
@@ -2001,7 +2021,7 @@ class _SingleFlight:
                 self.calls += 1
         if mine:
             try:
-                flight.result = list(self._search(query))
+                flight.result = self._wrap(self._search(query))
             except BaseException as exc:
                 # Deliberately broader than `Exception`, but NOT because a
                 # narrower clause would hang the waiters: the `finally` below
@@ -2020,9 +2040,12 @@ class _SingleFlight:
             flight.done.wait()
         if flight.error is not None:
             raise flight.error
-        # A fresh list per caller: one file's candidates list must not be the
-        # object another file is iterating.
-        return list(flight.result)
+        # Under the default `wrap=list`: a fresh list per caller, so one
+        # file's candidates list is never the object another file is
+        # iterating. A caller that passed `wrap=lambda x: x` is asking for
+        # the OPPOSITE guarantee — shared identity, not isolation — and this
+        # returns it, because that is the property its own use needs.
+        return self._wrap(flight.result)
 
 
 def pool_scenes(stash, marker):
