@@ -1,19 +1,28 @@
 import email.message
 import http.client
 import io
+import re
 import threading
 import unittest
 from contextlib import redirect_stdout
-from datetime import time
+from datetime import time, timezone
 from http.server import HTTPServer
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from cronicled.__main__ import waiting_counts
 from cronicled.jobs import JobRejected
+from cronicled.performer_tags import index_performers, match_tag
+from cronicled.performer_tags import proposal as reconcile_proposal
 from cronicled.schedule import LoopStatus, TickResult, resolve
+from cronicled.tag_hygiene import proposal as unused_proposal
+from cronicled.tags import cluster_tags
+from cronicled.tags import proposal as tag_merge_proposal
 from cronicled.web.actions import ApplyFailed, BulkApplyResult, UnknownProposal
 from cronicled.web.app import build_handler, serve, DEFAULT_HOST
-from cronicled.web.rows import to_schedule_view, to_summary_view
+from cronicled.web.rows import (to_merge_rows, to_reconcile_rows,
+                                to_schedule_view, to_summary_view,
+                                to_unused_groups)
 
 
 class _ScheduledProducer:
@@ -1076,13 +1085,18 @@ class EachInboxRouteServesOnlyItsOwnSubjectTypes(unittest.TestCase):
                 sent = _drive("GET", "/" + name, store=store)
                 self.assertIn(("<h1>%s</h1>" % title).encode(), sent["body"])
 
-    def test_a_tag_cluster_candidate_does_not_reach_the_tags_page_yet(self):
+    def test_a_tag_cluster_candidate_never_reaches_the_generic_row_list(self):
         # `to_rows` cannot build a row for a merge candidate (it dispatches
         # only on the description/tag-description subject types and treats
-        # everything else as scene-shaped -- see `web.app._NO_ROW_BUILDER`),
-        # so it is excluded from what `/tags` asks the store for at all,
-        # rather than reaching `to_rows` and raising `KeyError` on
-        # `payload["path"]`.
+        # everything else as scene-shaped -- see `web.app._SECTION_SUBJECTS`),
+        # so it is excluded from what the GENERIC row list asks the store
+        # for at all, rather than reaching `to_rows` and raising `KeyError`
+        # on `payload["path"]`. It has its own section instead (see
+        # `TheTagsPageComposesEverySectionTheCombinedPageDoes` below) -- this
+        # test is only about the raw store item never being read through
+        # `to_rows`, which is why no `merges=` callable is wired here at all:
+        # nothing would surface its fingerprint even if the fixture's own
+        # payload were real, because `to_rows` is never handed this item.
         store = _FakeStore([_tag_item("t1"),
                             {"fingerprint": "cluster-1", "state": "new",
                              "subject_type": "tag-cluster",
@@ -1186,13 +1200,59 @@ class TerminalStatePagesShowOnlyTheirOwnState(unittest.TestCase):
 
 
 def _cluster_item(fp, state="new"):
-    """A tag-cluster (merge) candidate -- one of the three subject types
-    `_NO_ROW_BUILDER` names. `to_rows` cannot build a row for it (see that
-    constant's own comment), and it is never asked for by `/tags` at all, so
-    only its `subject_type`/`state` matter here -- never rendered, only
-    counted or excluded from a count."""
+    """A bare tag-cluster (merge) candidate -- one of the three subject types
+    `web.app._SECTION_SUBJECTS` names. `to_rows` cannot build a row for it
+    (see that mapping's own comment), so a `Store` holding one of these is
+    used here only to prove what the GENERIC row list counts and excludes --
+    its `payload` is `{}` throughout because nothing here ever hands it to
+    `to_merge_row`, which would need a real one. A test that wants an actual
+    rendered "Tag merges" row uses `_merge_item` and the real `merges=`
+    callable instead (see `TheTagsPageComposesEverySectionTheCombinedPageDoes`
+    below).
+    """
     return {"fingerprint": fp, "state": state, "subject_type": "tag-cluster",
             "subject_id": "cluster-%s" % fp, "payload": {}}
+
+
+def _merge_item(fp="fp-merge", state="new"):
+    """One real tag-merge proposal, built through `cronicled.tags.proposal`
+    on an actual cluster rather than hand-assembled -- a hand-written payload
+    is exactly how a row builder comes to be handed a shape the producer
+    never emits, and `to_merge_row` indexes almost every field it reads.
+    """
+    tags = [
+        {"id": "1", "name": "Velvet Crane", "aliases": [], "description": None,
+         "scene_count": 12},
+        {"id": "9", "name": "VelvetCrane", "aliases": [], "description": None,
+         "scene_count": 4},
+    ]
+    built = tag_merge_proposal(cluster_tags(tags)[0], "library", [])
+    return {"fingerprint": fp, "state": state,
+            "subject_type": built["subject_type"],
+            "subject_id": built["subject_id"], "payload": built["payload"]}
+
+
+def _reconcile_item(fp="fp-reconcile", state="new"):
+    """One real tag/performer reconciliation, built the same way -- a tag
+    whose name matches one invented performer's, on two invented scenes."""
+    tag = {"id": "20", "name": "Marlowe Quill", "aliases": [],
+          "description": None, "scene_count": 3}
+    performer = {"id": "77", "name": "Marlowe Quill", "alias_list": []}
+    matches = match_tag(tag, index_performers([performer]))
+    built = reconcile_proposal(tag, matches, ["sc-1", "sc-2"], folder="library")
+    return {"fingerprint": fp, "state": state,
+            "subject_type": built["subject_type"],
+            "subject_id": built["subject_id"], "payload": built["payload"]}
+
+
+def _unused_item(fp="fp-unused", state="new"):
+    """One real low-count-tag proposal, built the same way -- an invented tag
+    on no scenes at all."""
+    tag = {"id": "55", "name": "Faded Ledger", "scene_count": 0}
+    built = unused_proposal(tag, folder="library")
+    return {"fingerprint": fp, "state": state,
+            "subject_type": built["subject_type"],
+            "subject_id": built["subject_id"], "payload": built["payload"]}
 
 
 class _StoreWithDetachedCounts:
@@ -1253,42 +1313,185 @@ class TheSidebarCountsComeFromTheStore(unittest.TestCase):
         self.assertIn(">3<", body)
 
 
-class TheSidebarCountsExcludeWhatThePageCannotRender(unittest.TestCase):
-    """The tags inbox spans four subject types, but `/tags` can only build a
-    row for one of them -- the other three have no row builder at all (see
-    `web.app._NO_ROW_BUILDER`) and are excluded from what `/tags` even asks
-    the store for. Counting the full four here would put a bigger number on
-    this link than the page behind it can ever show.
+class TheTagsCountNowSpansEverySubjectTypeTheInboxOwns(unittest.TestCase):
+    """The defect this ticket closes: a tag inbox has four subject types, and
+    the sidebar number by the Tags link used to add up only the one `to_rows`
+    can build a generic row for -- on a real library, 1456 rather than the
+    2606 the summary's own Waiting total reported for the same heading.
+    `_inbox_page` now composes a section for the other three (see
+    `web.app._SECTION_SUBJECTS`), and the count widens with it. The stronger,
+    one-render version of this same guarantee is
+    `TheSidebarTotalAgreesWithTheSummarysWaitingTotal` below.
     """
 
-    def test_a_tag_cluster_candidate_does_not_inflate_the_tags_count(self):
+    def test_a_tag_cluster_candidate_now_counts_toward_the_tags_total(self):
         store = _FakeStore([_tag_item("t1"), _tag_item("t2"),
                             _cluster_item("c1"), _cluster_item("c2"),
                             _cluster_item("c3")])
         body = _drive("GET", "/", store=store)["body"].decode()
-        self.assertIn(">2<", body)
-        self.assertNotIn(">5<", body)
+        self.assertIn(">5<", body)
+        self.assertNotIn(">2<", body)
 
-    def test_the_tags_page_names_the_boundary(self):
-        # Cheap over the alternative (composing the merge/reconcile/hygiene
-        # sections onto every per-inbox page): the reader is told where the
-        # rest of the tag work is rather than the count and the rows simply
-        # disagreeing with nothing said about why.
-        store = _FakeStore([_tag_item("t1"), _cluster_item("c1")])
-        tags_body = _drive("GET", "/tags", store=store)["body"].decode()
-        scenes_body = _drive("GET", "/scenes", store=store)["body"].decode()
-        self.assertIn("combined", tags_body)
-        self.assertIn("Inbox", tags_body)
-        self.assertNotIn("combined", scenes_body)
+    def test_a_dismissed_or_muted_one_of_the_three_is_still_excluded(self):
+        # Widening the TYPES a count spans must not accidentally widen which
+        # STATES count as waiting -- `store.counts()` excludes
+        # `Store._HIDDEN_STATES` regardless of how many subject types it is
+        # asked about.
+        store = _FakeStore([_tag_item("t1"),
+                            _cluster_item("c1", state="dismissed"),
+                            _cluster_item("c2", state="muted")])
+        body = _drive("GET", "/", store=store)["body"].decode()
+        self.assertIn(">1<", body)
+        self.assertNotIn(">3<", body)
 
-    def test_the_tags_page_does_not_render_the_sections_it_did_not_query(self):
-        # Checked against the SECTION heading the `section` macro actually
-        # emits (`Tag merges (`), not the bare phrase "Tag merges" -- the
-        # boundary note added above also uses that phrase in prose, and a
-        # looser check would pass whether or not the section itself rendered.
-        store = _FakeStore([_tag_item("t1"), _cluster_item("c1")])
-        body = _drive("GET", "/tags", store=store)["body"].decode()
+
+class TheTagsPageComposesEverySectionTheCombinedPageDoes(unittest.TestCase):
+    """`/tags` now builds the merge, tag/performer and low-count-tag sections
+    the same way the combined `/inbox` page does -- through the SAME
+    `merges=`/`reconciles=`/`unused=` closures (see `web.app._inbox_page`),
+    never a second copy of `to_merge_rows` et al. Three SEPARATE tests,
+    each pinning one kind, because a single test asserting "some section
+    appeared" cannot tell which of the three is missing if only one is.
+    """
+
+    def test_a_merge_reaches_the_tags_page(self):
+        sent = _drive("GET", "/tags", store=_FakeStore([]),
+                      merges=lambda: to_merge_rows([_merge_item()]))
+        body = sent["body"].decode()
+        self.assertIn("Merge into <b>Velvet Crane</b>", body)
+
+    def test_a_tag_performer_match_reaches_the_tags_page(self):
+        sent = _drive("GET", "/tags", store=_FakeStore([]),
+                      reconciles=lambda: to_reconcile_rows(
+                          [_reconcile_item()]))
+        body = sent["body"].decode()
+        self.assertIn("Marlowe Quill", body)
+        self.assertIn("matched on their name", body)
+
+    def test_an_unused_tag_reaches_the_tags_page(self):
+        sent = _drive("GET", "/tags", store=_FakeStore([]),
+                      unused=lambda: to_unused_groups([_unused_item()]))
+        body = sent["body"].decode()
+        self.assertIn("Faded Ledger", body)
+
+    def test_scenes_gains_none_of_the_three_even_when_they_are_wired(self):
+        # The quieter failure this project has recorded before: widening a
+        # selection too far. Wiring all three callables and pointing every
+        # assertion at `/scenes` proves the inbox itself decides what is
+        # composed, not merely that nobody happened to pass the keyword.
+        sent = _drive("GET", "/scenes", store=_FakeStore([]),
+                      merges=lambda: to_merge_rows([_merge_item()]),
+                      reconciles=lambda: to_reconcile_rows(
+                          [_reconcile_item()]),
+                      unused=lambda: to_unused_groups([_unused_item()]))
+        body = sent["body"].decode()
+        self.assertNotIn("Velvet Crane", body)
+        self.assertNotIn("Marlowe Quill", body)
+        self.assertNotIn("Faded Ledger", body)
         self.assertNotIn("Tag merges (", body)
+        self.assertNotIn("Tags that are a performer (", body)
+        self.assertNotIn("Tags that do almost no work (", body)
+
+    def test_performers_gains_none_of_the_three_either(self):
+        sent = _drive("GET", "/performers", store=_FakeStore([]),
+                      merges=lambda: to_merge_rows([_merge_item()]),
+                      reconciles=lambda: to_reconcile_rows(
+                          [_reconcile_item()]),
+                      unused=lambda: to_unused_groups([_unused_item()]))
+        body = sent["body"].decode()
+        self.assertNotIn("Velvet Crane", body)
+        self.assertNotIn("Marlowe Quill", body)
+        self.assertNotIn("Faded Ledger", body)
+
+    def test_the_combined_inbox_page_still_renders_exactly_as_before(self):
+        # What must not change: the one page that has always shown all six
+        # subject types keeps showing them, through the same closures.
+        sent = _drive("GET", "/inbox", store=_FakeStore([]),
+                      merges=lambda: to_merge_rows([_merge_item()]),
+                      reconciles=lambda: to_reconcile_rows(
+                          [_reconcile_item()]),
+                      unused=lambda: to_unused_groups([_unused_item()]))
+        body = sent["body"].decode()
+        self.assertIn("Merge into <b>Velvet Crane</b>", body)
+        self.assertIn("Marlowe Quill", body)
+        self.assertIn("Faded Ledger", body)
+
+    def test_a_dismissed_merge_still_carries_its_undismiss_on_the_tags_page(self):
+        # The whole reason `_merge_rows` reads the store three times: a
+        # dismissed cluster needs its Undismiss control, and it has to reach
+        # this page exactly as it reaches the combined one -- not only the
+        # waiting rows, which a narrower test could not tell apart from a
+        # section that dropped every closed state.
+        sent = _drive("GET", "/tags", store=_FakeStore([]),
+                      merges=lambda: to_merge_rows(
+                          [_merge_item(state="dismissed")]))
+        body = sent["body"].decode()
+        self.assertIn('<form method="post" action="/undismiss">'
+                      '<input type="hidden" name="fp" value="fp-merge">'
+                      '<button>Undismiss</button></form>', body)
+
+    def test_a_muted_unused_tag_still_carries_its_unmute_on_the_tags_page(self):
+        sent = _drive("GET", "/tags", store=_FakeStore([]),
+                      unused=lambda: to_unused_groups(
+                          [_unused_item(state="muted")]))
+        body = sent["body"].decode()
+        self.assertIn('<form method="post" action="/unmute">'
+                      '<input type="hidden" name="subject_type" '
+                      'value="tag-unused">'
+                      '<input type="hidden" name="subject_id" value="55">'
+                      '<button>Stop keeping</button></form>', body)
+
+
+class TheSidebarTotalAgreesWithTheSummarysWaitingTotal(unittest.TestCase):
+    """The two-number contradiction this ticket closes: the sidebar's Tags
+    count and the summary's own Waiting total for the same heading used to
+    read differently on a real library (1456 against 2606) because they were
+    built from two different subject-type lists. Both numbers are pulled off
+    ONE render of `/` -- asserting each separately against its own fixture
+    could not tell "both correct" from "both wrong the same way", which is
+    exactly the shape of this bug.
+    """
+
+    _SIDEBAR_RE = re.compile(
+        r'<a href="/tags">Tags</a>\s*<span class="count">(\d+)</span>')
+    _WAITING_RE = re.compile(r'<a href="/inbox">tags</a> &mdash; (\d+)')
+
+    def test_the_tags_sidebar_count_matches_the_waiting_total_for_tags(self):
+        items = [
+            _tag_item("t1"), _tag_item("t2"),
+            _tag_item("t-applied", state="applied"),
+            _cluster_item("c1"), _cluster_item("c2"), _cluster_item("c3"),
+            _cluster_item("c-dismissed", state="dismissed"),
+            {"fingerprint": "r1", "state": "new",
+             "subject_type": "tag-performer", "subject_id": "r1",
+             "payload": {}},
+            {"fingerprint": "r2", "state": "new",
+             "subject_type": "tag-performer", "subject_id": "r2",
+             "payload": {}},
+            {"fingerprint": "r-muted", "state": "muted",
+             "subject_type": "tag-performer", "subject_id": "r-muted",
+             "payload": {}},
+            {"fingerprint": "u1", "state": "new",
+             "subject_type": "tag-unused", "subject_id": "u1",
+             "payload": {}},
+        ]
+        store = _FakeStore(items)
+        body = _drive(
+            "GET", "/", store=store,
+            summary=lambda: to_summary_view(
+                [], waiting_counts(store.items()), None, zone=timezone.utc),
+        )["body"].decode()
+
+        sidebar_match = self._SIDEBAR_RE.search(body)
+        waiting_match = self._WAITING_RE.search(body)
+        self.assertIsNotNone(sidebar_match, body)
+        self.assertIsNotNone(waiting_match, body)
+        # Both numbers, from the SAME render: 2 tag + 3 tag-cluster +
+        # 2 tag-performer + 1 tag-unused = 8, with the applied tag, the
+        # dismissed cluster and the muted reconciliation all excluded from
+        # both counts on their own terms.
+        self.assertEqual(sidebar_match.group(1), "8")
+        self.assertEqual(sidebar_match.group(1), waiting_match.group(1))
 
 
 class TheSidebarCountExcludesApplied(unittest.TestCase):
@@ -1348,6 +1551,74 @@ class ASidebarNestedStateAppearsOnlyWhenThatInboxHasIt(unittest.TestCase):
         body = _drive("GET", "/", store=self._store())["body"].decode()
         self.assertNotIn('href="/scenes/muted"', body)
         self.assertNotIn('href="/tags/muted"', body)
+
+
+class TheNestedStateLinksStayNarrowedEvenAsTheCountWidens(unittest.TestCase):
+    """`_sidebar_context` widens the COUNT to every subject type an inbox
+    owns, but the nested `Applied`/`Dismissed`/`Muted` links stay narrowed to
+    what the GENERIC `/{name}/{state}` route can actually draw -- see that
+    function's own docstring for why. A dismissed or applied tag-cluster,
+    tag/performer match or low-count tag is real work, but it is shown
+    inline in its own section on `/tags` itself, never via the terminal
+    route these links point at, so the count and the nested links have to
+    stay on two different subject-type lists rather than the same one.
+    """
+
+    def test_an_applied_cluster_with_no_applied_tag_does_not_link_applied(self):
+        # If this used the SAME widened type list as the count, the applied
+        # tag-cluster below would make the link appear -- pointing at
+        # `/tags/applied`, which never draws a cluster row at all.
+        store = _FakeStore([
+            _tag_item("t-open", state="new"),
+            _cluster_item("c-applied", state="applied"),
+        ])
+        body = _drive("GET", "/", store=store)["body"].decode()
+        self.assertNotIn('href="/tags/applied"', body)
+
+    def test_a_dismissed_cluster_with_no_dismissed_tag_does_not_link_dismissed(self):
+        store = _FakeStore([
+            _tag_item("t-open", state="new"),
+            _cluster_item("c-dismissed", state="dismissed"),
+        ])
+        body = _drive("GET", "/", store=store)["body"].decode()
+        self.assertNotIn('href="/tags/dismissed"', body)
+
+    def test_an_applied_tag_still_links_applied_regardless(self):
+        # The narrowing above must not swallow the ordinary case: an applied
+        # row of a type the generic route DOES draw still lights up the link.
+        store = _FakeStore([
+            _tag_item("t-applied", state="applied"),
+            _cluster_item("c-open", state="new"),
+        ])
+        body = _drive("GET", "/", store=store)["body"].decode()
+        self.assertIn('href="/tags/applied"', body)
+
+
+class TheThreeSpecialSectionsAppearOnlyOnTheWorkingQueueView(unittest.TestCase):
+    """`merges`/`reconciles`/`unused` are composed only for `/{name}` itself
+    (`state is None`), never for the terminal `/{name}/{state}` routes --
+    each of the three already shows every state a control belongs to, inline,
+    on the working-queue page, so a second copy of the section on
+    `/tags/dismissed` or `/tags/muted` would either repeat it or, worse,
+    silently show a "nothing found" a mutation could make disagree with the
+    real one.
+    """
+
+    def test_the_dismissed_state_route_carries_no_merge_section_at_all(self):
+        sent = _drive("GET", "/tags/dismissed", store=_FakeStore([]),
+                      merges=lambda: to_merge_rows(
+                          [_merge_item(state="dismissed")]))
+        body = sent["body"].decode()
+        self.assertNotIn("Tag merges (", body)
+        self.assertNotIn("Velvet Crane", body)
+
+    def test_the_muted_state_route_carries_no_unused_section_at_all(self):
+        sent = _drive("GET", "/tags/muted", store=_FakeStore([]),
+                      unused=lambda: to_unused_groups(
+                          [_unused_item(state="muted")]))
+        body = sent["body"].decode()
+        self.assertNotIn("Tags that do almost no work (", body)
+        self.assertNotIn("Faded Ledger", body)
 
 
 class TheSidebarAppearsOnEveryPage(unittest.TestCase):
