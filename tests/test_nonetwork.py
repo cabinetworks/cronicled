@@ -81,10 +81,34 @@ class _Base(unittest.TestCase):
 
     def allowed(self, call):
         """Run `call`, require the guard to have recorded nothing, return
-        whatever it answered."""
+        whatever it answered.
+
+        Two claims in one, and that is only safe where the call is one every
+        platform answers the same way. Where it is not, use `passed_through`.
+        """
         answer = call()
         self.assertEqual(nonetwork.take(), [])
         return answer
+
+    def passed_through(self, call):
+        """Run `call` and require only that the GUARD had no opinion on it.
+
+        Separate from `allowed` because "the guard did not screen this" and
+        "the call succeeded" are different claims and only the first is the
+        guard's business. An empty host answers with the wildcard address on
+        one platform and refuses with EAI_NONAME on another; `allowed` asserts
+        the call returns, so using it here pinned whichever platform the test
+        was written on and broke on the other.
+
+        The resolver's own refusal is tolerated. A `NonLoopbackResolution` is
+        NOT -- it is outside `OSError`, so it escapes this handler and errors
+        the test, and a guard that started screening these still fails here.
+        """
+        try:
+            call()
+        except OSError:
+            pass
+        self.assertEqual(nonetwork.take(), [])
 
 
 class WhatCountsAsLoopback(_Base):
@@ -160,18 +184,29 @@ class DecidingAName(_Base):
 
 
 class NoHostAtAll(_Base):
-    """A wildcard bind names nobody, so it resolves nobody."""
+    """A wildcard bind names nobody, so there is nothing here to judge.
 
-    def test_no_host_is_allowed(self):
-        # With AI_PASSIVE this answers 0.0.0.0, which is not loopback -- so a
-        # guard that let this reach the address rules would refuse every
-        # server in the suite that binds every interface.
-        self.allowed(lambda: socket.getaddrinfo(None, 0,
-                                                flags=socket.AI_PASSIVE))
+    Both tests below assert that the GUARD had no opinion, and nothing about
+    what the resolver went on to do. That is the rule -- "no host to judge" --
+    and it is the only part that is the same everywhere: an empty host answers
+    with the wildcard address on one platform and refuses with EAI_NONAME on
+    another, while the guard's own decision is identical on both because it
+    never gets as far as asking.
 
-    def test_the_empty_host_is_allowed(self):
-        self.allowed(lambda: socket.getaddrinfo("", 0,
-                                                flags=socket.AI_PASSIVE))
+    Not a skip, because there is nothing here that cannot be unified. The
+    property holds on every platform; it was the assertion that did not.
+    """
+
+    def test_a_missing_host_is_not_screened(self):
+        # With AI_PASSIVE this asks for 0.0.0.0, which is NOT loopback -- so a
+        # guard that let it reach the address rules would refuse every server
+        # in the suite that binds every interface.
+        self.passed_through(lambda: socket.getaddrinfo(None, 0,
+                                                       flags=socket.AI_PASSIVE))
+
+    def test_an_empty_host_is_not_screened(self):
+        self.passed_through(lambda: socket.getaddrinfo("", 0,
+                                                       flags=socket.AI_PASSIVE))
 
     def test_a_host_given_as_bytes_is_refused_under_its_own_name(self):
         # `getaddrinfo` takes bytes as well as text. Left as bytes, the host

@@ -113,9 +113,18 @@ def resolving(host):
 def _named(host):
     """`host` as text, or None where the call names no host at all.
 
-    `getaddrinfo(None, port)` and `getaddrinfo("", port)` are how a server
-    asks for the wildcard address. Neither resolves a name, so neither is this
-    rule's business.
+    `None` and `""` are how a caller asks for the wildcard address rather
+    than for anybody in particular. Neither NAMES a host, so there is nothing
+    here to judge and both are passed through untouched.
+
+    The rule is "there is no host to judge", NOT "the resolver accepted it".
+    The two are easy to confuse and only the first is this guard's business:
+    what the resolver does with an empty host is not the same everywhere --
+    one platform answers with the wildcard address, another refuses with
+    EAI_NONAME. The guard's own decision is identical on both, because it
+    never gets as far as asking. A test that asserted the CALL SUCCEEDED
+    rather than that the guard had no opinion passed on the machine it was
+    written on and failed on the one the suite runs on.
 
     ONE bound here, not two. This was first written as
     `if host is None or host == ""`, which reads as more careful and is not:
