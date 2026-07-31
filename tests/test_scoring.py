@@ -489,6 +489,40 @@ class Deciding(unittest.TestCase):
         self.assertIsNone(d.match)
         self.assertIn("ambiguous", d.reason)
 
+    def test_two_scores_that_agree_are_still_refused_here(self):
+        """No change needed: `decide` is the one site in this audit where two
+        sources agreeing is not representable, so it cannot be misread.
+
+        What it is handed is a list of `Match` -- a score, a containment flag
+        and a token count -- and nothing saying WHICH candidate a score
+        belongs to. Two equal scores are therefore two candidates that scored
+        alike, which is a real choice, and never one answer named twice. The
+        shape that DID manufacture "ambiguous: X vs X" -- one scene listed
+        twice by two query variants -- is eliminated a layer up, by
+        `cronicled.search`'s dedup, and pinned end to end in
+        tests/test_search.py.
+
+        Loosening this to take a tie because "they agree" would be reading
+        equality of the SCORE as equality of the ANSWER, and the test below
+        shows those are different things.
+        """
+        d = decide([self._m(0.9), self._m(0.9)])
+
+        self.assertIsNone(d.match)
+        self.assertIn("ambiguous", d.reason)
+
+    def test_two_different_titles_can_produce_the_very_same_match(self):
+        # The evidence for the verdict above, rather than an assertion about
+        # `Match`'s field list: two visibly different titles -- not one title
+        # twice -- score to an identical `Match`. Whatever `decide` did with a
+        # tie it would be doing to these as much as to a duplicate, so a tie
+        # cannot be read as corroboration at this layer.
+        a = score("Morning Ritual.mp4", "", "Morning Ritual At Dawn")
+        b = score("Morning Ritual.mp4", "", "At Dawn Morning Ritual")
+
+        self.assertNotEqual("Morning Ritual At Dawn", "At Dawn Morning Ritual")
+        self.assertEqual(a, b)
+
     def test_two_contained_candidates_are_ambiguous(self):
         # both floor at 0.9, so this tie is a normal outcome, not a rarity
         d = decide([self._m(0.9, contained=True), self._m(0.9, contained=True)])

@@ -428,6 +428,78 @@ class ScheduleFileNamesJobsThatHaveBeenRenamed(unittest.TestCase):
         self.assertIn("86400", message)
         self.assertIn("03:00", message)
 
+    # -- ...and the half of it that is not a conflict at all --------------- #
+    #
+    # Two entries naming one job with the SAME settings do not disagree about
+    # anything. Whichever were kept, the job runs on the same cadence, so the
+    # refusal's own justification -- "one of them would silently do nothing"
+    # -- does not hold, and refusing stops the process starting over a file
+    # that expresses one unambiguous intent. It is the exact half-renamed
+    # state RENAMED_JOBS exists to let a configured deployment start in.
+
+    def test_two_names_asking_for_the_same_thing_is_agreement_not_a_refusal(self):
+        # HARM this fixes: an operator part-way through the rename, who has
+        # copied their entry under the new name and not yet deleted the old
+        # one, could not start the process at all -- defeating the one
+        # release of grace the rename mechanism exists to give them.
+        self._write_schedule('{"tag-merge": {"every": 3600},'
+                             ' "tag-scan": {"every": 3600}}')
+
+        loaded, printed = self._load_watching_stdout()
+
+        self.assertEqual(loaded, {"tag-scan": {"every": 3600}})
+        # Both spellings named, so "delete one" is actionable.
+        self.assertIn("tag-merge", printed)
+        self.assertIn("tag-scan", printed)
+
+    def test_agreeing_entries_read_the_same_whichever_order_they_come_in(self):
+        # The file is written by a person, and nothing an operator controls
+        # only by ordering their file may decide either the mapping or what
+        # they are told. Asserted against the OTHER order's own output rather
+        # than against a literal, so a rule that read position could not
+        # satisfy both halves.
+        self._write_schedule('{"tag-merge": {"every": 3600},'
+                             ' "tag-scan": {"every": 3600}}')
+        forwards, forwards_printed = self._load_watching_stdout()
+        self._write_schedule('{"tag-scan": {"every": 3600},'
+                             ' "tag-merge": {"every": 3600}}')
+        backwards, backwards_printed = self._load_watching_stdout()
+
+        self.assertEqual(forwards, backwards)
+        self.assertEqual(forwards_printed, backwards_printed)
+
+    def test_settings_that_differ_at_all_are_still_refused(self):
+        # The direction that must NOT be weakened. The same key on both sides
+        # and only the VALUE differing is the smallest disagreement the file
+        # can express -- a rule comparing only which keys were written would
+        # read this as agreement and schedule one of the two cadences with
+        # nothing said about the other.
+        self._write_schedule('{"tag-merge": {"every": 3600},'
+                             ' "tag-scan": {"every": 7200}}')
+
+        with self.assertRaises(ValueError) as caught:
+            load_schedule(env=self.env)
+
+        message = str(caught.exception)
+        self.assertIn("3600", message)
+        self.assertIn("7200", message)
+
+    def test_an_agreeing_pair_is_not_reported_as_a_plain_rename(self):
+        # The two notices say different things -- "your file is one release
+        # out of date" versus "your file says this twice" -- and an operator
+        # acts on them differently. A single catch-all sentence naming the
+        # old and the new spelling would satisfy every assertion above about
+        # both names appearing while telling them only half of it.
+        self._write_schedule('{"tag-merge": {"every": 3600},'
+                             ' "tag-scan": {"every": 3600}}')
+        agreeing = self._load_watching_stdout()[1]
+        self._write_schedule('{"tag-merge": {"every": 3600}}')
+        renamed = self._load_watching_stdout()[1]
+
+        self.assertNotEqual(agreeing, renamed)
+        self.assertIn("more than once", agreeing)
+        self.assertNotIn("more than once", renamed)
+
 
 class ScheduleFileNamesAKeyTwice(unittest.TestCase):
     """JSON keeps the last occurrence of a repeated key and discards the rest
@@ -491,6 +563,29 @@ class ScheduleFileNamesAKeyTwice(unittest.TestCase):
         self.assertEqual(load_schedule(env=self.env),
                          {"scene-scan": {"every": 3600},
                           "tag-scan": {"every": 3600}})
+
+    def test_one_key_written_twice_is_refused_even_when_it_says_the_same_thing(self):
+        """No change needed: this refusal is correct on agreement too, and
+        the test exists so that stays a rule rather than an accident.
+
+        Deliberately UNLIKE `_migrate_renamed_jobs`, which was changed to
+        migrate two names that ask for the same thing. The difference is not
+        the values but what the second occurrence IS. Two job names are two
+        keys a file may legitimately hold at once -- the rename mechanism
+        asks operators to pass through exactly that state for one release --
+        so refusing agreement there blocks a sanctioned workflow. One key
+        written twice in one object is never a state anything asks for; it
+        is a single author repeating themselves, the second occurrence
+        corroborates nothing the first did not already say, and the parser
+        discards half the file whatever the values are.
+        """
+        self._write_schedule(
+            '{"scene-scan": {"every": 3600}, "scene-scan": {"every": 3600}}')
+
+        with self.assertRaises(ValueError) as caught:
+            load_schedule(env=self.env)
+
+        self.assertIn("scene-scan", str(caught.exception))
 
 
 class LoadMarkerTag(unittest.TestCase):
