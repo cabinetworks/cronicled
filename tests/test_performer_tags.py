@@ -331,6 +331,30 @@ class TheProposal(unittest.TestCase):
             "counts_cover": COUNTS_COVER,
         })
 
+    def test_one_person_reached_two_ways_is_a_confident_match_not_a_finding(self):
+        """No change needed at `_summary`'s `len(matches) > 1`: agreement can
+        never reach it, because `index_performers` keys each surface's match
+        by the PERFORMER's id, so one person found through their name and
+        again through an alias is one `Match` before anything is counted.
+
+        The fixture is that person: their name and an alias of theirs both
+        normalise to this tag's key, so two surfaces genuinely claim it and
+        only the deduplication makes them one. Without it this reads as "2
+        performers answer to this name" -- an ambiguity manufactured out of
+        one person, sent to a reviewer who has nothing to decide, and
+        blocking the apply that `web.actions` refuses for a null performer.
+        """
+        got = self._one(tag(7, ASHGROVE),
+                        [performer(1, ASHGROVE, aliases=["Delia-Ashgrove"])],
+                        ["sc-1", "sc-2", "sc-3"])
+
+        self.assertEqual(got["summary"],
+                         "%s: also the performer %s, on 3 scenes"
+                         % (ASHGROVE, ASHGROVE))
+        self.assertEqual(got["payload"]["performer"],
+                         {"id": "1", "name": ASHGROVE})
+        self.assertIsNone(got["payload"]["ambiguous"])
+
     def test_the_summary_names_both_performers_and_the_count(self):
         got = self._one(tag(7, ASHGROVE),
                         [performer(1, ASHGROVE),
@@ -553,6 +577,38 @@ class ThePass(unittest.TestCase):
         self.assertIsNone(proposals[0]["payload"]["performer"])
         self.assertEqual(counts.ambiguous, 1)
         self.assertEqual(counts.outstanding, 1)
+
+    def test_a_tag_one_person_answers_to_twice_is_not_counted_ambiguous(self):
+        """No change needed at `_reconcile`'s `len(matches) > 1`: it is a
+        TALLY, not a refusal -- an ambiguous tag is still proposed, with the
+        performer left null for a person to name -- and agreement cannot
+        reach it anyway, because `index_performers` has already folded one
+        person's two surfaces into one `Match`.
+
+        The fixture is deliberately asymmetric and larger than one: three
+        matched tags of which TWO are genuinely ambiguous and one is the same
+        person reached through their name and an alias. A fixture of one
+        cannot tell `ambiguous += 1` from `ambiguous = 1`, and one where every
+        tag is ambiguous cannot tell the condition from its inverse.
+        """
+        vale = "Perrin Vale"
+        stash = FakeStash(
+            tags=[tag(7, ASHGROVE), tag(8, FENN), tag(9, vale)],
+            performers=[performer(1, ASHGROVE),
+                        performer(2, QUILL, aliases=[ASHGROVE]),
+                        performer(3, FENN),
+                        performer(4, WREN, aliases=[FENN]),
+                        performer(5, vale, aliases=["Perrin-Vale"])],
+            scenes={"7": [scene_row("sc-1")], "8": [scene_row("sc-2")],
+                    "9": [scene_row("sc-3")]})
+
+        proposals, counts = _reconciliations(stash, self.store)
+
+        self.assertEqual(counts.outstanding, 3)
+        self.assertEqual(counts.ambiguous, 2)
+        agreed = [p for p in proposals if p["subject_id"] == "9"]
+        self.assertEqual(agreed[0]["payload"]["performer"],
+                         {"id": "5", "name": vale})
 
     def test_the_performers_are_read_once_however_many_tags_match(self):
         # HARM: a lookup per tag is one request per tag against an answer one

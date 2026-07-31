@@ -153,13 +153,30 @@ def _migrate_renamed_jobs(overrides, path):
     the old name, at which point it stops the process starting — the operator
     has to be told now, while there is still an easy edit to make.
 
-    Two entries that end up naming the SAME job are refused, naming both, for
-    the reason a duplicate key is: it is one job scheduled twice, and there is
-    no way to tell which entry was meant. Keeping either by iteration order
-    would leave the other doing nothing and say so nowhere. The reachable
-    shape is an operator part-way through the rename, whose file names a job
-    by its old name and its new one at once — the two keys differ, so JSON
-    sees nothing wrong and `_refuse_duplicate_keys` cannot see it either.
+    Two entries that end up naming the SAME job are asked whether they
+    actually DISAGREE before either is refused, because those are two
+    different files with two different right answers. The reachable shape is
+    an operator part-way through the rename, whose file names a job by its
+    old name and its new one at once — the two keys differ, so JSON sees
+    nothing wrong and `_refuse_duplicate_keys` cannot see it either.
+
+    * **Different settings** are refused, naming both, for the reason a
+      duplicate key is: it is one job scheduled two ways, there is no way to
+      tell which was meant, and keeping either by iteration order would leave
+      the other doing nothing and say so nowhere.
+    * **Identical settings** are agreement, not a conflict. Whichever entry
+      were kept, the job runs on the same cadence, so nothing is silently
+      discarded and the refusal's own justification does not hold. Refusing
+      it would stop the process starting over a file that expresses one
+      unambiguous intent — in exactly the half-renamed state `RENAMED_JOBS`
+      exists to let a configured deployment start in. It is migrated and
+      reported instead, naming every spelling so the operator still knows to
+      delete one.
+
+    The agreeing report names the written spellings SORTED, and replaces the
+    ordinary rename warning rather than adding to it, so that what is printed
+    is a function of the file's content and not of which spelling the
+    operator happened to write first.
     """
     claimed = {}
     for written, settings in overrides.items():
@@ -169,12 +186,23 @@ def _migrate_renamed_jobs(overrides, path):
     migrated = {}
     for current, entries in claimed.items():
         if len(entries) > 1:
-            raise ValueError(
-                "%s schedules the job now called %r more than once: %s. Those "
-                "are one job under two names, so one of them would silently "
-                "do nothing — delete one."
-                % (path, current,
-                   " and ".join("%r as %r" % pair for pair in entries)))
+            first_settings = entries[0][1]
+            if any(settings != first_settings for _, settings in entries[1:]):
+                raise ValueError(
+                    "%s schedules the job now called %r more than once, and "
+                    "they disagree: %s. Those are one job under two names, so "
+                    "one of them would silently do nothing — delete one."
+                    % (path, current,
+                       " and ".join("%r as %r" % pair for pair in entries)))
+            print("WARNING: %s names the job now called %r more than once, as "
+                  "%s, and they all ask for the same thing, so it has been "
+                  "read once for this run. Nothing is being guessed at — "
+                  "still delete all but one."
+                  % (path, current,
+                     " and ".join(repr(name) for name
+                                  in sorted(written for written, _ in entries))))
+            migrated[current] = first_settings
+            continue
         written, settings = entries[0]
         if written != current:
             print("WARNING: %s names %r, which is now called %r, and has been "
