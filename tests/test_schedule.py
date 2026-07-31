@@ -16,6 +16,7 @@ rather than guessing how long it takes. Every wait is bounded, and every bound
 is only ever reached by a test that is failing.
 """
 import ast
+import dataclasses
 import os
 import pathlib
 import shutil
@@ -1709,6 +1710,26 @@ class TheLoopTicksInTheBackground(SchedulerCase):
         self.assertEqual(scheduler.status().appointments, {
             "nightly": Entry(producer="nightly", every=DAY, enabled=True,
                              at=None, zone=None)})
+
+    def test_a_status_cannot_be_built_without_stating_its_appointments(self):
+        # The docstring on the field argues that a defaulted empty mapping
+        # would read on the page exactly like a deployment with nothing
+        # scheduled, so a schedule that went missing would be invisible.
+        # That argument was unpinned: giving the field a default left every
+        # test passing, because no current caller omits it. This fails the
+        # moment one could.
+        fields = {f.name: f for f in dataclasses.fields(LoopStatus)}
+        self.assertIs(
+            fields["appointments"].default, dataclasses.MISSING,
+            "appointments must stay required")
+        self.assertIs(
+            fields["appointments"].default_factory, dataclasses.MISSING,
+            "appointments must stay required")
+        with self.assertRaises(TypeError):
+            LoopStatus(running=True, closed=False, ticks=0, failures=0,
+                       consecutive_failures=0, last_tick_at=None,
+                       last_error=None, last_error_at=None,
+                       last_traceback=None)
 
     def test_starting_the_loop_ticks_for_real_until_it_is_closed(self):
         watched = WatchedStore(self.store)
