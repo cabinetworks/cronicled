@@ -27,14 +27,23 @@ class InboxMapTotality(unittest.TestCase):
         six live values -- so the omission is not cosmetic: that draft
         would never have noticed "tag" losing its inbox. Walking the whole
         package removes the chance of leaving a module out.
+
+        Every one of the six is declared as a module-level `SUBJECT_TYPE`,
+        one per module, so reading that one fixed name would be total for
+        the convention as it stands. It is not read that way, because the
+        convention is enforced nowhere: a SECOND subject type added to an
+        existing module -- `ORPHAN_SUBJECT_TYPE`, say -- is invisible to a
+        fixed-name lookup, and would then appear on no page with nothing
+        said. Verified by adding exactly that and watching the fixed-name
+        version stay green. Any constant whose name ends in `SUBJECT_TYPE`
+        counts.
         """
         declared = {}
         for module in pkgutil.iter_modules(cronicled.__path__):
-            subject = getattr(
-                importlib.import_module("cronicled." + module.name),
-                "SUBJECT_TYPE", None)
-            if isinstance(subject, str):
-                declared[module.name] = subject
+            imported = importlib.import_module("cronicled." + module.name)
+            for name, value in vars(imported).items():
+                if name.endswith("SUBJECT_TYPE") and isinstance(value, str):
+                    declared["%s.%s" % (module.name, name)] = value
         # A discovery that found nothing would make the rest of this
         # vacuous -- six is the number of subject types the live database
         # holds.
