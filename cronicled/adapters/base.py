@@ -78,5 +78,23 @@ class SiteAdapter(object):
         `seed` is the resolved creator's name and `title_query` the filename
         read as a title — `cronicled.scoring.title_view`, the same derivation
         the scorer weighs, never a second one built at the call site.
+
+        Case-folded before it is returned, and that is the ONE normalisation
+        applied here. Search is case-insensitive essentially everywhere, so
+        folding costs nothing, and it closes the one gap that used to exist
+        between this string and `cronicled.text.normalize` — the scorer's own
+        equality test — for nothing but letter case.
+
+        Deliberately NOT run through `normalize` itself: that also strips
+        punctuation, folds accented letters, and expands `&` to `and`, and
+        each of those is a genuine, unmeasured guess for a QUERY rather than
+        for a comparison. Punctuation may be the one token distinguishing
+        this title from a wrong one; letter-folding may match a store that
+        folds accents and miss one that does not; and expanding `&` outright
+        would commit to one spelling when a store may index the other —
+        see `cronicled.censorship.search_variants`, which tries both instead
+        of guessing, for that one. So this string and the scorer's own
+        comparison stay deliberately different beyond case, documented here
+        and in `cronicled.scoring.title_view` and `cronicled.text.normalize`.
         """
-        return seed + " " + title_query
+        return (seed + " " + title_query).lower()

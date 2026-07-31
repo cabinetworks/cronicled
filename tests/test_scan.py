@@ -2278,7 +2278,7 @@ class ARefusalRecordsEveryStoreSearched(unittest.TestCase):
         searched to the end, dropping the rows would throw away real
         evidence."""
         search = ScriptedSearch({"Velvet Crane": [self.NEAR],
-                                 "Velvet Crane Morning Ritual":
+                                 "velvet crane morning ritual":
                                      RuntimeError("connection refused")})
         source = Source(name="alpha", search=search, owner_of=None,
                         catalog_resolvable=True, censorship={},
@@ -2425,8 +2425,11 @@ class PerTitleFallbackTest(unittest.TestCase):
     CREATOR = "Velvet Crane"
     # The whole string, not a fragment: a query that appended the title on
     # the wrong side of the space, or dropped the separator, would still
-    # contain the seed.
-    BY_TITLE = "Velvet Crane Morning Ritual"
+    # contain the seed. Lower-cased: `SiteAdapter.search_query` case-folds
+    # its output (see its own docstring), so this is what actually reaches
+    # a store, never the mixed case `CREATOR` and the filename happen to
+    # carry.
+    BY_TITLE = "velvet crane morning ritual"
     WANTED = candidate("Morning Ritual", "morning-ritual")
     # One page of the creator's OTHER clips -- what a store answers for a
     # creator whose catalogue does not fit in one response. Neither of these
@@ -2519,32 +2522,35 @@ class PerTitleFallbackTest(unittest.TestCase):
     def test_the_query_is_the_seed_and_the_scorers_own_view_of_the_title(self):
         """The whole query string, against a filename that exercises every
         part of the derivation at once: the container extension goes, the
-        repeated series prefix goes, and the unrecognised `.Final`
-        suffix STAYS -- a store that indexes the full title never answers a
-        query built without it. A query that phrased any of those three
-        differently from the view the scorer weighs is a recall loss with no
-        symptom: the store answers what it was asked, and the answers are
-        judged against something else."""
+        repeated series prefix goes, the unrecognised `.Final`
+        suffix STAYS, and the whole string is case-folded -- a store that
+        indexes the full title never answers a query built without it. A
+        query that phrased any of those differently from the view the
+        scorer weighs is a recall loss with no symptom: the store answers
+        what it was asked, and the answers are judged against something
+        else."""
         search = ScriptedSearch({self.CREATOR: self.OTHER_PAGE})
         path = "/library/Velvet Crane/Velvet Crane - Morning Ritual.Final.mp4"
 
         self.examine([self.source("alpha", search)], path=path)
 
         self.assertEqual(search.queries,
-                         [self.CREATOR, "Velvet Crane Morning Ritual.Final"])
+                         [self.CREATOR, "velvet crane morning ritual.final"])
 
     def test_the_title_text_is_the_scorers_derivation_not_a_second_one(self):
         """The same property stated as the relationship rather than as a
         string: the query's title half IS `scoring.title_view`. A local
         derivation in the scan that happened to agree today would drift the
-        moment either side changed."""
+        moment either side changed. Lower-cased on the right as well as the
+        left: `search_query` case-folds its whole return value, and this
+        compares against what it actually returns, not a second derivation."""
         search = ScriptedSearch({self.CREATOR: self.OTHER_PAGE})
         path = "/library/Velvet Crane/Velvet Crane - Morning Ritual.Final.mp4"
 
         self.examine([self.source("alpha", search)], path=path)
 
         title = title_view("Velvet Crane - Morning Ritual.Final.mp4")
-        self.assertEqual(search.queries[1], self.CREATOR + " " + title)
+        self.assertEqual(search.queries[1], (self.CREATOR + " " + title).lower())
         self.assertIs(cronicled.scan.title_view, title_view)
 
     def test_a_store_that_omits_the_seed_is_asked_for_the_title_alone(self):
@@ -2566,7 +2572,7 @@ class PerTitleFallbackTest(unittest.TestCase):
                       self.source("beta", beta,
                                   title_query=keeping.search_query)])
 
-        self.assertEqual(alpha.queries, [self.CREATOR, "Morning Ritual"])
+        self.assertEqual(alpha.queries, [self.CREATOR, "morning ritual"])
         self.assertEqual(beta.queries, [self.CREATOR, self.BY_TITLE])
 
     def test_a_store_with_no_title_query_configured_is_asked_once_only(self):
@@ -4595,7 +4601,7 @@ class ScanProducerTest(unittest.TestCase):
         not carry the file, and answers the file only when asked for it by
         title."""
         alpha = ScriptedSearch({"Velvet Crane": [self.LEDGER],
-                                "Velvet Crane Morning Ritual": [self.MORNING]})
+                                "velvet crane morning ritual": [self.MORNING]})
         sources = [Source(name="alpha", search=alpha,
                           title_query=SiteAdapter().search_query)]
 
@@ -4603,7 +4609,7 @@ class ScanProducerTest(unittest.TestCase):
                               sources=sources)
 
         self.assertEqual(alpha.queries,
-                         ["Velvet Crane", "Velvet Crane Morning Ritual"])
+                         ["Velvet Crane", "velvet crane morning ritual"])
         self.assertEqual(proposals[0]["payload"]["candidate"], self.MORNING)
 
     def test_the_closing_line_reports_the_fallback_queries_a_run_issued(self):
