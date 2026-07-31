@@ -382,11 +382,98 @@ def _shortfall(match, threshold):
 DEFAULT_THRESHOLD = 0.7
 
 
-def decide(matches, threshold=DEFAULT_THRESHOLD):
+def _agreed_index(tied, titles):
+    """Which of a tied set to carry when every one of them names the SAME
+    title -- or `None` when they don't, or when there is no title evidence
+    to ask at all.
+
+    `tied` is a list of `(value, index, match)` triples, already narrowed
+    by the caller to the candidates within `AMBIGUITY_MARGIN` of the top
+    score. `titles` is the RAW candidate title text, one per match and in
+    the same order -- see `decide`'s own docstring for why the raw text,
+    and not the text `matches` was scored against, is what belongs here,
+    and why `titles=None` answers `None` rather than guessing.
+
+    Judged by `normalize`, never by raw string equality: two listings of
+    one work commonly differ only in case or a trailing space, and that is
+    not a second title.
+
+    When they do agree, the one carried is the tied candidate whose OWN
+    raw title text sorts lexicographically first, index as the final
+    tiebreak for two listings whose raw text is byte-identical too. That
+    raw text is the one piece of content the caller has that CAN differ
+    between two listings whose normalised titles agree -- it is content,
+    not position, so the caller cannot control which one wins by
+    re-ordering its candidate list.
+    """
+    if titles is None:
+        return None
+    normalized = {normalize(titles[i]) for _, i, _ in tied}
+    if len(normalized) != 1:
+        return None
+    return min((titles[i], i) for _, i, _ in tied)[1]
+
+
+def decide(matches, threshold=DEFAULT_THRESHOLD, titles=None):
     """Pick the one candidate confident enough to apply automatically, or
-    refuse with a reason a person can act on. Never guesses between two
-    plausible candidates -- ambiguity is refused, not resolved by picking
-    whichever came first."""
+    refuse with a reason a person can act on.
+
+    A tie inside `AMBIGUITY_MARGIN` of the top is not automatically a
+    dilemma. When EVERY candidate in the tied set names the same title --
+    judged by `cronicled.text.normalize`, this project's one existing
+    answer to "are these the same string", never a second comparison
+    invented here -- the listings are corroborating each other rather than
+    offering a choice, and the title is proposed. Anything short of
+    unanimous across the WHOLE tied set is still refused exactly as
+    before: two candidates that agree and a third that does not is still a
+    real choice, not agreement with an outlier vote against it.
+
+    This is the SAME rule `cronicled.scan._choose_winner` applies one
+    level up, to the choice BETWEEN stores, and the two must not drift --
+    see that function's docstring for the fuller shape this one mirrors.
+    They differ in exactly one place, because they have to: cross-store
+    there is a store NAME to order an agreeing set by, a fact about the
+    store rather than about any one result, and `_choose_winner` uses it
+    to say whose URL an agreeing proposal carries. Within one store there
+    is no such name -- two listings of one work still each carry their own
+    URL, and choosing between them by row position would be exactly the
+    row-order dependency this project has already removed from four other
+    places. So here the tie-break is the one piece of content that CAN
+    differ between two listings whose normalised titles agree -- the raw
+    title text itself, lexicographically smallest first (see
+    `_agreed_index`). Deterministic and blind to arrival order: reversing
+    the candidate list cannot change which one wins, because nothing here
+    ever reads a position.
+
+    `titles`, when given, must be the RAW candidate title -- `c["title"]`
+    as the store returned it, never decensored -- one per match and in the
+    same order. Deliberately NOT the text `matches` was scored against:
+    `score` is handed the DECENSORED form so a store's own censored
+    spelling matches the filename, and `decensor` normalises as its very
+    first step, so within a single store's own listings that text is
+    already identical for two entries whose only difference was case or
+    punctuation -- comparing it here would still tell them apart for
+    AGREEMENT (both normalise the same either way) but would have nothing
+    left to tell them apart BY, and the tie-break would quietly fall back
+    to whichever happened to sort first in `matches`, i.e. row position.
+    The raw text carries exactly the distinction that matters here and
+    none of the reason decensoring exists (that reason lives entirely in
+    the score, not in this comparison), and normalising it with
+    `cronicled.text.normalize` -- this project's one existing answer to
+    "are these the same string", never a second comparison invented here
+    -- is what decides agreement.
+
+    Omitted (`None`, the default), agreement can never be established --
+    uncertainty may withhold evidence, never supply it -- so a tie refuses
+    exactly as it always has. Every production caller in this codebase
+    supplies it; the default exists for callers (most of this module's own
+    tests among them) that construct `Match`es directly with no title to
+    name at all.
+
+    Beyond that carve-out, still never guesses: an ambiguity that is not
+    unanimous agreement is refused, not resolved by picking whichever
+    candidate came first.
+    """
     if not matches:
         return Decision(match=None, index=None,
                         reason="no candidates offered", contenders=0,
@@ -443,6 +530,26 @@ def decide(matches, threshold=DEFAULT_THRESHOLD):
         # 0.05, and the majority of the pairs `score` produces land on the
         # unsafe side.
         if round(top_value - runner_value, 3) <= AMBIGUITY_MARGIN:
+            # The WHOLE tied set, not just the top two: checking only the
+            # runner-up is enough to tell whether a dilemma exists at all
+            # (sorted descending, nothing further down can be closer to the
+            # top than the runner-up is), but telling agreement from a real
+            # choice needs every member of it -- two agreeing and a third
+            # that doesn't is still a choice, and a rule that looked only at
+            # the top pair would miss the third entirely.
+            tied = [t for t in eligible
+                    if round(top_value - t[0], 3) <= AMBIGUITY_MARGIN]
+            agreed_index = _agreed_index(tied, titles)
+            if agreed_index is not None:
+                top_index = agreed_index
+                top_match = matches[agreed_index]
+                reason = (
+                    "chosen with score %.3f (%d listings agreed on this "
+                    "title)" % (top_value, len(tied))
+                )
+                return Decision(match=top_match, index=top_index,
+                                reason=reason, contenders=len(eligible),
+                                interrogated=interrogated)
             reason = "ambiguous: %.3f vs %.3f are too close to call" % (
                 top_value, runner_value,
             )

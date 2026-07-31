@@ -629,7 +629,11 @@ def examine(scene, *, search, folder, threshold=DEFAULT_THRESHOLD, aliases=None,
     matches = [score(name, directory, decensor(c["title"], censorship or {}),
                      artist=resolution.name)
                for c in candidates]
-    decision = decide(matches, threshold)
+    # The RAW title, never decensored, travels to `decide` alongside the
+    # matches it produced -- see `decide`'s docstring for why the text
+    # scored is the wrong text to hand it here.
+    decision = decide(matches, threshold,
+                      titles=[c["title"] for c in candidates])
     if decision.match is None:
         # A tie, a near miss, or evidence that was nothing but the creator's
         # own name. All three are refusals a person can act on — by looking,
@@ -822,13 +826,23 @@ def _judge(source, candidates, *, name, directory, artist, threshold):
     subtraction, the store's own censorship map, or the threshold, and a
     fallback candidate judged by different arithmetic than the pass it is
     meant to rescue is exactly the drift this ticket exists to avoid.
+
+    The RAW candidate title, never decensored, travels to `decide` alongside
+    the matches it produced, so two of THIS store's own candidates naming
+    the same title -- the ordinary shape of a clip a store lists more than
+    once -- can be told apart from a real choice between two different
+    ones. See `decide`'s docstring for the rule, which is the same one
+    `_choose_winner` below applies between stores rather than within one,
+    and for why the RAW text is what travels here rather than the
+    decensored form `matches` was scored against.
     """
     matches = [score(name, directory,
                      decensor(c["title"], source.censorship or {}),
                      artist=artist)
                for c in candidates]
     return _StoreDecision(source, candidates, matches,
-                          decide(matches, threshold))
+                          decide(matches, threshold,
+                                titles=[c["title"] for c in candidates]))
 
 
 def _combined_owners_of(sources):
