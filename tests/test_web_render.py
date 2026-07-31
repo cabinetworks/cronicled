@@ -1045,27 +1045,82 @@ class ApplifiedSectionRendering(unittest.TestCase):
 
     _HIGHLIGHT_CLASS = 'class="proposal just-applied"'
 
-    def test_a_fresh_approve_opens_the_section_and_highlights_its_row(self):
-        # The case ticket 98 calls out: the approve just made and
-        # immediately regretted. `just_applied` is the fingerprint the
-        # redirect from a successful /approve carries (see web/app.py).
+    # The exact opening tag of the Applied `<details>` element, anchored on
+    # its own `<summary>` rather than found by a bare `open` substring search
+    # -- an `open` attribute that a mutation moved onto a DIFFERENT section's
+    # tag would still satisfy `'<details class="section" open' in html`, and
+    # would still be a bug. Anchoring here means only Applied's own tag is
+    # ever inspected.
+    _APPLIED_DETAILS_TAG = re.compile(
+        r'<details class="section"[^>]*>(?=\s*<summary>Applied \()')
+
+    def _applied_details_tag(self, html):
+        m = self._APPLIED_DETAILS_TAG.search(html)
+        self.assertIsNotNone(m, "no Applied <details> tag found on the page")
+        return m.group(0)
+
+    def test_no_write_ever_opens_the_applied_section(self):
+        # The section's open state is the operator's; nothing here may
+        # override it. Same fixture as the section-count test above --
+        # applied has a row, no `just_applied` at all -- to isolate this
+        # rule from the confirmation-banner rules below.
+        row = _row(state="applied", prior_state={"title": "old"})
+        html = render("inbox.html", rows=[], counts={}, applied=[row])
+        self.assertNotIn("open", self._applied_details_tag(html))
+
+    def test_a_fresh_approve_leaves_the_section_closed(self):
+        # This is the ticket: an approve used to spring this section open on
+        # every request. `just_applied` is the fingerprint the redirect from
+        # a successful /approve carries (see web/app.py), and it must no
+        # longer reach this attribute at all.
         row = _row(state="applied", prior_state={"title": "old"},
                   fingerprint="fp-just-applied")
         html = render("inbox.html", rows=[], counts={}, applied=[row],
                       just_applied="fp-just-applied")
-        applied_section = html[html.index('<details class="section"'
-                                          ' open'):html.index("Muted (")]
-        self.assertIn(self._HIGHLIGHT_CLASS, applied_section)
+        self.assertNotIn("open", self._applied_details_tag(html))
 
-    def test_a_stale_just_applied_value_does_not_force_the_section_open(self):
+    def test_a_fresh_approve_shows_a_confirmation_banner_with_undo(self):
+        # The confirmation an open drawer used to provide moves here: the
+        # just-applied row, highlighted, with its Undo -- rendered above the
+        # fold, before the Applied `<details>` even appears in the markup,
+        # so reaching it never requires opening anything.
+        row = _row(state="applied", prior_state={"title": "old"},
+                  fingerprint="fp-just-applied")
+        html = render("inbox.html", rows=[], counts={}, applied=[row],
+                      just_applied="fp-just-applied")
+        applied_tag_at = html.index(self._applied_details_tag(html))
+        banner_at = html.index(self._HIGHLIGHT_CLASS)
+        self.assertLess(banner_at, applied_tag_at,
+                        "the confirmation must render before the (closed) "
+                        "Applied section, not inside it")
+        banner = html[:applied_tag_at]
+        self.assertIn('<form method="post" action="/undo">', banner)
+        self.assertIn("fp-just-applied", banner)
+
+    def test_a_non_undoable_just_applied_row_gets_no_undo_control_anywhere(self):
+        # No `prior_state` -- `revert_scene` raises on an empty one, so
+        # `row.undoable` is False and the row offers no Undo at all, in the
+        # section or in the banner. The banner must not promise a control
+        # the row itself does not have.
+        row = _row(state="applied", prior_state=None,
+                  fingerprint="fp-just-applied")
+        html = render("inbox.html", rows=[], counts={}, applied=[row],
+                      just_applied="fp-just-applied")
+        self.assertIn(self._HIGHLIGHT_CLASS, html)
+        self.assertNotIn('<form method="post" action="/undo">', html)
+
+    def test_a_stale_just_applied_value_shows_no_banner_and_no_open(self):
         # A `?applied=` query value naming a row not (or no longer) in
         # `applied` -- a bookmarked link, another tab's stale redirect --
-        # must not force the section open on nothing.
+        # must not force anything open and must not draw a confirmation for
+        # a row that is not there.
         row = _row(state="applied", prior_state={"title": "old"},
                   fingerprint="fp-1")
         html = render("inbox.html", rows=[], counts={}, applied=[row],
                       just_applied="fp-not-in-applied")
-        self.assertNotIn('<details class="section" open', html)
+        self.assertNotIn("open", self._applied_details_tag(html))
+        self.assertNotIn(self._HIGHLIGHT_CLASS, html)
+        self.assertNotIn("Just applied:", html)
 
     def test_a_row_that_is_not_just_applied_is_not_marked(self):
         # Note the CSS rule itself (`.proposal.just-applied`, in the

@@ -104,10 +104,12 @@
   details.section .proposal:first-of-type { border-top: 1px solid var(--line); }
   details.section p.empty { margin: 0; padding: 0.7rem 0.9rem; }
 
-  /* The row an Approve just produced, inside the Applied section it now
-     lives in -- a visible marker so undoing it is still a glance away, not
-     a search through the whole section's history. */
-  details.section .proposal.just-applied { border-left: 3px solid var(--warn-line); }
+  /* The row an Approve just produced. Marked wherever it renders: once above
+     the fold in the confirmation banner (never inside a `details.section`,
+     since nothing here forces Applied open any more), and again inside the
+     Applied section itself if the operator opens that drawer later -- same
+     row, same marker, in both places. */
+  .proposal.just-applied { border-left: 3px solid var(--warn-line); }
 
   /* A description rewrite is reviewed by reading two paragraphs against each
      other, so both get equal room and identical typography -- anything that

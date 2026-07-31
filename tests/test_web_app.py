@@ -167,8 +167,10 @@ class Posts(unittest.TestCase):
 class ApproveRedirectCarriesTheFingerprint(unittest.TestCase):
     """Ticket 98: undo has to stay reachable for the approve just made and
     immediately regretted. Carrying the fingerprint on `/approve`'s own
-    redirect is what lets the very next GET open the Applied section on
-    exactly that row -- see inbox.html's `just_applied_rows` guard.
+    redirect is what lets the very next GET show a one-row confirmation,
+    above the fold, for exactly that row -- without opening the Applied
+    section itself, which is the operator's own to open or leave closed.
+    See inbox.html's `just_applied_rows` guard and its confirmation banner.
     """
 
     def test_a_successful_approve_redirects_with_its_own_fingerprint(self):
@@ -320,17 +322,34 @@ class MutedDismissedRefusedRendering(unittest.TestCase):
         self.assertIn("Applied (0)", html)
         self.assertIn("Gone (0)", html)
 
-    def test_the_applied_query_param_opens_that_rows_section(self):
-        # The wiring half of ticket 98's "keep undo reachable" story: a GET
-        # carrying `?applied=fp-1` -- exactly the shape `/approve`'s own
-        # redirect now produces -- must reach the template as
-        # `just_applied`, not be dropped on the floor between the query
-        # string and `render()`.
+    def test_the_applied_query_param_reaches_the_page_without_opening_anything(self):
+        # The wiring half of "keep undo reachable" (see
+        # tests/test_web_render.py's `ApplifiedSectionRendering` for the
+        # rendering rules themselves): a GET carrying `?applied=fp-1` --
+        # exactly the shape `/approve`'s own redirect now produces -- must
+        # reach the template as `just_applied`, not be dropped on the floor
+        # between the query string and `render()`. It must show the
+        # confirmation, and it must NOT force the Applied section open --
+        # that section's open state is the operator's, whether or not a row
+        # just landed in it.
+        #
+        # The highlighted row also renders a second time INSIDE the (closed)
+        # Applied section regardless of this query param -- that is
+        # unaffected, existing behaviour -- so the confirmation is proved by
+        # its position, not merely its presence: it must appear before the
+        # Applied `<details>` tag even opens, not only somewhere in the page.
         html = self._get(path="/inbox?applied=fp-1", applied=lambda: [
             {"fingerprint": "fp-1", "state": "applied",
              "filename": "clip.mp4", "proposed_title": "T", "creator": "N",
              "creator_source": "folder", "score_text": "0.900"}])
-        self.assertIn('<details class="section" open', html)
+        self.assertNotIn('<details class="section" open', html)
+        applied_tag_at = html.index(
+            '<details class="section"',
+            max(0, html.index("Applied (") - 200))
+        banner_at = html.index('class="proposal just-applied"')
+        self.assertLess(banner_at, applied_tag_at,
+                        "the confirmation must render above the fold, "
+                        "before the Applied section's own tag")
 
     def test_the_schedule_status_callable_reaches_the_page(self):
         # The seam between a running `Scheduler` and the panel that reports

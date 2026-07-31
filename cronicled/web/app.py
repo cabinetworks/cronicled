@@ -264,12 +264,14 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
             # `applied` in the query string names the fingerprint a
             # successful /approve just redirected here with (see
             # `do_POST`'s own `applied` branch below) -- read-only, and
-            # never trusted as anything more than "open this one row's
-            # section for the person who is looking at the page right
-            # after clicking it". A stale or foreign value simply fails to
-            # match any row the template actually has (see inbox.html's own
-            # `just_applied_rows` guard), so there is nothing here to
-            # validate beyond parsing it out of the query string.
+            # never trusted as anything more than "show a one-row
+            # confirmation, above the fold, for the person who is looking at
+            # the page right after clicking it". It does NOT open the
+            # Applied section -- that drawer is the operator's own and
+            # nothing here overrides it; see inbox.html's confirmation
+            # banner and its own `just_applied_rows` guard, which is also
+            # what keeps a stale or foreign value from producing a
+            # confirmation for a row that is not (or no longer) there.
             just_applied = (urllib.parse.parse_qs(parsed.query)
                             .get("applied") or [None])[0]
             # `opened` names the COLLAPSED section a reversal (`/unmute`,
@@ -471,11 +473,13 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
             form = urllib.parse.parse_qs(
                 self.rfile.read(length).decode("utf-8"))
             # Overridden below only for a successful "approve" -- the one
-            # write that moves a row into the new Applied section (ticket
-            # 98). Carrying its fingerprint on the redirect is what lets the
-            # very next GET open that section and mark that one row, rather
-            # than requiring the person to go find it themselves among
-            # everything else ever applied.
+            # write that moves a row into the Applied section (ticket 98).
+            # Carrying its fingerprint on the redirect is what lets the very
+            # next GET show a one-row confirmation for exactly that row
+            # (see inbox.html) without opening the Applied drawer itself --
+            # the section's own open/closed state is the operator's, the
+            # same as every other section, and a row moving into it is not
+            # a reason to override that choice.
             #
             # Back to the INBOX, not to the landing page: every one of these
             # writes is a judgement made on a row while looking at the other
