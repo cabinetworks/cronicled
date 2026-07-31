@@ -120,7 +120,7 @@ SUMMARY_PATH = "/"
 INBOX_PATH = "/inbox"
 
 _ACTIONS = ("approve", "dismiss", "mute", "undo", "scan",
-           "unmute", "undismiss", "refresh")
+           "unmute", "undismiss", "refresh", "bulk_apply_tag_descriptions")
 
 # A REVERSAL undoes an earlier verdict recorded against a collapsed section --
 # `/unmute` reverses a mute (the "Muted" section), `/undismiss` a dismissal
@@ -155,6 +155,21 @@ DEFAULT_SCAN_LIMIT = 25
 # single-threaded (see `serve()`), so a wedge on any one connection stalls
 # every other request until it clears.
 _MAX_BODY_BYTES = 4096
+
+# `bulk_apply_tag_descriptions` is the one form on this whole site that
+# legitimately posts more than a handful of bytes: it carries one hidden
+# `fp` field per row the page showed, not one. The measured population
+# (ticket bulk179) is 1456 waiting tag-description proposals, and each
+# fingerprint is a 64-character sha256 hex digest (see
+# `cronicled.store.fingerprint`), so one field costs `len("fp=") + 64 +
+# len("&")` = 68 bytes: 1456 * 68 = 98,988 bytes for that whole measured
+# population in one submission. This bound is set well above that -- room
+# for roughly 3,800 fingerprints -- so the mechanism does not need
+# revisiting the next time the population grows a little, while still
+# being a BOUND rather than `_MAX_BODY_BYTES` simply widened for every
+# action: `rfile.read` here blocks on a fixed, generous ceiling, never an
+# attacker-chosen one, and every other action keeps the tight bound above.
+_MAX_BULK_BODY_BYTES = 262144
 
 # Sec-Fetch-Site values a legitimate write can carry. `same-origin` is a
 # request from a page this server served; `none` is the address bar, a
@@ -287,7 +302,31 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                      .get("opened") or [None])[0]
             if opened not in _OPENABLE_SECTIONS:
                 opened = None
+            # `bulk_requested`/`bulk_applied` name the two counts
+            # `/bulk_apply_tag_descriptions` just redirected here with (see
+            # `do_POST`'s own branch for that action) -- read-only, exactly
+            # like `applied` above, and shown as a banner stating both
+            # numbers rather than a single "succeeded" flag, so a partial
+            # batch cannot be collapsed into looking like a complete one.
+            # Either missing, or either not a plain non-negative integer,
+            # means no banner at all -- a stray or foreign query value must
+            # not invent a count that was never reported.
+            bulk_result = None
+            qs = urllib.parse.parse_qs(parsed.query)
+            raw_requested = (qs.get("bulk_requested") or [None])[0]
+            raw_applied = (qs.get("bulk_applied") or [None])[0]
+            if raw_requested is not None and raw_applied is not None:
+                try:
+                    requested_n = int(raw_requested)
+                    applied_n = int(raw_applied)
+                    if requested_n < 0 or applied_n < 0:
+                        raise ValueError("negative count")
+                    bulk_result = {"requested": requested_n,
+                                  "applied": applied_n}
+                except ValueError:
+                    bulk_result = None
             body = render("inbox.html", rows=rows(), counts={},
+                         bulk_result=bulk_result,
                          muted=_muted(), dismissed=_dismissed(),
                          refused=_refused(),
                          superseded=_superseded(),
@@ -466,7 +505,14 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                 self._send(400, b"malformed content-length",
                            [("Content-Type", "text/plain; charset=utf-8")])
                 return
-            if not (0 <= length <= _MAX_BODY_BYTES):
+            # `bulk_apply_tag_descriptions` alone gets the larger, still
+            # bounded ceiling -- see `_MAX_BULK_BODY_BYTES`'s own comment.
+            # Every other action keeps the tight one nothing genuine ever
+            # approaches.
+            max_body = (_MAX_BULK_BODY_BYTES
+                       if name == "bulk_apply_tag_descriptions"
+                       else _MAX_BODY_BYTES)
+            if not (0 <= length <= max_body):
                 self._send(400, b"malformed content-length",
                            [("Content-Type", "text/plain; charset=utf-8")])
                 return
@@ -530,6 +576,29 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                                [("Content-Type", "text/plain; charset=utf-8")])
                     return
                 location = "%s?opened=%s" % (INBOX_PATH, _REOPEN_SECTION[name])
+            elif name == "bulk_apply_tag_descriptions":
+                # Every hidden `fp` field the bulk form on the page posted --
+                # `parse_qs` already collects repeated keys into a list, so
+                # this IS the exact, ordered set the page rendered. Nothing
+                # here re-derives a set from a filter; see
+                # `Actions.bulk_apply_tag_descriptions`'s own docstring for
+                # why that distinction is the whole point of this action.
+                fps = form.get("fp") or []
+                if not fps:
+                    self._send(400, b"missing fingerprint")
+                    return
+                try:
+                    result = actions.bulk_apply_tag_descriptions(fps)
+                except Exception as exc:
+                    self._send(400, str(exc).encode("utf-8"),
+                               [("Content-Type", "text/plain; charset=utf-8")])
+                    return
+                # The two counts travel on the redirect, not a single
+                # "succeeded" flag: the page states "N of M applied" from
+                # both, so a partial batch cannot render as a plain success
+                # by there being nowhere on the page to say otherwise.
+                location = "%s?bulk_requested=%d&bulk_applied=%d" % (
+                    INBOX_PATH, len(result.requested), len(result.applied))
             else:
                 fp = (form.get("fp") or [""])[0]
                 if not fp:

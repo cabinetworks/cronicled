@@ -1,11 +1,13 @@
 """What a person can do from the inbox: approve, dismiss, mute, undo or
-refresh a proposal, reverse a dismissal or a mute, and start a scan of the
-whole library.
+refresh a proposal, reverse a dismissal or a mute, apply a whole batch of
+tag-description proposals at once, and start a scan of the whole library.
 
 Separated from request handling so the write paths can be tested without a
 socket, and so the handler cannot reach the store, the media server, or the
 job runner directly and grow another kind of write nobody reviewed.
 """
+from dataclasses import dataclass
+
 from cronicled import performer_tags, tag_hygiene, tags
 from cronicled.descriptions import SUBJECT_TYPE as DESCRIPTION_SUBJECT
 from cronicled.tag_descriptions import SUBJECT_TYPE as TAG_DESCRIPTION_SUBJECT
@@ -28,6 +30,37 @@ class ApplyFailed(RuntimeError):
     failed apply must not look, to the person watching the page, like a
     successful one. The proposal is already recorded as failed in the
     store before this is raised."""
+
+
+@dataclass(frozen=True)
+class BulkApplyResult:
+    """The outcome of one `Actions.bulk_apply_tag_descriptions` call.
+
+    `requested` is the caller's OWN submitted set, verbatim and in the order
+    it was given -- never re-derived from a store query. A test (or a page
+    rendering the outcome) can compare `applied` against `requested` and
+    know it is looking at the same rows an operator was shown, not a filter
+    run a second time.
+
+    `applied` and `failed` partition `requested` exactly: every fingerprint
+    in `requested` ends up in exactly one of the two, so there is no third,
+    silent outcome a fingerprint could fall into. `failed` entries are
+    `{"fingerprint": ..., "reason": ...}` -- covering a fingerprint this
+    call's own additive-only guard refused, one no longer found at all, and
+    one whose write itself raised `ApplyFailed` -- so a partial batch can be
+    told apart from a refused one without re-deriving either from the store.
+    """
+    requested: tuple
+    applied: tuple
+    failed: tuple
+
+    @property
+    def complete(self):
+        """True only when every requested fingerprint was applied. A batch
+        with even one failure or refusal must never read, from this alone,
+        as a success -- see `web.app`'s redirect, which reports the two
+        counts rather than collapsing them into one boolean of its own."""
+        return len(self.applied) == len(self.requested)
 
 
 _NO_STASH = ("no media server is configured -- start cronicled with "
@@ -173,6 +206,90 @@ class Actions:
             raise ApplyFailed("could not apply: %s" % exc) from exc
         self._store.mark_applied(fp, prior_state=result.get("prior"))
         return "applied"
+
+    def bulk_apply_tag_descriptions(self, fingerprints):
+        """Apply every tag-description proposal named in `fingerprints`,
+        and only those.
+
+        `fingerprints` is used EXACTLY as given -- iterated once, in order,
+        each looked up individually through `_find`. Nothing here queries
+        the store for "every waiting tag-description proposal" and applies
+        that instead: the set this writes is the set the caller passed, and
+        the caller (`web.app`'s handler) is expected to pass exactly the
+        fingerprints a rendered page showed. A filter re-evaluated here
+        between render and apply is how a bulk action could reach rows
+        nobody looked at -- see this method's own tests for what a mutation
+        that re-derives the set from the store does instead.
+
+        THE GUARD THAT MAKES THIS SAFE, and the reason this is
+        `bulk_apply_tag_descriptions` rather than a general bulk apply: a
+        fingerprint is refused, never written, unless its OWN stored
+        proposal is both
+
+        * a tag-description proposal (`subject_type ==
+          tag_descriptions.SUBJECT_TYPE`, carried here as
+          `TAG_DESCRIPTION_SUBJECT`) -- never a scene, a performer
+          description, a tag merge, a tag/performer reconciliation, or a
+          tag deletion, whatever `fingerprints` names; and
+        * carrying an EMPTY `original` -- the field this operation exists
+          to fill. A tag described since the pass ran is refused here, on
+          the same terms `approve` itself refuses one (see `Stash
+          .apply_tag_description`'s `expected=` check) -- but that check
+          only fires once the write is attempted, and this guard refuses
+          it before ever reaching the store or the media server.
+
+        Both conditions are checked from the row's OWN stored payload, read
+        fresh via `_find` for each fingerprint -- never assumed from the
+        fact that this method was called at all. A batch that included a
+        tag deletion's fingerprint (by a stale link, a crafted request, or
+        any other means) is refused for that one fingerprint and nothing
+        about it reaches `Stash.delete_tag`; the "no bulk delete" guarantee
+        (see `web.rows.UnusedTagGroup`) holds exactly as it does for a
+        single row, because this method can reach no write path but the one
+        below.
+
+        A single fingerprint's own failure -- refused by the guard above,
+        no longer found (`UnknownProposal`, e.g. it was already decided by
+        someone else in the meantime), or a real `ApplyFailed` from the
+        write itself -- never stops the batch: every other fingerprint is
+        still attempted, and the one that failed is recorded, never
+        silently dropped and never allowed to make this whole call raise.
+        See `BulkApplyResult`.
+
+        The write itself is `approve` -- the exact method a single-row
+        click already uses, called here unchanged -- so there is only one
+        implementation of "what it means to apply a tag-description
+        proposal" for this module to ever drift out of, and one place
+        `mark_applied`/`mark_failed` are called from.
+        """
+        applied = []
+        failed = []
+        for fp in fingerprints:
+            try:
+                item = self._find(fp)
+            except UnknownProposal:
+                failed.append({
+                    "fingerprint": fp,
+                    "reason": "no longer waiting -- it may already have "
+                              "been decided",
+                })
+                continue
+            if (item["subject_type"] != TAG_DESCRIPTION_SUBJECT
+                    or item["payload"]["original"]):
+                failed.append({
+                    "fingerprint": fp,
+                    "reason": "not an empty tag-description proposal -- "
+                              "this bulk action only fills a blank",
+                })
+                continue
+            try:
+                self.approve(fp)
+            except ApplyFailed as exc:
+                failed.append({"fingerprint": fp, "reason": str(exc)})
+                continue
+            applied.append(fp)
+        return BulkApplyResult(requested=tuple(fingerprints),
+                               applied=tuple(applied), failed=tuple(failed))
 
     def _approve_merge(self, fp, item):
         """Perform one tag merge: move every item off the losing spellings

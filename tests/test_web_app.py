@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from cronicled.jobs import JobRejected
 from cronicled.schedule import LoopStatus, TickResult, resolve
-from cronicled.web.actions import ApplyFailed, UnknownProposal
+from cronicled.web.actions import ApplyFailed, BulkApplyResult, UnknownProposal
 from cronicled.web.app import build_handler, serve, DEFAULT_HOST
 from cronicled.web.rows import to_schedule_view, to_summary_view
 
@@ -36,15 +36,30 @@ class _RecordingActions:
     the thing it stands in for, and that gap has cost this project a shipped
     bug before."""
 
-    def __init__(self, fail=None):
+    def __init__(self, fail=None, bulk_result=None):
         self.calls = []
         self._fail = fail or {}
+        # `None` means "report every submitted fingerprint applied" -- the
+        # ordinary case a test not exercising partial failure wants. A test
+        # that DOES want to render a partial outcome passes its own
+        # `BulkApplyResult` instead, exactly as `_fail` lets a test choose
+        # which single-row action raises.
+        self._bulk_result = bulk_result
 
     def _do(self, name, fp, ok):
         if name in self._fail:
             raise self._fail[name]
         self.calls.append((name, fp))
         return ok
+
+    def bulk_apply_tag_descriptions(self, fingerprints):
+        if "bulk_apply_tag_descriptions" in self._fail:
+            raise self._fail["bulk_apply_tag_descriptions"]
+        fps = tuple(fingerprints)
+        self.calls.append(("bulk_apply_tag_descriptions", fps))
+        if self._bulk_result is not None:
+            return self._bulk_result
+        return BulkApplyResult(requested=fps, applied=fps, failed=())
 
     def approve(self, fp):
         return self._do("approve", fp, "applied")
@@ -75,11 +90,13 @@ class _RecordingActions:
 
 
 class _Server:
-    def __init__(self, fail=None):
+    def __init__(self, fail=None, bulk_result=None):
         self._fail = fail
+        self._bulk_result = bulk_result
 
     def __enter__(self):
-        self.actions = _RecordingActions(fail=self._fail)
+        self.actions = _RecordingActions(fail=self._fail,
+                                         bulk_result=self._bulk_result)
         handler = build_handler(rows=lambda: [], actions=self.actions)
         self.httpd = HTTPServer(("127.0.0.1", 0), handler)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
@@ -243,6 +260,116 @@ class UnmutePost(unittest.TestCase):
         with _Server(fail={"unmute": UnknownProposal(("scene", "42"))}) as s:
             r = s.request("POST", "/unmute",
                           "subject_type=scene&subject_id=42")
+            self.assertEqual(r.status, 400)
+            self.assertEqual(s.actions.calls, [])
+
+
+class BulkApplyTagDescriptionsPost(unittest.TestCase):
+    # Shaped differently from every other action for the same reason
+    # `/unmute` is: it carries a SET, not a single fingerprint, so the
+    # request posts one repeated `fp` field per row rather than one.
+
+    def test_the_whole_submitted_set_reaches_the_action_in_order(self):
+        with _Server() as s:
+            r = s.request("POST", "/bulk_apply_tag_descriptions",
+                          "fp=fp-a&fp=fp-b&fp=fp-c")
+            self.assertEqual(
+                s.actions.calls,
+                [("bulk_apply_tag_descriptions", ("fp-a", "fp-b", "fp-c"))])
+            self.assertEqual(r.status, 303)
+
+    def test_a_post_without_any_fingerprint_is_rejected(self):
+        with _Server() as s:
+            r = s.request("POST", "/bulk_apply_tag_descriptions", "")
+            self.assertEqual(r.status, 400)
+            self.assertEqual(s.actions.calls, [])
+
+    def test_a_get_does_not_perform_it(self):
+        # Ticket bulk179's own acceptance: browsers prefetch, so this GET
+        # rule (see `GetNeverWrites` above) must cover the new action too.
+        with _Server() as s:
+            r = s.request("GET", "/bulk_apply_tag_descriptions")
+            self.assertEqual(r.status, 405)
+            self.assertEqual(s.actions.calls, [])
+
+    def test_a_cross_site_post_is_refused_and_does_not_fire(self):
+        # Every POST keeps the existing cross-origin refusal -- a new
+        # action that forgot it would be a live vulnerability, not a
+        # missing feature.
+        with _Server() as s:
+            r = s.request("POST", "/bulk_apply_tag_descriptions", "fp=fp-a",
+                          headers={"Sec-Fetch-Site": "cross-site"})
+            self.assertEqual(r.status, 403)
+            self.assertEqual(s.actions.calls, [])
+
+    def test_a_same_origin_post_still_works(self):
+        with _Server() as s:
+            r = s.request("POST", "/bulk_apply_tag_descriptions", "fp=fp-a",
+                          headers={"Sec-Fetch-Site": "same-origin"})
+            self.assertEqual(r.status, 303)
+            self.assertEqual(
+                s.actions.calls,
+                [("bulk_apply_tag_descriptions", ("fp-a",))])
+
+    def test_the_redirect_carries_both_counts_on_a_complete_batch(self):
+        with _Server() as s:
+            r = s.request("POST", "/bulk_apply_tag_descriptions",
+                          "fp=fp-a&fp=fp-b")
+            self.assertEqual(r.getheader("Location"),
+                            "/inbox?bulk_requested=2&bulk_applied=2")
+
+    def test_the_redirect_states_a_partial_outcome_as_partial(self):
+        # HARM: collapsing "2 requested, 1 applied" into the same redirect a
+        # complete batch gets is exactly how a partial failure would read
+        # as a success.
+        partial = BulkApplyResult(requested=("fp-a", "fp-b"),
+                                  applied=("fp-a",),
+                                  failed=({"fingerprint": "fp-b",
+                                          "reason": "a fixture failure"},))
+        with _Server(bulk_result=partial) as s:
+            r = s.request("POST", "/bulk_apply_tag_descriptions",
+                          "fp=fp-a&fp=fp-b")
+            self.assertEqual(r.getheader("Location"),
+                            "/inbox?bulk_requested=2&bulk_applied=1")
+
+    def test_a_bulk_apply_failure_is_reported_as_an_error_not_a_redirect(self):
+        with _Server(fail={"bulk_apply_tag_descriptions":
+                           RuntimeError("the store is unavailable")}) as s:
+            r = s.request("POST", "/bulk_apply_tag_descriptions", "fp=fp-a")
+            self.assertEqual(r.status, 400)
+
+    def test_a_batch_at_the_measured_population_size_still_works(self):
+        # The measured population (ticket bulk179) is 1456 waiting
+        # tag-description proposals, each fingerprint a 64-character sha256
+        # hex digest -- see `_MAX_BULK_BODY_BYTES`'s own comment in
+        # `cronicled.web.app`. The ordinary 4096-byte body cap every other
+        # action keeps (see `MalformedContentLength` below) would refuse
+        # this outright.
+        fps = ["%064d" % i for i in range(1456)]
+        body = "&".join("fp=%s" % fp for fp in fps)
+        with _Server() as s:
+            r = s.request("POST", "/bulk_apply_tag_descriptions", body)
+            self.assertEqual(r.status, 303)
+            self.assertEqual(len(s.actions.calls[0][1]), 1456)
+
+    def test_an_absurdly_large_bulk_body_is_still_refused(self):
+        # Bounded, not unlimited: a numeric-but-dishonest Content-Length far
+        # beyond even the bulk ceiling is still caught before `rfile.read`
+        # blocks waiting for bytes that are never coming.
+        with _Server() as s:
+            r = s.request("POST", "/bulk_apply_tag_descriptions", "fp=x",
+                          headers={"Content-Length": "999999999"})
+            self.assertEqual(r.status, 400)
+            self.assertEqual(s.actions.calls, [])
+
+    def test_an_ordinary_action_keeps_the_small_body_cap(self):
+        # The bulk action's larger ceiling must not have leaked into every
+        # other action -- `/approve` still refuses a body only the bulk
+        # action is allowed to send.
+        fps = ["%064d" % i for i in range(200)]
+        body = "fp=" + "&fp=".join(fps)
+        with _Server() as s:
+            r = s.request("POST", "/approve", body)
             self.assertEqual(r.status, 400)
             self.assertEqual(s.actions.calls, [])
 
