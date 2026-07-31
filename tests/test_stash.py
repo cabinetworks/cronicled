@@ -80,8 +80,14 @@ class Gql(unittest.TestCase):
             Stash("http://example.test", "k", transport=t).gql("query{x}")
         self.assertIn("boom", str(ctx.exception))
 
-    def test_no_test_opens_a_socket(self):
-        # the transport seam exists so the suite never needs the network
+    def test_one_call_reaches_the_injected_transport_exactly_once(self):
+        # Named for what it asserts. It was called "no test opens a socket",
+        # which is a claim about the whole suite that one client with one
+        # injected transport cannot make -- and which is not the property this
+        # suite should have anyway: the web tests serve real HTTP on a local
+        # port and cannot be exercised without binding one. The property that
+        # IS enforced, across every test rather than inside this one, lives in
+        # tests/nonetwork.py: no test resolves a name that is not loopback.
         t = _transport([{"data": {}}])
         Stash("http://example.test", "k", transport=t).gql("query{x}")
         self.assertEqual(len(t.calls), 1)
