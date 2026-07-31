@@ -458,6 +458,18 @@ def main(argv=None):
           "time on the page is shown in it)" % zone)
 
     store = Store(args.db)
+    # Before anything below can open a run of its own -- the scheduler
+    # further down this function, or a manual scan a request triggers later
+    # -- so every row this finds open belongs to a process that no longer
+    # exists (this one has just started and has opened nothing yet). See
+    # `Store.close_interrupted_runs` for why that makes the moment, not a
+    # timestamp or a heartbeat, the whole discriminator, and why calling
+    # this a second time later -- on a timer, or per run -- would risk
+    # closing a pass this same process is still genuinely running.
+    reopened = store.close_interrupted_runs()
+    if reopened:
+        print("run log: closed %d row(s) left open by an earlier process "
+              "(recorded as interrupted, not failed)" % reopened)
     # THREE sources, asked in this order and no other: the flags, then their
     # environment variables (argparse has already folded that half into
     # `args.server`), then `server.json` in this project's own config

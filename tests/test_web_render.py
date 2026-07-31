@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 from cronicled.jobs import Job
 from cronicled.schedule import LoopStatus, TickResult, resolve
+from cronicled.store import RUN_OUTCOME_INTERRUPTED
 from cronicled.tag_descriptions import Found
 from cronicled.tag_descriptions import proposal as tag_description_proposal
 from cronicled.tags import cluster_tags
@@ -1305,6 +1306,41 @@ class AFailedRunShowsItsError(unittest.TestCase):
                                         error=_HOSTILE)])
         self.assertNotIn("<script>", html)
         self.assertIn("&lt;script&gt;", html)
+
+
+class AnInterruptedRunReadsAsNeitherAFailureNorASuccess(unittest.TestCase):
+    """A run `Store.close_interrupted_runs` closed -- the process running it
+    stopped existing before it could record an outcome of its own.
+
+    Neither existing branch may draw it: the "still running" branch would
+    report a restart-ago process as working right now, and the counts branch
+    would report a partial, possibly-empty tally as the pass's actual result
+    -- both of which are exactly the misleading reads this outcome exists to
+    replace.
+    """
+
+    def test_an_interrupted_run_does_not_read_as_still_running(self):
+        html = _summary_html(runs=[_run(outcome=RUN_OUTCOME_INTERRUPTED,
+                                        counts={}, error=None)])
+        self.assertNotIn("still running", html)
+
+    def test_an_interrupted_run_does_not_read_as_failed(self):
+        html = _summary_html(runs=[_run(outcome=RUN_OUTCOME_INTERRUPTED,
+                                        counts={}, error=None)])
+        self.assertNotIn("FAILED", html)
+
+    def test_an_interrupted_run_with_partial_counts_does_not_show_them_as_its_result(
+            self):
+        # Counts it DOES have -- whatever it reached before the process
+        # disappeared -- so this cannot pass merely because there were none.
+        html = _summary_html(runs=[_run(outcome=RUN_OUTCOME_INTERRUPTED,
+                                        counts={"recorded": 4}, error=None)])
+        self.assertNotIn("recorded 4", html)
+
+    def test_an_interrupted_run_says_so(self):
+        html = _summary_html(runs=[_run(outcome=RUN_OUTCOME_INTERRUPTED,
+                                        counts={}, error=None)])
+        self.assertIn("interrupted", html)
 
 
 class WhatIsWaitingIsALinkToTheInbox(unittest.TestCase):

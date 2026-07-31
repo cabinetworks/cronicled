@@ -8,10 +8,12 @@ import sqlite3
 import tempfile
 import unicodedata
 import unittest
+import uuid
 from datetime import datetime, timezone
 
-from cronicled.store import (RUN_HISTORY_LIMIT, RUN_TRIGGERS, SCHEMA_VERSION,
-                             SchemaVersionError, Store, fingerprint)
+from cronicled.store import (RUN_HISTORY_LIMIT, RUN_OUTCOME_INTERRUPTED,
+                             RUN_TRIGGERS, SCHEMA_VERSION, SchemaVersionError,
+                             Store, fingerprint)
 
 
 class Fingerprint(unittest.TestCase):
@@ -1563,6 +1565,204 @@ class RunRetention(_RunLogCase):
         be a log that forgets faster than anyone looks at it, and one of zero
         would evict every run the moment it finished."""
         self.assertGreaterEqual(RUN_HISTORY_LIMIT, 90)
+
+
+class ClosingRunsInterruptedByARestart(_RunLogCase):
+    """`close_interrupted_runs` -- the fix for the residual `finish_run`
+    documents: nothing else ever closes a row left open by a process that
+    has stopped existing.
+    """
+
+    def _open_foreign(self, job="scene-scan", trigger="scheduled", at=None):
+        """Open a row directly against the connection, bypassing
+        `start_run`'s own bookkeeping of what THIS `Store` instance opened.
+
+        `_RunLogCase` shares one `self.store` across a whole test, so a row
+        meant to stand in for a DIFFERENT, dead process's leftover must not
+        go through `self.store.start_run` -- that would record it as this
+        instance's own and defeat the very thing under test. This is the
+        fixture's substitute for the real scenario, which
+        `AnOrphanedRunIsClosedOnlyByTheNextProcessToOpenTheStore` covers with
+        an actual second process.
+        """
+        run_id = str(uuid.uuid4())
+        when = at if at is not None else self._at(0)
+        self.store._conn.execute(
+            "INSERT INTO run (id, job, trigger, started) VALUES (?, ?, ?, ?)",
+            (run_id, job, trigger, when))
+        self.store._conn.commit()
+        return run_id
+
+    def test_a_row_open_at_startup_is_closed_as_interrupted(self):
+        orphan = self._open_foreign(at=self._at(0))
+        n = self.store.close_interrupted_runs(at=self._at(100))
+        self.assertEqual(n, 1)
+        # The whole row, not a sampled field: a mutation recording the
+        # outcome as "completed" or "failed" instead of the new value would
+        # still leave `finished` set, so asserting presence alone could not
+        # catch it.
+        self.assertEqual(self.store.recent_runs(), [{
+            "id": orphan, "job": "scene-scan", "trigger": "scheduled",
+            "started": self._at(0), "finished": self._at(100),
+            "outcome": RUN_OUTCOME_INTERRUPTED, "counts": {}, "error": None}])
+
+    def test_the_outcome_is_neither_completed_nor_failed(self):
+        # `RUN_OUTCOME_INTERRUPTED` itself, asserted directly, so a rename of
+        # the constant to either existing outcome is caught even if some
+        # other test's fixture happened to use the same literal.
+        self.assertNotIn(RUN_OUTCOME_INTERRUPTED, ("completed", "failed"))
+        orphan = self._open_foreign()
+        self.store.close_interrupted_runs()
+        row = self.store.recent_runs()[0]
+        self.assertEqual(row["id"], orphan)
+        self.assertNotEqual(row["outcome"], "completed")
+        self.assertNotEqual(row["outcome"], "failed")
+
+    def test_every_row_left_open_is_counted_and_closed(self):
+        orphans = [self._open_foreign(at=self._at(n)) for n in range(3)]
+        n = self.store.close_interrupted_runs(at=self._at(100))
+        self.assertEqual(n, 3)
+        closed = {r["id"]: r["outcome"] for r in self.store.recent_runs()}
+        for orphan in orphans:
+            self.assertEqual(closed[orphan], RUN_OUTCOME_INTERRUPTED)
+
+    def test_a_run_this_process_itself_started_is_never_closed_by_this_call(
+            self):
+        """The mutation that turns the fix into an outage: closing a run the
+        CURRENT process opened.
+
+        The order here is deliberate -- `start_run` first, THEN the
+        reconciliation -- because that is the shape of the one mutation that
+        matters: reconciliation wired to fire again after this process has
+        already started work of its own (a per-run cadence, or simply called
+        twice) rather than exactly once before anything is opened. A rule
+        keyed only on "is this row open" cannot tell such a row from a dead
+        process's leftover; this one is keyed on THIS instance's own record
+        of what it opened, which a late or repeated call cannot fool.
+        """
+        current = self.store.start_run("scene-scan", trigger="scheduled")
+        self.store.close_interrupted_runs()
+        row = self.store.recent_runs()[0]
+        self.assertEqual(row["id"], current)
+        self.assertIsNone(row["finished"])
+        self.assertIsNone(row["outcome"])
+
+    def test_a_run_this_process_started_survives_even_alongside_a_real_orphan(
+            self):
+        # The two rows are otherwise indistinguishable -- same job, both
+        # open -- so this is a claim about WHICH one closes, not merely how
+        # many do.
+        orphan = self._open_foreign(at=self._at(0))
+        current = self.store.start_run("scene-scan", trigger="scheduled",
+                                       at=self._at(1))
+        n = self.store.close_interrupted_runs(at=self._at(100))
+        self.assertEqual(n, 1)
+        rows = {r["id"]: r for r in self.store.recent_runs()}
+        self.assertEqual(rows[orphan]["outcome"], RUN_OUTCOME_INTERRUPTED)
+        self.assertIsNone(rows[current]["outcome"])
+        self.assertIsNone(rows[current]["finished"])
+
+    def test_running_it_twice_changes_nothing_the_second_time(self):
+        self._open_foreign(at=self._at(0))
+        first = self.store.close_interrupted_runs(at=self._at(100))
+        self.assertEqual(first, 1)
+        before = self.store.recent_runs()
+        second = self.store.close_interrupted_runs(at=self._at(200))
+        self.assertEqual(second, 0)
+        self.assertEqual(self.store.recent_runs(), before)
+
+    def test_running_it_twice_changes_nothing_with_a_current_run_open_too(
+            self):
+        # The other branch of the same method: at least one id THIS instance
+        # opened is on record, which takes a different query path (the `id
+        # NOT IN (...)` exclusion) than the case above, where none is.
+        self._open_foreign(at=self._at(0))
+        current = self.store.start_run("scene-scan", trigger="scheduled",
+                                       at=self._at(1))
+        first = self.store.close_interrupted_runs(at=self._at(100))
+        self.assertEqual(first, 1)
+        before = self.store.recent_runs()
+        second = self.store.close_interrupted_runs(at=self._at(200))
+        self.assertEqual(second, 0)
+        self.assertEqual(self.store.recent_runs(), before)
+        still_open = [r for r in before if r["id"] == current][0]
+        self.assertIsNone(still_open["finished"])
+
+    def test_nothing_open_is_a_no_op(self):
+        run_id = self.store.start_run("scene-scan", trigger="scheduled")
+        self.store.finish_run(run_id, outcome="completed")
+        n = self.store.close_interrupted_runs()
+        self.assertEqual(n, 0)
+        self.assertEqual(self.store.recent_runs()[0]["outcome"], "completed")
+
+    def test_a_finished_row_is_left_exactly_as_it_was(self):
+        run_id = self.store.start_run("scene-scan", trigger="manual",
+                                      at=self._at(0))
+        self.store.finish_run(run_id, outcome="failed", error="broke",
+                              counts={"recorded": 2}, at=self._at(5))
+        before = self.store.recent_runs()
+        self.store.close_interrupted_runs(at=self._at(100))
+        self.assertEqual(self.store.recent_runs(), before)
+
+    def test_a_closed_interrupted_row_becomes_an_ordinary_retention_candidate(
+            self):
+        """Once closed here, the row is finished, and retention cannot tell
+        it apart from any other finished row -- see `Store.finish_run`'s own
+        eviction, which this method deliberately leaves untouched and lets
+        the next real close apply on its own cadence."""
+        self._fill(RUN_HISTORY_LIMIT - 1)
+        self._open_foreign(at=self._at(RUN_HISTORY_LIMIT - 1))
+        self.store.close_interrupted_runs(at=self._at(RUN_HISTORY_LIMIT))
+        # Exactly at the bound -- nothing to evict yet.
+        self.assertEqual(self.store.runs_evicted(), 0)
+        run_id = self.store.start_run("scene-scan", trigger="scheduled",
+                                      at=self._at(9000))
+        self.store.finish_run(run_id, outcome="completed", at=self._at(9000))
+        self.assertEqual(self.store.runs_evicted(), 1)
+
+
+class AnOrphanedRunIsClosedOnlyByTheNextProcessToOpenTheStore(
+        unittest.TestCase):
+    """The literal scenario: one process opens a run and disappears; a later
+    one, on the same database file, is the one that closes it."""
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self.path = os.path.join(self._dir, "s.db")
+        self.addCleanup(shutil.rmtree, self._dir, True)
+
+    def test_a_row_an_earlier_process_left_open_is_closed_by_a_fresh_store(
+            self):
+        with Store(self.path) as dead_process:
+            orphan = dead_process.start_run(
+                "scene-scan", trigger="scheduled",
+                at="2026-03-01T01:06:40+00:00")
+            # No finish_run -- the process is gone, not merely slow.
+        with Store(self.path) as new_process:
+            n = new_process.close_interrupted_runs(
+                at="2026-03-01T02:01:13+00:00")
+            self.assertEqual(n, 1)
+            self.assertEqual(new_process.recent_runs(), [{
+                "id": orphan, "job": "scene-scan", "trigger": "scheduled",
+                "started": "2026-03-01T01:06:40+00:00",
+                "finished": "2026-03-01T02:01:13+00:00",
+                "outcome": RUN_OUTCOME_INTERRUPTED, "counts": {},
+                "error": None}])
+
+    def test_a_run_the_new_process_starts_itself_is_unaffected(self):
+        with Store(self.path) as dead_process:
+            dead_process.start_run("scene-scan", trigger="scheduled",
+                                   at="2026-03-01T01:06:40+00:00")
+        with Store(self.path) as new_process:
+            new_process.close_interrupted_runs(
+                at="2026-03-01T02:01:13+00:00")
+            current = new_process.start_run(
+                "scene-scan", trigger="scheduled",
+                at="2026-03-01T02:01:20+00:00")
+            row = [r for r in new_process.recent_runs()
+                  if r["id"] == current][0]
+            self.assertIsNone(row["finished"])
+            self.assertIsNone(row["outcome"])
 
 
 class ReadingRecentRuns(_RunLogCase):

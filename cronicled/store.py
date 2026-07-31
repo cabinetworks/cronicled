@@ -359,6 +359,14 @@ RUN_HISTORY_LIMIT = 500
 # see `Store.start_run`.
 RUN_TRIGGERS = ("scheduled", "manual")
 
+# What `Store.close_interrupted_runs` records on a row it closes. Distinct
+# from both `"completed"` and `"failed"`: the run did not succeed and it did
+# not fail, it simply never finished because the process running it stopped
+# existing first. A reader needs to tell that apart from a real failure -- an
+# interrupted pass will be redone on its own next appointment; a failed one
+# may need attention now.
+RUN_OUTCOME_INTERRUPTED = "interrupted"
+
 
 class SchemaVersionError(RuntimeError):
     """Raised by `Store.__init__` when a database's `PRAGMA user_version`
@@ -494,6 +502,10 @@ class Store:
         try:
             self._path = canonical_path
             self._lock = threading.Lock()
+            # Every run id THIS instance's own `start_run` has opened -- see
+            # `close_interrupted_runs`, which must never treat one of these
+            # as a leftover from a dead process no matter when it is called.
+            self._opened_runs = set()
             self._conn = sqlite3.connect(path, check_same_thread=False)
             with self._lock:
                 self._conn.execute("PRAGMA journal_mode=WAL")
@@ -1603,6 +1615,12 @@ class Store:
                 "VALUES (?, ?, ?, ?)",
                 (run_id, job, trigger, when),
             )
+            # Recorded before the commit even returns to the caller, so a
+            # `close_interrupted_runs` call cannot land in the gap between
+            # this row existing and this instance knowing it opened it -- see
+            # that method for why this is the guard that holds regardless of
+            # when it runs.
+            self._opened_runs.add(run_id)
             self._conn.commit()
         return run_id
 
@@ -1681,6 +1699,73 @@ class Store:
                     (dropped,),
                 )
             self._conn.commit()
+
+    # The other half of the residual `finish_run` documents above: a row left
+    # open by a process that no longer exists is never evicted by retention,
+    # because retention only ever looks at rows that HAVE finished, and
+    # nothing else ever closes one either. Two workers already close the rows
+    # they open on every path -- `JobRunner.start` (a refused start) and
+    # `JobRunner._run`'s own `finally` (a completed or failed one) -- so the
+    # only rows left open when this runs are ones no worker is coming back
+    # for.
+    def close_interrupted_runs(self, *, at=None):
+        """Close every run row still open, except ones THIS instance itself
+        opened, recording `RUN_OUTCOME_INTERRUPTED` rather than a success or
+        a failure.
+
+        Meant to be called exactly ONCE, at process start-up, before this
+        process's own scheduler or job runner opens anything. At that
+        moment every open row already belongs to a process that has stopped
+        existing -- this one has just started and has opened nothing yet --
+        which is a total discriminator: it needs no timestamp, no heartbeat,
+        and no guess about how long a pass may legitimately run. A guess
+        ("open for longer than N minutes is dead") would eventually close a
+        run that is still genuinely working on a slow night, turning a
+        working deployment into one that reports failures; this needs none.
+
+        `id NOT IN (...)` over the ids `start_run` has recorded on THIS
+        instance is a second, independent net, not the primary mechanism:
+        even called at the wrong moment -- after this same `Store` has
+        opened a run of its own -- it will still never close that run,
+        because membership is recorded the instant `start_run` inserts the
+        row, not inferred from when this method happens to run. It does NOT
+        protect a run a DIFFERENT process is genuinely running against the
+        same database concurrently; nothing here can tell that apart from a
+        dead one, which is why this must only ever be wired into the one
+        long-lived process that owns the schedule, and never into a
+        one-shot invocation that might run alongside it.
+
+        The outcome is neither `"completed"` nor `"failed"`: the run did not
+        succeed and did not fail, it simply never finished, and a reader
+        needs to tell that apart from both -- an interrupted pass will be
+        redone; a failed one may need attention.
+
+        Idempotent: a row this call has already closed no longer matches
+        `finished IS NULL`, so calling it again finds nothing left to close.
+
+        Returns how many rows were closed, so a caller can report the
+        number rather than closing them silently -- see `runs_evicted` for
+        the same reasoning applied to what retention drops.
+        """
+        when = at if at is not None else _utcnow()
+        with self._lock:
+            if self._opened_runs:
+                placeholders = ",".join("?" * len(self._opened_runs))
+                params = (when, RUN_OUTCOME_INTERRUPTED, *self._opened_runs)
+                n = self._conn.execute(
+                    "UPDATE run SET finished = ?, outcome = ? "
+                    "WHERE finished IS NULL AND id NOT IN (%s)"
+                    % placeholders,
+                    params,
+                ).rowcount
+            else:
+                n = self._conn.execute(
+                    "UPDATE run SET finished = ?, outcome = ? "
+                    "WHERE finished IS NULL",
+                    (when, RUN_OUTCOME_INTERRUPTED),
+                ).rowcount
+            self._conn.commit()
+        return n
 
     def recent_runs(self, limit=20):
         """The most recent runs, newest first, as a list of dicts.
