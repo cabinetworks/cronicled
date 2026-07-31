@@ -21,24 +21,48 @@ from .rows import to_rows, to_summary_view
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8571
 
-# The three subject types `rows.to_rows` cannot build a row for. It dispatches
-# only on `rows.DESCRIPTION_SUBJECT`/`rows.TAG_DESCRIPTION_SUBJECT` and treats
-# everything else as scene-shaped (see `to_rows`), so a tag-cluster,
-# tag-performer or tag-unused item forced through it KeyErrors on
-# `payload["path"]` — the same reason `cronicled.__main__`'s own
-# `_OWN_SECTION_SUBJECTS` excludes these three before calling `to_rows` for
-# the combined inbox. Named again here, independently, because a per-inbox
-# page filters its OWN group down to what it can safely show rather than
-# filtering one shared list down to what is left over.
+# The three subject types `rows.to_rows` cannot build a row for -- it
+# dispatches only on `rows.DESCRIPTION_SUBJECT`/`rows.TAG_DESCRIPTION_SUBJECT`
+# and treats everything else as scene-shaped (see `to_rows`), so a
+# tag-cluster, tag-performer or tag-unused item forced through it KeyErrors on
+# `payload["path"]`. That used to mean a per-inbox page simply left these
+# three out of what it asked the store for at all (see the ticket that added
+# `/tags`, `/scenes`, `/performers`) -- a real, named gap in what `/tags`
+# could show, since none of the three has a home on the generic per-item row
+# list `to_rows` builds.
 #
-# THE RESIDUAL, NAMED RATHER THAN HIDDEN: a working merge, reconciliation or
-# low-count-tag proposal still reaches the combined `/inbox` page exactly as
-# it does today (`cronicled.__main__` still wires it there); it simply does
-# not yet appear on the narrower `/tags` page, which does not yet carry the
-# three other row shapes (`to_merge_rows`, `to_reconcile_rows`,
-# `to_unused_groups`) these subject types need. That is a real gap in what
-# `/tags` shows today, not a hidden one.
-_NO_ROW_BUILDER = (_MERGE_SUBJECT, _RECONCILE_SUBJECT, _UNUSED_TAG_SUBJECT)
+# They are not homeless, though: each already has its OWN section on the
+# combined `/inbox` page (`to_merge_rows`, `to_reconcile_rows`,
+# `to_unused_groups`, wired in `cronicled.__main__` as `merges=`/
+# `reconciles=`/`unused=`) -- a cluster, a reconciliation and a
+# nothing-scenes-classify tag are not one-row-per-proposal the way a scene or
+# a description is; a merge is a decision about several spellings, and an
+# unused-tag group is many proposals collapsed into one expandable row. This
+# maps each of the three to the KEYWORD `_inbox_page` composes it under, so a
+# per-inbox page builds exactly the section the combined page builds for a
+# type its own inbox owns, through the SAME already-existing closure
+# (`_merges`/`_reconciles`/`_unused` below) -- never a second copy of
+# `to_merge_rows` et al., and never forced through `to_rows`.
+#
+# Also doubles as what the GENERIC row list (built through `to_rows`, for
+# every subject type that is neither of these three nor a description) has to
+# exclude when asking the store — see `_scene_subject_types` below, the one
+# place that exclusion happens.
+_SECTION_SUBJECTS = {
+    _MERGE_SUBJECT: "merges",
+    _RECONCILE_SUBJECT: "reconciles",
+    _UNUSED_TAG_SUBJECT: "unused",
+}
+
+
+def _scene_subject_types(types):
+    """`types`, narrowed to what `to_rows` can build a row for.
+
+    The one place `_SECTION_SUBJECTS`'s keys are subtracted out, so
+    `_sidebar_context` and `_inbox_page` cannot narrow by two separately
+    written tuples that could drift apart.
+    """
+    return tuple(t for t in types if t not in _SECTION_SUBJECTS)
 
 # The terminal states a per-inbox page can be asked for at `/{inbox}/{state}`.
 #
@@ -65,23 +89,33 @@ def _sidebar_context(store):
     `_serve_inbox_route` itself 404s on (see its own comment) -- because a
     link into a page that would 404 is worse than no navigation there at all.
 
-    THE COUNT IS DELIBERATELY NARROWED to `INBOXES[name]` minus
-    `_NO_ROW_BUILDER`, exactly the same subject types `_inbox_page` asks the
-    store for. A tag inbox has four subject types but `/tags` can only ever
-    render one of them (see `_NO_ROW_BUILDER`'s own comment for why the other
-    three still take no row on that page); counting the full four here would
-    put a bigger number on this link than the page it points at can ever
-    show, with nothing on either page saying why. This is the cheaper of the
-    two honest fixes named for that gap -- render only what can be rendered,
-    and count only that -- rather than the more thorough one (composing the
-    merge/reconcile/hygiene sections onto every per-inbox page too), because
-    the combined `/inbox` page already carries those three sections in full;
-    nothing here makes them harder to reach, only absent from a NUMBER this
-    narrower page did not previously have at all.
+    THE COUNT SPANS EVERY SUBJECT TYPE `INBOXES[name]` LISTS, not just the
+    ones `to_rows` can build a row for. `_inbox_page` now composes a section
+    for each of `_SECTION_SUBJECTS` too (see its own comment), so a tag
+    inbox's count has to add in every tag-cluster, tag-performer and
+    tag-unused proposal for the number here to agree with what `/tags`
+    itself now shows, and with `cronicled.__main__.waiting_counts`'s own total
+    for the same heading on the summary page -- the two used to disagree
+    (one counted four subject types, the other one), and that gap is the
+    defect this composition closes.
 
-    One `store.counts()` call answers "how many, in every non-hidden state"
-    for the inbox as a whole -- summed here excluding `applied`, the same way
-    `_inbox_page` itself drops an applied row from the working-queue view.
+    One `store.counts()` call over the FULL set answers "how many, in every
+    non-hidden state" for the inbox as a whole -- summed here excluding
+    `applied`, the same way `_inbox_page` itself drops an applied row from
+    the working-queue view.
+
+    THE NESTED STATE LINKS ('applied'/'dismissed'/'muted') stay narrowed to
+    `_scene_subject_types`, deliberately NOT widened alongside the count
+    above. A dismissed or muted tag-cluster, tag/performer match or
+    low-count-tag proposal is shown -- with its own Undismiss/Unmute control
+    -- INLINE in its own section on `/{name}` itself (see `_inbox_page`),
+    the same way the combined page has always shown it; there is no separate
+    `/{name}/dismissed` or `/{name}/muted` ROUTE for any of the three, because
+    the generic terminal-state route only ever draws `to_rows`-built rows.
+    Widening this check the same way as the count would light up a nested
+    link promising a dismissed proposal that the page behind it has no way to
+    draw.
+
     `counts()` cannot report `dismissed`/`muted` at all -- both are in
     `Store._HIDDEN_STATES` and excluded from its query by design, the same
     design that makes `items()`'s own default view hide them -- so whether
@@ -93,16 +127,19 @@ def _sidebar_context(store):
         return None
     entries = []
     for name in INBOXES:
-        types = tuple(t for t in INBOXES[name] if t not in _NO_ROW_BUILDER)
+        types = INBOXES[name]
         counts = store.counts(subject_types=types)
         waiting = sum(n for state, n in counts.items() if state != "applied")
+        scene_types = _scene_subject_types(types)
+        scene_counts = (counts if scene_types == types
+                       else store.counts(subject_types=scene_types))
         states = []
         for state in _INBOX_STATES:
             if state == "applied":
-                present = counts.get("applied", 0) > 0
+                present = scene_counts.get("applied", 0) > 0
             else:
-                present = bool(store.items(subject_types=types, state=state,
-                                           limit=1))
+                present = bool(store.items(subject_types=scene_types,
+                                           state=state, limit=1))
             if present:
                 states.append(state)
         entries.append({"name": name, "title": TITLES[name],
@@ -393,16 +430,39 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
         def _inbox_page(self, name, state):
             """The body of `/{name}` (`state` is `None`) or `/{name}/{state}`.
 
-            Narrowed to `name`'s own subject types via `Store.items
-            (subject_types=)` -- see `inboxes.INBOXES` -- and, for a
-            terminal-state page, further to `state`. `_NO_ROW_BUILDER`'s
-            three subject types are excluded from what is asked for at
-            all: see its own comment for why forcing one of them through
-            `to_rows` is not survivable, and for what is NOT yet shown here
-            because of it.
+            The GENERIC row list -- everything `to_rows` can build a row
+            for -- is narrowed to `name`'s own subject types minus
+            `_SECTION_SUBJECTS` (see `_scene_subject_types`) via `Store.items
+            (subject_types=)`, and, for a terminal-state page, further to
+            `state`.
+
+            The three subject types `_SECTION_SUBJECTS` names are composed
+            SEPARATELY, as their own sections, and only on the working-queue
+            view (`state is None`): each already has a dedicated builder
+            (`to_merge_rows`/`to_reconcile_rows`/`to_unused_groups`) reached
+            through the SAME `_merges`/`_reconciles`/`_unused` closures the
+            combined `/inbox` page composes from (see `build_handler`'s own
+            parameters) -- reused here rather than re-read from `_store`, so
+            there is exactly one place that ever builds a "Tag merges" (etc.)
+            section, for either page. Every one of those closures already
+            reads across every state a cluster/reconciliation/low-count tag
+            can carry a control in (`new`/`seen`/`failed` via `items()`'s own
+            default, plus `dismissed` and `muted` explicitly -- see
+            `cronicled.__main__._merge_rows`'s own docstring for why that is
+            three store reads, not one), so a dismissed or muted one reaches
+            this page, with its Undismiss/Unmute control, exactly as it does
+            on the combined page -- INLINE in its own section, never via the
+            terminal `/{name}/dismissed` or `/{name}/muted` route, which only
+            ever draws the generic list above.
+
+            Only included when `name`'s OWN inbox owns that subject type
+            (checked against the full, unnarrowed `INBOXES[name]`) -- `/tags`
+            gets all three, `/scenes` and `/performers` get none, because
+            `inboxes.INBOXES` maps each of the three to `tags` alone.
             """
-            types = tuple(t for t in INBOXES[name] if t not in _NO_ROW_BUILDER)
-            items = _store.items(subject_types=types, state=state)
+            types = INBOXES[name]
+            scene_types = _scene_subject_types(types)
+            items = _store.items(subject_types=scene_types, state=state)
             if state is None:
                 # `items()`'s own default excludes `dismissed`/`muted`/
                 # `superseded`/`gone` (see `Store._HIDDEN_STATES`) but NOT
@@ -433,14 +493,22 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                     for item, row in zip(items, built)]
             else:
                 context[state] = built
-            # `merges`/`reconciles`/`unused` are left OUT of this call
-            # entirely, rather than passed as `[]` -- inbox.html tells the
-            # two states apart (`is defined`) and renders none of those three
-            # sections at all here, rather than rendering each as a false
-            # "nothing found" for subject types this page never asked the
-            # store about. See `_sidebar_context` for the other half of this
-            # same decision: what a per-inbox page cannot show, it does not
-            # count either.
+            # `merges`/`reconciles`/`unused` are left OUT of the render call
+            # entirely -- never passed as `[]` -- for any inbox that does not
+            # own the corresponding subject type, and for any state other
+            # than the working queue: inbox.html tells the two apart (`is
+            # defined`) and renders none of those three sections at all when
+            # the keyword is simply absent, rather than rendering each as a
+            # false "nothing found" for a section this page never asked the
+            # store about.
+            extra = {}
+            if state is None:
+                if _MERGE_SUBJECT in types:
+                    extra["merges"] = _merges()
+                if _RECONCILE_SUBJECT in types:
+                    extra["reconciles"] = _reconciles()
+                if _UNUSED_TAG_SUBJECT in types:
+                    extra["unused"] = _unused()
             return render(
                 "inbox.html", title=TITLES[name],
                 rows=context["rows"], applied=context["applied"],
@@ -448,7 +516,8 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                 refused=[], superseded=[], gone=[], counts={},
                 low_count_is_not_proof=LOW_COUNT_IS_NOT_PROOF,
                 schedule=None, just_applied=None,
-                sidebar=_sidebar_context(_store))
+                sidebar=_sidebar_context(_store),
+                **extra)
 
         def _cross_origin_write(self):
             """Refuse a write whose own headers say it did not originate
