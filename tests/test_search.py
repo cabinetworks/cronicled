@@ -129,6 +129,36 @@ class CatalogSearchQueryExpansion(unittest.TestCase):
         self.assertEqual(stash.calls, [("scraper-alpha", CREATOR)])
 
 
+class AmpersandRescue(unittest.TestCase):
+    """The recall this ticket is about, proved end to end rather than at the
+    variant list alone: a candidate that answers only ONE spelling of the
+    query is still found, because `search_variants` now tries the other
+    spelling unconditionally -- no per-store censorship map involved."""
+
+    def test_a_row_indexed_under_the_spelled_out_form_is_still_found(self):
+        # HARM this reproduces: before the fix, a query built from a filename
+        # spelled with "&" reached the store as "&" and nothing else, so a
+        # store indexing the spelled-out form never answered -- a refusal
+        # that looks like judging the answers too harshly and is really
+        # asking the wrong question.
+        adapter = _Adapter("scraper-alpha")  # no censorship map needed
+        stash = _SpyStash({("scraper-alpha", "rock and roll"):
+                           [row("Rock and Roll", "u1")]})
+
+        results = catalog_search(stash, adapter)("rock & roll")
+
+        self.assertEqual(results, [row("Rock and Roll", "u1")])
+
+    def test_a_row_indexed_under_the_symbol_is_still_found_the_other_way(self):
+        adapter = _Adapter("scraper-alpha")
+        stash = _SpyStash({("scraper-alpha", "rock & roll"):
+                           [row("Rock & Roll", "u1")]})
+
+        results = catalog_search(stash, adapter)("rock and roll")
+
+        self.assertEqual(results, [row("Rock & Roll", "u1")])
+
+
 class CatalogSearchDeduplication(unittest.TestCase):
     def test_the_same_row_answering_two_variants_is_not_duplicated(self):
         # HARM: an undeduplicated pair is the SAME scene appearing twice in

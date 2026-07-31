@@ -148,6 +148,48 @@ class SearchOmitsSeed(unittest.TestCase):
                          "copper kettle")
 
 
+class SearchQueryCaseFolding(unittest.TestCase):
+    """The outbound query used to be plain concatenation of whatever case the
+    seed and the filename-as-title happened to carry, while the scorer's own
+    equality test (`cronicled.text.normalize`) folds case before judging two
+    strings the same -- so a query and the comparison it will eventually be
+    judged against could disagree on nothing but case. Folding case here
+    costs nothing (search is case-insensitive essentially everywhere) and
+    closes that one gap.
+
+    Punctuation stripping and letter-folding are a DIFFERENT question -- see
+    `SiteAdapter.search_query`'s docstring -- and the tests below pin that
+    boundary too, so a later change that reaches for `normalize` wholesale
+    has to touch a documented decision rather than slide past a silent one.
+    """
+
+    def test_the_whole_query_is_case_folded(self):
+        a = DeclarativeAdapter(NONE_SPEC)
+        self.assertEqual(a.search_query("VelvetCrane", "Copper KETTLE"),
+                         "velvetcrane copper kettle")
+
+    def test_case_folding_survives_search_omits_seed(self):
+        spec = dict(NONE_SPEC, name="omitseedsite", search_omits_seed=True)
+        a = DeclarativeAdapter(spec)
+        self.assertEqual(a.search_query("VelvetCrane", "Copper KETTLE"),
+                         "copper kettle")
+
+    def test_punctuation_is_left_exactly_alone(self):
+        # Deliberately NOT stripped: a punctuation mark may be the one token
+        # distinguishing this title from a wrong one, and this project does
+        # not guess that unmeasured -- see the module docstring.
+        a = DeclarativeAdapter(NONE_SPEC)
+        self.assertEqual(a.search_query("velvetcrane", "Copper Kettle: Part Two!"),
+                         "velvetcrane copper kettle: part two!")
+
+    def test_accents_are_left_exactly_alone(self):
+        # Deliberately NOT folded: a store that does not fold accents itself
+        # would be sent a query it cannot match if this folded them away.
+        a = DeclarativeAdapter(NONE_SPEC)
+        self.assertEqual(a.search_query("velvetcrane", "Séance"),
+                         "velvetcrane séance")
+
+
 class NoOwnerAnywhere(unittest.TestCase):
     def setUp(self):
         self.a = DeclarativeAdapter(NONE_SPEC)

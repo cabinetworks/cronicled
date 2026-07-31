@@ -178,6 +178,13 @@ def normalize(s):
     which loses the match outright rather than merely widening it. A
     generous match can still be judged by everything downstream that scores
     it; a match that was never returned cannot.
+
+    This function is never run over an outbound search query -- see
+    `cronicled.adapters.base.SiteAdapter.search_query`. Committing a query to
+    one expanded spelling would be exactly the guess this function's own
+    generous-match reasoning is allowed to make for a COMPARISON and is not
+    allowed to make for a QUESTION: a store may index either spelling, and
+    `cronicled.censorship.search_variants` tries both rather than picking.
     """
     if not s:
         return ""

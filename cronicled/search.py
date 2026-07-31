@@ -6,10 +6,10 @@ Nothing in `cronicled.scan` executes a query on its own, by design — see
 `scan.examine`'s docstring: the expensive, networked half belongs to the
 caller. This module is that caller. `catalog_search(stash, adapter)` returns
 a one-argument callable, `search(name)`, that asks `adapter.scraper_id` (via
-`stash.scrape_scenes_by_query`) for every censored-spelling variant of `name`
-that `cronicled.censorship.search_variants` proposes — using
-`adapter.censorship`, the store's own substitution map — and returns the
-union of what came back.
+`stash.scrape_scenes_by_query`) for every variant of `name` that
+`cronicled.censorship.search_variants` proposes — the store's own
+`adapter.censorship` substitution map, plus the unconditional ampersand swap
+`search_variants` always tries — and returns the union of what came back.
 
 `scan.examine` calls `search(resolution.name)` — the creator's NAME, not a
 title — because a lookup per creator, not per file, is the shape the

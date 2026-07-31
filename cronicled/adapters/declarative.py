@@ -203,7 +203,8 @@ class DeclarativeAdapter(SiteAdapter):
 
         Reached only by the per-title fallback, and only for a file the
         per-creator pass could not resolve — see `SiteAdapter.search_query`
-        for the whole ordering."""
+        for the whole ordering, including why this is case-folded and
+        nothing more."""
         if self._search_omits_seed:
-            return title_query
+            return title_query.lower()
         return super(DeclarativeAdapter, self).search_query(seed, title_query)

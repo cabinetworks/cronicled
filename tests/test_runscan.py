@@ -368,7 +368,7 @@ class BuildProducerWiring(unittest.TestCase):
         stash = _FakeStash(
             [scene(1, path)],
             script={("scraper-alpha", "Velvet Crane"): [other],
-                    ("scraper-alpha", "Velvet Crane Morning Ritual"): [wanted]})
+                    ("scraper-alpha", "velvet crane morning ritual"): [wanted]})
         adapter = _Adapter(scraper_id="scraper-alpha")
 
         finished = self._run_to_completion(
@@ -377,7 +377,7 @@ class BuildProducerWiring(unittest.TestCase):
         self.assertEqual(finished.recorded, 1)
         self.assertIn(
             ("scrape_scenes_by_query", "scraper-alpha",
-             "Velvet Crane Morning Ritual"),
+             "velvet crane morning ritual"),
             stash.calls)
 
     def test_the_adapters_own_query_phrasing_is_what_travels(self):

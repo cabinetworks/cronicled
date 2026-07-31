@@ -725,14 +725,14 @@ class TheConfiguredAliasesReachAScanStartedFromThePage(unittest.TestCase):
         # that reverted to the folder's own spelling would be a half-applied
         # alias, and a check on one query could not see it.
         self.assertEqual(self._scan(self.ALIASES),
-                         ["Velvet Crane", "Velvet Crane clip-1"])
+                         ["Velvet Crane", "velvet crane clip-1"])
 
     def test_without_the_alias_the_same_scan_searches_the_folder_name(self):
         # The control: the only difference between the two is the map in
         # `adapters.json`. Without it the folder's own spelling is what
         # reaches the store, which is the behaviour the alias exists to
         # change -- and is what this scan did with an alias configured.
-        self.assertEqual(self._scan({}), ["VCrane", "VCrane clip-1"])
+        self.assertEqual(self._scan({}), ["VCrane", "vcrane clip-1"])
 
 
 class TheMarkerTagReachesAScanStartedFromThePage(unittest.TestCase):

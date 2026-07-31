@@ -154,6 +154,17 @@ def title_view(name):
 
     Returns the extension-stripped name unchanged when there is no prefix to
     strip, so a caller never has to know which of the two it got.
+
+    This is the RAW view: it never runs through `normalize`, deliberately,
+    even though `score` immediately normalizes it for comparison. The query
+    `SiteAdapter.search_query` builds from this string case-folds it (the one
+    normalisation the query and the scorer's comparison share) but does not
+    strip punctuation or fold accented letters, and expands neither an `&`
+    nor a spelled-out `and` — see that method's own docstring for why each of
+    those is a genuine, unmeasured guess for a query in a way it is not for a
+    comparison, and `cronicled.censorship.search_variants` for where the
+    ampersand case is handled instead (as a variant to try, not a rewrite of
+    this string).
     """
     stripped = strip_ext(name)
     without_prefix = _without_series_prefix(stripped)
