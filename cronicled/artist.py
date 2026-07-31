@@ -219,11 +219,34 @@ class Resolution:
     rejected folder is the sharper of the two: with it empty, a filename-
     sourced attribution reads as "the folder had nothing to say", when in
     fact the folder named someone else and was overruled.
+
+    `unconfirmed` carries every plausible candidate `_resolve_by_evidence`
+    actually asked the catalogue about when NONE of them came back
+    supported -- see `_is_supported`. This is a THIRD, different fact from
+    the two above, and collapsing it into either one is exactly the mistake
+    this field exists to stop: unlike `rejected_folder`, every name in here
+    passed `_is_name` -- nothing here failed a guard -- and unlike
+    `competing`, nothing here won either, so there is no winner to report it
+    as the runner-up of. Before this field existed, a caller receiving
+    `name=None` with `rejected_folder=None` (because the folder itself WAS a
+    plausible candidate, just an unconfirmed one) could not tell "nothing in
+    the folder or filename even looked like a name" from "one or more names
+    were found and checked, and the catalogue backed none of them" -- and
+    wrote a reason claiming the former when the truth was the latter, which
+    reads to an operator as "this tool cannot read filenames" beside a file
+    whose name is right there. Empty (`()`) whenever the evidence check
+    never ran (no `owners_of`, or fewer than two candidates on offer) or it
+    resolved to exactly one supported candidate -- the ordinary cases, where
+    there is nothing unresolved to report here at all. Ordered folder-first,
+    the same order the candidates were built in and asked of the catalogue,
+    for a reader's benefit only -- nothing about which one is unconfirmed
+    depends on that order.
     """
     name: str | None = None
     source: str | None = None
     competing: str | None = None
     rejected_folder: str | None = None
+    unconfirmed: tuple = ()
 
 
 def _is_name(text):
@@ -462,18 +485,29 @@ def _resolve_by_evidence(folder_text, name, owners_of):
     assumed, not a tie to break by discarding one side).
 
     Zero supported candidates and more than one both come back unresolved
-    (`None, None, None`) -- deliberately the SAME outcome, for two different
-    reasons. Zero: nothing in the catalogue backs any reading, which is the
-    existing "creator unresolved" mute path and correct. More than one: two
-    candidates are BOTH catalogue-confirmed, and picking between them by
-    whichever was checked first is exactly the ordering mistake this project
-    has already removed from candidate scoring, alias-key collisions and
-    (until now) this module's own folder-vs-filename default. Reporting
-    nothing is the cheap, visible failure `resolve`'s own docstring commits
-    to; this case is not distinguished further because it has not been
-    observed, only reasoned about -- see this task's report for that
-    caveat. Neither path ever falls back to a candidate's position in the
-    list.
+    (`None, None, None, unconfirmed`) -- the same NAME/SOURCE/COMPETING
+    outcome, for two different reasons, but no longer indistinguishable from
+    each other or from "nothing to check in the first place": the fourth
+    return value is every candidate that was actually built and asked of the
+    catalogue, folder first. Zero supported: nothing in the catalogue backs
+    any reading. More than one supported: two candidates are BOTH
+    catalogue-confirmed, and picking between them by whichever was checked
+    first is exactly the ordering mistake this project has already removed
+    from candidate scoring, alias-key collisions and (until now) this
+    module's own folder-vs-filename default. Neither is distinguished
+    further from the other -- both are "this run could not settle on one
+    name", which is the fact `unconfirmed` exists to carry, and a caller
+    that wants a sharper split than that has not been asked for one yet.
+    Reporting nothing as NAME is still the cheap, visible failure
+    `resolve`'s own docstring commits to; what changed is that the REASON is
+    no longer thrown away with it. Neither path ever falls back to a
+    candidate's position in the list -- `unconfirmed`'s own order is for a
+    reader, not a decision.
+
+    This is NOT a mute. `resolve` returning `name=None` here has always
+    meant "refuse and let a later scan reconsider" (see
+    `cronicled.scan._unresolved_creator`); populating `unconfirmed` changes
+    what the refusal SAYS, not whether the file is muted.
     """
     candidates = []
     if _is_name(folder_text):
@@ -483,20 +517,21 @@ def _resolve_by_evidence(folder_text, name, owners_of):
             candidates.append((segment, "filename"))
 
     if not candidates:
-        return None, None, None
+        return None, None, None, ()
     if len(candidates) == 1:
         resolved, source = candidates[0]
-        return resolved, source, None
+        return resolved, source, None, ()
 
     supported = [(candidate_name, source) for candidate_name, source in candidates
                  if _is_supported(*_owner_support(candidate_name, owners_of(candidate_name)))]
     if len(supported) != 1:
-        return None, None, None
+        unconfirmed = tuple(candidate_name for candidate_name, _ in candidates)
+        return None, None, None, unconfirmed
 
     resolved, source = supported[0]
     competing = next((candidate_name for candidate_name, _ in candidates
                       if not _same_name(candidate_name, resolved)), None)
-    return resolved, source, competing
+    return resolved, source, competing, ()
 
 
 def _alias_index(aliases):
@@ -681,14 +716,18 @@ def resolve(name, folder, aliases=None, *, owners_of=None):
     guard will accept as a name, it is returned in `rejected_folder` instead.
     Neither is ever silently dropped -- see `Resolution`.
 
-    Returns a `Resolution`; all of its fields are None when nothing resolved
-    and there was no folder to reject, which is a real answer and not an
-    error -- and also the answer when `owners_of` found either no candidate
-    or more than one supported, on purpose; see `_resolve_by_evidence`.
+    Returns a `Resolution`; all of its fields are None (and `unconfirmed`
+    empty) when nothing resolved and there was no folder to reject, which is
+    a real answer and not an error -- and also the answer when `owners_of`
+    found no candidate at all to check. When `owners_of` found candidates but
+    could not settle on exactly one supported, `unconfirmed` carries them
+    instead of leaving that indistinguishable from "nothing to check"; see
+    `_resolve_by_evidence` and `Resolution`'s own docstring.
     """
     folder_text = clean_folder(folder or "")
     from_filename = _filename_candidate(name)
     folder_is_name = _is_name(folder_text)
+    unconfirmed = ()
 
     aliased = _alias_name(folder_text, aliases)
     if aliased is not None:
@@ -696,7 +735,7 @@ def resolve(name, folder, aliases=None, *, owners_of=None):
         competing = (from_filename if from_filename is not None
                      and not _same_name(resolved, from_filename) else None)
     elif owners_of is not None:
-        resolved, source, competing = _resolve_by_evidence(
+        resolved, source, competing, unconfirmed = _resolve_by_evidence(
             folder_text, name, owners_of)
     elif folder_is_name:
         resolved, source = folder_text, "folder"
@@ -716,4 +755,4 @@ def resolve(name, folder, aliases=None, *, owners_of=None):
     rejected_folder = folder_text or None
     if source in ("folder", "alias") or folder_is_name:
         rejected_folder = None
-    return Resolution(resolved, source, competing, rejected_folder)
+    return Resolution(resolved, source, competing, rejected_folder, unconfirmed)

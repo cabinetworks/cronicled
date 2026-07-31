@@ -43,7 +43,8 @@ from cronicled.jobs import COST_CLASS_LIMITS, JobRunner
 from cronicled.scan import (
     Conflict, Counts, DEFAULT_THRESHOLD, FingerprintPass, IDENTIFIED_BY_FINGERPRINT, Identified,
     MAX_RUNNERS_UP, MUTE_NO_CANDIDATES, Outcome, REFUSED_REJECTED_FOLDER,
-    REFUSED_UNRESOLVED_CREATOR, RETIRED_MUTE_UNRESOLVED_CREATOR,
+    REFUSED_UNCONFIRMED_CANDIDATE, REFUSED_UNRESOLVED_CREATOR,
+    RETIRED_MUTE_UNRESOLVED_CREATOR,
     GONE_READ_EMPTY, GONE_READ_FAILED, GONE_READ_PARTIAL,
     ScanProducer, Source, SUBJECT_TYPE, _SingleFlight, catalogue_link, examine,
     examine_sources, fingerprint_outcome, identify_by_fingerprint,
@@ -944,6 +945,23 @@ class ExamineTest(unittest.TestCase):
             self.assertNotIn("catalogue", refusal)
             self.assertNotEqual(refusal, MUTE_NO_CANDIDATES)
 
+    def test_the_unconfirmed_candidate_refusal_is_its_own_distinct_sentence(self):
+        """A third refusal, for a third fact: something WAS found (unlike
+        `REFUSED_UNRESOLVED_CREATOR`) and no guard rejected it (unlike
+        `REFUSED_REJECTED_FOLDER`) -- the catalogue simply never confirmed
+        it. It must not collapse into either existing sentence, or into the
+        one mute reason a scan still has.
+        """
+        self.assertIn("%s", REFUSED_UNCONFIRMED_CANDIDATE)
+        self.assertIn("catalogue", REFUSED_UNCONFIRMED_CANDIDATE)
+        # Distinct from the "nothing was ever offered" sentence: it must not
+        # claim that neither side yielded anything, which is exactly false
+        # when this reason fires.
+        self.assertNotIn("neither", REFUSED_UNCONFIRMED_CANDIDATE)
+        for other in (MUTE_NO_CANDIDATES, REFUSED_REJECTED_FOLDER,
+                      REFUSED_UNRESOLVED_CREATOR):
+            self.assertNotEqual(REFUSED_UNCONFIRMED_CANDIDATE, other)
+
     # -- the second kind: a human should look ----------------------------- #
 
     def test_an_ambiguous_decision_yields_no_proposal_and_no_mute(self):
@@ -1254,6 +1272,29 @@ class ExamineOwnerOfTest(unittest.TestCase):
             "name": "Amberlight", "source": "folder",
             "competing": "Wren Ashcombe", "rejected_folder": None})
         self.assertEqual(search.queries, ["Amberlight"])
+
+    def test_neither_candidate_confirmed_refuses_and_names_both(self):
+        # HARM this fixes: the folder ("Amberlight") and the filename ("Wren
+        # Ashcombe") both plainly name a possible creator, and the catalogue
+        # backs neither. Before `Resolution.unconfirmed`, this refused with
+        # "neither the folder nor the filename yielded a creator this run
+        # could accept" -- which reads, next to a file whose name is right
+        # there, as though the tool cannot read filenames. It is a REFUSAL,
+        # never a mute: either candidate could be confirmed by a later scan
+        # once an alias, a corrected handle, or another store answers for it.
+        search = ScriptedSearch({"Amberlight": [], "Wren Ashcombe": []})
+
+        outcome = examine(scene(1, self.PATH), search=search, folder=FOLDER,
+                          threshold=0.5, owner_of=self.owner_of)
+
+        self.assertIsNone(outcome.proposal)
+        self.assertIsNone(outcome.mute_reason)
+        self.assertEqual(
+            outcome.reason,
+            "creator unresolved: 'Amberlight', 'Wren Ashcombe' named a "
+            "possible creator, but no configured store's catalogue "
+            "confirmed any of them")
+        self.assertNotEqual(outcome.reason, REFUSED_UNRESOLVED_CREATOR)
 
 
 class ExamineEnrichmentTest(unittest.TestCase):
@@ -1959,16 +2000,19 @@ class ExamineSourcesTest(unittest.TestCase):
             scene(1, "/library/Amberlight/Wren Ashcombe - Morning Ritual.mp4"),
             sources=sources, folder=FOLDER, threshold=0.5)
 
-        # Refused, not muted — and refused with the sentence that claims
-        # nothing about the folder. "Amberlight" IS a plausible name; it was
-        # the evidence check that declined it, not a name guard, so there is
-        # no rejected text to quote and a reason saying the folder was empty
-        # would be false.
+        # Refused, not muted — and refused by NAMING what was found. Both
+        # "Amberlight" (the folder) and "Wren Ashcombe" (the filename) ARE
+        # plausible names; it was the evidence check that declined both, not
+        # a name guard, so there is no rejected folder text to quote either.
+        # The generic "neither...yielded a creator" sentence would be false
+        # here — it plainly reads as though nothing named a creator, when two
+        # candidates were found and checked against the catalogue.
         self.assertIsNone(outcome.mute_reason)
         self.assertEqual(
             outcome.reason,
-            "creator unresolved: neither the folder nor the filename yielded "
-            "a creator this run could accept")
+            "creator unresolved: 'Amberlight', 'Wren Ashcombe' named a "
+            "possible creator, but no configured store's catalogue "
+            "confirmed any of them")
 
     # -- malformed input ----------------------------------------------------- #
 

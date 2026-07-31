@@ -292,23 +292,51 @@ MAX_RUNNERS_UP = 3
 MUTE_NO_CANDIDATES = (
     "no candidates: the catalogue offered nothing for this creator")
 
-# The two refusals the unresolved-creator path produces, kept apart because
-# only one of them hands the operator something to act on. A folder whose text
-# a name guard turned down is exactly what an alias would be written against
-# (`Resolution.rejected_folder` records it for that reason), and a single
-# catch-all reason would say "unresolved" for both while losing the actionable
-# half. A folder that yielded no text for a guard to judge has nothing to
-# quote, and must say so as itself rather than by quoting an empty string.
+# The three refusals the unresolved-creator path produces, kept apart because
+# each hands the operator a different fact, and only some of them something to
+# act on directly.
 #
-# Neither claims the folder was empty: a folder can be a plausible name and
-# still leave the creator unresolved (the evidence check declining it), in
-# which case it was not rejected by a guard and there is nothing to quote.
+# A folder whose text a name guard turned down is exactly what an alias would
+# be written against (`Resolution.rejected_folder` records it for that
+# reason), and a single catch-all reason would say "unresolved" for both while
+# losing the actionable half. A folder that yielded no text for a guard to
+# judge has nothing to quote, and must say so as itself rather than by
+# quoting an empty string.
+#
+# Neither of the first two claims the folder was empty: a folder can be a
+# plausible name and still leave the creator unresolved. That happens two
+# different ways, and only one of them is REFUSED_UNRESOLVED_CREATOR's to
+# describe:
+#
+# * no search was ever run to check it (`owners_of` absent, or the folder was
+#   the only candidate on offer) -- there was truly nothing else to weigh, and
+#   REFUSED_UNRESOLVED_CREATOR's "neither...yielded a creator" is accurate;
+# * a search WAS run (`_resolve_by_evidence`, two or more candidates), and it
+#   declined every one of them. Here a name -- often more than one -- WAS
+#   found; the catalogue simply would not back it. Reusing
+#   REFUSED_UNRESOLVED_CREATOR for this is the exact bug this reason exists to
+#   end: a file named plainly by its folder or filename, refused with a
+#   sentence claiming NEITHER offered anything, reads to whoever finds it as
+#   "this tool cannot read filenames" -- and a reader who concludes that stops
+#   trusting every other reason it gives. `Resolution.unconfirmed` (see
+#   `cronicled.artist._resolve_by_evidence`) is what makes the two tellable
+#   apart; `REFUSED_UNCONFIRMED_CANDIDATE` is what this one says instead.
+#
+# This IS a refusal, the same as the other two, never a mute: the candidate(s)
+# named are exactly what an alias, a corrected handle, or a newly configured
+# store could confirm on a LATER scan, which is precisely what a mute
+# forecloses. A fourth mute reason is not the fix here -- these candidates
+# were never confirmed by anything, so there is nothing for a mute to be
+# right ABOUT yet.
 REFUSED_UNRESOLVED_CREATOR = (
     "creator unresolved: neither the folder nor the filename yielded a "
     "creator this run could accept")
 REFUSED_REJECTED_FOLDER = (
     "creator unresolved: the folder text %r was not accepted as a name, and "
     "the filename yielded none either")
+REFUSED_UNCONFIRMED_CANDIDATE = (
+    "creator unresolved: %s named a possible creator, but no configured "
+    "store's catalogue confirmed any of them")
 
 # What the retired rule wrote into the `mute` table before this. HISTORY, not
 # a message this code produces: it exists so `release_auto_mutes` can
@@ -387,16 +415,32 @@ def _unresolved_creator(resolution):
     both paths reach the same conclusion about the same file, and a second
     copy of this branch would be free to disagree about which one mutes.
 
-    The reason carries `Resolution.rejected_folder` when the resolver has one
-    — the folder text a name guard threw out. That text is what an operator
-    writes an alias against, and a mute row showed a bare id instead of it.
+    Checked in order of how much the resolver actually found, most specific
+    first:
 
-    Uncertainty withholds evidence rather than supplying it: with no rejected
-    folder, the reason says a creator was not resolved and stops there. It
-    does NOT claim the folder was empty, because a folder that IS a plausible
-    name can still leave the creator unresolved when the evidence check
-    declines it, and that folder was never rejected by any guard.
+    1. `Resolution.unconfirmed` — one or more candidates WERE found (folder,
+       filename, or both) and a catalogue search checked them, and none came
+       back supported. Naming them is the whole point: they are exactly what
+       an alias, a corrected handle, or a newly configured store could
+       confirm on a later scan, and reusing either sentence below for this
+       would tell an operator "nothing named a creator here" about a file
+       whose name plainly does. See `REFUSED_UNCONFIRMED_CANDIDATE`'s own
+       comment for the harm this replaced.
+    2. `Resolution.rejected_folder` — the folder text a name guard threw
+       out. That text is what an operator writes an alias against, and a
+       mute row showed a bare id instead of it.
+    3. Neither — nothing in the folder or the filename even looked like a
+       name, and no catalogue search ever ran to have an opinion either.
+
+    Uncertainty withholds evidence rather than supplying it: the fallback
+    reason does NOT claim the folder was empty, because a folder that IS a
+    plausible name can still leave the creator unresolved (case 1, or a
+    folder-only candidate no search was ever run to check), and that folder
+    was never rejected by any guard.
     """
+    if resolution.unconfirmed:
+        named = ", ".join(repr(candidate) for candidate in resolution.unconfirmed)
+        return Outcome(reason=REFUSED_UNCONFIRMED_CANDIDATE % (named,))
     if resolution.rejected_folder:
         return Outcome(reason=REFUSED_REJECTED_FOLDER
                        % (resolution.rejected_folder,))
