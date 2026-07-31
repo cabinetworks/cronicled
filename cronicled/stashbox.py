@@ -467,7 +467,16 @@ def check(box, performer_id, name, folder, resolution, *,
     matches = [score(name, folder, decensor(scene.get("title") or "", censorship or {}),
                      artist=resolution.name)
                for scene in listing.scenes]
-    decision = decide(matches, threshold)
+    # The RAW scene title, never decensored, travels to `decide` alongside
+    # the matches it produced, so two entries of this SAME listing naming
+    # the same title (the same clip submitted by two contributors, or
+    # re-submitted) can be told from a genuine choice between two different
+    # scenes -- see `decide`'s docstring for the rule and for why the raw
+    # text, not the decensored form `matches` was scored against, is what
+    # travels here.
+    decision = decide(matches, threshold,
+                      titles=[scene.get("title") or ""
+                              for scene in listing.scenes])
     # Both signals, not just the one a competing NAME sets: a folder whose
     # text a guard threw out never competed either, and the guard is a
     # heuristic, not a check against evidence -- see `listing_verdict`'s own

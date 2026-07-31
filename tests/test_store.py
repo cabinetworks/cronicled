@@ -8,10 +8,12 @@ import sqlite3
 import tempfile
 import unicodedata
 import unittest
+import uuid
 from datetime import datetime, timezone
 
-from cronicled.store import (RUN_HISTORY_LIMIT, RUN_TRIGGERS, SCHEMA_VERSION,
-                             SchemaVersionError, Store, fingerprint)
+from cronicled.store import (RUN_HISTORY_LIMIT, RUN_OUTCOME_INTERRUPTED,
+                             RUN_TRIGGERS, SCHEMA_VERSION, SchemaVersionError,
+                             Store, fingerprint)
 
 
 class Fingerprint(unittest.TestCase):
@@ -1004,6 +1006,188 @@ class ProducerRunsSurviveARestart(unittest.TestCase):
                              {"nightly-scrape": "2026-07-26T02:00:00+00:00"})
 
 
+class RenamedProducerRunsSurviveTheRename(unittest.TestCase):
+    """A run recorded under a job's OLD name must answer `last_run`/`runs` for
+    its current one, so a rename cannot make the scheduler read a producer
+    that has genuinely run for years as never-run.
+
+    Every fixture here writes `producer_run` directly with a raw connection,
+    the same way `RunTableAddedOnAnExistingDatabase` and
+    `SchemaAdditionOnAnExistingDatabase` emulate a database an earlier build
+    left behind — `Store` itself never writes the old name, so seeding it any
+    other way would not be testing what a real upgraded deployment has on
+    disk.
+
+    Literal old name, literal new name, one test each for the three real
+    renames — deriving either side from `RENAMED_JOBS` would move both halves
+    together, and a map emptied to `{}` or repointed would stay green.
+    """
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self.path = os.path.join(self._dir, "s.db")
+        self.addCleanup(shutil.rmtree, self._dir, True)
+
+    def _seed(self, producer, at):
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS producer_run "
+            "(producer TEXT PRIMARY KEY, at TEXT NOT NULL)")
+        connection.execute(
+            "INSERT INTO producer_run VALUES (?, ?)", (producer, at))
+        connection.commit()
+        connection.close()
+
+    def _seed_both(self, old, current, old_at, current_at):
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS producer_run "
+            "(producer TEXT PRIMARY KEY, at TEXT NOT NULL)")
+        connection.execute(
+            "INSERT INTO producer_run VALUES (?, ?)", (old, old_at))
+        connection.execute(
+            "INSERT INTO producer_run VALUES (?, ?)", (current, current_at))
+        connection.commit()
+        connection.close()
+
+    def _raw_producer_runs(self):
+        connection = sqlite3.connect(self.path)
+        rows = connection.execute(
+            "SELECT producer, at, rowid FROM producer_run").fetchall()
+        connection.close()
+        return rows
+
+    # -- the three real renames, each pinned by literals on both sides ---- #
+
+    def test_a_run_under_the_old_scene_name_is_read_under_the_new_one(self):
+        self._seed("nightly-library-scan", "2026-07-26T02:00:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.last_run("scene-scan"),
+                             "2026-07-26T02:00:00+00:00")
+            self.assertEqual(store.runs(),
+                             {"scene-scan": "2026-07-26T02:00:00+00:00"})
+
+    def test_a_run_under_the_old_performer_name_is_read_under_the_new_one(self):
+        self._seed("performer-descriptions", "2026-07-26T02:00:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.last_run("performer-scan"),
+                             "2026-07-26T02:00:00+00:00")
+            self.assertEqual(store.runs(),
+                             {"performer-scan": "2026-07-26T02:00:00+00:00"})
+
+    def test_a_run_under_the_old_tag_name_is_read_under_the_new_one(self):
+        self._seed("tag-merge", "2026-07-26T02:00:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.last_run("tag-scan"),
+                             "2026-07-26T02:00:00+00:00")
+            self.assertEqual(store.runs(),
+                             {"tag-scan": "2026-07-26T02:00:00+00:00"})
+
+    # -- the ordinary cases the migration must not disturb ----------------- #
+
+    def test_a_run_already_under_the_current_name_is_unchanged(self):
+        self._seed("scene-scan", "2026-07-26T02:00:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.runs(),
+                             {"scene-scan": "2026-07-26T02:00:00+00:00"})
+
+    def test_a_producer_with_no_history_under_either_name_stays_never_run(self):
+        # Guards the direction opposite the main fix: the migration must not
+        # invent a row for a renamed producer that has genuinely never run,
+        # which would make it look like it HAS and defeat the "still due
+        # immediately" guarantee `cronicled.schedule.due` provides.
+        with Store(self.path) as store:
+            self.assertIsNone(store.last_run("scene-scan"))
+            self.assertIsNone(store.last_run("performer-scan"))
+            self.assertIsNone(store.last_run("tag-scan"))
+            self.assertEqual(store.runs(), {})
+
+    # -- a history recorded under both names, e.g. an upgrade then a
+    # rollback then a second upgrade ---------------------------------------
+
+    def test_when_the_old_name_ran_more_recently_it_wins(self):
+        self._seed_both("nightly-library-scan", "scene-scan",
+                        old_at="2026-07-27T09:00:00+00:00",
+                        current_at="2026-07-20T03:00:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.runs(),
+                             {"scene-scan": "2026-07-27T09:00:00+00:00"})
+
+    def test_when_the_current_name_ran_more_recently_it_wins(self):
+        # The reverse direction, pinned separately: a fixture whose winner is
+        # always the same side cannot tell "later wins" from "old always
+        # wins" or "new always wins".
+        self._seed_both("nightly-library-scan", "scene-scan",
+                        old_at="2026-07-20T03:00:00+00:00",
+                        current_at="2026-07-27T09:00:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.runs(),
+                             {"scene-scan": "2026-07-27T09:00:00+00:00"})
+
+    def test_the_collision_leaves_exactly_one_row_not_two(self):
+        self._seed_both("nightly-library-scan", "scene-scan",
+                        old_at="2026-07-27T09:00:00+00:00",
+                        current_at="2026-07-20T03:00:00+00:00")
+        with Store(self.path):
+            pass
+        rows = self._raw_producer_runs()
+        self.assertEqual([r[0] for r in rows], ["scene-scan"])
+
+    # -- a reading on one side that cannot be read as a moment at all ------- #
+    #
+    # `record_run` stores whatever it is given, so either side of a collision
+    # could hold something that is not a usable timestamp -- see
+    # `cronicled.schedule.due`'s own tolerance for this. Recency cannot be
+    # compared against nothing, so the side that DOES parse is kept, rather
+    # than losing real information to a value that is not a moment at all.
+
+    def test_an_unreadable_old_reading_loses_to_a_readable_current_one(self):
+        self._seed_both("nightly-library-scan", "scene-scan",
+                        old_at="not-a-timestamp",
+                        current_at="2026-07-20T03:00:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.runs(),
+                             {"scene-scan": "2026-07-20T03:00:00+00:00"})
+
+    def test_an_unreadable_current_reading_loses_to_a_readable_old_one(self):
+        self._seed_both("nightly-library-scan", "scene-scan",
+                        old_at="2026-07-20T03:00:00+00:00",
+                        current_at="not-a-timestamp")
+        with Store(self.path) as store:
+            self.assertEqual(store.runs(),
+                             {"scene-scan": "2026-07-20T03:00:00+00:00"})
+
+    # -- idempotence: opening a second time must rewrite nothing ------------ #
+
+    def test_migrating_a_second_time_changes_nothing(self):
+        self._seed("nightly-library-scan", "2026-07-26T02:00:00+00:00")
+        with Store(self.path):
+            pass
+        first = self._raw_producer_runs()
+        with Store(self.path):
+            pass
+        second = self._raw_producer_runs()
+        # Whole rows, including `rowid`: identical `at` values with a
+        # different `rowid` would mean the row was deleted and reinserted on
+        # the second pass -- unobservable through `last_run` alone, since the
+        # value did not change, but exactly the "rewrites anything" this must
+        # not do.
+        self.assertEqual(second, first)
+        self.assertEqual([r[0] for r in first], ["scene-scan"])
+
+    def test_migrating_a_collision_a_second_time_changes_nothing_either(self):
+        self._seed_both("nightly-library-scan", "scene-scan",
+                        old_at="2026-07-27T09:00:00+00:00",
+                        current_at="2026-07-20T03:00:00+00:00")
+        with Store(self.path):
+            pass
+        first = self._raw_producer_runs()
+        with Store(self.path):
+            pass
+        second = self._raw_producer_runs()
+        self.assertEqual(second, first)
+
+
 class _RunLogCase(_StoreCase):
     """Shared fixture for the run log: distinct, increasing start times.
 
@@ -1381,6 +1565,204 @@ class RunRetention(_RunLogCase):
         be a log that forgets faster than anyone looks at it, and one of zero
         would evict every run the moment it finished."""
         self.assertGreaterEqual(RUN_HISTORY_LIMIT, 90)
+
+
+class ClosingRunsInterruptedByARestart(_RunLogCase):
+    """`close_interrupted_runs` -- the fix for the residual `finish_run`
+    documents: nothing else ever closes a row left open by a process that
+    has stopped existing.
+    """
+
+    def _open_foreign(self, job="scene-scan", trigger="scheduled", at=None):
+        """Open a row directly against the connection, bypassing
+        `start_run`'s own bookkeeping of what THIS `Store` instance opened.
+
+        `_RunLogCase` shares one `self.store` across a whole test, so a row
+        meant to stand in for a DIFFERENT, dead process's leftover must not
+        go through `self.store.start_run` -- that would record it as this
+        instance's own and defeat the very thing under test. This is the
+        fixture's substitute for the real scenario, which
+        `AnOrphanedRunIsClosedOnlyByTheNextProcessToOpenTheStore` covers with
+        an actual second process.
+        """
+        run_id = str(uuid.uuid4())
+        when = at if at is not None else self._at(0)
+        self.store._conn.execute(
+            "INSERT INTO run (id, job, trigger, started) VALUES (?, ?, ?, ?)",
+            (run_id, job, trigger, when))
+        self.store._conn.commit()
+        return run_id
+
+    def test_a_row_open_at_startup_is_closed_as_interrupted(self):
+        orphan = self._open_foreign(at=self._at(0))
+        n = self.store.close_interrupted_runs(at=self._at(100))
+        self.assertEqual(n, 1)
+        # The whole row, not a sampled field: a mutation recording the
+        # outcome as "completed" or "failed" instead of the new value would
+        # still leave `finished` set, so asserting presence alone could not
+        # catch it.
+        self.assertEqual(self.store.recent_runs(), [{
+            "id": orphan, "job": "scene-scan", "trigger": "scheduled",
+            "started": self._at(0), "finished": self._at(100),
+            "outcome": RUN_OUTCOME_INTERRUPTED, "counts": {}, "error": None}])
+
+    def test_the_outcome_is_neither_completed_nor_failed(self):
+        # `RUN_OUTCOME_INTERRUPTED` itself, asserted directly, so a rename of
+        # the constant to either existing outcome is caught even if some
+        # other test's fixture happened to use the same literal.
+        self.assertNotIn(RUN_OUTCOME_INTERRUPTED, ("completed", "failed"))
+        orphan = self._open_foreign()
+        self.store.close_interrupted_runs()
+        row = self.store.recent_runs()[0]
+        self.assertEqual(row["id"], orphan)
+        self.assertNotEqual(row["outcome"], "completed")
+        self.assertNotEqual(row["outcome"], "failed")
+
+    def test_every_row_left_open_is_counted_and_closed(self):
+        orphans = [self._open_foreign(at=self._at(n)) for n in range(3)]
+        n = self.store.close_interrupted_runs(at=self._at(100))
+        self.assertEqual(n, 3)
+        closed = {r["id"]: r["outcome"] for r in self.store.recent_runs()}
+        for orphan in orphans:
+            self.assertEqual(closed[orphan], RUN_OUTCOME_INTERRUPTED)
+
+    def test_a_run_this_process_itself_started_is_never_closed_by_this_call(
+            self):
+        """The mutation that turns the fix into an outage: closing a run the
+        CURRENT process opened.
+
+        The order here is deliberate -- `start_run` first, THEN the
+        reconciliation -- because that is the shape of the one mutation that
+        matters: reconciliation wired to fire again after this process has
+        already started work of its own (a per-run cadence, or simply called
+        twice) rather than exactly once before anything is opened. A rule
+        keyed only on "is this row open" cannot tell such a row from a dead
+        process's leftover; this one is keyed on THIS instance's own record
+        of what it opened, which a late or repeated call cannot fool.
+        """
+        current = self.store.start_run("scene-scan", trigger="scheduled")
+        self.store.close_interrupted_runs()
+        row = self.store.recent_runs()[0]
+        self.assertEqual(row["id"], current)
+        self.assertIsNone(row["finished"])
+        self.assertIsNone(row["outcome"])
+
+    def test_a_run_this_process_started_survives_even_alongside_a_real_orphan(
+            self):
+        # The two rows are otherwise indistinguishable -- same job, both
+        # open -- so this is a claim about WHICH one closes, not merely how
+        # many do.
+        orphan = self._open_foreign(at=self._at(0))
+        current = self.store.start_run("scene-scan", trigger="scheduled",
+                                       at=self._at(1))
+        n = self.store.close_interrupted_runs(at=self._at(100))
+        self.assertEqual(n, 1)
+        rows = {r["id"]: r for r in self.store.recent_runs()}
+        self.assertEqual(rows[orphan]["outcome"], RUN_OUTCOME_INTERRUPTED)
+        self.assertIsNone(rows[current]["outcome"])
+        self.assertIsNone(rows[current]["finished"])
+
+    def test_running_it_twice_changes_nothing_the_second_time(self):
+        self._open_foreign(at=self._at(0))
+        first = self.store.close_interrupted_runs(at=self._at(100))
+        self.assertEqual(first, 1)
+        before = self.store.recent_runs()
+        second = self.store.close_interrupted_runs(at=self._at(200))
+        self.assertEqual(second, 0)
+        self.assertEqual(self.store.recent_runs(), before)
+
+    def test_running_it_twice_changes_nothing_with_a_current_run_open_too(
+            self):
+        # The other branch of the same method: at least one id THIS instance
+        # opened is on record, which takes a different query path (the `id
+        # NOT IN (...)` exclusion) than the case above, where none is.
+        self._open_foreign(at=self._at(0))
+        current = self.store.start_run("scene-scan", trigger="scheduled",
+                                       at=self._at(1))
+        first = self.store.close_interrupted_runs(at=self._at(100))
+        self.assertEqual(first, 1)
+        before = self.store.recent_runs()
+        second = self.store.close_interrupted_runs(at=self._at(200))
+        self.assertEqual(second, 0)
+        self.assertEqual(self.store.recent_runs(), before)
+        still_open = [r for r in before if r["id"] == current][0]
+        self.assertIsNone(still_open["finished"])
+
+    def test_nothing_open_is_a_no_op(self):
+        run_id = self.store.start_run("scene-scan", trigger="scheduled")
+        self.store.finish_run(run_id, outcome="completed")
+        n = self.store.close_interrupted_runs()
+        self.assertEqual(n, 0)
+        self.assertEqual(self.store.recent_runs()[0]["outcome"], "completed")
+
+    def test_a_finished_row_is_left_exactly_as_it_was(self):
+        run_id = self.store.start_run("scene-scan", trigger="manual",
+                                      at=self._at(0))
+        self.store.finish_run(run_id, outcome="failed", error="broke",
+                              counts={"recorded": 2}, at=self._at(5))
+        before = self.store.recent_runs()
+        self.store.close_interrupted_runs(at=self._at(100))
+        self.assertEqual(self.store.recent_runs(), before)
+
+    def test_a_closed_interrupted_row_becomes_an_ordinary_retention_candidate(
+            self):
+        """Once closed here, the row is finished, and retention cannot tell
+        it apart from any other finished row -- see `Store.finish_run`'s own
+        eviction, which this method deliberately leaves untouched and lets
+        the next real close apply on its own cadence."""
+        self._fill(RUN_HISTORY_LIMIT - 1)
+        self._open_foreign(at=self._at(RUN_HISTORY_LIMIT - 1))
+        self.store.close_interrupted_runs(at=self._at(RUN_HISTORY_LIMIT))
+        # Exactly at the bound -- nothing to evict yet.
+        self.assertEqual(self.store.runs_evicted(), 0)
+        run_id = self.store.start_run("scene-scan", trigger="scheduled",
+                                      at=self._at(9000))
+        self.store.finish_run(run_id, outcome="completed", at=self._at(9000))
+        self.assertEqual(self.store.runs_evicted(), 1)
+
+
+class AnOrphanedRunIsClosedOnlyByTheNextProcessToOpenTheStore(
+        unittest.TestCase):
+    """The literal scenario: one process opens a run and disappears; a later
+    one, on the same database file, is the one that closes it."""
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self.path = os.path.join(self._dir, "s.db")
+        self.addCleanup(shutil.rmtree, self._dir, True)
+
+    def test_a_row_an_earlier_process_left_open_is_closed_by_a_fresh_store(
+            self):
+        with Store(self.path) as dead_process:
+            orphan = dead_process.start_run(
+                "scene-scan", trigger="scheduled",
+                at="2026-03-01T01:06:40+00:00")
+            # No finish_run -- the process is gone, not merely slow.
+        with Store(self.path) as new_process:
+            n = new_process.close_interrupted_runs(
+                at="2026-03-01T02:01:13+00:00")
+            self.assertEqual(n, 1)
+            self.assertEqual(new_process.recent_runs(), [{
+                "id": orphan, "job": "scene-scan", "trigger": "scheduled",
+                "started": "2026-03-01T01:06:40+00:00",
+                "finished": "2026-03-01T02:01:13+00:00",
+                "outcome": RUN_OUTCOME_INTERRUPTED, "counts": {},
+                "error": None}])
+
+    def test_a_run_the_new_process_starts_itself_is_unaffected(self):
+        with Store(self.path) as dead_process:
+            dead_process.start_run("scene-scan", trigger="scheduled",
+                                   at="2026-03-01T01:06:40+00:00")
+        with Store(self.path) as new_process:
+            new_process.close_interrupted_runs(
+                at="2026-03-01T02:01:13+00:00")
+            current = new_process.start_run(
+                "scene-scan", trigger="scheduled",
+                at="2026-03-01T02:01:20+00:00")
+            row = [r for r in new_process.recent_runs()
+                  if r["id"] == current][0]
+            self.assertIsNone(row["finished"])
+            self.assertIsNone(row["outcome"])
 
 
 class ReadingRecentRuns(_RunLogCase):
@@ -2203,3 +2585,78 @@ class UnmuteBringsTheRowBack(unittest.TestCase):
         self.store.mute("scene", "9")
         self.store.unmute("scene", "9")
         self.assertEqual(len(self.store.items()), 0)
+
+
+class SubjectTypeFiltering(_StoreCase):
+    """`items()` and `counts()` narrowing to a caller-given tuple of subject
+    types -- how an inbox page (see `cronicled.web.inboxes`) asks the store
+    for only the rows it owns, instead of every subject type in the
+    database.
+    """
+
+    def _tag(self, subject_id):
+        return self.store.record(folder="tag-matches", subject_type="tag",
+                                 subject_id=subject_id, summary="a tag",
+                                 payload={"key": "kettle"}, producer="tags")
+
+    def _cluster(self, subject_id):
+        return self.store.record(folder="tag-matches",
+                                 subject_type="tag-cluster",
+                                 subject_id=subject_id, summary="a cluster",
+                                 payload={"key": "kettle"}, producer="tags")
+
+    def test_items_filters_to_the_given_subject_types(self):
+        self._tag("t1")
+        self._cluster("c1")
+        self._record(subject_id="s1")  # subject_type="scene"
+        got = {(i["subject_type"], i["subject_id"])
+               for i in self.store.items(subject_types=("tag", "tag-cluster"))}
+        self.assertEqual(got, {("tag", "t1"), ("tag-cluster", "c1")})
+
+    def test_items_with_no_subject_types_is_unchanged(self):
+        # The existing callers pass nothing and must keep seeing everything.
+        self._tag("t1")
+        self._record(subject_id="s1")
+        self.assertEqual(len(self.store.items()), 2)
+
+    def test_an_empty_subject_type_tuple_selects_nothing_in_items(self):
+        # An empty tuple is a real, distinct request -- "select nothing" --
+        # not "no filter given". Falling through to truthiness here would
+        # make an inbox with no subject types (a bug elsewhere) silently see
+        # every row instead of none.
+        self._tag("t1")
+        self.assertEqual(self.store.items(subject_types=()), [])
+
+    def test_counts_filters_to_the_given_subject_types(self):
+        self._tag("t1")
+        self._record(subject_id="s1")  # subject_type="scene"
+        self.assertEqual(self.store.counts(subject_types=("tag",)),
+                         {"new": 1})
+
+    def test_counts_with_no_subject_types_is_unchanged(self):
+        self._tag("t1")
+        self._record(subject_id="s1")
+        self.assertEqual(self.store.counts(), {"new": 2})
+
+    def test_an_empty_subject_type_tuple_selects_nothing_in_counts(self):
+        self._tag("t1")
+        self.assertEqual(self.store.counts(subject_types=()), {})
+
+    def test_subject_type_filter_combines_with_folder(self):
+        # Both narrowings apply at once, not one silently overriding the
+        # other. A scene sharing the tag's own folder makes the folder
+        # filter alone insufficient to produce the expected set, so this
+        # can only pass if the subject_type filter is doing real work too --
+        # a fixture where the folder filter alone gave the same answer would
+        # let a dropped subject_type clause hide behind it.
+        self._tag("t1")
+        self.store.record(folder="tag-matches", subject_type="scene",
+                          subject_id="s-same-folder", summary="a scene",
+                          payload={"title": "invented placeholder title"},
+                          producer="scan")
+        self.store.record(folder="scene-matches", subject_type="tag",
+                          subject_id="t2", summary="a tag",
+                          payload={"key": "other"}, producer="tags")
+        got = {i["subject_id"] for i in
+               self.store.items(folder="tag-matches", subject_types=("tag",))}
+        self.assertEqual(got, {"t1"})

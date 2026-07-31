@@ -30,6 +30,8 @@ import uuid
 import weakref
 from datetime import datetime, timezone
 
+from cronicled.config import RENAMED_JOBS
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS item (
     fingerprint   TEXT PRIMARY KEY,
@@ -191,6 +193,104 @@ def _add_missing_columns(conn):
             conn.execute("ALTER TABLE %s ADD COLUMN %s %s"
                          % (table, column, definition))
 
+
+def _later_producer_run(old_at, new_at):
+    """Which of two `producer_run.at` values survives a rename collision.
+
+    Reached only when ONE producer holds a row under both its old name and
+    its current one -- see `_migrate_renamed_producer_runs`. There is no row
+    order to break the tie by (a `dict`/query result has none worth trusting
+    -- see this project's own record of iteration-order bugs), but there IS a
+    fact to compare: which of the two really happened more recently. That is
+    exactly what `producer_run` exists to answer, so the later moment wins,
+    not the row that happened to be read first.
+
+    Each value is parsed the same tolerant way `cronicled.schedule.due` reads
+    a stored run: an aware timestamp compares; anything else -- unparseable,
+    or naive with no offset -- does not, because guessing its zone would be
+    inventing a fact this function does not have. When a value cannot be
+    compared, this prefers whichever side DOES parse, so the surviving row
+    carries real information rather than the one `due()` would immediately
+    treat as due anyway. When NEITHER parses, which one survives makes no
+    observable difference: `due()` treats an unreadable last run as due
+    immediately either way, and the next run overwrites it -- so this keeps
+    `new_at` without that being a meaningful choice.
+    """
+    def moment(value):
+        try:
+            parsed = datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+
+    old_moment = moment(old_at)
+    new_moment = moment(new_at)
+    if old_moment is None:
+        return new_at
+    if new_moment is None:
+        return old_at
+    return old_at if old_moment > new_moment else new_at
+
+
+def _migrate_renamed_producer_runs(conn):
+    """Carry `producer_run`'s "has this run before" answer across a rename.
+
+    `RENAMED_JOBS` (see `cronicled.config`) already lets a schedule override
+    survive a producer being renamed. It does nothing for this table, keyed
+    on the same producer name, so a rename alone made every renamed producer
+    read back as never-run -- due immediately, on whatever cadence its new
+    appointment names, the moment an upgraded deployment first ticks. This is
+    the other half of that rename: applied here, once, to the stored row
+    itself, rather than translated on every read, for the same reason the
+    schema above is migrated in place rather than re-interpreted each time --
+    a database opened by many entry points (the scheduler, a one-shot scan,
+    a stashbox pass) must agree on one shape without each of them repeating
+    the translation.
+
+    Idempotent by construction: once a producer's row is renamed, no row
+    remains under its old name, so a second call finds nothing to do for it
+    -- exactly how `_add_missing_columns` above is idempotent by checking
+    what is already there rather than by a flag saying it already ran.
+
+    The reachable collision -- a deployment that ran the renamed build, then
+    rolled back to one still writing the old name, then upgraded again -- can
+    leave ONE row under each name. Both are folded into a single row under
+    the current name, keeping whichever `at` is later; see
+    `_later_producer_run` for why that is the later MOMENT and not the row
+    that happened to be read first.
+
+    Only `producer_run` is touched. The separate, bounded run log (`run`,
+    written by `start_run`/`finish_run`) is a record of what a run was CALLED
+    at the time it happened, read only for a person's "what has happened"
+    question (`recent_runs`) -- `cronicled.schedule.due` never reads it, so a
+    stale name there cannot reproduce this incident, and relabelling history
+    to say a past run was always called something it was not would be a
+    different kind of wrong.
+    """
+    for old, current in RENAMED_JOBS.items():
+        old_row = conn.execute(
+            "SELECT at FROM producer_run WHERE producer = ?", (old,)
+        ).fetchone()
+        if old_row is None:
+            continue
+        current_row = conn.execute(
+            "SELECT at FROM producer_run WHERE producer = ?", (current,)
+        ).fetchone()
+        if current_row is None:
+            conn.execute(
+                "UPDATE producer_run SET producer = ? WHERE producer = ?",
+                (current, old))
+            continue
+        winner = _later_producer_run(old_row[0], current_row[0])
+        conn.execute(
+            "DELETE FROM producer_run WHERE producer IN (?, ?)",
+            (old, current))
+        conn.execute(
+            "INSERT INTO producer_run (producer, at) VALUES (?, ?)",
+            (current, winner))
+
 # The shape's version, stamped into the database file itself via SQLite's
 # built-in `PRAGMA user_version` (an integer the engine reserves for
 # application use and never touches itself).
@@ -258,6 +358,14 @@ RUN_HISTORY_LIMIT = 500
 # not the button somebody pressed at noon. A closed set, checked on the way in:
 # see `Store.start_run`.
 RUN_TRIGGERS = ("scheduled", "manual")
+
+# What `Store.close_interrupted_runs` records on a row it closes. Distinct
+# from both `"completed"` and `"failed"`: the run did not succeed and it did
+# not fail, it simply never finished because the process running it stopped
+# existing first. A reader needs to tell that apart from a real failure -- an
+# interrupted pass will be redone on its own next appointment; a failed one
+# may need attention now.
+RUN_OUTCOME_INTERRUPTED = "interrupted"
 
 
 class SchemaVersionError(RuntimeError):
@@ -394,6 +502,10 @@ class Store:
         try:
             self._path = canonical_path
             self._lock = threading.Lock()
+            # Every run id THIS instance's own `start_run` has opened -- see
+            # `close_interrupted_runs`, which must never treat one of these
+            # as a leftover from a dead process no matter when it is called.
+            self._opened_runs = set()
             self._conn = sqlite3.connect(path, check_same_thread=False)
             with self._lock:
                 self._conn.execute("PRAGMA journal_mode=WAL")
@@ -417,6 +529,12 @@ class Store:
                 # column; tables that survived from an earlier open do not,
                 # because `CREATE TABLE IF NOT EXISTS` skipped them whole.
                 _add_missing_columns(self._conn)
+                # Same idempotent-by-construction idiom as the column
+                # addition just above: this checks what `producer_run`
+                # currently holds rather than a flag saying it already ran,
+                # so a database already migrated does one query per renamed
+                # producer and no writes.
+                _migrate_renamed_producer_runs(self._conn)
                 self._conn.commit()
                 if found == 0:
                     # Unstamped — either brand new, or written before this
@@ -1288,7 +1406,8 @@ class Store:
             item["prior_state"] = json.loads(item["prior_state"])
         return item
 
-    def items(self, folder=None, state=None, limit=None, offset=0):
+    def items(self, folder=None, state=None, limit=None, offset=0,
+              subject_types=None):
         """Proposals in the store, as dicts with `payload` (and
         `prior_state`, when present) decoded back into the Python object
         that was originally recorded.
@@ -1298,6 +1417,12 @@ class Store:
         rows are excluded — the inbox stays clean of a reviewer's own
         rejections. Ask for them explicitly with `items(state="dismissed")`
         or `items(state="muted")`.
+
+        `subject_types`, when given, narrows to rows whose `subject_type` is
+        one of the tuple's members — this is how an inbox page (see
+        `cronicled.web.inboxes`) asks for only the subject types it owns.
+        Checked with `is not None`, not truthiness: an empty tuple is a
+        real, distinct request ("select nothing"), not "no filter given".
         """
         query = "SELECT %s FROM item" % self._ITEM_COLUMNS
         clauses = []
@@ -1305,6 +1430,19 @@ class Store:
         if folder is not None:
             clauses.append("folder = ?")
             params.append(folder)
+        if subject_types is not None:
+            # `(subject_placeholders or "NULL")` reads like a typo but is
+            # deliberate: an empty tuple joins to "", which would otherwise
+            # emit `IN ()`. On the SQLite bundled with this project's pinned
+            # interpreter that already matches no row rather than raising,
+            # so this guard is not load-bearing here -- but `IN ()` was a
+            # syntax error on SQLite before 3.31 (2020), and nothing pins
+            # this project to a build newer than that. Kept for that
+            # portability rather than relied on for this one's behaviour.
+            subject_placeholders = ", ".join("?" for _ in subject_types)
+            clauses.append(
+                "subject_type IN (%s)" % (subject_placeholders or "NULL"))
+            params.extend(subject_types)
         if state is not None:
             clauses.append("state = ?")
             params.append(state)
@@ -1324,8 +1462,10 @@ class Store:
             rows = cursor.fetchall()
         return [self._decode_item(columns, row) for row in rows]
 
-    def counts(self, folder=None):
-        """Number of proposals in each state, optionally scoped to a folder.
+    def counts(self, folder=None, subject_types=None):
+        """Number of proposals in each state, optionally scoped to a folder
+        and/or to a tuple of subject types (see `items()`'s `subject_types`
+        for the same `is not None` / empty-tuple reasoning).
 
         Excludes `dismissed` and `muted` rows, same as `items()`'s default —
         a badge counting a reviewer's own rejections as outstanding work
@@ -1337,6 +1477,12 @@ class Store:
         if folder is not None:
             query += " AND folder = ?"
             params.append(folder)
+        if subject_types is not None:
+            # See `items()`'s own `subject_types` clause for why the
+            # `(... or "NULL")` guard is here.
+            subject_placeholders = ", ".join("?" for _ in subject_types)
+            query += " AND subject_type IN (%s)" % (subject_placeholders or "NULL")
+            params.extend(subject_types)
         query += " GROUP BY state"
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
@@ -1469,6 +1615,12 @@ class Store:
                 "VALUES (?, ?, ?, ?)",
                 (run_id, job, trigger, when),
             )
+            # Recorded before the commit even returns to the caller, so a
+            # `close_interrupted_runs` call cannot land in the gap between
+            # this row existing and this instance knowing it opened it -- see
+            # that method for why this is the guard that holds regardless of
+            # when it runs.
+            self._opened_runs.add(run_id)
             self._conn.commit()
         return run_id
 
@@ -1547,6 +1699,73 @@ class Store:
                     (dropped,),
                 )
             self._conn.commit()
+
+    # The other half of the residual `finish_run` documents above: a row left
+    # open by a process that no longer exists is never evicted by retention,
+    # because retention only ever looks at rows that HAVE finished, and
+    # nothing else ever closes one either. Two workers already close the rows
+    # they open on every path -- `JobRunner.start` (a refused start) and
+    # `JobRunner._run`'s own `finally` (a completed or failed one) -- so the
+    # only rows left open when this runs are ones no worker is coming back
+    # for.
+    def close_interrupted_runs(self, *, at=None):
+        """Close every run row still open, except ones THIS instance itself
+        opened, recording `RUN_OUTCOME_INTERRUPTED` rather than a success or
+        a failure.
+
+        Meant to be called exactly ONCE, at process start-up, before this
+        process's own scheduler or job runner opens anything. At that
+        moment every open row already belongs to a process that has stopped
+        existing -- this one has just started and has opened nothing yet --
+        which is a total discriminator: it needs no timestamp, no heartbeat,
+        and no guess about how long a pass may legitimately run. A guess
+        ("open for longer than N minutes is dead") would eventually close a
+        run that is still genuinely working on a slow night, turning a
+        working deployment into one that reports failures; this needs none.
+
+        `id NOT IN (...)` over the ids `start_run` has recorded on THIS
+        instance is a second, independent net, not the primary mechanism:
+        even called at the wrong moment -- after this same `Store` has
+        opened a run of its own -- it will still never close that run,
+        because membership is recorded the instant `start_run` inserts the
+        row, not inferred from when this method happens to run. It does NOT
+        protect a run a DIFFERENT process is genuinely running against the
+        same database concurrently; nothing here can tell that apart from a
+        dead one, which is why this must only ever be wired into the one
+        long-lived process that owns the schedule, and never into a
+        one-shot invocation that might run alongside it.
+
+        The outcome is neither `"completed"` nor `"failed"`: the run did not
+        succeed and did not fail, it simply never finished, and a reader
+        needs to tell that apart from both -- an interrupted pass will be
+        redone; a failed one may need attention.
+
+        Idempotent: a row this call has already closed no longer matches
+        `finished IS NULL`, so calling it again finds nothing left to close.
+
+        Returns how many rows were closed, so a caller can report the
+        number rather than closing them silently -- see `runs_evicted` for
+        the same reasoning applied to what retention drops.
+        """
+        when = at if at is not None else _utcnow()
+        with self._lock:
+            if self._opened_runs:
+                placeholders = ",".join("?" * len(self._opened_runs))
+                params = (when, RUN_OUTCOME_INTERRUPTED, *self._opened_runs)
+                n = self._conn.execute(
+                    "UPDATE run SET finished = ?, outcome = ? "
+                    "WHERE finished IS NULL AND id NOT IN (%s)"
+                    % placeholders,
+                    params,
+                ).rowcount
+            else:
+                n = self._conn.execute(
+                    "UPDATE run SET finished = ?, outcome = ? "
+                    "WHERE finished IS NULL",
+                    (when, RUN_OUTCOME_INTERRUPTED),
+                ).rowcount
+            self._conn.commit()
+        return n
 
     def recent_runs(self, limit=20):
         """The most recent runs, newest first, as a list of dicts.

@@ -977,6 +977,93 @@ class ExamineTest(unittest.TestCase):
             proposal=None, mute_reason=None, error=None,
             reason="ambiguous: 0.955 vs 0.955 are too close to call"))
 
+    def test_two_candidates_agreeing_on_title_within_one_store_is_proposed(self):
+        """The same rule `_choose_winner` applies BETWEEN stores, one level
+        down: two of this store's OWN listings naming the same title --
+        the ordinary shape of a clip a catalogue lists more than once --
+        are corroborating each other, not offering a choice, and this must
+        propose rather than refuse as `test_an_ambiguous_decision_...`
+        above does for two candidates that genuinely differ.
+
+        The whole shape is asserted, not sampled fields: a field-by-field
+        check would not notice the WRONG one being carried.
+        """
+        top = candidate("Morning Ritual Dawn", "alpha-dawn")
+        also = candidate("morning ritual dawn!", "beta-dawn")
+
+        outcome, _ = self.run_examine(
+            "/library/Velvet Crane/Morning Ritual.mp4", results=[top, also])
+
+        self.assertEqual(outcome, Outcome(
+            proposal={
+                "folder": FOLDER,
+                "subject_type": SUBJECT_TYPE,
+                "subject_id": "1",
+                "summary": 'Morning Ritual.mp4 -> "Morning Ritual Dawn" '
+                           'by Velvet Crane (score 0.955)',
+                "confidence": 0.955,
+                "payload": {
+                    "path": "/library/Velvet Crane/Morning Ritual.mp4",
+                    "creator": {"name": "Velvet Crane", "source": "folder",
+                                "competing": None, "rejected_folder": None},
+                    "candidate": top,
+                    "score": 0.955,
+                    "runners_up": [{"candidate": also, "score": 0.955}],
+                },
+            },
+            mute_reason=None, error=None,
+            reason="chosen with score 0.955 (2 listings agreed on this "
+                   "title)"))
+
+    def test_two_agreeing_and_one_differing_within_one_store_is_still_ambiguous(self):
+        """Partial agreement is not agreement, one level down exactly as it
+        is not between stores: two of three tied candidates name one title
+        and the third names another, so there is still a real choice and
+        nothing may be proposed.
+
+        Ordered so the first TWO happen to be the agreeing pair -- a rule
+        that only inspected the top two tied entries, rather than the
+        whole tied set, would see unanimous agreement here and propose.
+        """
+        dawn_a = candidate("Morning Ritual Dawn", "alpha-dawn")
+        dawn_b = candidate("morning ritual dawn!", "beta-dawn")
+        dusk = candidate("Morning Ritual Dusk", "gamma-dusk")
+
+        outcome, _ = self.run_examine(
+            "/library/Velvet Crane/Morning Ritual.mp4",
+            results=[dawn_a, dawn_b, dusk])
+
+        self.assertIsNone(
+            outcome.proposal,
+            "two of three tied candidates agreeing was taken for agreement")
+        self.assertIn("ambiguous", outcome.reason)
+
+    def test_which_candidate_is_carried_within_one_store_ignores_row_order(self):
+        """Re-ordering whatever a store happened to return must not change
+        what a proposal carries. The two listings agree about the title --
+        the thing being decided -- so which one is carried is a
+        preference among equals, not a verdict.
+
+        The fixture is deliberately not symmetric: each listing carries
+        its own URL and its own raw spelling of the title, so getting the
+        same answer after reversing the results is a real observation, not
+        the reversal of two identical things. This is also a regression
+        test for a defect caught while building this fix: comparing the
+        DECENSORED title (the text `score` is handed) rather than the raw
+        one collapses both listings to the identical normalised string,
+        leaving nothing to break the tie with except row position --
+        exactly the dependency this is meant to rule out.
+        """
+        alpha = candidate("Morning Ritual Dawn", "alpha-dawn")
+        beta = candidate("morning ritual dawn!", "beta-dawn")
+
+        for results in ([alpha, beta], [beta, alpha]):
+            outcome, _ = self.run_examine(
+                "/library/Velvet Crane/Morning Ritual.mp4", results=results)
+            payload = outcome.proposal["payload"]
+            self.assertEqual(payload["candidate"], alpha,
+                            [c["title"] for c in results])
+
     def test_nothing_above_the_threshold_yields_no_proposal_and_no_mute(self):
         """The catalogue had candidates and none was good enough. The lever
         that would fix that is the threshold, which is a decision a human

@@ -129,20 +129,29 @@ class Duration(_RunnerCase):
         self.runner.wait(job.id, timeout=5)
 
     def test_a_finished_job_reports_a_sub_second_duration(self):
-        # A real run of this producer completes in well under a second, so
-        # `started_at == finished_at` for it -- the exact case `duration`
-        # exists to cover. Driven with a real clock (not mocked) so the
-        # assertion is about the actual failure mode, not a value we handed
-        # the code back to itself.
-        self.runner.register(_Producer(count=1))
-        job = self.runner.start("test-producer", trigger="manual")
-        self.runner.wait(job.id, timeout=5)
+        # The ordinary case, not an edge case: a job that finishes inside the
+        # second it started, so `started_at == finished_at` -- exactly what
+        # `duration` exists to cover. A real run only produces that
+        # combination when the machine is fast enough to clear both `_now()`
+        # calls inside one wall-clock second, which is not true under load
+        # (this flaked once in a stress run, off by one second). Both clocks
+        # are injected instead, so the scenario holds by construction and the
+        # recorded duration is an exact value, not a threshold a slow run
+        # could trip.
+        with mock.patch("cronicled.jobs._now",
+                         return_value="2026-07-27T00:00:00+00:00"), \
+             mock.patch("cronicled.jobs.time.monotonic",
+                        side_effect=[200.0, 200.4]):
+            self.runner.register(_Producer(count=1))
+            job = self.runner.start("test-producer", trigger="manual")
+            self.runner.wait(job.id, timeout=5)
         done = self.runner.job(job.id)
+        # Confirms the runner stores what `_now()` handed it rather than a
+        # second, independently-timed call to the real wall clock -- a
+        # regression there would break this even with `_now()` pinned.
         self.assertEqual(done.started_at, done.finished_at,
-                         "the fixture is only interesting if this holds")
-        self.assertIsNotNone(done.duration)
-        self.assertGreaterEqual(done.duration, 0.0)
-        self.assertLess(done.duration, 1.0)
+                         "both timestamps come from the same pinned clock")
+        self.assertAlmostEqual(done.duration, 0.4, places=6)
 
     def test_duration_is_measured_from_a_monotonic_clock_not_the_timestamps(self):
         # Pins the mechanism, not just the outcome: two monotonic readings

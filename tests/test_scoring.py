@@ -489,6 +489,40 @@ class Deciding(unittest.TestCase):
         self.assertIsNone(d.match)
         self.assertIn("ambiguous", d.reason)
 
+    def test_two_scores_that_agree_are_still_refused_here(self):
+        """No change needed: `decide` is the one site in this audit where two
+        sources agreeing is not representable, so it cannot be misread.
+
+        What it is handed is a list of `Match` -- a score, a containment flag
+        and a token count -- and nothing saying WHICH candidate a score
+        belongs to. Two equal scores are therefore two candidates that scored
+        alike, which is a real choice, and never one answer named twice. The
+        shape that DID manufacture "ambiguous: X vs X" -- one scene listed
+        twice by two query variants -- is eliminated a layer up, by
+        `cronicled.search`'s dedup, and pinned end to end in
+        tests/test_search.py.
+
+        Loosening this to take a tie because "they agree" would be reading
+        equality of the SCORE as equality of the ANSWER, and the test below
+        shows those are different things.
+        """
+        d = decide([self._m(0.9), self._m(0.9)])
+
+        self.assertIsNone(d.match)
+        self.assertIn("ambiguous", d.reason)
+
+    def test_two_different_titles_can_produce_the_very_same_match(self):
+        # The evidence for the verdict above, rather than an assertion about
+        # `Match`'s field list: two visibly different titles -- not one title
+        # twice -- score to an identical `Match`. Whatever `decide` did with a
+        # tie it would be doing to these as much as to a duplicate, so a tie
+        # cannot be read as corroboration at this layer.
+        a = score("Morning Ritual.mp4", "", "Morning Ritual At Dawn")
+        b = score("Morning Ritual.mp4", "", "At Dawn Morning Ritual")
+
+        self.assertNotEqual("Morning Ritual At Dawn", "At Dawn Morning Ritual")
+        self.assertEqual(a, b)
+
     def test_two_contained_candidates_are_ambiguous(self):
         # both floor at 0.9, so this tie is a normal outcome, not a rarity
         d = decide([self._m(0.9, contained=True), self._m(0.9, contained=True)])
@@ -751,3 +785,108 @@ class TheDefaultThresholdIsTheMeasuredOne(unittest.TestCase):
         m = Match(value=0.65, contained=False, meaningful_count=2)
         self.assertIsNone(decide([m]).match)
         self.assertIsNotNone(decide([m], threshold=0.5).match)
+
+
+class WithinStoreAgreement(unittest.TestCase):
+    """Two candidates from ONE store, tied within `AMBIGUITY_MARGIN`, are
+    the same shape `scan._choose_winner` already resolves between stores:
+    agreement on the title is corroboration, not a dilemma. This is that
+    same rule applied one level down, inside `decide` itself, and every
+    test here has a sibling in `test_scan.py`'s cross-store suite -- see
+    that one for the wording this mirrors.
+    """
+
+    def _m(self, value, contained=False, meaningful_count=2):
+        return Match(value=value, contained=contained,
+                     meaningful_count=meaningful_count)
+
+    def test_two_candidates_agreeing_on_title_are_proposed(self):
+        d = decide([self._m(0.9), self._m(0.9)],
+                  titles=["Morning Ritual", "morning ritual"])
+        self.assertIsNotNone(
+            d.match, "two listings naming the same title were refused "
+                     "as a dilemma")
+
+    def test_two_candidates_naming_different_titles_still_refuse(self):
+        # Mutating the agreement check so everything counts as agreement
+        # (e.g. `len(normalized) != 1` inverted, or dropped) must fail this.
+        d = decide([self._m(0.9), self._m(0.9)],
+                  titles=["Morning Ritual Dawn", "Morning Ritual Dusk"])
+        self.assertIsNone(d.match)
+        self.assertIn("ambiguous", d.reason)
+
+    def test_two_agreeing_and_one_differing_is_still_an_ambiguity(self):
+        # A two-candidate fixture cannot tell "all agree" from "any two
+        # agree" -- this needs a third, tied, candidate that names a
+        # different title, positioned so that a rule which only looked at
+        # the FIRST two tied entries (rather than the whole tied set) would
+        # wrongly see unanimous agreement and propose.
+        d = decide(
+            [self._m(0.9), self._m(0.9), self._m(0.9)],
+            titles=["Morning Ritual Dawn", "morning ritual dawn",
+                    "Morning Ritual Dusk"])
+        self.assertIsNone(
+            d.match,
+            "two of three tied candidates agreeing was taken for agreement")
+        self.assertIn("ambiguous", d.reason)
+
+    def test_titles_differing_only_in_case_or_punctuation_still_agree(self):
+        # Mutating the comparison to raw string equality (dropping
+        # `normalize`) must fail this: these two are the same title spelled
+        # two ways, not two titles.
+        d = decide([self._m(0.9), self._m(0.9)],
+                  titles=["Morning Ritual, Dawn!", "morning ritual dawn"])
+        self.assertIsNotNone(d.match)
+
+    def test_a_single_candidate_above_threshold_is_unaffected(self):
+        # No tie exists at all here, so titles have nothing to say -- the
+        # ordinary, by-far-most-common case must behave exactly as before
+        # this rule existed.
+        d = decide([self._m(0.9)], titles=["Morning Ritual"])
+        self.assertIsNotNone(d.match)
+        self.assertEqual(d.index, 0)
+
+    def test_without_titles_a_tie_still_refuses(self):
+        # `titles=None`, the default, means agreement can never be
+        # established -- uncertainty may withhold evidence, never supply
+        # it -- so every caller that has not been updated to pass titles
+        # keeps the historical refuse-on-tie behaviour rather than a
+        # silent, unintended change in what it does.
+        d = decide([self._m(0.9), self._m(0.9)])
+        self.assertIsNone(d.match)
+        self.assertIn("ambiguous", d.reason)
+
+    def test_the_agreement_reason_names_how_many_listings_agreed(self):
+        d = decide([self._m(0.9), self._m(0.9), self._m(0.9)],
+                  titles=["Morning Ritual", "Morning Ritual", "morning ritual"])
+        self.assertIn("3", d.reason)
+        self.assertIn("agreed", d.reason)
+
+    def test_which_agreeing_candidate_is_carried_ignores_row_order(self):
+        # The fixture is deliberately not symmetric: the two raw titles
+        # differ by more than case or a trailing space, so getting the same
+        # answer after reversing the list is a real observation, not the
+        # reversal of two identical things (a palindrome reversed is a
+        # no-op, and would prove nothing about order-independence).
+        first = ("Morning Ritual Dawn", self._m(0.9))
+        second = ("morning ritual dawn!!", self._m(0.9))
+
+        def decide_in(order):
+            pool = {"first": first, "second": second}
+            chosen = [pool[name] for name in order]
+            titles = [title for title, _ in chosen]
+            matches = [match for _, match in chosen]
+            return titles, decide(matches, titles=titles)
+
+        for order in (("first", "second"), ("second", "first")):
+            titles, d = decide_in(order)
+            self.assertEqual(titles[d.index], "Morning Ritual Dawn", order)
+
+    def test_agreement_still_reports_the_contenders_and_interrogation(self):
+        # An agreed proposal is still a Decision like any other -- the
+        # fields a caller reads to distinguish an absence claim from a real
+        # choice must not go missing just because this path is new.
+        d = decide([self._m(0.9), self._m(0.9)],
+                  titles=["Morning Ritual", "morning ritual"])
+        self.assertEqual(d.contenders, 2)
+        self.assertTrue(d.interrogated)
