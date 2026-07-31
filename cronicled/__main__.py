@@ -46,8 +46,7 @@ import argparse
 import os
 from datetime import time
 
-from . import (descriptions, performer_tags, scan, tag_descriptions,
-               tag_hygiene, tags)
+from . import performer_tags, tag_hygiene, tags
 from .adapters.registry import default_adapters_path, load_adapters
 from .config import (CONFIG_DIR_ENV_VAR, ZONE_ENV_VAR, config_dir,
                      default_server_path, load_marker_tag, load_schedule,
@@ -59,6 +58,7 @@ from .schedule import Scheduler, check_zone
 from .store import GONE, RUN_HISTORY_LIMIT, Store
 from .stash import Stash
 from .tags import TagMergeProducer
+from .web import inboxes
 from .web.actions import Actions
 from .web.app import DEFAULT_HOST, DEFAULT_PORT, serve
 from .web.rows import (to_merge_rows, to_mute_rows, to_reconcile_rows,
@@ -81,22 +81,30 @@ _OWN_SECTION_SUBJECTS = (tags.SUBJECT_TYPE, performer_tags.SUBJECT_TYPE,
 # tag, a performer -- and not in terms of which pass proposed it, so the four
 # tag-shaped producers are one number.
 #
+# Derived from `web.inboxes.INBOXES` rather than declared a second time here.
+# The two used to be independent, exhaustive maps over the same six subject
+# types -- this one, and the inbox each subject type's page belongs to -- and
+# two maps over one set of values drift silently: the summary would count one
+# grouping while the sidebar and routes used another, with nothing to say so.
+# `INBOXES` is the survivor because its own totality is enforced (see
+# `inboxes.check_total` and `tests/test_inboxes.py`); this reads it rather
+# than re-declaring it, so the two cannot disagree again.
+#
 # EVERY subject type this package declares must appear here, and
 # `tests/test_main.py::test_every_subject_type_this_package_declares_has_a_heading`
 # discovers them by import rather than by list, so a seventh added later fails
-# the suite instead of arriving on the page under a heading nobody designed.
+# the suite instead of arriving on the page under a heading nobody designed --
+# kept even though `INBOXES`'s own exhaustiveness test now covers the same
+# ground independently, because the two catch a regression in different
+# places (a heading and a page) and neither implies the other stays wired.
 # That check is where the coverage rule lives; `waiting_counts` itself still
 # falls back rather than raising, for the reason stated in its docstring.
 #
 # Ordered, and rendered in this order, because a list that reorders itself as
 # the counts change is one a reader has to re-find their place in every time
-# they look.
-WAITING_SECTIONS = (
-    ("scenes", (scan.SUBJECT_TYPE,)),
-    ("tags", (tags.SUBJECT_TYPE, tag_descriptions.SUBJECT_TYPE,
-              performer_tags.SUBJECT_TYPE, tag_hygiene.SUBJECT_TYPE)),
-    ("performers", (descriptions.SUBJECT_TYPE,)),
-)
+# they look. `INBOXES` is itself ordered scenes/tags/performers (see its own
+# module), so this preserves the order rather than choosing one.
+WAITING_SECTIONS = tuple(inboxes.INBOXES.items())
 
 # How much of the run log the summary reads to find each job's last run.
 # `recent_runs`'s own default is twenty, which is the wrong bound for this
@@ -665,6 +673,13 @@ def main(argv=None):
                   waiting_counts(store.items()),
                   None if scheduler is None else scheduler.status(),
                   zone=zone),
+              # The per-inbox routes (`/{inbox}`, `/{inbox}/{state}`) narrow
+              # by subject type through `Store.items(subject_types=)`
+              # directly -- see `web.app._serve_inbox_route` -- so they need
+              # the store and the same `base_url` every other row's link is
+              # built from, not a pre-built callable the way every section
+              # above is wired.
+              store=store, base_url=base_url,
               host=args.host, port=args.port)
     finally:
         # In a `finally`, so a `serve` that raises still stops the loop

@@ -1,0 +1,42 @@
+{# cronicled/web/templates/_sidebar.html #}
+{#
+  The persistent navigation: one entry per inbox, every time, on every page
+  this server serves -- so getting from a per-inbox page back to the summary,
+  or across to a different inbox, never depends on the browser's Back button.
+
+  `sidebar` is built once, in `web.app._sidebar_context`, and handed to every
+  `render()` call alongside whatever else that page needs; this partial does
+  no counting or filtering of its own. It is `None` -- not an empty list --
+  when no store is wired, and this include renders nothing at all in that
+  case: a link into `/{inbox}` that a store-less install could not answer
+  would be worse than no navigation there (see `_sidebar_context`'s own
+  docstring).
+
+  Each entry's count is deliberately the number `/{name}` itself will show,
+  not the number every producer for that inbox has ever proposed -- see
+  `_sidebar_context` for why those two differ for the tags inbox today, and
+  the note on the Tags page itself for where the rest of that work still is.
+
+  A nested state link (`Applied`, `Dismissed`, `Muted`) appears only when
+  that inbox actually has something in it -- a link that always leads to an
+  empty page teaches a reader to stop trusting this list.
+#}
+{% if sidebar %}
+<nav class="sidebar">
+  <ul>
+    {% for entry in sidebar %}
+    <li>
+      <a href="/{{ entry.name }}">{{ entry.title }}</a>
+      <span class="count">{{ entry.count }}</span>
+      {% if entry.states %}
+      <ul class="nested">
+        {% for state in entry.states %}
+        <li><a href="/{{ entry.name }}/{{ state }}">{{ state | capitalize }}</a></li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+</nav>
+{% endif %}

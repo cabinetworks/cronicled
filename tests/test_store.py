@@ -2385,3 +2385,78 @@ class UnmuteBringsTheRowBack(unittest.TestCase):
         self.store.mute("scene", "9")
         self.store.unmute("scene", "9")
         self.assertEqual(len(self.store.items()), 0)
+
+
+class SubjectTypeFiltering(_StoreCase):
+    """`items()` and `counts()` narrowing to a caller-given tuple of subject
+    types -- how an inbox page (see `cronicled.web.inboxes`) asks the store
+    for only the rows it owns, instead of every subject type in the
+    database.
+    """
+
+    def _tag(self, subject_id):
+        return self.store.record(folder="tag-matches", subject_type="tag",
+                                 subject_id=subject_id, summary="a tag",
+                                 payload={"key": "kettle"}, producer="tags")
+
+    def _cluster(self, subject_id):
+        return self.store.record(folder="tag-matches",
+                                 subject_type="tag-cluster",
+                                 subject_id=subject_id, summary="a cluster",
+                                 payload={"key": "kettle"}, producer="tags")
+
+    def test_items_filters_to_the_given_subject_types(self):
+        self._tag("t1")
+        self._cluster("c1")
+        self._record(subject_id="s1")  # subject_type="scene"
+        got = {(i["subject_type"], i["subject_id"])
+               for i in self.store.items(subject_types=("tag", "tag-cluster"))}
+        self.assertEqual(got, {("tag", "t1"), ("tag-cluster", "c1")})
+
+    def test_items_with_no_subject_types_is_unchanged(self):
+        # The existing callers pass nothing and must keep seeing everything.
+        self._tag("t1")
+        self._record(subject_id="s1")
+        self.assertEqual(len(self.store.items()), 2)
+
+    def test_an_empty_subject_type_tuple_selects_nothing_in_items(self):
+        # An empty tuple is a real, distinct request -- "select nothing" --
+        # not "no filter given". Falling through to truthiness here would
+        # make an inbox with no subject types (a bug elsewhere) silently see
+        # every row instead of none.
+        self._tag("t1")
+        self.assertEqual(self.store.items(subject_types=()), [])
+
+    def test_counts_filters_to_the_given_subject_types(self):
+        self._tag("t1")
+        self._record(subject_id="s1")  # subject_type="scene"
+        self.assertEqual(self.store.counts(subject_types=("tag",)),
+                         {"new": 1})
+
+    def test_counts_with_no_subject_types_is_unchanged(self):
+        self._tag("t1")
+        self._record(subject_id="s1")
+        self.assertEqual(self.store.counts(), {"new": 2})
+
+    def test_an_empty_subject_type_tuple_selects_nothing_in_counts(self):
+        self._tag("t1")
+        self.assertEqual(self.store.counts(subject_types=()), {})
+
+    def test_subject_type_filter_combines_with_folder(self):
+        # Both narrowings apply at once, not one silently overriding the
+        # other. A scene sharing the tag's own folder makes the folder
+        # filter alone insufficient to produce the expected set, so this
+        # can only pass if the subject_type filter is doing real work too --
+        # a fixture where the folder filter alone gave the same answer would
+        # let a dropped subject_type clause hide behind it.
+        self._tag("t1")
+        self.store.record(folder="tag-matches", subject_type="scene",
+                          subject_id="s-same-folder", summary="a scene",
+                          payload={"title": "invented placeholder title"},
+                          producer="scan")
+        self.store.record(folder="scene-matches", subject_type="tag",
+                          subject_id="t2", summary="a tag",
+                          payload={"key": "other"}, producer="tags")
+        got = {i["subject_id"] for i in
+               self.store.items(folder="tag-matches", subject_types=("tag",))}
+        self.assertEqual(got, {"t1"})

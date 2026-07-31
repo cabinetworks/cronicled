@@ -756,5 +756,435 @@ class TheScanControlOnItsNewPageStillRefusesCrossOrigin(unittest.TestCase):
         self.assertEqual(sent["actions"].calls, [("scan", 25)])
 
 
+class _FakeStore:
+    """A minimal stand-in for `Store.items`, filtering an in-memory list the
+    same way the real one filters SQL rows: `subject_types` is checked with
+    `is not None`, never truthiness (an empty tuple is a real "select
+    nothing", not "no filter given"), and a `state=None` call excludes the
+    same four states `Store._HIDDEN_STATES` names -- everything else asks
+    for exactly one state.
+    """
+
+    _HIDDEN_STATES = ("dismissed", "muted", "superseded", "gone")
+
+    def __init__(self, items):
+        self._items = items
+
+    def items(self, folder=None, state=None, limit=None, offset=0,
+             subject_types=None):
+        result = self._items
+        if subject_types is not None:
+            result = [i for i in result if i["subject_type"] in subject_types]
+        if state is not None:
+            result = [i for i in result if i["state"] == state]
+        else:
+            result = [i for i in result
+                     if i["state"] not in self._HIDDEN_STATES]
+        return result
+
+    def counts(self, folder=None, subject_types=None):
+        """Mirrors `Store.counts`: grouped by state, the same
+        `_HIDDEN_STATES` excluded regardless of what is asked for -- there is
+        no `state=` argument here to ask for one of those explicitly, unlike
+        `items()` above, because the real method has none either."""
+        result = self._items
+        if subject_types is not None:
+            result = [i for i in result if i["subject_type"] in subject_types]
+        result = [i for i in result if i["state"] not in self._HIDDEN_STATES]
+        counts = {}
+        for i in result:
+            counts[i["state"]] = counts.get(i["state"], 0) + 1
+        return counts
+
+
+# Three invented fixtures, one per inbox, each carrying its own fingerprint
+# inside a field its own row builder actually renders -- a scene's filename,
+# a tag description's name, a performer description's name -- so a test can
+# tell whether ITS row reached the page without depending on the fingerprint
+# appearing anywhere in the markup (it does not, in the Muted section: see
+# `web/templates/inbox.html`'s Unmute form, which posts `subject_type`/
+# `subject_id` and never `fp`).
+
+def _scene_item(fp, state="new"):
+    return {
+        "fingerprint": fp, "state": state, "subject_type": "scene",
+        "subject_id": "scene-%s" % fp,
+        "payload": {
+            "path": "/invented/library/%s.mp4" % fp,
+            "identified_by": "invented-box", "box": "invented-box",
+            "candidate": {"title": "An Invented Title", "image": None,
+                          "performers": [], "studio": None},
+        },
+    }
+
+
+def _tag_item(fp, state="new"):
+    return {
+        "fingerprint": fp, "state": state, "subject_type": "tag",
+        "subject_id": "tag-%s" % fp,
+        "payload": {
+            "name": "%s-invented-tag" % fp, "source_box": "invented-box",
+            "original": "", "description": "an invented description",
+        },
+    }
+
+
+def _performer_item(fp, state="new"):
+    return {
+        "fingerprint": fp, "state": state, "subject_type": "performer",
+        "subject_id": "performer-%s" % fp,
+        "payload": {
+            "name": "%s Invented Performer" % fp, "faults": ("markup",),
+            "original": "<b>before</b>", "cleaned": "before",
+        },
+    }
+
+
+class EachInboxRouteServesOnlyItsOwnSubjectTypes(unittest.TestCase):
+    """`/scenes`, `/tags` and `/performers` -- narrowed by `inboxes.INBOXES`
+    through `Store.items(subject_types=)`, reusing `to_rows` unchanged."""
+
+    def test_each_inbox_route_serves_only_its_own_subject_types(self):
+        store = _FakeStore([_scene_item("s1"), _tag_item("t1")])
+        scenes = _drive("GET", "/scenes", store=store)
+        tags = _drive("GET", "/tags", store=store)
+        self.assertEqual(scenes["status"], 200)
+        self.assertIn(b"s1", scenes["body"])
+        self.assertNotIn(b"t1", scenes["body"])
+        self.assertEqual(tags["status"], 200)
+        self.assertIn(b"t1", tags["body"])
+        self.assertNotIn(b"s1", tags["body"])
+
+    def test_the_performers_inbox_is_served_too(self):
+        store = _FakeStore([_performer_item("p1"), _scene_item("s1")])
+        sent = _drive("GET", "/performers", store=store)
+        self.assertEqual(sent["status"], 200)
+        self.assertIn(b"p1", sent["body"])
+        self.assertNotIn(b"s1", sent["body"])
+
+    def test_each_inbox_shows_its_own_title(self):
+        store = _FakeStore([])
+        for name, title in (("scenes", "Scenes"), ("tags", "Tags"),
+                            ("performers", "Performers")):
+            with self.subTest(name):
+                sent = _drive("GET", "/" + name, store=store)
+                self.assertIn(("<h1>%s</h1>" % title).encode(), sent["body"])
+
+    def test_a_tag_cluster_candidate_does_not_reach_the_tags_page_yet(self):
+        # `to_rows` cannot build a row for a merge candidate (it dispatches
+        # only on the description/tag-description subject types and treats
+        # everything else as scene-shaped -- see `web.app._NO_ROW_BUILDER`),
+        # so it is excluded from what `/tags` asks the store for at all,
+        # rather than reaching `to_rows` and raising `KeyError` on
+        # `payload["path"]`.
+        store = _FakeStore([_tag_item("t1"),
+                            {"fingerprint": "cluster-1", "state": "new",
+                             "subject_type": "tag-cluster",
+                             "subject_id": "1", "payload": {}}])
+        sent = _drive("GET", "/tags", store=store)
+        self.assertEqual(sent["status"], 200)
+        self.assertIn(b"t1", sent["body"])
+        self.assertNotIn(b"cluster-1", sent["body"])
+
+
+class UnknownInboxesAndStatesAre404(unittest.TestCase):
+    def test_an_unknown_inbox_is_404_not_an_empty_page(self):
+        # A typo that rendered an empty page would read as "nothing to
+        # review", the same silent-wrong-answer failure this project refuses
+        # elsewhere.
+        sent = _drive("GET", "/scene", store=_FakeStore([]))  # singular typo
+        self.assertEqual(sent["status"], 404)
+
+    def test_an_unknown_state_is_404_not_an_empty_page(self):
+        sent = _drive("GET", "/scenes/pending", store=_FakeStore([]))
+        self.assertEqual(sent["status"], 404)
+
+    def test_refused_is_404_not_an_empty_page(self):
+        # `refused` is not a state an `item` row ever carries (see
+        # `Store._HIDDEN_STATES` and `items()`'s own docstring) -- it lives in
+        # a wholly separate `refusal` table, keyed by subject, and
+        # `Store.refusals()` takes no `subject_types` argument to narrow it
+        # by. There is no honest way to serve it through
+        # `Store.items(subject_types=)`, the one interface these routes
+        # consume, so it 404s rather than rendering an empty page that would
+        # read as "nothing refused" for an inbox that may have plenty.
+        sent = _drive("GET", "/scenes/refused", store=_FakeStore([]))
+        self.assertEqual(sent["status"], 404)
+
+    def test_a_third_path_segment_is_404(self):
+        sent = _drive("GET", "/scenes/applied/extra", store=_FakeStore([]))
+        self.assertEqual(sent["status"], 404)
+
+    def test_with_no_store_wired_a_per_inbox_route_is_404_not_a_crash(self):
+        # Every existing test's double supplies no store at all -- a
+        # per-inbox route with nothing to ask 404s rather than raising
+        # `AttributeError` on `None.items`.
+        sent = _drive("GET", "/scenes")
+        self.assertEqual(sent["status"], 404)
+
+
+class TheNewRoutesDoNotAcceptPosts(unittest.TestCase):
+    def test_the_new_routes_do_not_accept_posts(self):
+        sent = _drive("POST", "/scenes", b"", store=_FakeStore([]))
+        self.assertEqual(sent["status"], 404)
+
+    def test_a_terminal_state_route_does_not_accept_posts_either(self):
+        sent = _drive("POST", "/scenes/applied", b"", store=_FakeStore([]))
+        self.assertEqual(sent["status"], 404)
+
+
+class TerminalStatePagesShowOnlyTheirOwnState(unittest.TestCase):
+    """`/{inbox}/{state}` for `applied`, `dismissed` and `muted`."""
+
+    def test_an_applied_row_does_not_reach_the_working_queue_page(self):
+        # `items()`'s own default excludes dismissed/muted/superseded/gone
+        # but NOT applied (see `Store._HIDDEN_STATES`) -- an applied
+        # proposal is a decision already made, and the working queue must
+        # still filter it out itself, the same way
+        # `cronicled.__main__._inbox_rows` does for the combined inbox.
+        store = _FakeStore([_scene_item("open-1", state="new"),
+                            _scene_item("closed-1", state="applied")])
+        sent = _drive("GET", "/scenes", store=store)
+        self.assertIn(b"open-1", sent["body"])
+        self.assertNotIn(b"closed-1", sent["body"])
+
+    def test_the_applied_state_page_shows_only_applied_rows(self):
+        store = _FakeStore([_scene_item("open-1", state="new"),
+                            _scene_item("closed-1", state="applied")])
+        sent = _drive("GET", "/scenes/applied", store=store)
+        self.assertIn(b"closed-1", sent["body"])
+        self.assertNotIn(b"open-1", sent["body"])
+
+    def test_the_dismissed_state_page_shows_only_dismissed_rows(self):
+        store = _FakeStore([_scene_item("open-1", state="new"),
+                            _scene_item("hidden-1", state="dismissed")])
+        sent = _drive("GET", "/scenes/dismissed", store=store)
+        self.assertIn(b"hidden-1", sent["body"])
+        self.assertNotIn(b"open-1", sent["body"])
+
+    def test_the_muted_state_page_shows_only_muted_rows_and_offers_unmute(self):
+        store = _FakeStore([_scene_item("open-1", state="new"),
+                            _scene_item("hidden-1", state="muted")])
+        sent = _drive("GET", "/scenes/muted", store=store)
+        body = sent["body"].decode()
+        self.assertIn("hidden-1", body)
+        self.assertNotIn("open-1", body)
+        self.assertIn('action="/unmute"', body)
+        # Not just THAT an Unmute control is offered -- it has to post the
+        # RIGHT subject. `Row` carries no `subject_type`/`subject_id` of its
+        # own (see `_inbox_page`'s own comment on the `muted` branch), so
+        # this is the one guard against those two being read from the wrong
+        # place, or not at all.
+        self.assertIn('name="subject_type" value="scene"', body)
+        self.assertIn('name="subject_id" value="scene-hidden-1"', body)
+
+
+def _cluster_item(fp, state="new"):
+    """A tag-cluster (merge) candidate -- one of the three subject types
+    `_NO_ROW_BUILDER` names. `to_rows` cannot build a row for it (see that
+    constant's own comment), and it is never asked for by `/tags` at all, so
+    only its `subject_type`/`state` matter here -- never rendered, only
+    counted or excluded from a count."""
+    return {"fingerprint": fp, "state": state, "subject_type": "tag-cluster",
+            "subject_id": "cluster-%s" % fp, "payload": {}}
+
+
+class _StoreWithDetachedCounts:
+    """A store double whose `.counts()` answers from a number handed to it
+    directly, wholly independent of what `.items()` would return for the same
+    request -- so a sidebar built from `store.counts()` and one built by
+    counting `items()` (paginated or not) give two DIFFERENT, distinguishable
+    answers. `.items()` still filters for real, the same way `_FakeStore`
+    does, so the page beneath the sidebar renders its own true (small) set of
+    rows while the sidebar is handed a larger, invented total -- the shape a
+    real paginated page would have, without this project's `Store` actually
+    supporting pagination on this route yet.
+    """
+
+    _HIDDEN_STATES = ("dismissed", "muted", "superseded", "gone")
+
+    def __init__(self, items, waiting_count):
+        self._items = items
+        self._waiting_count = waiting_count
+
+    def items(self, folder=None, state=None, limit=None, offset=0,
+             subject_types=None):
+        result = self._items
+        if subject_types is not None:
+            result = [i for i in result if i["subject_type"] in subject_types]
+        if state is not None:
+            result = [i for i in result if i["state"] == state]
+        else:
+            result = [i for i in result
+                     if i["state"] not in self._HIDDEN_STATES]
+        return result
+
+    def counts(self, folder=None, subject_types=None):
+        return {"new": self._waiting_count}
+
+
+class TheSidebarCountsComeFromTheStore(unittest.TestCase):
+    """The number beside each inbox's link is `store.counts()`, not a count
+    of whatever `to_rows` happened to build for the page underneath it --
+    the gap between the two is invisible until a page is paginated, which is
+    exactly why it has to be pinned here rather than trusted by inspection.
+    """
+
+    def test_the_count_is_read_from_the_store_not_from_rendered_rows(self):
+        # One actual row on the page; the store reports three waiting. A
+        # sidebar built from `len(rendered rows)` would say 1.
+        store = _StoreWithDetachedCounts([_tag_item("t1")], waiting_count=3)
+        body = _drive("GET", "/tags", store=store)["body"].decode()
+        self.assertIn(">3<", body)
+        self.assertNotIn(">1<", body)
+
+    def test_the_same_store_derived_count_appears_on_the_summary_page(self):
+        # The sidebar is the same partial everywhere -- the summary page's
+        # copy must not silently fall back to a different (rendering-based)
+        # source just because there is no page of rows underneath it there.
+        store = _StoreWithDetachedCounts([_tag_item("t1")], waiting_count=3)
+        body = _drive("GET", "/", store=store)["body"].decode()
+        self.assertIn(">3<", body)
+
+
+class TheSidebarCountsExcludeWhatThePageCannotRender(unittest.TestCase):
+    """The tags inbox spans four subject types, but `/tags` can only build a
+    row for one of them -- the other three have no row builder at all (see
+    `web.app._NO_ROW_BUILDER`) and are excluded from what `/tags` even asks
+    the store for. Counting the full four here would put a bigger number on
+    this link than the page behind it can ever show.
+    """
+
+    def test_a_tag_cluster_candidate_does_not_inflate_the_tags_count(self):
+        store = _FakeStore([_tag_item("t1"), _tag_item("t2"),
+                            _cluster_item("c1"), _cluster_item("c2"),
+                            _cluster_item("c3")])
+        body = _drive("GET", "/", store=store)["body"].decode()
+        self.assertIn(">2<", body)
+        self.assertNotIn(">5<", body)
+
+    def test_the_tags_page_names_the_boundary(self):
+        # Cheap over the alternative (composing the merge/reconcile/hygiene
+        # sections onto every per-inbox page): the reader is told where the
+        # rest of the tag work is rather than the count and the rows simply
+        # disagreeing with nothing said about why.
+        store = _FakeStore([_tag_item("t1"), _cluster_item("c1")])
+        tags_body = _drive("GET", "/tags", store=store)["body"].decode()
+        scenes_body = _drive("GET", "/scenes", store=store)["body"].decode()
+        self.assertIn("combined", tags_body)
+        self.assertIn("Inbox", tags_body)
+        self.assertNotIn("combined", scenes_body)
+
+    def test_the_tags_page_does_not_render_the_sections_it_did_not_query(self):
+        # Checked against the SECTION heading the `section` macro actually
+        # emits (`Tag merges (`), not the bare phrase "Tag merges" -- the
+        # boundary note added above also uses that phrase in prose, and a
+        # looser check would pass whether or not the section itself rendered.
+        store = _FakeStore([_tag_item("t1"), _cluster_item("c1")])
+        body = _drive("GET", "/tags", store=store)["body"].decode()
+        self.assertNotIn("Tag merges (", body)
+
+
+class TheSidebarCountExcludesApplied(unittest.TestCase):
+    """An applied proposal is a decision already made -- `/tags` itself drops
+    it from the working queue (see `_inbox_page`), and the count beside the
+    link has to agree with that, not with every non-hidden row regardless of
+    state."""
+
+    def test_an_applied_row_is_not_counted_as_waiting(self):
+        store = _FakeStore([_tag_item("t1", state="new"),
+                            _tag_item("t2", state="applied")])
+        body = _drive("GET", "/", store=store)["body"].decode()
+        self.assertIn(">1<", body)
+        self.assertNotIn(">2<", body)
+
+
+class ASidebarNestedStateAppearsOnlyWhenThatInboxHasIt(unittest.TestCase):
+    """`Applied`, `Dismissed` and `Muted` are each a real link only for an
+    inbox that actually has something in that state -- a fixture where every
+    inbox carries the same states could not tell "shown because present"
+    from "shown regardless", so each inbox below is given a DIFFERENT one.
+    """
+
+    def _store(self):
+        return _FakeStore([
+            _scene_item("s-open", state="new"),
+            _scene_item("s-applied", state="applied"),
+            _tag_item("t-open", state="new"),
+            _tag_item("t-dismissed", state="dismissed"),
+            _performer_item("p-open", state="new"),
+            _performer_item("p-muted", state="muted"),
+        ])
+
+    def test_the_inbox_with_an_applied_row_links_to_it(self):
+        body = _drive("GET", "/", store=self._store())["body"].decode()
+        self.assertIn('href="/scenes/applied"', body)
+
+    def test_an_inbox_with_no_applied_row_does_not_link_to_it(self):
+        body = _drive("GET", "/", store=self._store())["body"].decode()
+        self.assertNotIn('href="/tags/applied"', body)
+        self.assertNotIn('href="/performers/applied"', body)
+
+    def test_the_inbox_with_a_dismissed_row_links_to_it(self):
+        body = _drive("GET", "/", store=self._store())["body"].decode()
+        self.assertIn('href="/tags/dismissed"', body)
+
+    def test_an_inbox_with_no_dismissed_row_does_not_link_to_it(self):
+        body = _drive("GET", "/", store=self._store())["body"].decode()
+        self.assertNotIn('href="/scenes/dismissed"', body)
+        self.assertNotIn('href="/performers/dismissed"', body)
+
+    def test_the_inbox_with_a_muted_row_links_to_it(self):
+        body = _drive("GET", "/", store=self._store())["body"].decode()
+        self.assertIn('href="/performers/muted"', body)
+
+    def test_an_inbox_with_no_muted_row_does_not_link_to_it(self):
+        body = _drive("GET", "/", store=self._store())["body"].decode()
+        self.assertNotIn('href="/scenes/muted"', body)
+        self.assertNotIn('href="/tags/muted"', body)
+
+
+class TheSidebarAppearsOnEveryPage(unittest.TestCase):
+    """Cross-navigation is the point: a per-inbox page has to lead somewhere
+    other than itself, and so does the summary."""
+
+    def test_the_summary_page_links_to_each_inbox(self):
+        store = _FakeStore([_tag_item("t1")])
+        body = _drive("GET", "/", store=store)["body"].decode()
+        self.assertIn('href="/scenes"', body)
+        self.assertIn('href="/tags"', body)
+        self.assertIn('href="/performers"', body)
+
+    def test_the_combined_inbox_page_links_to_each_inbox(self):
+        store = _FakeStore([_tag_item("t1")])
+        body = _drive("GET", "/inbox", store=store)["body"].decode()
+        self.assertIn('href="/scenes"', body)
+        self.assertIn('href="/tags"', body)
+        self.assertIn('href="/performers"', body)
+
+    def test_a_per_inbox_page_links_back_to_the_other_inboxes(self):
+        store = _FakeStore([_tag_item("t1")])
+        body = _drive("GET", "/tags", store=store)["body"].decode()
+        self.assertIn('href="/scenes"', body)
+        self.assertIn('href="/performers"', body)
+
+
+class TheSidebarIsAbsentWithoutAStore(unittest.TestCase):
+    """No store means `/{inbox}` itself 404s (see
+    `test_with_no_store_wired_a_per_inbox_route_is_404_not_a_crash`) -- a
+    sidebar offering a link into a page that cannot answer would be worse
+    than no navigation there, so it is not offered at all."""
+
+    def test_the_summary_page_offers_no_inbox_links_without_a_store(self):
+        body = _drive("GET", "/")["body"].decode()
+        self.assertNotIn('href="/tags"', body)
+        self.assertNotIn('href="/scenes"', body)
+        self.assertNotIn('href="/performers"', body)
+
+    def test_the_combined_inbox_page_offers_no_inbox_links_without_a_store(self):
+        body = _drive("GET", "/inbox")["body"].decode()
+        self.assertNotIn('href="/tags"', body)
+
+
 if __name__ == "__main__":
     unittest.main()

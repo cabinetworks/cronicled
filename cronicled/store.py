@@ -1394,7 +1394,8 @@ class Store:
             item["prior_state"] = json.loads(item["prior_state"])
         return item
 
-    def items(self, folder=None, state=None, limit=None, offset=0):
+    def items(self, folder=None, state=None, limit=None, offset=0,
+              subject_types=None):
         """Proposals in the store, as dicts with `payload` (and
         `prior_state`, when present) decoded back into the Python object
         that was originally recorded.
@@ -1404,6 +1405,12 @@ class Store:
         rows are excluded — the inbox stays clean of a reviewer's own
         rejections. Ask for them explicitly with `items(state="dismissed")`
         or `items(state="muted")`.
+
+        `subject_types`, when given, narrows to rows whose `subject_type` is
+        one of the tuple's members — this is how an inbox page (see
+        `cronicled.web.inboxes`) asks for only the subject types it owns.
+        Checked with `is not None`, not truthiness: an empty tuple is a
+        real, distinct request ("select nothing"), not "no filter given".
         """
         query = "SELECT %s FROM item" % self._ITEM_COLUMNS
         clauses = []
@@ -1411,6 +1418,19 @@ class Store:
         if folder is not None:
             clauses.append("folder = ?")
             params.append(folder)
+        if subject_types is not None:
+            # `(subject_placeholders or "NULL")` reads like a typo but is
+            # deliberate: an empty tuple joins to "", which would otherwise
+            # emit `IN ()`. On the SQLite bundled with this project's pinned
+            # interpreter that already matches no row rather than raising,
+            # so this guard is not load-bearing here -- but `IN ()` was a
+            # syntax error on SQLite before 3.31 (2020), and nothing pins
+            # this project to a build newer than that. Kept for that
+            # portability rather than relied on for this one's behaviour.
+            subject_placeholders = ", ".join("?" for _ in subject_types)
+            clauses.append(
+                "subject_type IN (%s)" % (subject_placeholders or "NULL"))
+            params.extend(subject_types)
         if state is not None:
             clauses.append("state = ?")
             params.append(state)
@@ -1430,8 +1450,10 @@ class Store:
             rows = cursor.fetchall()
         return [self._decode_item(columns, row) for row in rows]
 
-    def counts(self, folder=None):
-        """Number of proposals in each state, optionally scoped to a folder.
+    def counts(self, folder=None, subject_types=None):
+        """Number of proposals in each state, optionally scoped to a folder
+        and/or to a tuple of subject types (see `items()`'s `subject_types`
+        for the same `is not None` / empty-tuple reasoning).
 
         Excludes `dismissed` and `muted` rows, same as `items()`'s default —
         a badge counting a reviewer's own rejections as outstanding work
@@ -1443,6 +1465,12 @@ class Store:
         if folder is not None:
             query += " AND folder = ?"
             params.append(folder)
+        if subject_types is not None:
+            # See `items()`'s own `subject_types` clause for why the
+            # `(... or "NULL")` guard is here.
+            subject_placeholders = ", ".join("?" for _ in subject_types)
+            query += " AND subject_type IN (%s)" % (subject_placeholders or "NULL")
+            params.extend(subject_types)
         query += " GROUP BY state"
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()

@@ -787,6 +787,42 @@ class SceneUrlWiring(_Base):
                          "http://media.example/scenes/9")
 
 
+class PerInboxRouteWiring(_Base):
+    """`/{inbox}` and `/{inbox}/{state}` narrow by subject type through
+    `Store.items(subject_types=)` directly (see `web.app._serve_inbox_route`)
+    rather than through a pre-built callable the way every other section is
+    wired -- so what reaches `serve()` is the store itself and the same
+    `base_url` every other row's link is built from, not a section-shaped
+    function.
+    """
+
+    def test_the_store_reaches_serve(self):
+        self._seed()
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path])
+        # The SAME store `actions` was wired with, not a second handle on the
+        # same file: two connections would each hold their own view of
+        # in-flight writes, and a per-inbox page reading one while an approve
+        # commits through the other is exactly the kind of split this project
+        # avoids elsewhere by threading one object through.
+        self.assertIs(captured.kwargs["store"], captured.kwargs["actions"]._store)
+
+    def test_a_configured_server_reaches_the_per_inbox_base_url(self):
+        self._seed()
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path, "--server", "http://media.example"])
+        self.assertEqual(captured.kwargs["base_url"], "http://media.example")
+
+    def test_no_configured_server_leaves_the_per_inbox_base_url_none(self):
+        self._seed()
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.serve", captured):
+            main(["--db", self.db_path])
+        self.assertIsNone(captured.kwargs["base_url"])
+
+
 class HostAndPortEnvironmentDefaults(_Base):
     # Mirrors the coverage --db already has for $CRONICLED_DB: a container
     # can only pass these through ENV (see the Dockerfile), so the flag
