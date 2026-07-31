@@ -66,6 +66,32 @@ class Normalize(unittest.TestCase):
         self.assertEqual(normalize(None), "")
 
 
+class NormalizeExpandsAmpersand(unittest.TestCase):
+    """`&` expands to "and" rather than being folded away as punctuation, so a
+    filename spelling a title out and a store title using the symbol (or the
+    reverse) still normalise alike. Every assertion below checks the actual
+    normalised text, not merely that two forms agree with each other — two
+    forms that both collapsed to "" would satisfy a bare equality check, and
+    that is exactly the trap this class exists to avoid.
+    """
+
+    def test_symbol_and_spelled_out_form_normalise_to_the_same_text(self):
+        self.assertEqual(normalize(TITLES["ampersand_form"]), "salt and anchor")
+        self.assertEqual(normalize(TITLES["expanded_form"]), "salt and anchor")
+
+    def test_ampersand_with_no_surrounding_whitespace(self):
+        self.assertEqual(normalize("Salt&Anchor"), "salt and anchor")
+
+    def test_ampersand_at_the_start_of_the_title(self):
+        self.assertEqual(normalize("&Anchor"), "and anchor")
+
+    def test_ampersand_at_the_end_of_the_title(self):
+        self.assertEqual(normalize("Salt&"), "salt and")
+
+    def test_ampersand_alone(self):
+        self.assertEqual(normalize("&"), "and")
+
+
 class Spaceless(unittest.TestCase):
     def test_removes_every_space(self):
         self.assertEqual(spaceless(PERFORMERS["two_word"]), "velvetcrane")

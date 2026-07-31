@@ -163,6 +163,21 @@ def normalize(s):
 
     Non-Latin letters are preserved rather than deleted: dropping them
     would give a non-Latin name an empty slug, which matches nothing.
+
+    `&` expands to "and" rather than being reduced to a separator like every
+    other punctuation mark, so "Alpha & Omega" and "Alpha and Omega" normalise
+    to the same text in EITHER direction -- a filename spelling it out and a
+    store title using the symbol, or the reverse. `&` is not always a
+    conjunction: it appears inside names and in constructions where "and"
+    reads wrong, so this is a default, not a claim that the expansion is
+    always the correct reading. It is the right default because of the
+    asymmetry between the two failure modes, not because expansion is always
+    right: expanding it wrongly makes two spellings that arguably should not
+    match agree -- a slightly generous match. The previous behaviour, folding
+    `&` away as punctuation, made two spellings of the SAME title disagree,
+    which loses the match outright rather than merely widening it. A
+    generous match can still be judged by everything downstream that scores
+    it; a match that was never returned cannot.
     """
     if not s:
         return ""
@@ -172,7 +187,7 @@ def normalize(s):
         if unicodedata.combining(ch):
             continue          # a stripped accent
         kept.append(ch)
-    folded = "".join(kept).translate(_LETTER_FOLD)
+    folded = "".join(kept).translate(_LETTER_FOLD).replace("&", " and ")
     return " ".join("".join(c if c.isalnum() else " " for c in folded).lower().split())
 
 
