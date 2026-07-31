@@ -34,7 +34,7 @@ import json
 import os
 import sys
 
-from cronicled.config import config_dir, load_server, load_stashbox
+from cronicled.config import config_dir, load_marker_tag, load_server, load_stashbox
 from cronicled.jobs import JobRunner
 from cronicled.performer_ids import derive_performer_ids, merge_performer_ids
 from cronicled.scoring import DEFAULT_THRESHOLD
@@ -68,9 +68,10 @@ def load_performer_ids(path=None, env=None):
 
 
 def build_producer(stash, box, performer_ids, store, *, limit, folder="library",
-                   name_filter=None, threshold=DEFAULT_THRESHOLD):
+                   name_filter=None, threshold=DEFAULT_THRESHOLD, marker=None):
     """The `StashBoxCheckProducer` that checks `stash`'s unorganized scenes
-    against `box`, recording nothing -- see that class's own docstring.
+    (plus, with `marker` given, the organized ones carrying that tag) against
+    `box`, recording nothing -- see that class's own docstring.
 
     `limit` is REQUIRED, with no permissive default, for the same reason
     `cronicled.runscan.build_producer` refuses one: every file selected pays
@@ -78,6 +79,13 @@ def build_producer(stash, box, performer_ids, store, *, limit, folder="library",
     first run against a whole library must not be reachable by a caller who
     simply forgot the flag. Pass `limit=0` deliberately to run the selection
     accounting alone, with no reads spent at all.
+
+    `marker` is passed straight through -- see `cronicled.stashbox_scan`'s own
+    docstring for what it reaches and what it costs. Read at the caller's
+    entry point (`main`, below) with `cronicled.config.load_marker_tag`, the
+    SAME loader `cronicled.runscan.main` reads for the scan itself: there is
+    no second setting for "the marker" here, on purpose, so the two never
+    drift apart.
     """
     if limit is None:
         raise ValueError(
@@ -89,7 +97,7 @@ def build_producer(stash, box, performer_ids, store, *, limit, folder="library",
             "is wanted).")
     return StashBoxCheckProducer(
         stash, box, performer_ids, store=store, folder=folder, limit=limit,
-        name_filter=name_filter, threshold=threshold)
+        name_filter=name_filter, threshold=threshold, marker=marker)
 
 
 def main(argv=None):
@@ -120,6 +128,13 @@ def main(argv=None):
 
     try:
         server = load_server()
+        # Read HERE, beside the other config, and never inside
+        # `build_producer`: it is configuration, read once at start-up, and a
+        # failure to understand it belongs in the same "cannot run a
+        # stash-box check" message every other loader's failure lands in.
+        # The SAME loader `cronicled.runscan.main` reads for the scan --
+        # there is no second setting for "the marker" here.
+        marker = load_marker_tag()
     except ValueError as exc:
         print("cannot run a stash-box check: %s" % exc, file=sys.stderr)
         return 1
@@ -157,7 +172,7 @@ def main(argv=None):
         producer = build_producer(
             stash, box, performer_ids, store, limit=args.limit,
             folder=args.folder, name_filter=args.name_filter,
-            threshold=args.threshold)
+            threshold=args.threshold, marker=marker)
         runner.register(producer)
 
         job = runner.start(producer.name, trigger="manual")

@@ -75,6 +75,31 @@ class BuildProducerRequiresALimit(unittest.TestCase):
         self.assertEqual(producer._performer_ids, {"Velvet Crane": "pf-1"})
 
 
+class TheMarkerTagReachesTheProducer(unittest.TestCase):
+    """The provisionally-organized marker travels from `build_producer` to
+    the producer unchanged -- see that function's own docstring for why it
+    is read at the entry point (`main`, below) and never here. Mirrors
+    `tests.test_runscan.TheMarkerTagReachesEveryScanThisModuleBuilds`.
+    """
+
+    MARKER = "inferred-metadata"
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+
+    def test_the_configured_marker_reaches_the_producer(self):
+        producer = build_producer(
+            mock.Mock(), mock.Mock(), {}, self.store, limit=10,
+            marker=self.MARKER)
+        self.assertEqual(producer._marker, self.MARKER)
+
+    def test_a_check_built_without_one_carries_no_marker(self):
+        producer = build_producer(
+            mock.Mock(), mock.Mock(), {}, self.store, limit=10)
+        self.assertIsNone(producer._marker)
+
+
 class LoadPerformerIds(unittest.TestCase):
     def test_an_absent_file_is_a_legitimate_empty_mapping(self):
         with tempfile.TemporaryDirectory() as d:
@@ -184,6 +209,55 @@ class MainOrchestration(unittest.TestCase):
                 rc = main(["--limit", "5"])
 
             self.assertEqual(rc, 1)
+
+    def test_the_configured_marker_tag_is_read_and_passed_to_the_producer(self):
+        # The seam: `main` is where this install's config directory is read,
+        # and `build_producer` is deliberately not a second reader of it --
+        # there is no separate stash-box-only marker setting. Mirrors
+        # `tests.test_runscan.MainOrchestration
+        # .test_the_configured_marker_tag_is_read_and_passed_to_the_producer`.
+        with self._patched() as mocks, \
+             mock.patch("cronicled.runstashbox.load_marker_tag") as load_marker:
+            load_marker.return_value = "inferred-metadata"
+            mocks["load_server"].return_value = {
+                "url": "http://server.example.test", "api_key": "K"}
+            mocks["load_stashbox"].return_value = {
+                "url": "http://box.example.test", "api_key": "BK"}
+            mocks["load_performer_ids"].return_value = {}
+            producer = mock.Mock()
+            producer.name = "stashbox-check"
+            mocks["build_producer"].return_value = producer
+            runner = mocks["JobRunner"].return_value
+            runner.start.return_value = mock.Mock(id="job-1")
+            runner.job.return_value = mock.Mock(
+                id="job-1", state="done", message="finished: checked 0",
+                error=None)
+
+            self.assertEqual(main(["--limit", "5"]), 0)
+
+            _args, kwargs = mocks["build_producer"].call_args
+            self.assertEqual(kwargs["marker"], "inferred-metadata")
+
+    def test_an_unreadable_marker_config_refuses_before_anything_is_built(self):
+        # A malformed setting is a start-up failure that names itself, on
+        # the same terms a missing server is already -- never a check that
+        # starts and silently pools what it always did.
+        with self._patched() as mocks, \
+             mock.patch("cronicled.runstashbox.load_marker_tag") as load_marker:
+            load_marker.side_effect = ValueError(
+                "scan.json sets 'marker_tag' to '', which names no tag")
+            mocks["load_server"].return_value = {
+                "url": "http://server.example.test", "api_key": "K"}
+
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = main(["--limit", "5"])
+
+            self.assertEqual(rc, 1)
+            self.assertIn("marker_tag", err.getvalue())
+            mocks["Stash"].assert_not_called()
+            mocks["StashBox"].assert_not_called()
+            mocks["Store"].assert_not_called()
+            mocks["build_producer"].assert_not_called()
 
     def test_an_unconfigured_server_is_refused_before_anything_is_built(self):
         with self._patched() as mocks:
