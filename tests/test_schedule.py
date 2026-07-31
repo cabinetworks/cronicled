@@ -15,7 +15,10 @@ and a store double that counts the ticks that have begun and hands back a
 rather than guessing how long it takes. Every wait is bounded, and every bound
 is only ever reached by a test that is failing.
 """
+import ast
+import dataclasses
 import os
+import pathlib
 import shutil
 import tempfile
 import threading
@@ -23,6 +26,7 @@ import unittest
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from cronicled import schedule
 from cronicled.jobs import JobRunner
 from cronicled.schedule import (Entry, LoopStatus, Scheduler, TickResult,
                                 as_utc, check_zone, due, resolve)
@@ -945,6 +949,17 @@ class RunnableProducer:
             raise RuntimeError("the producer gave up")
 
 
+class StatedProducer(RunnableProducer):
+    """A producer the runner can drive that declares a STATED TIME instead of
+    a cadence -- the shape all three unattended passes really declare, and the
+    one a status has an hour to report for."""
+
+    def __init__(self, name, at, zone, cost="local"):
+        super().__init__(name, every=None, cost=cost)
+        self.at = at
+        self.zone = zone
+
+
 class ClosedRunner:
     """Stands in for a runner that has been closed.
 
@@ -1591,15 +1606,130 @@ class TheIntervalBetweenTicks(SchedulerCase):
             self.scheduler(RunnableProducer("nightly"), interval=True)
 
 
+class TheResolvedScheduleIsTheSchedulersOwn(unittest.TestCase):
+    """`status()` is the whole of what anything outside this module may know
+    about the schedule.
+
+    The shortcut this exists to prevent is a page reading `Scheduler._entries`
+    directly. It would work, and it would couple rendering to a structure this
+    module keeps internal -- so the next change to how a schedule is resolved
+    would break the page, with no test standing between the two. Stated as a
+    rule over the source rather than as a habit, because a habit is not
+    something a later change can fail.
+    """
+
+    def _package(self):
+        return pathlib.Path(schedule.__file__).resolve().parent
+
+    @staticmethod
+    def _reaches_in(path):
+        """Does this file read `<something>._entries` as an attribute?
+
+        PARSED, not searched for as text: prose is allowed to name the rule --
+        the docstrings on both sides of this boundary do -- and a guard that
+        counted a mention as a violation would make the rule unwritable
+        exactly where it most needs explaining.
+        """
+        tree = ast.parse(path.read_text(), filename=str(path))
+        return any(isinstance(node, ast.Attribute) and node.attr == "_entries"
+                   for node in ast.walk(tree))
+
+    def test_nothing_outside_this_module_reaches_into_the_resolved_entries(self):
+        package = self._package()
+        reaching = sorted(path.relative_to(package).as_posix()
+                          for path in package.rglob("*.py")
+                          if path.name != "schedule.py"
+                          and self._reaches_in(path))
+        self.assertEqual(
+            reaching, [],
+            "these read the scheduler's resolved entries directly; the "
+            "schedule reaches a caller through `Scheduler.status()` and "
+            "nowhere else, so that how a schedule is resolved stays this "
+            "module's to change")
+
+    def test_the_rule_is_looking_at_the_files_it_thinks_it_is(self):
+        # The guard above passes just as happily over an empty file list, and
+        # a walk that stopped matching would report "nothing reaches in" about
+        # a package it never opened. Both halves are checked: the module the
+        # page really renders from is among the files scanned, and the rule
+        # finds the reach-in that is SUPPOSED to be there, in the one file
+        # allowed to have it.
+        package = self._package()
+        scanned = {path.relative_to(package).as_posix()
+                   for path in package.rglob("*.py")
+                   if path.name != "schedule.py"}
+        self.assertIn("web/rows.py", scanned)
+        self.assertIn("__main__.py", scanned)
+        self.assertTrue(self._reaches_in(package / "schedule.py"))
+
+
 class TheLoopTicksInTheBackground(SchedulerCase):
     def test_a_scheduler_that_has_never_started_says_so(self):
         scheduler = self.scheduler(RunnableProducer("nightly"))
+        # The whole status, every field at once, against values written out
+        # here -- including the schedule, which is true BEFORE the first tick
+        # and is the half a count of ticks can never say anything about.
         self.assertEqual(
             scheduler.status(),
             LoopStatus(running=False, closed=False, ticks=0, failures=0,
                        consecutive_failures=0, last_tick_at=None,
                        last_error=None, last_error_at=None,
-                       last_traceback=None, failing_to_start={}))
+                       last_traceback=None,
+                       appointments={"nightly": Entry(
+                           producer="nightly", every=DAY, enabled=True,
+                           at=None, zone=None)},
+                       failing_to_start={}))
+
+    def test_the_status_states_the_schedule_as_well_as_the_ticks(self):
+        # THE WIDENING, tested as its own rule. Every other field on
+        # `LoopStatus` is an observation about ticks; this one is the
+        # declaration, and it is the only route anything outside this module
+        # has to the resolved schedule -- so a `status()` that stopped
+        # reporting it would leave a page with no way to say when a pass is
+        # due except by reaching into `Scheduler._entries`.
+        scheduler = self.scheduler(
+            RunnableProducer("nightly"),
+            StatedProducer("overnight", at=time(3, 20),
+                           zone=ZoneInfo("Europe/Madrid")))
+        self.assertEqual(scheduler.status().appointments, {
+            "nightly": Entry(producer="nightly", every=DAY, enabled=True,
+                             at=None, zone=None),
+            "overnight": Entry(producer="overnight", every=None, enabled=True,
+                               at=time(3, 20),
+                               zone=ZoneInfo("Europe/Madrid")),
+        })
+
+    def test_editing_the_answer_does_not_edit_the_schedule(self):
+        # A copy, for the reason `failing_to_start` is copied. A caller
+        # holding the status must not be able to unschedule a producer, or
+        # add one, in the loop this is still ticking.
+        scheduler = self.scheduler(RunnableProducer("nightly"))
+        answer = scheduler.status().appointments
+        answer["nightly"] = "tampered"
+        answer["invented"] = "also tampered"
+        self.assertEqual(scheduler.status().appointments, {
+            "nightly": Entry(producer="nightly", every=DAY, enabled=True,
+                             at=None, zone=None)})
+
+    def test_a_status_cannot_be_built_without_stating_its_appointments(self):
+        # The docstring on the field argues that a defaulted empty mapping
+        # would read on the page exactly like a deployment with nothing
+        # scheduled, so a schedule that went missing would be invisible.
+        # That argument was unpinned: giving the field a default left every
+        # test passing, because no current caller omits it. This fails the
+        # moment one could.
+        fields = {f.name: f for f in dataclasses.fields(LoopStatus)}
+        self.assertIs(
+            fields["appointments"].default, dataclasses.MISSING,
+            "appointments must stay required")
+        self.assertIs(
+            fields["appointments"].default_factory, dataclasses.MISSING,
+            "appointments must stay required")
+        with self.assertRaises(TypeError):
+            LoopStatus(running=True, closed=False, ticks=0, failures=0,
+                       consecutive_failures=0, last_tick_at=None,
+                       last_error=None, last_error_at=None,
+                       last_traceback=None)
 
     def test_starting_the_loop_ticks_for_real_until_it_is_closed(self):
         watched = WatchedStore(self.store)

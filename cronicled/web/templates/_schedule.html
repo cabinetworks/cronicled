@@ -20,6 +20,21 @@
   {% else %}
 <p>Loop: <b>NOT RUNNING</b>, and not stopped either &mdash; it died after {{ schedule.ticks }} ticks</p>
   {% endif %}
+{# WHAT IT IS MEANT TO DO, before what it has done. A stated appointment is an
+   hour and a minute -- it has no date and none is invented -- and a producer
+   on an interval says so instead of being given a predicted next run, which
+   would read as a statement and be wrong the first night something is late.
+
+   The zone is named ONCE, here, and never on a line: it is one setting for the
+   whole deployment. It is absent when there is nothing to say it about, and
+   when two producers state their times in DIFFERENT zones -- in which case
+   each line names its own, because one heading cannot be true of both. #}
+  {% if schedule.appointments.zone %}
+<p class="note">Stated times are in {{ schedule.appointments.zone }}.</p>
+  {% endif %}
+  {% for p in schedule.appointments.producers %}
+<p class="note">{{ p.name }} &mdash; {{ p.when }}</p>
+  {% endfor %}
 <p class="note">last tick {{ schedule.last_tick_at or "never" }}</p>
   {% if schedule.last_error %}
 <p class="note">last error {{ schedule.last_error_at }}: {{ schedule.last_error }}</p>

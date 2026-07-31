@@ -1,9 +1,10 @@
+import re
 import unittest
 from dataclasses import asdict, replace
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
 
-from cronicled.schedule import LoopStatus, TickResult
+from cronicled.schedule import Entry, LoopStatus, TickResult, resolve
 from cronicled.scan import _runners_up, candidate_url
 from cronicled.scoring import Match
 from cronicled.tag_descriptions import Found
@@ -12,10 +13,11 @@ from cronicled.tags import MERGE_IS_IRREVERSIBLE, UNDECIDED_MANY, cluster_tags
 from cronicled.tags import proposal as tag_proposal
 from cronicled.web.rows import (
     IDENTIFIED_SCORE_TEXT, KIND_DESCRIPTION, KIND_SCENE, KIND_TAG_DESCRIPTION,
-    STORE_ANSWERED, STORE_EMPTY, STORE_FAILED, Row, local, local_times,
-    scene_url, tag_url, to_description_row, to_merge_row, to_merge_rows,
-    to_mute_row, to_mute_rows, to_refusal_row, to_refusal_rows, to_row,
-    to_rows, to_schedule_view, to_tag_description_row,
+    STORE_ANSWERED, STORE_EMPTY, STORE_FAILED, Appointments, Row,
+    ScheduledProducer, local, local_times, scene_url, tag_url,
+    to_description_row, to_merge_row, to_merge_rows, to_mute_row,
+    to_mute_rows, to_refusal_row, to_refusal_rows, to_row, to_rows,
+    to_schedule_view, to_tag_description_row,
 )
 
 # A REAL zone that observes daylight saving, and one whose offset differs from
@@ -1560,6 +1562,37 @@ class MuteRowTimestamps(unittest.TestCase):
                          [_WINTER_LOCAL, _SUMMER_LOCAL])
 
 
+class _Declared:
+    """A producer as `resolve` reads one: a name, and whatever timing it
+    declares for itself."""
+
+    def __init__(self, name, every=None, at=None, zone=None):
+        self.name = name
+        self.every = every
+        self.at = at
+        self.zone = zone
+
+
+def _entries(*producers, overrides=None):
+    """The resolved schedule the loop hands over, built by the REAL `resolve`.
+
+    Hand-written `Entry` literals would be a fixture more capable than the
+    thing it stands in for: `resolve` refuses an entry naming both a cadence
+    and a time, a time with no zone, and a producer with no schedule at all,
+    so a literal could state a schedule the loop can never be holding and the
+    view would be tested against it. The three defaults are the three
+    unattended passes, at the three staggered times `cronicled.__main__`
+    really declares.
+    """
+    if not producers:
+        producers = (
+            _Declared("nightly-library-scan", at=time(3, 0), zone=ZONE),
+            _Declared("performer-descriptions", at=time(3, 20), zone=ZONE),
+            _Declared("tag-merge", at=time(3, 40), zone=ZONE),
+        )
+    return resolve(producers, overrides)
+
+
 def _status(**over):
     """A `LoopStatus` the loop could really have produced, built from the real
     dataclasses rather than a hand-written stand-in.
@@ -1572,6 +1605,7 @@ def _status(**over):
     fields = dict(
         running=True, closed=False, ticks=7, failures=1,
         consecutive_failures=0,
+        appointments=_entries(),
         last_tick_at=_SUMMER_UTC,
         last_error="ValueError: nothing passed by %s" % _WINTER_UTC,
         last_error_at=_WINTER_UTC,
@@ -1650,6 +1684,17 @@ class ScheduleViewTimestamps(unittest.TestCase):
             # The one field deliberately NOT converted, and the only one the
             # template does not render: frames are read as they were recorded.
             "last_traceback": "Traceback...\n  at %s" % _WINTER_UTC,
+            # The declaration, phrased rather than relabelled: three stated
+            # hours, no dates, no seconds, no offsets, and the zone said once
+            # for the whole panel instead of on every line.
+            "appointments": {
+                "zone": "Europe/Madrid",
+                "producers": (
+                    {"name": "nightly-library-scan", "when": "03:00"},
+                    {"name": "performer-descriptions", "when": "03:20"},
+                    {"name": "tag-merge", "when": "03:40"},
+                ),
+            },
             "failing_to_start": {"tag-merge": 3},
             "last_result": {
                 "at": _SUMMER_LOCAL,
@@ -1696,3 +1741,238 @@ class ScheduleViewTimestamps(unittest.TestCase):
         self.assertIsNone(view.last_error_at)
         self.assertIsNone(view.last_result)
         self.assertEqual(view.ticks, 7)
+
+    def test_a_loop_that_has_not_ticked_yet_still_states_its_appointments(self):
+        # THE FIELD THAT IS NOT A DIAGNOSTIC. Every other field here is an
+        # observation about ticks, and before the first tick they are all
+        # empty; the schedule is true already, and it is the only thing on the
+        # panel worth reading at that moment.
+        view = to_schedule_view(
+            _status(last_tick_at=None, last_error=None, last_error_at=None,
+                    last_traceback=None, last_result=None), zone=ZONE)
+        self.assertEqual([p.when for p in view.appointments.producers],
+                         ["03:00", "03:20", "03:40"])
+
+
+# An hour and a minute, and nothing else. Written as a pattern rather than as
+# three separate "no date"/"no seconds"/"no offset" assertions because it is
+# ONE rule -- and because a pattern goes on holding for a fourth producer that
+# nobody thought to add an assertion for.
+_STATED_HOUR = re.compile(r"^\d{2}:\d{2}$")
+
+
+class AStatedAppointmentShortensToAnHourAndAMinute(unittest.TestCase):
+    """The half of the boundary this ticket adds.
+
+    A recorded instant keeps its date (`local_minute`, and the tests over it in
+    tests/test_web_render.py); a STATED appointment has no date to keep, and
+    carrying one would invent it. The two must not be confused in either
+    direction.
+    """
+
+    def view(self, *producers, page_zone=ZONE, **over):
+        status = _status(appointments=_entries(*producers), **over)
+        return to_schedule_view(status, zone=page_zone).appointments
+
+    def test_a_stated_time_is_an_hour_and_a_minute(self):
+        # 03:00 rather than 3:0: both zero-pads are load-bearing and one
+        # fixture kills either mutation, because both fields are single-digit.
+        self.assertEqual(
+            self.view(_Declared("nightly", at=time(3, 0), zone=ZONE)).producers,
+            (ScheduledProducer(name="nightly", when="03:00"),))
+
+    def test_the_minute_shown_is_the_producers_own(self):
+        # A second fixture whose minute is not zero. Without it, a renderer
+        # that printed the hour and a literal ":00" would pass every
+        # assertion above and put all three unattended passes at the top of
+        # the hour on a page an operator uses to check the stagger.
+        self.assertEqual(
+            self.view(_Declared("late", at=time(3, 20), zone=ZONE))
+            .producers[0].when, "03:20")
+
+    def test_no_date_no_seconds_and_no_offset_reach_the_page(self):
+        # The three ways this could over-state a declaration, as one rule.
+        # An appointment has no date, so any date on it is invented; the
+        # seconds and the offset are noise on a fact stated to the minute.
+        for stated in self.view().producers:
+            self.assertRegex(stated.when, _STATED_HOUR)
+
+    def test_the_appointment_is_stated_in_its_own_zone_not_the_pages(self):
+        # The page's zone converts INSTANTS. An appointment is not an instant:
+        # "03:00 in Madrid" is a wall-clock time, and turning it into another
+        # zone needs a date this does not have and must not invent -- so the
+        # hour is unmoved and the zone reported is the one it was declared in,
+        # even when the page is being drawn for a reader somewhere else.
+        appointments = self.view(page_zone=ZoneInfo("America/New_York"))
+        self.assertEqual(appointments.zone, "Europe/Madrid")
+        self.assertEqual(appointments.producers[0].when, "03:00")
+
+    def test_it_does_not_move_with_the_date_the_loop_last_ticked_on(self):
+        # THE DAYLIGHT-SAVING TRAP. Madrid is +01:00 in January and +02:00 in
+        # July, so an implementation that reached for a date -- the tick's,
+        # today's, any -- and converted through it would show two different
+        # hours for one declaration, and neither of them 03:00. Both sides of
+        # the transition, and the stated value written out by hand.
+        winter = self.view(last_tick_at=_WINTER_UTC)
+        summer = self.view(last_tick_at=_SUMMER_UTC)
+        self.assertEqual([p.when for p in winter.producers],
+                         ["03:00", "03:20", "03:40"])
+        self.assertEqual([p.when for p in summer.producers],
+                         [p.when for p in winter.producers])
+
+    def test_the_zone_is_named_once_and_never_on_a_line(self):
+        appointments = self.view()
+        self.assertEqual(appointments.zone, "Europe/Madrid")
+        self.assertEqual(len(appointments.producers), 3)
+        for stated in appointments.producers:
+            self.assertNotIn("Madrid", stated.when)
+
+    def test_the_producers_are_listed_by_name_not_as_they_were_registered(self):
+        # By CONTENT, so the panel reads the same on every visit. The two
+        # fixtures are deliberately in the opposite order alphabetically and
+        # by appointment, so a sort on either the registry's order or on the
+        # hour fails here rather than agreeing by luck.
+        appointments = self.view(_Declared("zulu", at=time(3, 0), zone=ZONE),
+                                 _Declared("alpha", at=time(4, 0), zone=ZONE))
+        self.assertEqual([(p.name, p.when) for p in appointments.producers],
+                         [("alpha", "04:00"), ("zulu", "03:00")])
+
+    def test_nothing_scheduled_lists_nothing_and_claims_no_zone(self):
+        self.assertEqual(self.view(_Declared("only", every=60)),
+                         Appointments(zone=None, producers=(
+                             ScheduledProducer(name="only",
+                                               when="every 60s"),)))
+
+    def test_the_loops_own_schedule_is_not_rewritten_by_drawing_the_page(self):
+        # The direction `to_schedule_view` takes everywhere: this builds a
+        # copy for a reader, and what the scheduler goes on comparing against
+        # the store is untouched however often the page is drawn.
+        status = _status()
+        to_schedule_view(status, zone=ZONE)
+        self.assertEqual(status.appointments["tag-merge"],
+                         Entry(producer="tag-merge", every=None, enabled=True,
+                               at=time(3, 40), zone=ZONE))
+
+
+class AnIntervalHasNoAppointmentToShow(unittest.TestCase):
+    """A producer declaring a cadence has no hour, and one is not manufactured
+    for it out of the last run plus the interval: that is a PREDICTION, and
+    printing it where a statement goes makes it wrong the first night a run is
+    late. The two read differently instead.
+    """
+
+    def when(self, **declared):
+        return to_schedule_view(
+            _status(appointments=_entries(_Declared("hourly", **declared))),
+            zone=ZONE).appointments.producers[0].when
+
+    def test_a_cadence_says_it_is_a_cadence(self):
+        self.assertEqual(self.when(every=3600), "every 3600s")
+
+    def test_it_is_not_dressed_up_as_an_hour_of_the_day(self):
+        # The rule in its own right, and the one that matters: whatever a
+        # cadence reads as, it must not read as a time somebody stated.
+        self.assertNotRegex(self.when(every=3600), _STATED_HOUR)
+
+    def test_a_whole_number_of_seconds_loses_its_decimal_point(self):
+        self.assertEqual(self.when(every=3600.0), "every 3600s")
+
+    def test_a_fractional_cadence_keeps_every_digit_it_was_given(self):
+        # Nothing is rounded for display. A cadence the page and the scheduler
+        # disagree about is a cadence an operator cannot check.
+        self.assertEqual(self.when(every=0.5), "every 0.5s")
+
+    def test_a_cadence_contributes_no_zone_because_it_names_none(self):
+        self.assertIsNone(to_schedule_view(
+            _status(appointments=_entries(_Declared("hourly", every=3600))),
+            zone=ZONE).appointments.zone)
+
+
+class ADisabledProducerIsStillListed(unittest.TestCase):
+    """A producer somebody switched off has no appointment and must not
+    disappear: a line missing from this panel reads as a producer that was
+    never wired up, which is the one thing the panel exists to tell apart."""
+
+    def appointments(self, **over):
+        producers = (_Declared("off", at=time(4, 0), zone=ZoneInfo("UTC")),
+                     _Declared("on", at=time(3, 0), zone=ZONE))
+        return to_schedule_view(
+            _status(appointments=_entries(
+                *producers, overrides={"off": {"enabled": False}})),
+            zone=ZONE).appointments
+
+    def test_it_says_it_is_off_rather_than_naming_an_hour(self):
+        self.assertEqual([(p.name, p.when)
+                          for p in self.appointments().producers],
+                         [("off", "disabled"), ("on", "03:00")])
+
+    def test_its_zone_does_not_decide_the_panels(self):
+        # A disabled producer keeps whatever timing it declared -- an override
+        # of `{"enabled": false}` alone changes nothing else -- so its zone is
+        # still on the entry. It must not be counted: the panel's heading
+        # describes the appointments that will actually be kept, and this one
+        # will not be.
+        self.assertEqual(self.appointments().zone, "Europe/Madrid")
+
+
+class AnEntryTheSchedulerWouldRefuseIsNotRendered(unittest.TestCase):
+    """`resolve` cannot produce any of these, and they are refused again here
+    for the reason `due` refuses them again: a page must not state a schedule
+    the loop will raise on every tick over. A blank line, or an hour shown for
+    a producer nothing can run, would put the failure inside the one panel an
+    operator opens to find it.
+    """
+
+    def render(self, **fields):
+        entry = Entry(producer="broken", **fields)
+        return to_schedule_view(_status(appointments={"broken": entry}),
+                                zone=ZONE)
+
+    def test_an_enabled_entry_with_no_schedule_at_all_raises(self):
+        with self.assertRaisesRegex(ValueError, "neither a cadence"):
+            self.render(every=None, at=None)
+
+    def test_an_enabled_entry_naming_both_raises(self):
+        with self.assertRaisesRegex(ValueError, "both a cadence"):
+            self.render(every=3600, at=time(3, 0), zone=ZONE)
+
+    def test_a_stated_time_with_no_zone_raises_rather_than_guessing_one(self):
+        # The host's zone is a property of the deployment, not of the
+        # schedule. Rendering "03:00" with no zone named, on a panel whose
+        # heading states one, would attribute this appointment to a zone
+        # nothing declared it in.
+        with self.assertRaisesRegex(ValueError, "no zone"):
+            self.render(every=None, at=time(3, 0), zone=None)
+
+    def test_a_disabled_entry_with_no_schedule_is_fine_and_says_so(self):
+        # The one shape of the three that IS reachable: `resolve` exempts a
+        # producer explicitly disabled from needing a schedule at all.
+        view = self.render(every=None, at=None, enabled=False)
+        self.assertEqual(view.appointments.producers[0].when, "disabled")
+
+
+class TwoZonesAreReportedRatherThanOneChosen(unittest.TestCase):
+    """An operator's per-producer override can state a time in a zone that is
+    not the deployment's. One heading cannot be true of both, and picking
+    either by iteration order would hide the disagreement rather than report
+    it -- leaving the panel saying 3am about a pass that runs at a different
+    3am, which is the confusion one configured zone exists to remove.
+    """
+
+    def appointments(self):
+        return to_schedule_view(_status(appointments=_entries(
+            _Declared("here", at=time(3, 0), zone=ZONE),
+            _Declared("elsewhere", at=time(3, 0), zone=ZoneInfo("UTC")))),
+            zone=ZONE).appointments
+
+    def test_no_single_zone_is_claimed_for_the_panel(self):
+        self.assertIsNone(self.appointments().zone)
+
+    def test_each_line_names_the_zone_its_own_hour_is_read_in(self):
+        # Both, and the pair is the test: the two hours are the same text and
+        # are hours apart, so a panel that showed them without their zones
+        # would be stating that two passes run at the same moment.
+        self.assertEqual([(p.name, p.when)
+                          for p in self.appointments().producers],
+                         [("elsewhere", "03:00 (UTC)"),
+                          ("here", "03:00 (Europe/Madrid)")])

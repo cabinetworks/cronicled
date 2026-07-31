@@ -4,15 +4,27 @@ import io
 import threading
 import unittest
 from contextlib import redirect_stdout
+from datetime import time
 from http.server import HTTPServer
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from cronicled.jobs import JobRejected
-from cronicled.schedule import LoopStatus, TickResult
+from cronicled.schedule import LoopStatus, TickResult, resolve
 from cronicled.web.actions import ApplyFailed, UnknownProposal
 from cronicled.web.app import build_handler, serve, DEFAULT_HOST
-from cronicled.web.rows import to_summary_view
+from cronicled.web.rows import to_schedule_view, to_summary_view
+
+
+class _ScheduledProducer:
+    """A producer as `resolve` reads one, so a `LoopStatus` built here
+    carries a schedule the loop could really be holding."""
+
+    def __init__(self, name, at=None, zone=None):
+        self.name = name
+        self.every = None
+        self.at = at
+        self.zone = zone
 
 
 class _RecordingActions:
@@ -329,6 +341,9 @@ class MutedDismissedRefusedRendering(unittest.TestCase):
             running=True, closed=False, ticks=4, failures=0,
             consecutive_failures=0, last_tick_at="2026-07-27T03:00:00+00:00",
             last_error=None, last_error_at=None, last_traceback=None,
+            appointments=resolve([_ScheduledProducer(
+                "nightly-library-scan", at=time(3, 0),
+                zone=ZoneInfo("Europe/Madrid"))]),
             failing_to_start={},
             last_result=TickResult(at="2026-07-27T03:00:00+00:00",
                                    due=["nightly-library-scan"], started={},
@@ -336,6 +351,26 @@ class MutedDismissedRefusedRendering(unittest.TestCase):
                                             "disabled by override"},
                                    failed_to_start={})))
         self.assertIn("did not run: disabled by override", html)
+
+    def test_a_converted_status_puts_the_appointment_on_the_page(self):
+        # THE SHAPE PRODUCTION ACTUALLY SERVES. `cronicled.__main__` hands
+        # this callable the output of `to_schedule_view`, never a raw
+        # `LoopStatus`, and the template reads the appointments off the
+        # converted form -- so a seam that stopped converting would draw a
+        # panel with no appointment lines and no error, which reads as a
+        # deployment where nothing is scheduled overnight.
+        status = LoopStatus(
+            running=True, closed=False, ticks=4, failures=0,
+            consecutive_failures=0, last_tick_at="2026-07-27T03:00:00+00:00",
+            last_error=None, last_error_at=None, last_traceback=None,
+            appointments=resolve([_ScheduledProducer(
+                "nightly-library-scan", at=time(3, 0),
+                zone=ZoneInfo("Europe/Madrid"))]),
+            failing_to_start={}, last_result=None)
+        html = self._get(schedule_status=lambda: to_schedule_view(
+            status, zone=ZoneInfo("Europe/Madrid")))
+        self.assertIn("nightly-library-scan &mdash; 03:00", html)
+        self.assertIn("Stated times are in Europe/Madrid.", html)
         self.assertNotIn("Nothing is scheduled", html)
 
     def test_omitting_it_says_nothing_is_scheduled(self):
