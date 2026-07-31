@@ -30,6 +30,20 @@ INBOX_PATH = "/inbox"
 _ACTIONS = ("approve", "dismiss", "mute", "undo", "scan",
            "unmute", "undismiss", "refresh")
 
+# A REVERSAL undoes an earlier verdict recorded against a collapsed section --
+# `/unmute` reverses a mute (the "Muted" section), `/undismiss` a dismissal
+# (the "Dismissed" section) -- and both sections start collapsed, the same as
+# every section but Applied. Before this, every reversal redirected to the
+# plain inbox, which closes the section again: reversing seventeen mutes in
+# one sitting meant opening "Muted" seventeen times, and every open lost the
+# scroll position too. The redirect now names which section it acted in (see
+# `do_POST` below), and `do_GET` reopens exactly that one -- never every
+# section (that would bury whatever the inbox exists to surface under a pile
+# of reversed rows) and never a bulk reversal (approving, muting and now
+# reversing all stay one row at a time).
+_REOPEN_SECTION = {"unmute": "muted", "undismiss": "dismissed"}
+_OPENABLE_SECTIONS = tuple(_REOPEN_SECTION.values())
+
 # Pre-filled into the number input so a person is not left guessing a value
 # from nothing -- never read on the code path itself. A request that omits
 # `limit` is refused there (see `do_POST`), not silently given this number.
@@ -159,6 +173,19 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
             # validate beyond parsing it out of the query string.
             just_applied = (urllib.parse.parse_qs(parsed.query)
                             .get("applied") or [None])[0]
+            # `opened` names the COLLAPSED section a reversal (`/unmute`,
+            # `/undismiss`) just redirected here from, so that section
+            # re-opens instead of every write closing it again -- see
+            # `do_POST`'s own `_REOPEN_SECTION` use below. Unlike `applied`,
+            # this never names a specific row, so there is no stale-row check
+            # to make; it is still checked against the fixed set this server
+            # actually knows how to reopen, so a stray or foreign query value
+            # opens nothing rather than being handed to the template as a
+            # section name it has never heard of.
+            opened = (urllib.parse.parse_qs(parsed.query)
+                     .get("opened") or [None])[0]
+            if opened not in _OPENABLE_SECTIONS:
+                opened = None
             body = render("inbox.html", rows=rows(), counts={},
                          muted=_muted(), dismissed=_dismissed(),
                          refused=_refused(),
@@ -175,7 +202,8 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                          # this important is a second copy free to drift.
                          low_count_is_not_proof=LOW_COUNT_IS_NOT_PROOF,
                          schedule=_schedule_status(),
-                         just_applied=just_applied).encode()
+                         just_applied=just_applied,
+                         opened=opened).encode()
             self._send(200, body,
                        [("Content-Type", "text/html; charset=utf-8")])
 
@@ -309,6 +337,7 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                     self._send(400, str(exc).encode("utf-8"),
                                [("Content-Type", "text/plain; charset=utf-8")])
                     return
+                location = "%s?opened=%s" % (INBOX_PATH, _REOPEN_SECTION[name])
             else:
                 fp = (form.get("fp") or [""])[0]
                 if not fp:
@@ -323,6 +352,8 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                 if name == "approve":
                     location = "%s?applied=%s" % (
                         INBOX_PATH, urllib.parse.quote(fp, safe=""))
+                elif name in _REOPEN_SECTION:
+                    location = "%s?opened=%s" % (INBOX_PATH, _REOPEN_SECTION[name])
             # 303 so a refresh redraws the page rather than repeating the write.
             self._send(303, b"", [("Location", location)])
 
