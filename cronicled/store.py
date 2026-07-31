@@ -30,6 +30,8 @@ import uuid
 import weakref
 from datetime import datetime, timezone
 
+from cronicled.config import RENAMED_JOBS
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS item (
     fingerprint   TEXT PRIMARY KEY,
@@ -190,6 +192,104 @@ def _add_missing_columns(conn):
         if column not in present:
             conn.execute("ALTER TABLE %s ADD COLUMN %s %s"
                          % (table, column, definition))
+
+
+def _later_producer_run(old_at, new_at):
+    """Which of two `producer_run.at` values survives a rename collision.
+
+    Reached only when ONE producer holds a row under both its old name and
+    its current one -- see `_migrate_renamed_producer_runs`. There is no row
+    order to break the tie by (a `dict`/query result has none worth trusting
+    -- see this project's own record of iteration-order bugs), but there IS a
+    fact to compare: which of the two really happened more recently. That is
+    exactly what `producer_run` exists to answer, so the later moment wins,
+    not the row that happened to be read first.
+
+    Each value is parsed the same tolerant way `cronicled.schedule.due` reads
+    a stored run: an aware timestamp compares; anything else -- unparseable,
+    or naive with no offset -- does not, because guessing its zone would be
+    inventing a fact this function does not have. When a value cannot be
+    compared, this prefers whichever side DOES parse, so the surviving row
+    carries real information rather than the one `due()` would immediately
+    treat as due anyway. When NEITHER parses, which one survives makes no
+    observable difference: `due()` treats an unreadable last run as due
+    immediately either way, and the next run overwrites it -- so this keeps
+    `new_at` without that being a meaningful choice.
+    """
+    def moment(value):
+        try:
+            parsed = datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+
+    old_moment = moment(old_at)
+    new_moment = moment(new_at)
+    if old_moment is None:
+        return new_at
+    if new_moment is None:
+        return old_at
+    return old_at if old_moment > new_moment else new_at
+
+
+def _migrate_renamed_producer_runs(conn):
+    """Carry `producer_run`'s "has this run before" answer across a rename.
+
+    `RENAMED_JOBS` (see `cronicled.config`) already lets a schedule override
+    survive a producer being renamed. It does nothing for this table, keyed
+    on the same producer name, so a rename alone made every renamed producer
+    read back as never-run -- due immediately, on whatever cadence its new
+    appointment names, the moment an upgraded deployment first ticks. This is
+    the other half of that rename: applied here, once, to the stored row
+    itself, rather than translated on every read, for the same reason the
+    schema above is migrated in place rather than re-interpreted each time --
+    a database opened by many entry points (the scheduler, a one-shot scan,
+    a stashbox pass) must agree on one shape without each of them repeating
+    the translation.
+
+    Idempotent by construction: once a producer's row is renamed, no row
+    remains under its old name, so a second call finds nothing to do for it
+    -- exactly how `_add_missing_columns` above is idempotent by checking
+    what is already there rather than by a flag saying it already ran.
+
+    The reachable collision -- a deployment that ran the renamed build, then
+    rolled back to one still writing the old name, then upgraded again -- can
+    leave ONE row under each name. Both are folded into a single row under
+    the current name, keeping whichever `at` is later; see
+    `_later_producer_run` for why that is the later MOMENT and not the row
+    that happened to be read first.
+
+    Only `producer_run` is touched. The separate, bounded run log (`run`,
+    written by `start_run`/`finish_run`) is a record of what a run was CALLED
+    at the time it happened, read only for a person's "what has happened"
+    question (`recent_runs`) -- `cronicled.schedule.due` never reads it, so a
+    stale name there cannot reproduce this incident, and relabelling history
+    to say a past run was always called something it was not would be a
+    different kind of wrong.
+    """
+    for old, current in RENAMED_JOBS.items():
+        old_row = conn.execute(
+            "SELECT at FROM producer_run WHERE producer = ?", (old,)
+        ).fetchone()
+        if old_row is None:
+            continue
+        current_row = conn.execute(
+            "SELECT at FROM producer_run WHERE producer = ?", (current,)
+        ).fetchone()
+        if current_row is None:
+            conn.execute(
+                "UPDATE producer_run SET producer = ? WHERE producer = ?",
+                (current, old))
+            continue
+        winner = _later_producer_run(old_row[0], current_row[0])
+        conn.execute(
+            "DELETE FROM producer_run WHERE producer IN (?, ?)",
+            (old, current))
+        conn.execute(
+            "INSERT INTO producer_run (producer, at) VALUES (?, ?)",
+            (current, winner))
 
 # The shape's version, stamped into the database file itself via SQLite's
 # built-in `PRAGMA user_version` (an integer the engine reserves for
@@ -417,6 +517,12 @@ class Store:
                 # column; tables that survived from an earlier open do not,
                 # because `CREATE TABLE IF NOT EXISTS` skipped them whole.
                 _add_missing_columns(self._conn)
+                # Same idempotent-by-construction idiom as the column
+                # addition just above: this checks what `producer_run`
+                # currently holds rather than a flag saying it already ran,
+                # so a database already migrated does one query per renamed
+                # producer and no writes.
+                _migrate_renamed_producer_runs(self._conn)
                 self._conn.commit()
                 if found == 0:
                     # Unstamped — either brand new, or written before this

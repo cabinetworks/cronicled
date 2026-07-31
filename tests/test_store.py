@@ -1004,6 +1004,188 @@ class ProducerRunsSurviveARestart(unittest.TestCase):
                              {"nightly-scrape": "2026-07-26T02:00:00+00:00"})
 
 
+class RenamedProducerRunsSurviveTheRename(unittest.TestCase):
+    """A run recorded under a job's OLD name must answer `last_run`/`runs` for
+    its current one, so a rename cannot make the scheduler read a producer
+    that has genuinely run for years as never-run.
+
+    Every fixture here writes `producer_run` directly with a raw connection,
+    the same way `RunTableAddedOnAnExistingDatabase` and
+    `SchemaAdditionOnAnExistingDatabase` emulate a database an earlier build
+    left behind — `Store` itself never writes the old name, so seeding it any
+    other way would not be testing what a real upgraded deployment has on
+    disk.
+
+    Literal old name, literal new name, one test each for the three real
+    renames — deriving either side from `RENAMED_JOBS` would move both halves
+    together, and a map emptied to `{}` or repointed would stay green.
+    """
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self.path = os.path.join(self._dir, "s.db")
+        self.addCleanup(shutil.rmtree, self._dir, True)
+
+    def _seed(self, producer, at):
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS producer_run "
+            "(producer TEXT PRIMARY KEY, at TEXT NOT NULL)")
+        connection.execute(
+            "INSERT INTO producer_run VALUES (?, ?)", (producer, at))
+        connection.commit()
+        connection.close()
+
+    def _seed_both(self, old, current, old_at, current_at):
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS producer_run "
+            "(producer TEXT PRIMARY KEY, at TEXT NOT NULL)")
+        connection.execute(
+            "INSERT INTO producer_run VALUES (?, ?)", (old, old_at))
+        connection.execute(
+            "INSERT INTO producer_run VALUES (?, ?)", (current, current_at))
+        connection.commit()
+        connection.close()
+
+    def _raw_producer_runs(self):
+        connection = sqlite3.connect(self.path)
+        rows = connection.execute(
+            "SELECT producer, at, rowid FROM producer_run").fetchall()
+        connection.close()
+        return rows
+
+    # -- the three real renames, each pinned by literals on both sides ---- #
+
+    def test_a_run_under_the_old_scene_name_is_read_under_the_new_one(self):
+        self._seed("nightly-library-scan", "2026-07-26T02:00:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.last_run("scene-scan"),
+                             "2026-07-26T02:00:00+00:00")
+            self.assertEqual(store.runs(),
+                             {"scene-scan": "2026-07-26T02:00:00+00:00"})
+
+    def test_a_run_under_the_old_performer_name_is_read_under_the_new_one(self):
+        self._seed("performer-descriptions", "2026-07-26T02:00:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.last_run("performer-scan"),
+                             "2026-07-26T02:00:00+00:00")
+            self.assertEqual(store.runs(),
+                             {"performer-scan": "2026-07-26T02:00:00+00:00"})
+
+    def test_a_run_under_the_old_tag_name_is_read_under_the_new_one(self):
+        self._seed("tag-merge", "2026-07-26T02:00:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.last_run("tag-scan"),
+                             "2026-07-26T02:00:00+00:00")
+            self.assertEqual(store.runs(),
+                             {"tag-scan": "2026-07-26T02:00:00+00:00"})
+
+    # -- the ordinary cases the migration must not disturb ----------------- #
+
+    def test_a_run_already_under_the_current_name_is_unchanged(self):
+        self._seed("scene-scan", "2026-07-26T02:00:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.runs(),
+                             {"scene-scan": "2026-07-26T02:00:00+00:00"})
+
+    def test_a_producer_with_no_history_under_either_name_stays_never_run(self):
+        # Guards the direction opposite the main fix: the migration must not
+        # invent a row for a renamed producer that has genuinely never run,
+        # which would make it look like it HAS and defeat the "still due
+        # immediately" guarantee `cronicled.schedule.due` provides.
+        with Store(self.path) as store:
+            self.assertIsNone(store.last_run("scene-scan"))
+            self.assertIsNone(store.last_run("performer-scan"))
+            self.assertIsNone(store.last_run("tag-scan"))
+            self.assertEqual(store.runs(), {})
+
+    # -- a history recorded under both names, e.g. an upgrade then a
+    # rollback then a second upgrade ---------------------------------------
+
+    def test_when_the_old_name_ran_more_recently_it_wins(self):
+        self._seed_both("nightly-library-scan", "scene-scan",
+                        old_at="2026-07-27T09:00:00+00:00",
+                        current_at="2026-07-20T03:00:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.runs(),
+                             {"scene-scan": "2026-07-27T09:00:00+00:00"})
+
+    def test_when_the_current_name_ran_more_recently_it_wins(self):
+        # The reverse direction, pinned separately: a fixture whose winner is
+        # always the same side cannot tell "later wins" from "old always
+        # wins" or "new always wins".
+        self._seed_both("nightly-library-scan", "scene-scan",
+                        old_at="2026-07-20T03:00:00+00:00",
+                        current_at="2026-07-27T09:00:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.runs(),
+                             {"scene-scan": "2026-07-27T09:00:00+00:00"})
+
+    def test_the_collision_leaves_exactly_one_row_not_two(self):
+        self._seed_both("nightly-library-scan", "scene-scan",
+                        old_at="2026-07-27T09:00:00+00:00",
+                        current_at="2026-07-20T03:00:00+00:00")
+        with Store(self.path):
+            pass
+        rows = self._raw_producer_runs()
+        self.assertEqual([r[0] for r in rows], ["scene-scan"])
+
+    # -- a reading on one side that cannot be read as a moment at all ------- #
+    #
+    # `record_run` stores whatever it is given, so either side of a collision
+    # could hold something that is not a usable timestamp -- see
+    # `cronicled.schedule.due`'s own tolerance for this. Recency cannot be
+    # compared against nothing, so the side that DOES parse is kept, rather
+    # than losing real information to a value that is not a moment at all.
+
+    def test_an_unreadable_old_reading_loses_to_a_readable_current_one(self):
+        self._seed_both("nightly-library-scan", "scene-scan",
+                        old_at="not-a-timestamp",
+                        current_at="2026-07-20T03:00:00+00:00")
+        with Store(self.path) as store:
+            self.assertEqual(store.runs(),
+                             {"scene-scan": "2026-07-20T03:00:00+00:00"})
+
+    def test_an_unreadable_current_reading_loses_to_a_readable_old_one(self):
+        self._seed_both("nightly-library-scan", "scene-scan",
+                        old_at="2026-07-20T03:00:00+00:00",
+                        current_at="not-a-timestamp")
+        with Store(self.path) as store:
+            self.assertEqual(store.runs(),
+                             {"scene-scan": "2026-07-20T03:00:00+00:00"})
+
+    # -- idempotence: opening a second time must rewrite nothing ------------ #
+
+    def test_migrating_a_second_time_changes_nothing(self):
+        self._seed("nightly-library-scan", "2026-07-26T02:00:00+00:00")
+        with Store(self.path):
+            pass
+        first = self._raw_producer_runs()
+        with Store(self.path):
+            pass
+        second = self._raw_producer_runs()
+        # Whole rows, including `rowid`: identical `at` values with a
+        # different `rowid` would mean the row was deleted and reinserted on
+        # the second pass -- unobservable through `last_run` alone, since the
+        # value did not change, but exactly the "rewrites anything" this must
+        # not do.
+        self.assertEqual(second, first)
+        self.assertEqual([r[0] for r in first], ["scene-scan"])
+
+    def test_migrating_a_collision_a_second_time_changes_nothing_either(self):
+        self._seed_both("nightly-library-scan", "scene-scan",
+                        old_at="2026-07-27T09:00:00+00:00",
+                        current_at="2026-07-20T03:00:00+00:00")
+        with Store(self.path):
+            pass
+        first = self._raw_producer_runs()
+        with Store(self.path):
+            pass
+        second = self._raw_producer_runs()
+        self.assertEqual(second, first)
+
+
 class _RunLogCase(_StoreCase):
     """Shared fixture for the run log: distinct, increasing start times.
 
