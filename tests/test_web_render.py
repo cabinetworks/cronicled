@@ -235,6 +235,171 @@ class ButtonWiring(unittest.TestCase):
                          [("/refresh", "Refresh", row.fingerprint)])
 
 
+class BatchCheckboxRendering(unittest.TestCase):
+    """The ticked-selection mechanism: one checkbox per row, tied to the
+    shared `#batch-form` by the HTML `form` attribute rather than by
+    nesting (a `<form>` inside a row's own `<form>` -- Approve/Dismiss/
+    Mute/Refresh, or Undo -- is invalid HTML and would be silently
+    dropped), plus the "select all on this page" form built from the exact
+    rows this render was given."""
+
+    _CHECKBOX_RE = re.compile(
+        r'<input type="checkbox" name="fp" value="(?P<fp>[^"]*)"'
+        r' form="batch-form">')
+
+    def test_a_row_gets_exactly_one_checkbox_naming_its_own_fingerprint(self):
+        row = _row()
+        html = render("inbox.html", rows=[row], counts={})
+        self.assertEqual(self._CHECKBOX_RE.findall(html), [row.fingerprint])
+
+    def test_two_rows_each_get_their_own_checkbox_in_order(self):
+        first, second = _row(fingerprint="fp-1"), _row(fingerprint="fp-2")
+        html = render("inbox.html", rows=[first, second], counts={})
+        self.assertEqual(self._CHECKBOX_RE.findall(html), ["fp-1", "fp-2"])
+
+    def test_the_ticked_selection_form_offers_exactly_the_four_verdicts(self):
+        html = render("inbox.html", rows=[_row()], counts={})
+        self.assertIn('<form id="batch-form" method="post" action="/batch">',
+                      html)
+        match = re.search(
+            r'<form id="batch-form" method="post" action="/batch">'
+            r'(?P<body>.*?)</form>', html, re.DOTALL)
+        self.assertIsNotNone(match)
+        verdicts = re.findall(r'<button name="verdict" value="([^"]+)">',
+                              match.group("body"))
+        self.assertEqual(verdicts, ["approve", "dismiss", "mute", "refresh"])
+
+    def test_the_select_all_form_carries_every_shown_rows_fingerprint(self):
+        first, second = _row(fingerprint="fp-1"), _row(fingerprint="fp-2")
+        html = render("inbox.html", rows=[first, second], counts={})
+        match = re.search(
+            r'<form method="post" action="/batch">(?P<body>.*?)</form>',
+            html, re.DOTALL)
+        self.assertIsNotNone(match)
+        fps = re.findall(r'<input type="hidden" name="fp" value="([^"]*)">',
+                         match.group("body"))
+        self.assertEqual(fps, ["fp-1", "fp-2"])
+        verdicts = re.findall(r'<button name="verdict" value="([^"]+)">',
+                              match.group("body"))
+        self.assertEqual(verdicts, ["approve", "dismiss", "mute", "refresh"])
+
+    def test_no_rows_means_no_batch_controls_at_all(self):
+        html = render("inbox.html", rows=[], counts={})
+        self.assertNotIn("batch-form", html)
+        self.assertNotIn('action="/batch"', html)
+        self.assertNotIn('type="checkbox"', html)
+
+    def test_a_hostile_fingerprint_is_escaped_in_the_checkbox_value(self):
+        # Fingerprints are ordinarily a sha256 hex digest, never attacker
+        # text -- this proves the template's own escaping, not that a
+        # hostile fingerprint is a real shape.
+        row = _row(fingerprint=_HOSTILE)
+        html = render("inbox.html", rows=[row], counts={})
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+
+class BatchConfirmationPageRendering(unittest.TestCase):
+    """`batch_confirm.html` -- the stop before `approve`/`refresh` fire on a
+    ticked selection. The set echoed back must be exactly, and only, the
+    set the caller handed it -- never re-derived, never re-ordered."""
+
+    def test_the_count_and_every_fingerprint_reach_the_page_in_order(self):
+        html = render("batch_confirm.html", verdict="approve",
+                      fingerprints=["fp-a", "fp-b", "fp-c"], count=3)
+        self.assertIn("3", html)
+        fps = re.findall(r'<input type="hidden" name="fp" value="([^"]*)">',
+                         html)
+        self.assertEqual(fps, ["fp-a", "fp-b", "fp-c"])
+
+    def test_the_confirm_form_also_carries_the_verdict_and_the_confirmed_flag(self):
+        html = render("batch_confirm.html", verdict="approve",
+                      fingerprints=["fp-a"], count=1)
+        self.assertIn('<input type="hidden" name="verdict" value="approve">',
+                      html)
+        self.assertIn('<input type="hidden" name="confirmed" value="1">',
+                      html)
+
+    def test_approve_warns_that_the_write_is_not_additive(self):
+        html = render("batch_confirm.html", verdict="approve",
+                      fingerprints=["fp-a"], count=1)
+        self.assertIn("overwrites", html.lower())
+
+    def test_approve_states_that_undo_is_per_row(self):
+        html = render("batch_confirm.html", verdict="approve",
+                      fingerprints=["fp-a"], count=1)
+        self.assertIn("per row", html.lower())
+
+    def test_refresh_says_it_contacts_nothing_itself(self):
+        # The brief's own framing of `refresh` ("spends lookups against
+        # rate-limited third parties") does not match what `Store.supersede`
+        # actually does -- it only frees the subject for a LATER scan to
+        # examine, and that scan's own configured limit bounds the real
+        # cost. The confirmation text says the mechanism, not the brief's
+        # inaccurate shorthand for it.
+        html = render("batch_confirm.html", verdict="refresh",
+                      fingerprints=["fp-a"], count=1)
+        self.assertIn("next scan", html.lower())
+        self.assertIn("does not itself contact", html.lower())
+
+    def test_approve_and_refresh_render_visibly_different_text(self):
+        approve_html = render("batch_confirm.html", verdict="approve",
+                              fingerprints=["fp-a"], count=1)
+        refresh_html = render("batch_confirm.html", verdict="refresh",
+                              fingerprints=["fp-a"], count=1)
+        self.assertNotEqual(approve_html, refresh_html)
+
+    def test_a_hostile_fingerprint_is_escaped(self):
+        html = render("batch_confirm.html", verdict="approve",
+                      fingerprints=[_HOSTILE], count=1)
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+
+class BatchResultBannerRendering(unittest.TestCase):
+    """The banner `/batch`'s own redirect produces -- shared shape across
+    all four verdicts, but the verb and the partial-outcome wording must
+    tell them apart, the same "state both counts, never one flag" reasoning
+    `bulk_result`'s own banner already follows."""
+
+    def _banner(self, verdict, requested, applied):
+        return render("inbox.html", rows=[], counts={},
+                      batch_result={"verdict": verdict, "requested": requested,
+                                    "applied": applied})
+
+    def test_a_complete_approve_batch_names_the_verb_and_the_count(self):
+        html = self._banner("approve", 3, 3)
+        self.assertIn("Applied all 3 ticked rows", html)
+
+    def test_a_partial_approve_batch_states_both_counts_not_a_success(self):
+        html = self._banner("approve", 3, 2)
+        self.assertIn("Applied 2 of 3 ticked rows", html)
+        self.assertNotIn("Applied all", html)
+
+    def test_dismiss_mute_and_refresh_each_get_their_own_verb(self):
+        self.assertIn("Dismissed all 1 ticked row",
+                     self._banner("dismiss", 1, 1))
+        self.assertIn("Muted all 1 ticked row", self._banner("mute", 1, 1))
+        self.assertIn("Refreshed all 1 ticked row",
+                     self._banner("refresh", 1, 1))
+
+    def test_no_batch_result_means_no_banner_at_all(self):
+        html = render("inbox.html", rows=[], counts={})
+        for verb in ("Applied all", "Dismissed all", "Muted all",
+                    "Refreshed all"):
+            self.assertNotIn(verb, html)
+
+    def test_an_unrecognised_verdict_is_never_reached_from_the_page(self):
+        # `web/app.py` only ever builds `batch_result` after checking
+        # `raw_verdict in BATCH_VERDICTS` -- this fixes what the template
+        # itself does if that contract is ever violated: the final `else`
+        # branch reads as `refresh` rather than raising, so a malformed
+        # context degrades to A banner rather than a broken page. Not a
+        # claim that an unknown verdict can reach here in production.
+        html = self._banner("something-else", 1, 1)
+        self.assertIn("Refreshed all 1 ticked row", html)
+
+
 class CoverWarning(unittest.TestCase):
     """The warning a person needs before Approve writes something Undo
     cannot take back -- and the same fact, past tense, once the row is
