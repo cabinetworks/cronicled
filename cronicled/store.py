@@ -1245,35 +1245,59 @@ class Store:
             )
             self._conn.commit()
 
-    def refusals(self):
+    # The `WHERE` clause `refusals()` and `refusal_count()` share -- the
+    # not-GONE exclusion below -- built once here for the same reason
+    # `_item_clauses` is: two hand-written copies of "a subject the media
+    # server no longer holds is not a standing refusal any more" are two
+    # chances for a bounded page's stated total and its actual rows to
+    # silently disagree.
+    _REFUSAL_NOT_GONE = (
+        "NOT EXISTS (SELECT 1 FROM gone g "
+        "            WHERE g.subject_type = refusal.subject_type "
+        "              AND g.subject_id = refusal.subject_id)"
+    )
+
+    def refusals(self, limit=None, offset=0):
         """Every standing refusal, as dicts with `subject_type`,
         `subject_id`, `path`, `reason`, `at` and `stores` — the last decoded
         back into the list of dicts that was recorded, the same way `items()`
         decodes a payload.
 
         Ordered by `at` then `subject_id`, the same tie-break `items()` and
-        `mutes()` use for their own listings.
+        `mutes()` use for their own listings. `limit`/`offset` paginate this
+        same order, exactly as `items()`'s do.
 
         A subject marked GONE is left out, for the reason `mutes()` leaves one
         out: a refusal is a standing "a person should look at this file", and
         there is no longer a file to look at. The `refusal` row is untouched --
         nothing here deletes what was decided.
         """
+        query = ("SELECT subject_type, subject_id, path, reason, at, stores "
+                 "FROM refusal WHERE %s ORDER BY at, subject_id"
+                 % self._REFUSAL_NOT_GONE)
+        params = []
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT subject_type, subject_id, path, reason, at, stores "
-                "FROM refusal "
-                "WHERE NOT EXISTS (SELECT 1 FROM gone g "
-                "                  WHERE g.subject_type = refusal.subject_type "
-                "                    AND g.subject_id = refusal.subject_id) "
-                "ORDER BY at, subject_id"
-            ).fetchall()
+            rows = self._conn.execute(query, params).fetchall()
         return [
             {"subject_type": subject_type, "subject_id": subject_id,
              "path": path, "reason": reason, "at": at,
              "stores": json.loads(stores)}
             for subject_type, subject_id, path, reason, at, stores in rows
         ]
+
+    def refusal_count(self):
+        """How many rows `refusals()` would return, ignoring `limit`/
+        `offset` -- see `item_count`'s own docstring for why this is a
+        separate query rather than `len(self.refusals())`."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM refusal WHERE %s"
+                % self._REFUSAL_NOT_GONE
+            ).fetchone()
+        return row[0]
 
     # Marking a subject the media server no longer holds
     # ---------------------------------------------------
@@ -1406,25 +1430,21 @@ class Store:
             item["prior_state"] = json.loads(item["prior_state"])
         return item
 
-    def items(self, folder=None, state=None, limit=None, offset=0,
-              subject_types=None):
-        """Proposals in the store, as dicts with `payload` (and
-        `prior_state`, when present) decoded back into the Python object
-        that was originally recorded.
+    def _item_clauses(self, folder, state, subject_types, exclude_states):
+        """The `WHERE` clause fragments and bound params `items()` and
+        `item_count()` both filter by, built in exactly one place so the
+        two can never quietly disagree about which rows they mean.
 
-        Optionally filtered by `folder` and/or `state`, and paginated with
-        `limit`/`offset`. With no `state` given, `dismissed` and `muted`
-        rows are excluded — the inbox stays clean of a reviewer's own
-        rejections. Ask for them explicitly with `items(state="dismissed")`
-        or `items(state="muted")`.
+        `item_count()` exists ONLY to answer "how many rows would `items()`
+        return for these same arguments" for a page too large to fetch
+        whole just to learn its own length -- so the two MUST filter
+        identically, which is the entire reason this is factored out rather
+        than written twice. A second, slightly different copy of this
+        `WHERE` clause is exactly how a page's stated total and its actual
+        rows would drift apart.
 
-        `subject_types`, when given, narrows to rows whose `subject_type` is
-        one of the tuple's members — this is how an inbox page (see
-        `cronicled.web.inboxes`) asks for only the subject types it owns.
-        Checked with `is not None`, not truthiness: an empty tuple is a
-        real, distinct request ("select nothing"), not "no filter given".
+        `exclude_states` is documented on `items()` itself.
         """
-        query = "SELECT %s FROM item" % self._ITEM_COLUMNS
         clauses = []
         params = []
         if folder is not None:
@@ -1444,12 +1464,76 @@ class Store:
                 "subject_type IN (%s)" % (subject_placeholders or "NULL"))
             params.extend(subject_types)
         if state is not None:
+            if exclude_states:
+                # Refusing rather than silently ignoring one of the two: a
+                # caller asking for exactly one state AND naming states to
+                # exclude has written a self-contradictory request, and
+                # picking one to honour would hide which -- see this
+                # project's own rule against a default that happens to skip
+                # a guard.
+                raise ValueError(
+                    "exclude_states is meaningless together with an "
+                    "explicit state -- ask for one or the other, not both"
+                )
             clauses.append("state = ?")
             params.append(state)
         else:
-            placeholders = ", ".join("?" for _ in self._HIDDEN_STATES)
+            hidden = self._HIDDEN_STATES + tuple(exclude_states)
+            placeholders = ", ".join("?" for _ in hidden)
             clauses.append(f"state NOT IN ({placeholders})")
-            params.extend(self._HIDDEN_STATES)
+            params.extend(hidden)
+        return clauses, params
+
+    def items(self, folder=None, state=None, limit=None, offset=0,
+              subject_types=None, exclude_states=()):
+        """Proposals in the store, as dicts with `payload` (and
+        `prior_state`, when present) decoded back into the Python object
+        that was originally recorded.
+
+        Optionally filtered by `folder` and/or `state`, and paginated with
+        `limit`/`offset`. With no `state` given, `dismissed` and `muted`
+        rows are excluded — the inbox stays clean of a reviewer's own
+        rejections. Ask for them explicitly with `items(state="dismissed")`
+        or `items(state="muted")`.
+
+        `subject_types`, when given, narrows to rows whose `subject_type` is
+        one of the tuple's members — this is how an inbox page (see
+        `cronicled.web.inboxes`) asks for only the subject types it owns.
+        Checked with `is not None`, not truthiness: an empty tuple is a
+        real, distinct request ("select nothing"), not "no filter given".
+
+        `exclude_states`, when given, adds MORE states to the default hidden
+        set above -- only meaningful when `state is None` (raises otherwise;
+        see `_item_clauses`). This is how a bounded working-queue page asks
+        for "every visible row except a decision already made" (`applied`)
+        without a second, hand-written `state NOT IN (...)` query that could
+        drift from the one this method already builds -- `cronicled.__main__
+        ._inbox_rows` used to filter `applied` out in Python, AFTER the page
+        was already fetched whole, which is exactly what a page bounded by
+        `limit`/`offset` cannot afford to do: filtering post-fetch can leave
+        a page short of its own bound for no reason a reader would see.
+
+        Ordered by `created_at, fingerprint` -- oldest first, ties broken by
+        the fingerprint (a sha256 hex digest, so never a tie itself). This
+        is a FIFO queue, deliberately: a proposal that arrives waits behind
+        every one still waiting, never overtaken by a fresher or
+        higher-scoring one arriving later. The alternative -- ordering by
+        score or confidence -- would let a proposal's position drift on its
+        own between one render and the next as later scans revise scores,
+        which is precisely the instability a bounded page cannot tolerate:
+        acting on a row on one page must not silently reshuffle which rows a
+        LATER page shows for a reason that has nothing to do with what was
+        just acted on. `created_at` never changes once a row is written
+        (only `last_seen_at` does — see `record()`), and the fingerprint
+        tiebreak is likewise fixed for the row's whole life, so this order
+        is a genuine, stable total order: the only way a row moves in it is
+        by being removed from the set entirely (approved, dismissed, muted,
+        applied) or a new row being inserted behind everything already
+        there.
+        """
+        query = "SELECT %s FROM item" % self._ITEM_COLUMNS
+        clauses, params = self._item_clauses(folder, state, subject_types,
+                                             exclude_states)
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY created_at, fingerprint"
@@ -1461,6 +1545,27 @@ class Store:
             columns = [d[0] for d in cursor.description]
             rows = cursor.fetchall()
         return [self._decode_item(columns, row) for row in rows]
+
+    def item_count(self, folder=None, state=None, subject_types=None,
+                  exclude_states=()):
+        """How many rows `items()` would return for the same arguments,
+        ignoring `limit`/`offset` -- the total a bounded page's own
+        pagination is computed against.
+
+        Deliberately a SEPARATE query rather than `len(self.items(...))`:
+        the entire reason a page asks for this instead of just fetching
+        everything is that fetching everything is exactly what a bound
+        exists to avoid. See `_item_clauses` for why the filtering the two
+        share is factored into one place rather than repeated here.
+        """
+        clauses, params = self._item_clauses(folder, state, subject_types,
+                                             exclude_states)
+        query = "SELECT COUNT(*) FROM item"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        with self._lock:
+            row = self._conn.execute(query, params).fetchone()
+        return row[0]
 
     def counts(self, folder=None, subject_types=None):
         """Number of proposals in each state, optionally scoped to a folder
