@@ -28,7 +28,7 @@ from cronicled.web.actions import Actions, ApplyFailed
 from cronicled.web.app import build_handler
 from cronicled.web.render import render
 from cronicled.web.rows import (UnusedTagGroup, UnusedTagRow, to_unused_groups,
-                                to_unused_row)
+                                to_unused_row, windowed_unused_groups)
 from tests.test_tags import (FakeBoxClient, FakeCtx, FakeStash, box_credential,
                              box_tag, catalogue, tag)
 
@@ -942,6 +942,96 @@ class TheGrouping(unittest.TestCase):
 
         self.assertEqual(groups[0].rows[0].tag_url,
                          "http://server.invalid/tags/4")
+
+
+class TheWindowedGrouping(unittest.TestCase):
+    """`windowed_unused_groups` bounds how many ROWS a render puts on the
+    page -- never how many groups, since there are only ever as many groups
+    as `tag_hygiene.GROUPS` names (two, today) while a single population
+    measured at 786 rows on a real library is exactly the weight a page
+    bound has to cover. Every test here uses a population LARGER than one
+    page (`page_size=100` against 250 rows), on purpose -- a fixture the
+    size of one page cannot tell "the true count" apart from "what fit"."""
+
+    def _items(self, n, name_prefix="Tag", scene_count=0, subject_prefix="t"):
+        # Zero-padded so lexical (name, subject_id) order -- what
+        # `to_unused_groups` itself sorts by -- matches numeric order, and a
+        # test asserting "the first hundred" means the same hundred a person
+        # would read off the page.
+        return [_item(subject_id="%s%03d" % (subject_prefix, i),
+                      name="%s %03d" % (name_prefix, i),
+                      scene_count=scene_count)
+                for i in range(n)]
+
+    def test_the_total_is_every_row_before_windowing_not_after(self):
+        groups = to_unused_groups(self._items(250))
+        windowed, total = windowed_unused_groups(groups, page=1, page_size=100)
+        self.assertEqual(total, 250)
+        self.assertEqual(sum(len(g.rows) for g in windowed), 100)
+
+    def test_the_groups_own_count_stays_the_true_population_size(self):
+        # The exact bug a rendered-row-count would introduce: `count` on the
+        # group is what the section's summary line states, and it must go
+        # on saying "250", not "100", once the rows themselves are bounded.
+        groups = to_unused_groups(self._items(250))
+        windowed, _ = windowed_unused_groups(groups, page=1, page_size=100)
+        self.assertEqual(windowed[0].count, 250)
+        self.assertEqual(len(windowed[0].rows), 100)
+
+    def test_every_row_is_reachable_across_every_page_exactly_once(self):
+        groups = to_unused_groups(self._items(250))
+        _, total = windowed_unused_groups(groups, page=1, page_size=100)
+        pages = -(-total // 100)
+        seen = []
+        for page in range(1, pages + 1):
+            windowed, _ = windowed_unused_groups(groups, page=page,
+                                                 page_size=100)
+            for g in windowed:
+                seen.extend(r.fingerprint for r in g.rows)
+        self.assertEqual(len(seen), 250)
+        self.assertEqual(len(set(seen)), 250)
+        self.assertEqual(set(seen),
+                         {r.fingerprint for g in groups for r in g.rows})
+
+    def test_a_page_boundary_falling_inside_one_population_still_regroups_it(self):
+        # 150 in NO_SCENES, 100 in ONE_SCENE -- a page of 100 rows starting
+        # at offset 100 straddles the two populations (the last 50 of the
+        # first, the first 50 of the second), which a flatten-then-slice
+        # approach handles naturally and a per-group slice could not.
+        items = (self._items(150, name_prefix="Empty", scene_count=0,
+                             subject_prefix="e")
+                 + self._items(100, name_prefix="Single", scene_count=1,
+                              subject_prefix="s"))
+        groups = to_unused_groups(items)
+        windowed, total = windowed_unused_groups(groups, page=2, page_size=100)
+        self.assertEqual(total, 250)
+        self.assertEqual(len(windowed), 2)
+        self.assertEqual(len(windowed[0].rows), 50)
+        self.assertEqual(len(windowed[1].rows), 50)
+        # Every row on this page really is the 50 straddling the boundary,
+        # not just the right COUNT of them.
+        self.assertEqual(windowed[0].rows[-1].name, "Empty 149")
+        self.assertEqual(windowed[1].rows[0].name, "Single 000")
+
+    def test_a_page_past_the_end_returns_no_rows_but_keeps_the_true_total(self):
+        groups = to_unused_groups(self._items(50))
+        windowed, total = windowed_unused_groups(groups, page=5, page_size=100)
+        self.assertEqual(windowed, ())
+        self.assertEqual(total, 50)
+
+    def test_an_empty_store_windows_to_nothing_with_a_zero_total(self):
+        windowed, total = windowed_unused_groups((), page=1, page_size=100)
+        self.assertEqual(windowed, ())
+        self.assertEqual(total, 0)
+
+    def test_windowing_preserves_the_within_group_content_order(self):
+        # `to_unused_groups` already orders rows by (name, subject_id); a
+        # window must not disturb that order, only bound how much of it is
+        # shown.
+        groups = to_unused_groups(self._items(10))
+        windowed, _ = windowed_unused_groups(groups, page=1, page_size=4)
+        self.assertEqual([r.name for r in windowed[0].rows],
+                         ["Tag 000", "Tag 001", "Tag 002", "Tag 003"])
 
 
 # -- the page ------------------------------------------------------------- #
