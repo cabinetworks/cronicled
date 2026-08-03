@@ -1,0 +1,48 @@
+{# cronicled/web/templates/batch_confirm.html #}
+{#
+  The stop `/batch` inserts before `approve` or `refresh` ever fires for a
+  ticked selection. Both write something real -- `approve` to the library,
+  `refresh` retiring a proposal outright -- so both state the exact count
+  and the exact set before anything happens, rather than after.
+
+  This is NOT a redirect back through a query string: the set a person is
+  about to act on is echoed back here as hidden fields on THIS page's own
+  form, verbatim, in the order it was submitted -- never reconstructed by
+  asking the store again. Confirming re-posts exactly this set to `/batch`
+  with `confirmed=1`; nothing here re-derives it from anything else.
+
+  `dismiss`/`mute` never reach this template at all -- see `web/app.py`'s
+  `_BATCH_CONFIRM_VERDICTS` -- both are reversible and act immediately, on
+  the same terms a single row's own click already does.
+#}
+{% include "_style.html" %}
+{% include "_sidebar.html" %}
+
+{% if verdict == "approve" %}
+<h1>Confirm: apply {{ count }} row{% if count != 1 %}s{% endif %}</h1>
+<p>This writes to your library. Approving overwrites any field on these
+  {{ count }} row{% if count != 1 %}s{% endif %} that you or somebody else may
+  already have set by hand -- it is not additive.</p>
+<p class="note">Undo, if you need it afterward, is per row -- open the row in
+  the Applied section and use its own Undo control. There is no undo for a
+  whole batch at once.</p>
+{% elif verdict == "refresh" %}
+<h1>Confirm: refresh {{ count }} row{% if count != 1 %}s{% endif %}</h1>
+<p>This retires {{ count }} proposal{% if count != 1 %}s{% endif %} as
+  superseded and frees the file{% if count != 1 %}s{% endif %} behind them for
+  the next scan to look at again. It does not itself contact any external
+  source -- nothing is looked up until a scan actually runs, and that scan's
+  own configured limit decides how many of the freed files it revisits.</p>
+{% else %}
+<h1>Confirm: {{ verdict }} {{ count }} row{% if count != 1 %}s{% endif %}</h1>
+{% endif %}
+
+<form method="post" action="/batch">
+  {% for fp in fingerprints %}
+  <input type="hidden" name="fp" value="{{ fp }}">
+  {% endfor %}
+  <input type="hidden" name="verdict" value="{{ verdict }}">
+  <input type="hidden" name="confirmed" value="1">
+  <button>Confirm</button>
+</form>
+<p><a href="/inbox">Cancel -- back to the inbox</a></p>

@@ -14,6 +14,7 @@ from cronicled.tag_hygiene import LOW_COUNT_IS_NOT_PROOF
 from cronicled.tag_hygiene import SUBJECT_TYPE as _UNUSED_TAG_SUBJECT
 from cronicled.tags import SUBJECT_TYPE as _MERGE_SUBJECT
 
+from .actions import BATCH_VERDICTS
 from .inboxes import INBOXES, TITLES
 from .pagination import PAGE_SIZE, offset_for, page_number, total_pages, window
 from .render import render
@@ -158,7 +159,8 @@ SUMMARY_PATH = "/"
 INBOX_PATH = "/inbox"
 
 _ACTIONS = ("approve", "dismiss", "mute", "undo", "scan",
-           "unmute", "undismiss", "refresh", "bulk_apply_tag_descriptions")
+           "unmute", "undismiss", "refresh", "bulk_apply_tag_descriptions",
+           "batch")
 
 # A REVERSAL undoes an earlier verdict recorded against a collapsed section --
 # `/unmute` reverses a mute (the "Muted" section), `/undismiss` a dismissal
@@ -194,20 +196,32 @@ DEFAULT_SCAN_LIMIT = 25
 # every other request until it clears.
 _MAX_BODY_BYTES = 4096
 
-# `bulk_apply_tag_descriptions` is the one form on this whole site that
-# legitimately posts more than a handful of bytes: it carries one hidden
-# `fp` field per row the page showed, not one. The measured population
-# (ticket bulk179) is 1456 waiting tag-description proposals, and each
-# fingerprint is a 64-character sha256 hex digest (see
+# `bulk_apply_tag_descriptions` and `batch` are the two forms on this whole
+# site that legitimately post more than a handful of bytes: each carries one
+# hidden or ticked `fp` field per row the page showed, not one. The measured
+# population (ticket bulk179) is 1456 waiting tag-description proposals, and
+# each fingerprint is a 64-character sha256 hex digest (see
 # `cronicled.store.fingerprint`), so one field costs `len("fp=") + 64 +
 # len("&")` = 68 bytes: 1456 * 68 = 98,988 bytes for that whole measured
-# population in one submission. This bound is set well above that -- room
-# for roughly 3,800 fingerprints -- so the mechanism does not need
-# revisiting the next time the population grows a little, while still
-# being a BOUND rather than `_MAX_BODY_BYTES` simply widened for every
-# action: `rfile.read` here blocks on a fixed, generous ceiling, never an
-# attacker-chosen one, and every other action keeps the tight bound above.
+# population in one submission. `batch` never carries more than one bounded
+# page's worth (`PAGE_SIZE` = 200 fingerprints, roughly 13,600 bytes) since
+# its own selection never reaches past the rendered page -- well inside the
+# same ceiling. This bound is set well above the larger of the two -- room
+# for roughly 3,800 fingerprints -- so neither mechanism needs revisiting the
+# next time its population grows a little, while still being a BOUND rather
+# than `_MAX_BODY_BYTES` simply widened for every action: `rfile.read` here
+# blocks on a fixed, generous ceiling, never an attacker-chosen one, and
+# every other action keeps the tight bound above.
 _MAX_BULK_BODY_BYTES = 262144
+
+# The two verdicts `batch` never fires on its first POST -- see `do_POST`'s
+# own handling below. `approve` writes to the library and `refresh` retires a
+# proposal outright (see `cronicled.web.actions.Actions.refresh`), so both
+# get a confirmation page stating the count before anything happens; `dismiss`
+# and `mute` are reversible and recorded (both already have an Undismiss/
+# Unmute reachable from the page), so they act immediately on the same terms
+# a single row's own click already does.
+_BATCH_CONFIRM_VERDICTS = ("approve", "refresh")
 
 # Sec-Fetch-Site values a legitimate write can carry. `same-origin` is a
 # request from a page this server served; `none` is the address bar, a
@@ -444,6 +458,31 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                 except ValueError:
                     bulk_result = None
 
+            # `batch_verdict`/`batch_requested`/`batch_applied` are the same
+            # idea as `bulk_result` above, widened to name which of the four
+            # verdicts `/batch` just carried out -- read-only, on the same
+            # "a stray or foreign value shows nothing" terms: `batch_verdict`
+            # must also be one of `BATCH_VERDICTS`, not just any string, or a
+            # bookmarked/foreign link could claim a verdict this page never
+            # performed.
+            batch_result = None
+            raw_verdict = (qs.get("batch_verdict") or [None])[0]
+            raw_batch_requested = (qs.get("batch_requested") or [None])[0]
+            raw_batch_applied = (qs.get("batch_applied") or [None])[0]
+            if (raw_verdict in BATCH_VERDICTS
+                    and raw_batch_requested is not None
+                    and raw_batch_applied is not None):
+                try:
+                    requested_n = int(raw_batch_requested)
+                    applied_n = int(raw_batch_applied)
+                    if requested_n < 0 or applied_n < 0:
+                        raise ValueError("negative count")
+                    batch_result = {"verdict": raw_verdict,
+                                    "requested": requested_n,
+                                    "applied": applied_n}
+                except ValueError:
+                    batch_result = None
+
             # Every pagination query key this page knows, read once so a
             # link built for one section can carry every other section's
             # own current page forward unchanged -- see `_pager`.
@@ -494,6 +533,7 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
 
             body = render("inbox.html", rows=rows_window, counts={},
                          bulk_result=bulk_result,
+                         batch_result=batch_result,
                          muted=sections["muted"],
                          dismissed=sections["dismissed"],
                          refused=sections["refused"],
@@ -737,12 +777,12 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                 self._send(400, b"malformed content-length",
                            [("Content-Type", "text/plain; charset=utf-8")])
                 return
-            # `bulk_apply_tag_descriptions` alone gets the larger, still
-            # bounded ceiling -- see `_MAX_BULK_BODY_BYTES`'s own comment.
-            # Every other action keeps the tight one nothing genuine ever
-            # approaches.
+            # `bulk_apply_tag_descriptions` and `batch` alone get the larger,
+            # still bounded ceiling -- see `_MAX_BULK_BODY_BYTES`'s own
+            # comment. Every other action keeps the tight one nothing
+            # genuine ever approaches.
             max_body = (_MAX_BULK_BODY_BYTES
-                       if name == "bulk_apply_tag_descriptions"
+                       if name in ("bulk_apply_tag_descriptions", "batch")
                        else _MAX_BODY_BYTES)
             if not (0 <= length <= max_body):
                 self._send(400, b"malformed content-length",
@@ -831,6 +871,56 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                 # by there being nowhere on the page to say otherwise.
                 location = "%s?bulk_requested=%d&bulk_applied=%d" % (
                     INBOX_PATH, len(result.requested), len(result.applied))
+            elif name == "batch":
+                # Every ticked (or page-wide "select all on this page")
+                # `fp` field the page's own batch form posted -- `parse_qs`
+                # already collects repeated keys into a list, in the order
+                # they were submitted, so this IS the exact set the page's
+                # own checkboxes carried. Nothing here re-derives a set from
+                # the store; see `Actions.batch_apply`'s own docstring for
+                # why that is the whole point of this action, the same
+                # reasoning `bulk_apply_tag_descriptions` above already
+                # relies on.
+                verdict = (form.get("verdict") or [""])[0]
+                if verdict not in BATCH_VERDICTS:
+                    self._send(400, b"missing or unrecognised verdict")
+                    return
+                fps = form.get("fp") or []
+                if not fps:
+                    self._send(400, b"missing fingerprint")
+                    return
+                confirmed = (form.get("confirmed") or [""])[0] == "1"
+                if verdict in _BATCH_CONFIRM_VERDICTS and not confirmed:
+                    # NOT a redirect: a redirect would have to carry every
+                    # ticked fingerprint on the query string, which is
+                    # exactly the large-body problem `_MAX_BULK_BODY_BYTES`
+                    # exists to accommodate in a POST body rather than
+                    # encourage in a URL. The confirmation page instead
+                    # echoes the caller's OWN submitted set back as hidden
+                    # fields on its own form -- never reconstructed from the
+                    # store -- so the count a person reads here is the exact
+                    # set `batch_apply` receives if they confirm.
+                    body = render(
+                        "batch_confirm.html", verdict=verdict,
+                        fingerprints=fps, count=len(fps),
+                        sidebar=_sidebar_context(_store)).encode()
+                    self._send(200, body,
+                               [("Content-Type", "text/html; charset=utf-8")])
+                    return
+                try:
+                    result = actions.batch_apply(verdict, fps)
+                except Exception as exc:
+                    self._send(400, str(exc).encode("utf-8"),
+                               [("Content-Type", "text/plain; charset=utf-8")])
+                    return
+                # The same "state both counts" reasoning
+                # `bulk_apply_tag_descriptions` already applies above, plus
+                # which verdict this batch was -- the banner reads
+                # differently for "3 of 5 approved" than for "3 of 5 muted".
+                location = ("%s?batch_verdict=%s&batch_requested=%d&"
+                           "batch_applied=%d"
+                           % (INBOX_PATH, verdict, len(result.requested),
+                              len(result.applied)))
             else:
                 fp = (form.get("fp") or [""])[0]
                 if not fp:
