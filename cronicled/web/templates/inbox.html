@@ -418,18 +418,55 @@
 </details>
 {% endmacro %}
 
-{% macro section(name, entries, empty_text, open=False, count=None) %}
+{# The Prev/Next control for one bounded section. `pager` is one of
+   `pagination`'s own values (see web/app.py's `_pager`) -- `None`, or a
+   dict missing entirely (a caller that predates pagination, or one that
+   never wired a `pagination=` context at all), draws nothing at all, and a
+   single page draws nothing either: a pager on a section with only one
+   page to show is a control that does nothing, which is worse than no
+   control. `prev_href`/`next_href` are `None` exactly when there is
+   nowhere to go in that direction, so the disabled span (never a link to
+   the current page) is what appears at either end. #}
+{% macro pager_nav(pager) %}
+{% if pager and pager.total_pages and pager.total_pages > 1 %}
+<div class="pager">
+  {% if pager.prev_href %}<a href="{{ pager.prev_href }}">&laquo; Prev</a>{% else %}<span class="pager-disabled">&laquo; Prev</span>{% endif %}
+  <span class="pager-info">Page {{ pager.page }} of {{ pager.total_pages }}</span>
+  {% if pager.next_href %}<a href="{{ pager.next_href }}">Next &raquo;</a>{% else %}<span class="pager-disabled">Next &raquo;</span>{% endif %}
+</div>
+{% endif %}
+{% endmacro %}
+
+{# `count`/`pager` state the same fact two ways for two different callers:
+   `count` is a caller-supplied override with no pagination behind it (the
+   low-count-tag section's total-across-groups, when nothing paginates it);
+   `pager` is what a bounded page hands every section it built a window
+   for, and its own `.total` -- never `entries | length`, which would be
+   "how many fit on this page" -- takes precedence over `count` when both
+   are given. Neither given falls back to `entries | length`, unchanged
+   from before this ticket -- the ordinary case for a caller that renders a
+   short, complete list directly (a test, or a section nothing bounds). #}
+{% macro section(name, entries, empty_text, open=False, count=None, pager=None) %}
 <details class="section"{% if open %} open{% endif %}>
-  <summary>{{ name }} ({% if count is none %}{{ entries | length }}{% else %}{{ count }}{% endif %})</summary>
+  <summary>{{ name }} ({% if pager %}{{ pager.total }}{% elif count is none %}{{ entries | length }}{% else %}{{ count }}{% endif %})</summary>
   {% if not entries %}
   <p class="empty">{{ empty_text }}</p>
   {% endif %}
   {{ caller() }}
+  {{ pager_nav(pager) }}
 </details>
 {% endmacro %}
 
 <h1>{{ title | default("Inbox") }}</h1>
 
+{# One pager per bounded section, keyed by name (see web/app.py's `_pager`
+   and `do_GET`/`_inbox_page`, which build this dict). Defaulted to `{}`
+   rather than required: a caller that renders this template directly with
+   a short, complete list (most of this project's own render tests) has no
+   pagination to report, and `pagination.<name>` on an empty dict reads as
+   Jinja's `Undefined` -- falsy, so `pager_nav`/`section` both fall back to
+   their pre-pagination behaviour exactly as before this ticket. #}
+{% set pagination = pagination | default({}) %}
 {% set applied = applied | default([]) %}
 {# The fingerprint a successful `/approve` redirected here with (see
    web/app.py's do_POST) -- read-only, and only ever used to find the SAME
@@ -503,6 +540,7 @@
 {% for row in rows %}
 {{ row_block(row) }}
 {% endfor %}
+{{ pager_nav(pagination.rows) }}
 
 {# `merges`/`reconciles`/`unused` are rendered only when the CALLER passed
    them -- `is defined`, checked before either is coerced with `default([])`
@@ -520,7 +558,8 @@
    count either. #}
 {% if merges is defined %}
 {% set merges = merges | default([]) %}
-{% call section("Tag merges", merges, "No duplicate tag spellings found.") %}
+{% call section("Tag merges", merges, "No duplicate tag spellings found.",
+                pager=pagination.merges) %}
   {% for row in merges %}
   {{ merge_block(row) }}
   {% endfor %}
@@ -529,7 +568,8 @@
 
 {% if reconciles is defined %}
 {% set reconciles = reconciles | default([]) %}
-{% call section("Tags that are a performer", reconciles, "No tag matches a performer's name.") %}
+{% call section("Tags that are a performer", reconciles, "No tag matches a performer's name.",
+                pager=pagination.reconciles) %}
   {% for row in reconciles %}
   {{ reconcile_block(row) }}
   {% endfor %}
@@ -540,10 +580,14 @@
 {% set unused = unused | default([]) %}
 {# The TOTAL number of tags, not the number of groups. See the `section` macro's
    own note: "(2)" over a thousand rows is the one number on that line a person
-   would read as how much is waiting. #}
+   would read as how much is waiting. `pagination.unused.total` says the same
+   thing when a pager is wired (see `web.rows.windowed_unused_groups`, whose
+   `total` is the row count before windowing); the `count=` fallback keeps
+   answering it when nothing paginates this render at all. #}
 {% call section("Tags that do almost no work", unused,
                 "No tag is on nought or one scene, or a configured source could not be read.",
-                count=(unused | sum(attribute="count"))) %}
+                count=(unused | sum(attribute="count")),
+                pager=pagination.unused) %}
   {% if unused %}
   <p class="note">{{ low_count_is_not_proof }}</p>
   {% endif %}
@@ -566,7 +610,7 @@
    `applied`/`just_applied`/`just_applied_rows` are set once, above the
    main row loop, because the banner needs them before this point in the
    page. #}
-{% call section("Applied", applied, "Nothing applied yet.") %}
+{% call section("Applied", applied, "Nothing applied yet.", pager=pagination.applied) %}
   {% for row in applied %}
   {{ row_block(row, highlight=(row.fingerprint == just_applied)) }}
   {% endfor %}
@@ -590,7 +634,7 @@
    every single one. Never forced open any other way -- a page loaded
    without that query value keeps this collapsed, the same as every other
    section. #}
-{% call section("Muted", muted, "Nothing muted.", open=(opened == "muted")) %}
+{% call section("Muted", muted, "Nothing muted.", open=(opened == "muted"), pager=pagination.muted) %}
   {% for m in muted %}
   <div class="proposal">
     <div class="head">
@@ -609,7 +653,7 @@
 
 {# `open=(opened == "dismissed")`: the same reopening `/unmute` gets above,
    for a successful `/undismiss` -- see web/app.py's `_REOPEN_SECTION`. #}
-{% call section("Dismissed", dismissed, "Nothing dismissed.", open=(opened == "dismissed")) %}
+{% call section("Dismissed", dismissed, "Nothing dismissed.", open=(opened == "dismissed"), pager=pagination.dismissed) %}
   {% for row in dismissed %}
   <div class="proposal">
     <div class="head">
@@ -631,7 +675,7 @@
    left is the record: what was proposed, what it scored, and that a decision
    was once made about a file that is not there any more. A state with nowhere
    to render is a state that vanished. #}
-{% call section("Gone", gone, "Nothing gone.") %}
+{% call section("Gone", gone, "Nothing gone.", pager=pagination.gone) %}
   {% for row in gone %}
   <div class="proposal">
     <div class="head">
@@ -643,7 +687,7 @@
   {% endfor %}
 {% endcall %}
 
-{% call section("Superseded", superseded, "Nothing superseded.") %}
+{% call section("Superseded", superseded, "Nothing superseded.", pager=pagination.superseded) %}
   {% for row in superseded %}
   <div class="proposal">
     <div class="head">
@@ -655,7 +699,7 @@
   {% endfor %}
 {% endcall %}
 
-{% call section("Refused", refused, "Nothing refused.") %}
+{% call section("Refused", refused, "Nothing refused.", pager=pagination.refused) %}
   {% for r in refused %}
   <div class="proposal">
     <div class="head">

@@ -488,6 +488,144 @@ class Reads(_StoreCase):
         self.assertEqual(self.store.counts(), {"new": 1, "seen": 1})
 
 
+class TheOrderIsAStableTotalOrder(unittest.TestCase):
+    """A bounded page's own reachability depends on `items()`'s order being
+    a genuine total order -- see `items()`'s own docstring for why
+    `created_at, fingerprint` is that (oldest first, ties broken by a
+    fingerprint that is itself fixed for a row's whole life). The risk this
+    pins is specifically the coarse resolution of `created_at`: `_utcnow()`
+    only has one-second precision (see the module docstring above
+    `record_run`), so a batch of proposals recorded inside one second --
+    ordinary for a scan -- ties on `created_at` entirely and the ORDER BY's
+    second column is the only thing keeping their relative order fixed. A
+    fixture that gives every row a distinct timestamp (as most of this
+    file's fixtures do, via `now=`) cannot exercise this at all.
+    """
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self.store = Store(os.path.join(self._dir, "s.db"))
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        self.store.close()
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+    def test_rows_sharing_one_created_at_still_come_back_in_one_fixed_order(self):
+        # The SAME `now=` for every row -- forcing the exact tie a fast
+        # scan produces in production (every proposal from one run landing
+        # in the same `_utcnow()` second), deterministically rather than
+        # hoping this process is fast enough for it to happen on its own.
+        fps = [self.store.record(
+            folder="library", subject_type="scene", subject_id=str(i),
+            summary="s", payload={"i": i}, producer="p",
+            now="2026-07-01T00:00:00")
+            for i in range(50)]
+        first_read = [i["fingerprint"] for i in self.store.items()]
+        second_read = [i["fingerprint"] for i in self.store.items()]
+        self.assertEqual(first_read, second_read)
+        # And the order IS the fingerprint order -- not merely "some order
+        # SQLite happens to repeat" -- which is what `, fingerprint` in the
+        # `ORDER BY` clause is actually for.
+        self.assertEqual(first_read, sorted(fps))
+
+    def test_the_same_holds_with_pagination(self):
+        whole_ids = [self.store.record(
+            folder="library", subject_type="scene", subject_id=str(i),
+            summary="s", payload={"i": i}, producer="p",
+            now="2026-07-01T00:00:00")
+            for i in range(250)]
+        whole = [i["fingerprint"] for i in self.store.items(limit=10_000)]
+        self.assertEqual(whole, sorted(whole_ids))
+        first_page = [i["fingerprint"]
+                     for i in self.store.items(limit=100, offset=0)]
+        second_page = [i["fingerprint"]
+                      for i in self.store.items(limit=100, offset=100)]
+        self.assertEqual(first_page, whole[:100])
+        self.assertEqual(second_page, whole[100:200])
+
+
+class ItemCount(_StoreCase):
+    """`item_count` answers the same question `len(items(...))` would, for a
+    caller that cannot afford to fetch a page's whole population just to
+    learn its size -- the reason a bounded page exists at all. Every test
+    here uses a population LARGER than any page a caller of this method
+    would actually render, on purpose: a fixture the size of one page cannot
+    tell "the true total" apart from "the size of what was fetched", which
+    is exactly the gap this method exists to keep visible.
+    """
+
+    def test_matches_len_of_items_with_no_filter(self):
+        for i in range(250):
+            self._record(subject_id=str(i))
+        self.assertEqual(self.store.item_count(), 250)
+        self.assertEqual(self.store.item_count(),
+                         len(self.store.items(limit=10_000)))
+
+    def test_unaffected_by_limit_and_offset_items_would_take(self):
+        # The whole point: a page fetches two rows and still learns the
+        # population is 250, not 2.
+        for i in range(250):
+            self._record(subject_id=str(i))
+        self.assertEqual(len(self.store.items(limit=2)), 2)
+        self.assertEqual(self.store.item_count(), 250)
+
+    def test_respects_the_state_filter(self):
+        for i in range(250):
+            fp = self._record(subject_id=str(i))
+            if i < 60:
+                self.store.mark_seen(fp)
+        self.assertEqual(self.store.item_count(state="seen"), 60)
+        self.assertEqual(self.store.item_count(state="new"), 190)
+
+    def test_respects_the_subject_types_filter(self):
+        for i in range(250):
+            self.store.record(folder="library", subject_type="scene",
+                              subject_id="scene-%d" % i, summary="s",
+                              payload={"i": i}, producer="p")
+        for i in range(30):
+            self.store.record(folder="library", subject_type="performer",
+                              subject_id="perf-%d" % i, summary="s",
+                              payload={"i": i}, producer="p")
+        self.assertEqual(
+            self.store.item_count(subject_types=("scene",)), 250)
+        self.assertEqual(
+            self.store.item_count(subject_types=("performer",)), 30)
+        self.assertEqual(
+            self.store.item_count(subject_types=()), 0)
+
+    def test_exclude_states_widens_the_default_hidden_set(self):
+        for i in range(250):
+            fp = self._record(subject_id=str(i))
+            if i < 40:
+                self.store.mark_applied(fp)
+        # Without `exclude_states`, an applied row is still counted (only
+        # dismissed/muted/superseded/gone are hidden by default).
+        self.assertEqual(self.store.item_count(), 250)
+        self.assertEqual(
+            self.store.item_count(exclude_states=("applied",)), 210)
+
+    def test_matches_items_of_the_same_call_when_exclude_states_is_used(self):
+        for i in range(250):
+            fp = self._record(subject_id=str(i))
+            if i < 40:
+                self.store.mark_applied(fp)
+        self.assertEqual(
+            self.store.item_count(exclude_states=("applied",)),
+            len(self.store.items(limit=10_000,
+                                 exclude_states=("applied",))))
+
+    def test_exclude_states_together_with_an_explicit_state_raises(self):
+        # A caller asking for exactly one state AND naming states to
+        # exclude has written a self-contradictory request -- see
+        # `Store._item_clauses`'s own docstring for why this refuses rather
+        # than silently picking one half to honour.
+        with self.assertRaises(ValueError):
+            self.store.item_count(state="new", exclude_states=("applied",))
+        with self.assertRaises(ValueError):
+            self.store.items(state="new", exclude_states=("applied",))
+
+
 class Has(_StoreCase):
     def test_true_for_a_recorded_proposal(self):
         fp = self._record()
@@ -828,6 +966,42 @@ class Refusals(_StoreCase):
         self.store.record_refusal("scene", "1", "/library/x/clip.mp4", "a tie")
         self._record(subject_id="2")
         self.assertEqual(len(self.store.refusals()), 1)
+
+    def test_paginates_in_the_same_order_as_an_unpaginated_read(self):
+        for i in range(250):
+            self.store.record_refusal(
+                "scene", str(i), "/library/%d.mp4" % i, "a tie",
+                now="2026-07-01T00:00:%02d" % (i % 60))
+        whole = self.store.refusals()
+        self.assertEqual(len(whole), 250)
+        first_page = self.store.refusals(limit=100)
+        second_page = self.store.refusals(limit=100, offset=100)
+        third_page = self.store.refusals(limit=100, offset=200)
+        self.assertEqual(first_page, whole[:100])
+        self.assertEqual(second_page, whole[100:200])
+        self.assertEqual(third_page, whole[200:])
+
+    def test_refusal_count_matches_len_of_an_unpaginated_read(self):
+        for i in range(250):
+            self.store.record_refusal(
+                "scene", str(i), "/library/%d.mp4" % i, "a tie")
+        self.assertEqual(self.store.refusal_count(), 250)
+
+    def test_refusal_count_is_unaffected_by_limit(self):
+        for i in range(250):
+            self.store.record_refusal(
+                "scene", str(i), "/library/%d.mp4" % i, "a tie")
+        self.assertEqual(len(self.store.refusals(limit=5)), 5)
+        self.assertEqual(self.store.refusal_count(), 250)
+
+    def test_refusal_count_excludes_a_subject_marked_gone(self):
+        for i in range(250):
+            self.store.record_refusal(
+                "scene", str(i), "/library/%d.mp4" % i, "a tie")
+        for i in range(40):
+            self.store.mark_gone("scene", str(i))
+        self.assertEqual(self.store.refusal_count(), 210)
+        self.assertEqual(len(self.store.refusals(limit=10_000)), 210)
 
     # -- what every store returned, kept as values ------------------------- #
 

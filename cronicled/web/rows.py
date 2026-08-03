@@ -31,6 +31,7 @@ from cronicled.schedule import as_utc
 from cronicled.tag_descriptions import SUBJECT_TYPE as TAG_DESCRIPTION_SUBJECT
 from cronicled.tags import MERGE_IS_IRREVERSIBLE
 from cronicled.text import slug_match, spaceless
+from cronicled.web.pagination import PAGE_SIZE, window
 
 # An ISO-8601 instant carrying an offset, as it appears INSIDE a sentence the
 # scheduler wrote ("last ran 2026-07-28T21:17:08+00:00; next due at ...").
@@ -1132,6 +1133,57 @@ def to_unused_groups(items, base_url=None):
             count=len(rows),
             rows=tuple(rows)))
     return tuple(groups)
+
+
+def windowed_unused_groups(groups, page, page_size=PAGE_SIZE):
+    """`groups` (as `to_unused_groups` builds them), bounded to `page`'s own
+    window of ROWS -- never of groups, because there are only ever as many
+    groups as `tag_hygiene.GROUPS` has populations (two, today), while a
+    single population measured at 786 rows on a real library is exactly the
+    weight this ticket exists to bound. Windowing the two-element list of
+    groups would leave every row inside whichever group came first
+    unbounded.
+
+    The windowing itself flattens every group's rows into ONE list first, in
+    the same order `to_unused_groups` already put them in (population order,
+    then name/id inside it) -- deterministic and independent of anything
+    this function does -- takes the page's own slice of THAT, and only then
+    re-groups whatever survived. A group with no row on this page is left
+    out of the result entirely, the same way `to_unused_groups` already
+    omits a population with nothing in it; the two reasons are the same one.
+
+    `count` on each returned group is the TRUE population size carried over
+    from `groups`, never `len(<the windowed rows>)` -- the summary line
+    ("793") must keep answering "how many tags are in this population",
+    not "how many of them fit on this page". This is the same rule
+    `Store.item_count` exists to uphold for the generic row list, applied
+    here to a section built in Python instead of fetched with `limit`/
+    `offset`; see this module's own docstring for why the two sections are
+    windowed differently.
+
+    Returns `(windowed_groups, total)`, `total` being the count of ROWS
+    across every group before windowing -- what a pager needs to compute
+    how many pages this section has, the same total a rendered page must
+    never be the one to invent (see `cronicled.web.pagination`'s own
+    docstring on that point).
+    """
+    true_count = {g.group: g.count for g in groups}
+    label = {g.group: g.label for g in groups}
+    note = {g.group: g.note for g in groups}
+    flat = [(g.group, row) for g in groups for row in g.rows]
+    total = len(flat)
+    windowed = {}
+    order = []
+    for group, row in window(flat, page, page_size=page_size):
+        if group not in windowed:
+            windowed[group] = []
+            order.append(group)
+        windowed[group].append(row)
+    return tuple(
+        UnusedTagGroup(group=g, label=label[g], note=note[g],
+                       count=true_count[g], rows=tuple(windowed[g]))
+        for g in order
+    ), total
 
 
 def _refused_store_view(entry):

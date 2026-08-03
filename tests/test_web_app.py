@@ -15,13 +15,15 @@ from cronicled.jobs import JobRejected
 from cronicled.performer_tags import index_performers, match_tag
 from cronicled.performer_tags import proposal as reconcile_proposal
 from cronicled.schedule import LoopStatus, TickResult, resolve
+from cronicled.store import Store
 from cronicled.tag_hygiene import proposal as unused_proposal
 from cronicled.tags import cluster_tags
 from cronicled.tags import proposal as tag_merge_proposal
 from cronicled.web.actions import ApplyFailed, BulkApplyResult, UnknownProposal
-from cronicled.web.app import build_handler, serve, DEFAULT_HOST
+from cronicled.web.app import (PAGE_SIZE, _current_pages, _pager,
+                                build_handler, serve, DEFAULT_HOST)
 from cronicled.web.rows import (to_merge_rows, to_reconcile_rows,
-                                to_schedule_view, to_summary_view,
+                                to_rows, to_schedule_view, to_summary_view,
                                 to_unused_groups)
 
 
@@ -106,7 +108,7 @@ class _Server:
     def __enter__(self):
         self.actions = _RecordingActions(fail=self._fail,
                                          bulk_result=self._bulk_result)
-        handler = build_handler(rows=lambda: [], actions=self.actions)
+        handler = build_handler(rows=lambda **_: [], actions=self.actions)
         self.httpd = HTTPServer(("127.0.0.1", 0), handler)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
         return self
@@ -391,7 +393,7 @@ class MutedDismissedRefusedRendering(unittest.TestCase):
 
     def _get(self, path="/inbox", **callables):
         actions = _RecordingActions()
-        handler = build_handler(rows=lambda: [], actions=actions, **callables)
+        handler = build_handler(rows=lambda **_: [], actions=actions, **callables)
         httpd = HTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
@@ -768,7 +770,7 @@ class ServeWarnsOnNonDefaultHost(unittest.TestCase):
         out = io.StringIO()
         with patch("cronicled.web.app.HTTPServer", _NoopServer):
             with redirect_stdout(out):
-                serve(rows=lambda: [], actions=_RecordingActions(),
+                serve(rows=lambda **_: [], actions=_RecordingActions(),
                       host="0.0.0.0", port=0)
         self.assertIn("WARNING", out.getvalue())
 
@@ -776,7 +778,7 @@ class ServeWarnsOnNonDefaultHost(unittest.TestCase):
         out = io.StringIO()
         with patch("cronicled.web.app.HTTPServer", _NoopServer):
             with redirect_stdout(out):
-                serve(rows=lambda: [], actions=_RecordingActions(),
+                serve(rows=lambda **_: [], actions=_RecordingActions(),
                       host=DEFAULT_HOST, port=0)
         self.assertNotIn("WARNING", out.getvalue())
 
@@ -791,7 +793,7 @@ def _drive(method, path, body=b"", headers=None, **callables):
     `tests/test_tag_hygiene.py`.
     """
     actions = callables.pop("actions", None) or _RecordingActions()
-    handler = build_handler(rows=lambda: [], actions=actions, **callables)
+    handler = build_handler(rows=lambda **_: [], actions=actions, **callables)
     instance = object.__new__(handler)
     instance.path = path
     instance.headers = email.message.Message()
@@ -972,12 +974,13 @@ class TheScanControlOnItsNewPageStillRefusesCrossOrigin(unittest.TestCase):
 
 
 class _FakeStore:
-    """A minimal stand-in for `Store.items`, filtering an in-memory list the
-    same way the real one filters SQL rows: `subject_types` is checked with
-    `is not None`, never truthiness (an empty tuple is a real "select
-    nothing", not "no filter given"), and a `state=None` call excludes the
-    same four states `Store._HIDDEN_STATES` names -- everything else asks
-    for exactly one state.
+    """A minimal stand-in for `Store.items`/`Store.item_count`, filtering an
+    in-memory list the same way the real one filters SQL rows:
+    `subject_types` is checked with `is not None`, never truthiness (an
+    empty tuple is a real "select nothing", not "no filter given"), and a
+    `state=None` call excludes the same four states `Store._HIDDEN_STATES`
+    names, widened by `exclude_states` -- everything else asks for exactly
+    one state.
     """
 
     _HIDDEN_STATES = ("dismissed", "muted", "superseded", "gone")
@@ -985,17 +988,28 @@ class _FakeStore:
     def __init__(self, items):
         self._items = items
 
-    def items(self, folder=None, state=None, limit=None, offset=0,
-             subject_types=None):
+    def _filtered(self, folder, state, subject_types, exclude_states):
         result = self._items
         if subject_types is not None:
             result = [i for i in result if i["subject_type"] in subject_types]
         if state is not None:
             result = [i for i in result if i["state"] == state]
         else:
-            result = [i for i in result
-                     if i["state"] not in self._HIDDEN_STATES]
+            hidden = self._HIDDEN_STATES + tuple(exclude_states)
+            result = [i for i in result if i["state"] not in hidden]
         return result
+
+    def items(self, folder=None, state=None, limit=None, offset=0,
+             subject_types=None, exclude_states=()):
+        result = self._filtered(folder, state, subject_types, exclude_states)
+        if limit is not None:
+            result = result[offset:offset + limit]
+        return result
+
+    def item_count(self, folder=None, state=None, subject_types=None,
+                  exclude_states=()):
+        return len(self._filtered(folder, state, subject_types,
+                                  exclude_states))
 
     def counts(self, folder=None, subject_types=None):
         """Mirrors `Store.counts`: grouped by state, the same
@@ -1257,14 +1271,12 @@ def _unused_item(fp="fp-unused", state="new"):
 
 class _StoreWithDetachedCounts:
     """A store double whose `.counts()` answers from a number handed to it
-    directly, wholly independent of what `.items()` would return for the same
-    request -- so a sidebar built from `store.counts()` and one built by
-    counting `items()` (paginated or not) give two DIFFERENT, distinguishable
-    answers. `.items()` still filters for real, the same way `_FakeStore`
-    does, so the page beneath the sidebar renders its own true (small) set of
-    rows while the sidebar is handed a larger, invented total -- the shape a
-    real paginated page would have, without this project's `Store` actually
-    supporting pagination on this route yet.
+    directly, wholly independent of what `.items()`/`.item_count()` would
+    return for the same request -- so a sidebar built from `store.counts()`
+    and one built from a paginated page's own total give two DIFFERENT,
+    distinguishable answers. `.items()` still filters for real, the same way
+    `_FakeStore` does, so the page beneath the sidebar renders its own true
+    (small) set of rows while the sidebar is handed a larger, invented total.
     """
 
     _HIDDEN_STATES = ("dismissed", "muted", "superseded", "gone")
@@ -1273,17 +1285,28 @@ class _StoreWithDetachedCounts:
         self._items = items
         self._waiting_count = waiting_count
 
-    def items(self, folder=None, state=None, limit=None, offset=0,
-             subject_types=None):
+    def _filtered(self, folder, state, subject_types, exclude_states):
         result = self._items
         if subject_types is not None:
             result = [i for i in result if i["subject_type"] in subject_types]
         if state is not None:
             result = [i for i in result if i["state"] == state]
         else:
-            result = [i for i in result
-                     if i["state"] not in self._HIDDEN_STATES]
+            hidden = self._HIDDEN_STATES + tuple(exclude_states)
+            result = [i for i in result if i["state"] not in hidden]
         return result
+
+    def items(self, folder=None, state=None, limit=None, offset=0,
+             subject_types=None, exclude_states=()):
+        result = self._filtered(folder, state, subject_types, exclude_states)
+        if limit is not None:
+            result = result[offset:offset + limit]
+        return result
+
+    def item_count(self, folder=None, state=None, subject_types=None,
+                  exclude_states=()):
+        return len(self._filtered(folder, state, subject_types,
+                                  exclude_states))
 
     def counts(self, folder=None, subject_types=None):
         return {"new": self._waiting_count}
@@ -1661,6 +1684,371 @@ class TheSidebarIsAbsentWithoutAStore(unittest.TestCase):
     def test_the_combined_inbox_page_offers_no_inbox_links_without_a_store(self):
         body = _drive("GET", "/inbox")["body"].decode()
         self.assertNotIn('href="/tags"', body)
+
+
+# -- pagination, against a real Store ------------------------------------- #
+#
+# Every test below uses a population LARGER than one page (`PAGE_SIZE`
+# scene proposals plus a remainder), on purpose, in every fixture -- a
+# fixture the size of one page cannot tell "the true total" apart from
+# "what fit on a page", which is exactly the gap this ticket exists to keep
+# visible. A real `Store` (SQLite, `:memory:`) is used rather than
+# `_FakeStore` here specifically to prove the wiring this ticket adds --
+# `Store.items(limit=, offset=)`, `Store.item_count`, `exclude_states` --
+# actually reaches a rendered page, not only a Python-level fixture that
+# happens to agree with it.
+
+def _record_scene(store, i, now=None):
+    """One fingerprint-identified scene proposal -- the shape with the
+    fewest required payload fields (see `to_row`'s `identified_by` branch),
+    which is all these tests need: a distinct, orderable row.
+    """
+    return store.record(
+        folder="library", subject_type="scene", subject_id="scene-%d" % i,
+        summary="a proposal",
+        payload={"path": "/invented/library/%03d.mp4" % i,
+                "identified_by": "invented-box", "box": "invented-box",
+                "candidate": {"title": "Invented Title %03d" % i,
+                             "image": None, "performers": [],
+                             "studio": None}},
+        producer="test-producer", now=now)
+
+
+def _scene_rows_callables(store):
+    """The same shape `cronicled.__main__._inbox_rows`/`_inbox_rows_count`
+    wire in production, narrowed to just `scene` (nothing here needs the
+    tag/performer special sections) -- built here rather than imported,
+    because those two are closures private to `main()`.
+    """
+    def rows(limit=None, offset=0):
+        items = store.items(subject_types=("scene",),
+                            exclude_states=("applied",),
+                            limit=limit, offset=offset)
+        return to_rows(items)
+
+    def rows_count():
+        return store.item_count(subject_types=("scene",),
+                                exclude_states=("applied",))
+
+    return rows, rows_count
+
+
+def _drive_paginated(method, path, store, body=b""):
+    """Like `_drive`, but lets `rows`/`rows_count` be the REAL,
+    `store`-backed callables above -- `_drive` itself hardcodes a zero-row
+    `rows`, which is right for every test elsewhere in this module (none of
+    them exercise real pagination) and wrong for the ones below.
+    """
+    rows, rows_count = _scene_rows_callables(store)
+    handler = build_handler(rows=rows, rows_count=rows_count,
+                            actions=_RecordingActions(), store=store)
+    instance = object.__new__(handler)
+    instance.path = path
+    instance.headers = email.message.Message()
+    if body:
+        instance.headers["Content-Length"] = str(len(body))
+    instance.rfile = io.BytesIO(body)
+    sent = {}
+    instance._send = lambda status, body=b"", headers=(): sent.update(
+        status=status, body=body, headers=dict(headers))
+    getattr(instance, "do_" + method)()
+    return sent
+
+
+_FINGERPRINT_IN_A_FORM_RE = re.compile(
+    r'<input type="hidden" name="fp" value="(?P<fp>[^"]*)">')
+
+
+class TheGenericListIsBounded(unittest.TestCase):
+    """Acceptance: "a page must render at most a bounded number of rows;
+    a test must fail if the bound is exceeded, asserted on the rendered
+    output rather than on a parameter." 250 > `PAGE_SIZE` (200).
+    """
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+        for i in range(250):
+            _record_scene(self.store, i,
+                         now="2026-07-01T00:00:00.%06d" % i)
+
+    def test_the_first_page_renders_no_more_than_the_page_size(self):
+        body = _drive_paginated("GET", "/inbox", self.store)["body"].decode()
+        self.assertLessEqual(body.count('class="proposal"'), PAGE_SIZE)
+        # Not merely "fewer than 250" -- exactly the bound, since 250 rows
+        # over a 200-row page leaves a full first page.
+        self.assertEqual(body.count('class="proposal"'), PAGE_SIZE)
+
+    def test_the_second_page_renders_the_remainder(self):
+        body = _drive_paginated(
+            "GET", "/inbox?page=2", self.store)["body"].decode()
+        self.assertEqual(body.count('class="proposal"'), 50)
+
+
+class CountsComeFromTheStoreNotFromThePage(unittest.TestCase):
+    """Acceptance: counts must keep coming from the store, never from what
+    was rendered -- pinned on a fixture (250 rows) strictly larger than one
+    page (200), which a same-or-smaller fixture cannot distinguish this
+    from.
+    """
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+        for i in range(250):
+            _record_scene(self.store, i,
+                         now="2026-07-01T00:00:00.%06d" % i)
+
+    def test_the_sidebar_states_the_true_total_not_the_page_size(self):
+        body = _drive_paginated("GET", "/inbox", self.store)["body"].decode()
+        self.assertIn(">250<", body)
+        self.assertNotIn(">%d<" % PAGE_SIZE, body)
+
+    def test_the_summary_pages_own_sidebar_states_the_true_total_too(self):
+        # The sidebar is the same partial on every page (see
+        # `_sidebar_context`); this is not a claim about the summary's own
+        # waiting-total block, which needs its own `summary=` callable that
+        # nothing here wires -- see `TheSidebarTotalAgreesWithTheSummarysWaitingTotal`
+        # for that guarantee, which this ticket does not touch.
+        body = _drive_paginated("GET", "/", self.store)["body"].decode()
+        self.assertIn(">250<", body)
+
+    def test_the_second_pages_own_sidebar_still_states_the_true_total(self):
+        # The count is a property of the STORE, not of which page is open --
+        # a sidebar that only got this right on page 1 would still be
+        # reading it from what got rendered, just less obviously.
+        body = _drive_paginated(
+            "GET", "/inbox?page=2", self.store)["body"].decode()
+        self.assertIn(">250<", body)
+
+
+class EveryWaitingProposalIsReachable(unittest.TestCase):
+    """Acceptance: every waiting proposal must be reachable -- a test must
+    fail if a row exists that no page reaches. Walks every page a
+    `Prev`/`Next` control could actually lead to and checks the union
+    against the full set the store holds.
+    """
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+        self.fingerprints = {
+            _record_scene(self.store, i, now="2026-07-01T00:00:00.%06d" % i)
+            for i in range(250)
+        }
+
+    def _fingerprints_on(self, page):
+        body = _drive_paginated(
+            "GET", "/inbox?page=%d" % page, self.store)["body"].decode()
+        return set(_FINGERPRINT_IN_A_FORM_RE.findall(body))
+
+    def test_every_recorded_fingerprint_appears_on_some_page(self):
+        seen = self._fingerprints_on(1) | self._fingerprints_on(2)
+        self.assertEqual(seen, self.fingerprints)
+
+    def test_the_two_pages_do_not_overlap(self):
+        # Each row reachable from exactly one page, not duplicated onto a
+        # neighbour and not left out of both.
+        page_one = self._fingerprints_on(1)
+        page_two = self._fingerprints_on(2)
+        self.assertEqual(page_one & page_two, set())
+        self.assertEqual(len(page_one), PAGE_SIZE)
+        self.assertEqual(len(page_two), 50)
+
+    def test_a_page_past_the_end_is_simply_empty_not_an_error(self):
+        body = _drive_paginated(
+            "GET", "/inbox?page=99", self.store)
+        self.assertEqual(body["status"], 200)
+
+
+class TheOrderIsStableAcrossRenders(unittest.TestCase):
+    """Acceptance: the order must be stable across renders; a test must
+    fail if acting on one row changes which rows appear on a later page.
+
+    The store's order (`created_at`, then the fingerprint as a tiebreak --
+    see `Store.items`'s own docstring) is a fixed total order for a row's
+    whole life: nothing about rendering, or about a DIFFERENT row being
+    acted on, may reshuffle it. What acting on a row legitimately changes is
+    the SIZE of the waiting set (removing that one row) -- distinguished
+    here from a row going silently missing, which is what an unstable order
+    would produce.
+    """
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+        self.fingerprints = [
+            _record_scene(self.store, i, now="2026-07-01T00:00:00.%06d" % i)
+            for i in range(250)
+        ]
+
+    def test_rendering_the_same_page_twice_gives_byte_identical_output(self):
+        first = _drive_paginated("GET", "/inbox", self.store)["body"]
+        second = _drive_paginated("GET", "/inbox", self.store)["body"]
+        self.assertEqual(first, second)
+
+    def test_approving_a_row_on_page_one_does_not_disturb_page_ones_rest(self):
+        before = re.findall(_FINGERPRINT_IN_A_FORM_RE,
+                            _drive_paginated("GET", "/inbox",
+                                            self.store)["body"].decode())
+        # The oldest waiting row -- first in the store's own order -- is
+        # removed from the waiting set entirely.
+        self.store.mark_applied(self.fingerprints[0])
+        after = re.findall(_FINGERPRINT_IN_A_FORM_RE,
+                           _drive_paginated("GET", "/inbox",
+                                           self.store)["body"].decode())
+        # Deduplicate (each row posts its own fingerprint on more than one
+        # form) while keeping the ORDER the page draws them in -- a plain
+        # `set` would prove membership but not this test's actual claim.
+        def ordered_unique(fps):
+            seen = []
+            for fp in fps:
+                if fp not in seen:
+                    seen.append(fp)
+            return seen
+
+        before_unique = ordered_unique(before)
+        after_unique = ordered_unique(after)
+        # Every row that was on page one and was NOT the one just approved
+        # is still there, in the SAME relative order -- nothing shuffled.
+        # The list is still exactly `PAGE_SIZE` long (249 rows remain, still
+        # more than one page), so the LAST slot is now filled by whatever
+        # row immediately followed page one before -- refilling from behind
+        # is the correctly-working version of "the set got one row
+        # smaller", not a bug; what this pins is that it is filled by that
+        # SPECIFIC row and not some other one shuffled forward out of order.
+        self.assertEqual(after_unique[:-1], before_unique[1:])
+        self.assertEqual(len(after_unique), PAGE_SIZE)
+
+    def test_no_other_row_is_skipped_by_the_removal(self):
+        self.store.mark_applied(self.fingerprints[0])
+        page_one = set(re.findall(_FINGERPRINT_IN_A_FORM_RE,
+                                  _drive_paginated(
+                                      "GET", "/inbox",
+                                      self.store)["body"].decode()))
+        page_two = set(re.findall(_FINGERPRINT_IN_A_FORM_RE,
+                                  _drive_paginated(
+                                      "GET", "/inbox?page=2",
+                                      self.store)["body"].decode()))
+        self.assertEqual(page_one | page_two,
+                         set(self.fingerprints[1:]))
+        self.assertEqual(page_one & page_two, set())
+
+
+class ThePagerHelper(unittest.TestCase):
+    """`web.app._pager`/`_current_pages` -- the Python side of the pager
+    context a template reads (see `tests.test_web_render.ThePagerControl`
+    for the template side). Exercised directly so a mistake in the href
+    arithmetic is caught here rather than only by a rendered-page assertion
+    that happens to include the right substring for the wrong reason.
+    """
+
+    def test_current_pages_reads_every_known_key(self):
+        qs = {"page": ["3"], "applied_page": ["2"]}
+        current = _current_pages(qs)
+        self.assertEqual(current["page"], 3)
+        self.assertEqual(current["applied_page"], 2)
+        # Every OTHER key defaults to page 1, not merely the ones present.
+        self.assertEqual(current["dismissed_page"], 1)
+        self.assertEqual(current["muted_page"], 1)
+
+    def test_a_malformed_value_reads_as_page_one(self):
+        current = _current_pages({"page": ["not-a-number"]})
+        self.assertEqual(current["page"], 1)
+
+    def test_the_next_href_advances_only_the_named_key(self):
+        current = _current_pages({"page": ["1"], "applied_page": ["4"]})
+        pager = _pager("/inbox", current, "page", total=450)
+        self.assertEqual(pager["next_href"], "/inbox?page=2&applied_page=4")
+
+    def test_the_prev_href_goes_back_only_the_named_key(self):
+        current = _current_pages({"page": ["2"]})
+        pager = _pager("/inbox", current, "page", total=450)
+        self.assertEqual(pager["prev_href"], "/inbox")
+
+    def test_a_key_at_its_default_is_dropped_from_the_href(self):
+        # `applied_page` sits at 1 (its default), so it is left out of the
+        # query string entirely -- a page with nothing else paginated keeps
+        # a plain, bookmarkable URL.
+        current = _current_pages({"page": ["1"], "applied_page": ["1"]})
+        pager = _pager("/inbox", current, "page", total=450)
+        self.assertEqual(pager["next_href"], "/inbox?page=2")
+
+    def test_no_prev_on_page_one(self):
+        current = _current_pages({"page": ["1"]})
+        pager = _pager("/inbox", current, "page", total=450)
+        self.assertIsNone(pager["prev_href"])
+
+    def test_no_next_on_the_last_page(self):
+        current = _current_pages({"page": ["3"]})
+        # 450 rows at the default PAGE_SIZE (200) is exactly 3 pages.
+        pager = _pager("/inbox", current, "page", total=450)
+        self.assertEqual(pager["total_pages"], 3)
+        self.assertIsNone(pager["next_href"])
+
+    def test_the_total_is_carried_through_unchanged(self):
+        current = _current_pages({})
+        pager = _pager("/inbox", current, "page", total=450)
+        self.assertEqual(pager["total"], 450)
+
+    def test_two_different_sections_pagers_do_not_interfere(self):
+        current = _current_pages({"page": ["5"], "applied_page": ["2"]})
+        # 1200, not 1000: page 5 of 1000-at-200/page is the LAST page (5),
+        # which would have no `next_href` at all and defeat this test's own
+        # assertion below for a reason unrelated to what it is pinning.
+        rows_pager = _pager("/inbox", current, "page", total=1200)
+        # Also more than one page past `applied_page`'s own current value
+        # (2), for the same reason.
+        applied_pager = _pager("/inbox", current, "applied_page", total=800)
+        self.assertEqual(rows_pager["page"], 5)
+        self.assertEqual(applied_pager["page"], 2)
+        # Paging `rows` forward carries `applied_page` along unchanged, and
+        # vice versa.
+        self.assertIn("applied_page=2", rows_pager["next_href"])
+        self.assertIn("page=5", applied_pager["next_href"])
+
+
+class BulkApplySubmitsExactlyThePagesOwnFingerprints(unittest.TestCase):
+    """Acceptance: bulk apply must write exactly the rows submitted from
+    the page that showed them. Pagination makes the SHOWN set smaller --
+    which is safer -- but only if the bulk form's hidden fields stay that
+    page's own rows and never the whole waiting population, which is what
+    ticket bulk179's own population (1456) would otherwise put in one form.
+    """
+
+    def _tag_items(self, n):
+        return [_tag_item(str(i)) for i in range(n)]
+
+    def _bulk_form_fingerprints(self, body):
+        match = re.search(
+            r'<form method="post" action="/bulk_apply_tag_descriptions">'
+            r'(?P<body>.*?)</form>', body, re.DOTALL)
+        return [] if match is None else _FINGERPRINT_IN_A_FORM_RE.findall(
+            match.group("body"))
+
+    def test_the_bulk_form_on_page_one_carries_only_page_ones_rows(self):
+        store = _FakeStore(self._tag_items(250))
+        body = _drive("GET", "/tags", store=store)["body"].decode()
+        fps = self._bulk_form_fingerprints(body)
+        self.assertEqual(len(fps), PAGE_SIZE)
+        self.assertEqual(fps, [str(i) for i in range(PAGE_SIZE)])
+
+    def test_the_bulk_form_on_page_two_carries_only_page_twos_rows(self):
+        store = _FakeStore(self._tag_items(250))
+        body = _drive("GET", "/tags?page=2", store=store)["body"].decode()
+        fps = self._bulk_form_fingerprints(body)
+        self.assertEqual(fps, [str(i) for i in range(PAGE_SIZE, 250)])
+
+    def test_submitting_page_ones_form_applies_only_page_ones_rows(self):
+        store = _FakeStore(self._tag_items(250))
+        actions = _RecordingActions()
+        body = "&".join("fp=%d" % i for i in range(PAGE_SIZE))
+        sent = _drive("POST", "/bulk_apply_tag_descriptions", body.encode(),
+                      store=store, actions=actions)
+        self.assertEqual(sent["status"], 303)
+        self.assertEqual(actions.calls,
+                         [("bulk_apply_tag_descriptions",
+                           tuple(str(i) for i in range(PAGE_SIZE)))])
 
 
 if __name__ == "__main__":
