@@ -19,7 +19,8 @@ from cronicled.store import Store
 from cronicled.tag_hygiene import proposal as unused_proposal
 from cronicled.tags import cluster_tags
 from cronicled.tags import proposal as tag_merge_proposal
-from cronicled.web.actions import ApplyFailed, BulkApplyResult, UnknownProposal
+from cronicled.web.actions import (ApplyFailed, BatchResult, BulkApplyResult,
+                                   UnknownProposal)
 from cronicled.web.app import (PAGE_SIZE, _current_pages, _pager,
                                 build_handler, serve, DEFAULT_HOST)
 from cronicled.web.rows import (to_merge_rows, to_reconcile_rows,
@@ -47,7 +48,7 @@ class _RecordingActions:
     the thing it stands in for, and that gap has cost this project a shipped
     bug before."""
 
-    def __init__(self, fail=None, bulk_result=None):
+    def __init__(self, fail=None, bulk_result=None, batch_result=None):
         self.calls = []
         self._fail = fail or {}
         # `None` means "report every submitted fingerprint applied" -- the
@@ -56,6 +57,9 @@ class _RecordingActions:
         # `BulkApplyResult` instead, exactly as `_fail` lets a test choose
         # which single-row action raises.
         self._bulk_result = bulk_result
+        # Same idea, for `batch_apply` -- a test wanting a partial outcome
+        # passes its own `BatchResult`.
+        self._batch_result = batch_result
 
     def _do(self, name, fp, ok):
         if name in self._fail:
@@ -71,6 +75,16 @@ class _RecordingActions:
         if self._bulk_result is not None:
             return self._bulk_result
         return BulkApplyResult(requested=fps, applied=fps, failed=())
+
+    def batch_apply(self, verdict, fingerprints):
+        if "batch_apply" in self._fail:
+            raise self._fail["batch_apply"]
+        fps = tuple(fingerprints)
+        self.calls.append(("batch_apply", verdict, fps))
+        if self._batch_result is not None:
+            return self._batch_result
+        return BatchResult(verdict=verdict, requested=fps, applied=fps,
+                           failed=())
 
     def approve(self, fp):
         return self._do("approve", fp, "applied")
@@ -101,13 +115,15 @@ class _RecordingActions:
 
 
 class _Server:
-    def __init__(self, fail=None, bulk_result=None):
+    def __init__(self, fail=None, bulk_result=None, batch_result=None):
         self._fail = fail
         self._bulk_result = bulk_result
+        self._batch_result = batch_result
 
     def __enter__(self):
         self.actions = _RecordingActions(fail=self._fail,
-                                         bulk_result=self._bulk_result)
+                                         bulk_result=self._bulk_result,
+                                         batch_result=self._batch_result)
         handler = build_handler(rows=lambda **_: [], actions=self.actions)
         self.httpd = HTTPServer(("127.0.0.1", 0), handler)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
@@ -382,6 +398,171 @@ class BulkApplyTagDescriptionsPost(unittest.TestCase):
         with _Server() as s:
             r = s.request("POST", "/approve", body)
             self.assertEqual(r.status, 400)
+            self.assertEqual(s.actions.calls, [])
+
+
+_CONFIRM_HIDDEN_FP_RE = re.compile(
+    r'<input type="hidden" name="fp" value="(?P<fp>[^"]*)">')
+
+
+class BatchPost(unittest.TestCase):
+    """`/batch` -- one verdict, applied to a ticked (or "select all on this
+    page") set of fingerprints. `dismiss`/`mute` act immediately, exactly
+    like a single row's own click; `approve`/`refresh` stop at a
+    confirmation page first (see `batch_confirm.html`) and only act once
+    that page's own form re-posts here with `confirmed=1`.
+    """
+
+    def test_dismiss_reaches_the_action_with_the_whole_set_in_order(self):
+        with _Server() as s:
+            r = s.request("POST", "/batch",
+                          "verdict=dismiss&fp=fp-a&fp=fp-b&fp=fp-c")
+            self.assertEqual(
+                s.actions.calls,
+                [("batch_apply", "dismiss", ("fp-a", "fp-b", "fp-c"))])
+            self.assertEqual(r.status, 303)
+
+    def test_mute_also_acts_immediately_with_no_confirmation_step(self):
+        with _Server() as s:
+            r = s.request("POST", "/batch", "verdict=mute&fp=fp-a")
+            self.assertEqual(
+                s.actions.calls, [("batch_apply", "mute", ("fp-a",))])
+            self.assertEqual(r.status, 303)
+
+    def test_a_post_without_any_fingerprint_is_rejected(self):
+        with _Server() as s:
+            r = s.request("POST", "/batch", "verdict=dismiss")
+            self.assertEqual(r.status, 400)
+            self.assertEqual(s.actions.calls, [])
+
+    def test_a_post_without_a_verdict_is_rejected(self):
+        with _Server() as s:
+            r = s.request("POST", "/batch", "fp=fp-a")
+            self.assertEqual(r.status, 400)
+            self.assertEqual(s.actions.calls, [])
+
+    def test_an_unrecognised_verdict_is_rejected_before_it_reaches_the_action(self):
+        with _Server() as s:
+            r = s.request("POST", "/batch", "verdict=delete&fp=fp-a")
+            self.assertEqual(r.status, 400)
+            self.assertEqual(s.actions.calls, [])
+
+    def test_a_get_does_not_perform_it(self):
+        with _Server() as s:
+            r = s.request("GET", "/batch")
+            self.assertEqual(r.status, 405)
+            self.assertEqual(s.actions.calls, [])
+
+    def test_a_cross_site_post_is_refused_and_does_not_fire(self):
+        # Every POST keeps the existing cross-origin refusal -- a new
+        # action that forgot it would be a live vulnerability, not a
+        # missing feature.
+        with _Server() as s:
+            r = s.request("POST", "/batch", "verdict=dismiss&fp=fp-a",
+                          headers={"Sec-Fetch-Site": "cross-site"})
+            self.assertEqual(r.status, 403)
+            self.assertEqual(s.actions.calls, [])
+
+    def test_the_redirect_carries_the_verdict_and_both_counts(self):
+        with _Server() as s:
+            r = s.request("POST", "/batch", "verdict=mute&fp=fp-a&fp=fp-b")
+            self.assertEqual(
+                r.getheader("Location"),
+                "/inbox?batch_verdict=mute&batch_requested=2&batch_applied=2")
+
+    def test_a_partial_batch_states_a_partial_outcome_not_a_success(self):
+        partial = BatchResult(
+            verdict="mute", requested=("fp-a", "fp-b"), applied=("fp-a",),
+            failed=({"fingerprint": "fp-b", "reason": "a fixture failure"},))
+        with _Server(batch_result=partial) as s:
+            r = s.request("POST", "/batch", "verdict=mute&fp=fp-a&fp=fp-b")
+            self.assertEqual(
+                r.getheader("Location"),
+                "/inbox?batch_verdict=mute&batch_requested=2&batch_applied=1")
+
+    def test_a_batch_apply_failure_is_reported_as_an_error_not_a_redirect(self):
+        with _Server(fail={"batch_apply":
+                           RuntimeError("the store is unavailable")}) as s:
+            r = s.request("POST", "/batch", "verdict=mute&fp=fp-a")
+            self.assertEqual(r.status, 400)
+
+    def test_a_batch_at_the_page_size_still_works(self):
+        # `PAGE_SIZE` (200) fingerprints, each a real 64-character sha256
+        # digest -- the largest a selection scoped to one page can ever
+        # legitimately carry, well inside the bulk ceiling this action
+        # shares with `bulk_apply_tag_descriptions`.
+        fps = ["%064d" % i for i in range(PAGE_SIZE)]
+        body = "verdict=mute&" + "&".join("fp=%s" % fp for fp in fps)
+        with _Server() as s:
+            r = s.request("POST", "/batch", body)
+            self.assertEqual(r.status, 303)
+            self.assertEqual(len(s.actions.calls[0][2]), PAGE_SIZE)
+
+    def test_an_absurdly_large_batch_body_is_still_refused(self):
+        with _Server() as s:
+            r = s.request("POST", "/batch", "verdict=mute&fp=x",
+                          headers={"Content-Length": "999999999"})
+            self.assertEqual(r.status, 400)
+            self.assertEqual(s.actions.calls, [])
+
+
+class BatchApproveAndRefreshRequireConfirmation(unittest.TestCase):
+    """`approve` and `refresh` never fire on the first POST -- the response
+    is a 200 confirmation page stating the exact set and count, and only a
+    second POST carrying `confirmed=1` (that page's own form) actually
+    calls `batch_apply`. `dismiss`/`mute` never reach this page at all --
+    see `BatchPost` above, where both act on the first POST."""
+
+    def test_approve_without_confirmation_renders_a_confirmation_page_and_does_not_fire(self):
+        with _Server() as s:
+            r = s.request("POST", "/batch", "verdict=approve&fp=fp-a&fp=fp-b")
+            self.assertEqual(r.status, 200)
+            self.assertEqual(s.actions.calls, [])
+            body = r.read().decode()
+            self.assertIn("2", body)
+            self.assertEqual(
+                _CONFIRM_HIDDEN_FP_RE.findall(body), ["fp-a", "fp-b"])
+
+    def test_refresh_without_confirmation_also_stops_at_the_confirmation_page(self):
+        with _Server() as s:
+            r = s.request("POST", "/batch", "verdict=refresh&fp=fp-a")
+            self.assertEqual(r.status, 200)
+            self.assertEqual(s.actions.calls, [])
+
+    def test_confirming_approve_reaches_the_action_with_the_same_set(self):
+        with _Server() as s:
+            r = s.request(
+                "POST", "/batch",
+                "verdict=approve&fp=fp-a&fp=fp-b&confirmed=1")
+            self.assertEqual(r.status, 303)
+            self.assertEqual(
+                s.actions.calls,
+                [("batch_apply", "approve", ("fp-a", "fp-b"))])
+
+    def test_confirming_refresh_reaches_the_action_with_the_same_set(self):
+        with _Server() as s:
+            r = s.request(
+                "POST", "/batch", "verdict=refresh&fp=fp-a&confirmed=1")
+            self.assertEqual(r.status, 303)
+            self.assertEqual(
+                s.actions.calls, [("batch_apply", "refresh", ("fp-a",))])
+
+    def test_a_stray_confirmed_value_on_dismiss_changes_nothing(self):
+        # `dismiss`/`mute` already fire on the first POST -- an incidental
+        # `confirmed=1` alongside one (a browser resubmitting a form, say)
+        # must not change what fires or skip anything.
+        with _Server() as s:
+            r = s.request(
+                "POST", "/batch", "verdict=dismiss&fp=fp-a&confirmed=1")
+            self.assertEqual(r.status, 303)
+            self.assertEqual(
+                s.actions.calls, [("batch_apply", "dismiss", ("fp-a",))])
+
+    def test_the_cross_origin_refusal_still_applies_to_the_confirmation_step(self):
+        with _Server() as s:
+            r = s.request("POST", "/batch", "verdict=approve&fp=fp-a",
+                          headers={"Sec-Fetch-Site": "cross-site"})
+            self.assertEqual(r.status, 403)
             self.assertEqual(s.actions.calls, [])
 
 
@@ -2049,6 +2230,66 @@ class BulkApplySubmitsExactlyThePagesOwnFingerprints(unittest.TestCase):
         self.assertEqual(actions.calls,
                          [("bulk_apply_tag_descriptions",
                            tuple(str(i) for i in range(PAGE_SIZE)))])
+
+
+_CHECKBOX_FP_RE = re.compile(
+    r'<input type="checkbox" name="fp" value="(?P<fp>[^"]*)"')
+
+# The "select all on this page" form's own action tag, deliberately WITHOUT
+# an `id` attribute -- `#batch-form` (the ticked-selection form) carries one
+# and so never matches this, letting this regex isolate the other form's
+# hidden fields specifically. See inbox.html.
+_SELECT_ALL_FORM_RE = re.compile(
+    r'<form method="post" action="/batch">(?P<body>.*?)</form>', re.DOTALL)
+
+
+class TheBatchCheckboxSelectionIsBoundToThePage(unittest.TestCase):
+    """Acceptance: "select all" (and every individual checkbox) must not
+    reach beyond the rendered page -- a test must fail if either carries a
+    fingerprint the page did not actually draw. Pinned against a REAL
+    `Store` and 250 scene rows (more than one `PAGE_SIZE` page), the same
+    fixture `EveryWaitingProposalIsReachable`/`TheOrderIsStableAcrossRenders`
+    use above for the identical claim about the existing per-row forms.
+    """
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+        self.fingerprints = [
+            _record_scene(self.store, i, now="2026-07-01T00:00:00.%06d" % i)
+            for i in range(250)
+        ]
+
+    def _page_body(self, page=None):
+        path = "/inbox" if page is None else "/inbox?page=%d" % page
+        return _drive_paginated("GET", path, self.store)["body"].decode()
+
+    def test_page_ones_checkboxes_are_exactly_page_ones_own_rows(self):
+        body = self._page_body()
+        checked = _CHECKBOX_FP_RE.findall(body)
+        self.assertEqual(len(checked), PAGE_SIZE)
+        self.assertEqual(set(checked), set(self.fingerprints[:PAGE_SIZE]))
+
+    def test_page_twos_checkboxes_never_include_a_page_one_fingerprint(self):
+        body = self._page_body(2)
+        checked = set(_CHECKBOX_FP_RE.findall(body))
+        self.assertEqual(checked, set(self.fingerprints[PAGE_SIZE:]))
+        self.assertEqual(checked & set(self.fingerprints[:PAGE_SIZE]), set())
+
+    def test_the_select_all_form_on_page_one_carries_only_page_ones_rows(self):
+        body = self._page_body()
+        match = _SELECT_ALL_FORM_RE.search(body)
+        self.assertIsNotNone(match)
+        fps = _FINGERPRINT_IN_A_FORM_RE.findall(match.group("body"))
+        self.assertEqual(len(fps), PAGE_SIZE)
+        self.assertEqual(set(fps), set(self.fingerprints[:PAGE_SIZE]))
+
+    def test_the_select_all_form_on_page_two_carries_only_page_twos_rows(self):
+        body = self._page_body(2)
+        match = _SELECT_ALL_FORM_RE.search(body)
+        self.assertIsNotNone(match)
+        fps = _FINGERPRINT_IN_A_FORM_RE.findall(match.group("body"))
+        self.assertEqual(set(fps), set(self.fingerprints[PAGE_SIZE:]))
 
 
 if __name__ == "__main__":

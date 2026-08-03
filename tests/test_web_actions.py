@@ -4,6 +4,8 @@ import unittest
 from cronicled.adapters.base import SiteAdapter
 from cronicled.adapters.declarative import DeclarativeAdapter
 from cronicled.jobs import JobRejected, JobRunner
+from cronicled.performer_tags import index_performers, match_tag
+from cronicled.performer_tags import proposal as reconcile_proposal
 from cronicled.scan import Identified, fingerprint_outcome
 from cronicled.stash import Stash
 from cronicled.store import Store
@@ -12,8 +14,8 @@ from cronicled.tag_descriptions import proposal as tag_description_proposal
 from cronicled.tag_hygiene import proposal as tag_hygiene_proposal
 from cronicled.tags import cluster_tags
 from cronicled.tags import proposal as tag_proposal
-from cronicled.web.actions import (Actions, ApplyFailed, BulkApplyResult,
-                                   UnknownProposal)
+from cronicled.web.actions import (Actions, ApplyFailed, BatchResult,
+                                   BulkApplyResult, UnknownProposal)
 from tests.test_stash import CATALOGUE, LINK, OTHER_LINK, _MutableScene
 
 WAIT = 10
@@ -1487,13 +1489,24 @@ class CatalogueLinkOnApprove(unittest.TestCase):
 
 class _FakeMultiItemStore:
     """A store holding several proposals at once, keyed by fingerprint --
-    the shape `bulk_apply_tag_descriptions` needs and `_FakeStore` above
-    cannot offer (it holds exactly one proposal). `mark_applied`/
-    `mark_failed` mutate the held item's OWN `state`, the same as the real
-    `Store`, so a fingerprint looked up later -- by a later row in the same
-    batch, or by a later assertion -- sees what an earlier one actually did,
-    not a frozen snapshot from before the call started.
+    the shape `bulk_apply_tag_descriptions`/`batch_apply` need and
+    `_FakeStore` above cannot offer (it holds exactly one proposal).
+    `mark_applied`/`mark_failed`/`dismiss`/`mute`/`supersede` all mutate the
+    held item's OWN `state`, the same as the real `Store`, so a fingerprint
+    looked up later -- by a later row in the same batch, or by a later
+    assertion -- sees what an earlier one actually did, not a frozen
+    snapshot from before the call started.
     """
+
+    # The same two states the real `Store.dismiss`/`mute`/`supersede`
+    # protect from being overwritten (see their own docstrings): a
+    # `dismiss`/`mute` reaching an already-applied or -failed row must not
+    # erase the fact (and the resolution) that a real write happened or was
+    # attempted. `batch_apply`'s own guard already keeps `dismiss`/`mute`
+    # from reaching an applied row at all -- this mirrors the real store's
+    # limitation anyway, so a double that is MORE forgiving than the real
+    # collaborator can never be the reason a test here passes.
+    _TERMINAL_STATES = ("applied", "failed")
 
     def __init__(self, items):
         self._items = {item["fingerprint"]: dict(item) for item in items}
@@ -1518,6 +1531,24 @@ class _FakeMultiItemStore:
         self.calls.append(("failed", fp, error))
         self._items[fp]["state"] = "failed"
         self._items[fp]["error"] = error
+
+    def dismiss(self, fp, reason=None):
+        self.calls.append(("dismissed", fp, reason))
+        if self._items[fp]["state"] not in self._TERMINAL_STATES:
+            self._items[fp]["state"] = "dismissed"
+
+    def mute(self, subject_type, subject_id, reason=None):
+        self.calls.append(("muted", subject_type, subject_id, reason))
+        for item in self._items.values():
+            if (item["subject_type"], item["subject_id"]) == (
+                    subject_type, subject_id):
+                if item["state"] not in self._TERMINAL_STATES:
+                    item["state"] = "muted"
+
+    def supersede(self, fp):
+        self.calls.append(("superseded", fp))
+        if self._items[fp]["state"] not in self._TERMINAL_STATES:
+            self._items[fp]["state"] = "superseded"
 
 
 class _FakeMultiTagStash:
@@ -1775,3 +1806,357 @@ class BulkApplyPartialFailure(unittest.TestCase):
 
         self.assertEqual(result.applied, ("fp-ok",))
         self.assertEqual([f["fingerprint"] for f in result.failed], ["fp-bad"])
+
+
+# ===========================================================================
+# batch_apply -- the general, ticked-selection sibling of
+# bulk_apply_tag_descriptions above. See that section's own fixtures
+# (`_item`, `_description_item`, `_bulk_tag_item`, `_merge_item`,
+# `_hygiene_item`, `_FakeMultiItemStore`) for scene, performer-description,
+# tag-description, tag-merge and tag-deletion proposals; only the
+# reconciliation fixture and a wider stash double are new here.
+# ===========================================================================
+
+
+def _reconcile_item(fp="fp-r", **over):
+    """One tag/performer-reconciliation item, built through
+    `cronicled.performer_tags`'s own producer path rather than hand-written,
+    so it cannot describe a payload shape nothing ever emits -- used in the
+    batch tests below only to prove the subject-type guard refuses it,
+    never to reconcile anything."""
+    tag_row = {"id": "50", "name": "Rare Bird Society", "aliases": [],
+              "description": None, "scene_count": 3}
+    performer_row = {"id": "9", "name": "Rare Bird Society", "alias_list": []}
+    matches = match_tag(tag_row, index_performers([performer_row]))
+    built = reconcile_proposal(tag_row, matches, ["sc-1", "sc-2"],
+                               folder="library")
+    item = {"fingerprint": fp, "state": "new",
+            "subject_type": built["subject_type"],
+            "subject_id": built["subject_id"], "prior_state": None,
+            "payload": built["payload"]}
+    item.update(over)
+    return item
+
+
+class _FakeMultiKindStash:
+    """A media server able to answer every apply path `batch_apply` may
+    LEGITIMATELY reach -- scene, performer-description, tag-description --
+    and nothing else. `merge_tags`/`delete_tag`/`reconcile_tag_to_performer`
+    all raise on sight: the guard under test in the section below is exactly
+    what must stop a merge/reconcile/deletion fingerprint from ever reaching
+    them, and a double that answered them anyway could not tell a guard that
+    fired from one that quietly let the write through -- the same reasoning
+    `_FakeMultiTagStash` above applies to `bulk_apply_tag_descriptions`,
+    widened here to the three subject types this wider action may touch.
+    """
+
+    def __init__(self, prior=None, tag_descriptions=None,
+                performer_descriptions=None, fail_scene_ids=(),
+                fail_tag_ids=()):
+        self.calls = []
+        self._prior = prior if prior is not None else {"title": "old"}
+        self.tag_descriptions = dict(tag_descriptions or {})
+        self.performer_descriptions = dict(performer_descriptions or {})
+        self._fail_scene_ids = set(fail_scene_ids)
+        self._fail_tag_ids = set(fail_tag_ids)
+
+    def apply_scene(self, scene_id, match):
+        if scene_id in self._fail_scene_ids:
+            raise RuntimeError("the media server refused scene %s" % scene_id)
+        self.calls.append(("apply-scene", scene_id))
+        return {"prior": self._prior}
+
+    def apply_performer_description(self, performer_id, description, *,
+                                    expected):
+        if self.performer_descriptions.get(performer_id) != expected:
+            raise RuntimeError(
+                "performer %s's description is not the text this proposal "
+                "was made from" % performer_id)
+        prior = self.performer_descriptions.get(performer_id)
+        self.performer_descriptions[performer_id] = description
+        self.calls.append(("apply-performer", performer_id, description))
+        return {"prior": {"details": prior}}
+
+    def apply_tag_description(self, tag_id, description, *, expected):
+        if tag_id in self._fail_tag_ids:
+            raise RuntimeError("the media server refused tag %s" % tag_id)
+        if self.tag_descriptions.get(tag_id) != expected:
+            raise RuntimeError(
+                "tag %s's description is not the text this proposal was "
+                "made against" % tag_id)
+        prior = self.tag_descriptions.get(tag_id)
+        self.tag_descriptions[tag_id] = description
+        self.calls.append(("apply-tag", tag_id, description))
+        return {"prior": {"description": prior}}
+
+    def merge_tags(self, *args, **kwargs):
+        raise AssertionError(
+            "a batch verdict reached the tag-merge path -- the subject-type "
+            "guard must refuse a tag-cluster fingerprint before this")
+
+    def delete_tag(self, *args, **kwargs):
+        raise AssertionError(
+            "a batch verdict reached the tag-delete path -- this is exactly "
+            "what 'no bulk delete' must never allow")
+
+    def reconcile_tag_to_performer(self, *args, **kwargs):
+        raise AssertionError(
+            "a batch verdict reached the reconcile path -- the subject-type "
+            "guard must refuse a tag-performer fingerprint before this")
+
+
+class BatchApplyExplicitSelection(unittest.TestCase):
+    """Acceptance: the set `batch_apply` acts on is exactly the fingerprints
+    submitted, in the order submitted, whichever verdict -- never a filter
+    re-evaluated against the store. Assert the WHOLE set of store/media-server
+    calls, never a count and never a sampled member: this project has had an
+    unlisted field slip past a field-by-field assertion before, and in a
+    module like this one that would mean a row nobody ticked getting
+    written."""
+
+    def test_approve_writes_exactly_the_submitted_mixed_batch_and_nothing_else(self):
+        scene = _item(fingerprint="fp-scene")
+        description = _description_item()
+        tag = _bulk_tag_item("fp-tag", "1", "Lantern Work")
+        untouched_tag = _bulk_tag_item("fp-other-tag", "2", "Passenger Boat")
+        store = _FakeMultiItemStore([scene, description, tag, untouched_tag])
+        stash = _FakeMultiKindStash(
+            performer_descriptions={"7": "<p>Before.</p>"})
+
+        result = Actions(store, stash).batch_apply(
+            "approve", ["fp-scene", "fp-d", "fp-tag"])
+
+        self.assertIsInstance(result, BatchResult)
+        self.assertEqual(result.verdict, "approve")
+        self.assertEqual(result.requested, ("fp-scene", "fp-d", "fp-tag"))
+        self.assertEqual(result.applied, ("fp-scene", "fp-d", "fp-tag"))
+        self.assertEqual(result.failed, ())
+        self.assertTrue(result.complete)
+        # The WHOLE set of writes the media server actually received, in
+        # order -- never a count, never one sampled call.
+        self.assertEqual(
+            stash.calls,
+            [("apply-scene", "42"),
+             ("apply-performer", "7", "Before."),
+             ("apply-tag", "1", "a description from a stash-box")])
+        # The row never named in the submitted set is untouched.
+        self.assertEqual(store.item("fp-other-tag")["state"], "new")
+
+    def test_a_row_not_in_the_submitted_set_is_left_completely_untouched(self):
+        # HARM: a filter re-evaluated between render and apply reaches rows
+        # nobody ticked. `fp-b` qualifies for `dismiss` exactly as much as
+        # `fp-a` does and must stay exactly as it was when only `fp-a` is
+        # submitted.
+        store = _FakeMultiItemStore(
+            [_item(fingerprint="fp-a"),
+             _item(fingerprint="fp-b", subject_id="43")])
+
+        result = Actions(store, _FakeStash()).batch_apply("dismiss", ["fp-a"])
+
+        self.assertEqual(result.applied, ("fp-a",))
+        self.assertEqual(
+            store.calls, [("dismissed", "fp-a", "dismissed from the inbox")])
+        self.assertEqual(store.item("fp-b")["state"], "new")
+
+    def test_an_unknown_fingerprint_is_reported_as_a_failure_not_a_crash(self):
+        store = _FakeMultiItemStore([_item(fingerprint="fp-a")])
+
+        result = Actions(store, _FakeStash()).batch_apply(
+            "mute", ["fp-a", "fp-missing"])
+
+        self.assertEqual(result.applied, ("fp-a",))
+        self.assertEqual([f["fingerprint"] for f in result.failed],
+                         ["fp-missing"])
+        self.assertFalse(result.complete)
+
+
+class BatchApplySubjectTypeGuard(unittest.TestCase):
+    """The subject-type guard: the single most important check in this
+    feature. Without it, a crafted (or merely stale) fingerprint could ride
+    a batch call into `approve`'s own merge/reconcile/delete dispatch --
+    exactly the three writes this project chose never to offer in bulk. Each
+    of the three gets its own hostile test isolating exactly the one row
+    that must be refused, mirroring `BulkApplyTagDescriptionsGuard` above.
+    Mutating the guard (`item["subject_type"] not in _BATCH_SUBJECT_TYPES`)
+    so every subject type qualifies must fail every test below."""
+
+    def test_a_tag_merge_fingerprint_is_refused_and_never_reaches_the_merge_path(self):
+        merge_item = _merge_item()
+        store = _FakeMultiItemStore(
+            [merge_item, _bulk_tag_item("fp-t", "1", "Lantern Work")])
+        stash = _FakeMultiKindStash()
+
+        result = Actions(store, stash).batch_apply(
+            "approve", [merge_item["fingerprint"], "fp-t"])
+
+        self.assertEqual(result.applied, ("fp-t",))
+        self.assertEqual([f["fingerprint"] for f in result.failed],
+                         [merge_item["fingerprint"]])
+        self.assertEqual(store.item(merge_item["fingerprint"])["state"], "new")
+
+    def test_a_reconcile_fingerprint_is_refused_and_never_reaches_the_reconcile_path(self):
+        reconcile_item = _reconcile_item()
+        store = _FakeMultiItemStore(
+            [reconcile_item, _bulk_tag_item("fp-t", "1", "Lantern Work")])
+        stash = _FakeMultiKindStash()
+
+        result = Actions(store, stash).batch_apply(
+            "approve", [reconcile_item["fingerprint"], "fp-t"])
+
+        self.assertEqual(result.applied, ("fp-t",))
+        self.assertEqual([f["fingerprint"] for f in result.failed],
+                         [reconcile_item["fingerprint"]])
+        self.assertEqual(
+            store.item(reconcile_item["fingerprint"])["state"], "new")
+
+    def test_a_tag_deletion_fingerprint_is_refused_and_never_deletes_anything(self):
+        # This IS "no bulk delete", exercised through this action: if the
+        # guard did not refuse it, `_FakeMultiKindStash.delete_tag` above
+        # raises `AssertionError` rather than deleting anything -- so a
+        # broken guard fails LOUDLY here, not by quietly succeeding against
+        # a double that also knows how to delete.
+        store = _FakeMultiItemStore(
+            [_hygiene_item("fp-h"), _bulk_tag_item("fp-t", "1", "Lantern Work")])
+        stash = _FakeMultiKindStash()
+
+        result = Actions(store, stash).batch_apply("approve", ["fp-h", "fp-t"])
+
+        self.assertEqual(result.applied, ("fp-t",))
+        self.assertEqual([f["fingerprint"] for f in result.failed], ["fp-h"])
+        self.assertEqual(store.item("fp-h")["state"], "new")
+
+    def test_the_guard_refuses_a_disallowed_subject_type_for_every_verdict(self):
+        # Not only `approve`: `dismiss`/`mute`/`refresh` reaching a subject
+        # type this action may never touch must be refused on the same
+        # terms, not merely happen to be harmless for those three because
+        # nothing else caught it.
+        for verdict in ("dismiss", "mute", "refresh"):
+            with self.subTest(verdict=verdict):
+                store = _FakeMultiItemStore([_hygiene_item("fp-h")])
+
+                result = Actions(store, _FakeStash()).batch_apply(
+                    verdict, ["fp-h"])
+
+                self.assertEqual(result.applied, ())
+                self.assertEqual(
+                    [f["fingerprint"] for f in result.failed], ["fp-h"])
+                self.assertEqual(store.calls, [])
+                self.assertEqual(store.item("fp-h")["state"], "new")
+
+
+class BatchApplyAppliedStateGuard(unittest.TestCase):
+    """`approve`/`dismiss`/`mute` refuse a row already `applied`; `refresh`
+    is deliberately exempt (ticket 86: an applied row has no other way off
+    the block it leaves in `scan.select`). Both halves of that asymmetry are
+    pinned -- testing only the restrictive side would miss a mutation that
+    widened the exemption to every verdict, or narrowed it to none, the same
+    "only one side of a guard is pinned" gap this project has been caught by
+    before."""
+
+    def test_approve_refuses_an_already_applied_row(self):
+        store = _FakeMultiItemStore(
+            [_item(fingerprint="fp-a", state="applied",
+                  prior_state={"title": "was"})])
+
+        result = Actions(store, _FakeStash()).batch_apply("approve", ["fp-a"])
+
+        self.assertEqual(result.applied, ())
+        self.assertEqual([f["fingerprint"] for f in result.failed], ["fp-a"])
+        self.assertIn("already applied", result.failed[0]["reason"])
+
+    def test_dismiss_refuses_an_already_applied_row(self):
+        store = _FakeMultiItemStore(
+            [_item(fingerprint="fp-a", state="applied",
+                  prior_state={"title": "was"})])
+
+        result = Actions(store, _FakeStash()).batch_apply("dismiss", ["fp-a"])
+
+        self.assertEqual(result.applied, ())
+        self.assertEqual(store.calls, [])
+
+    def test_mute_refuses_an_already_applied_row(self):
+        store = _FakeMultiItemStore(
+            [_item(fingerprint="fp-a", state="applied",
+                  prior_state={"title": "was"})])
+
+        result = Actions(store, _FakeStash()).batch_apply("mute", ["fp-a"])
+
+        self.assertEqual(result.applied, ())
+        self.assertEqual(store.calls, [])
+
+    def test_refresh_still_reaches_an_already_applied_row(self):
+        # The one case ticket 86 exists for. If this fell to the same
+        # exclusion as the other three, an applied row would be left with no
+        # way off the block it leaves in `scan.select` -- exactly the dead
+        # end that ticket closed for a single row.
+        store = _FakeMultiItemStore(
+            [_item(fingerprint="fp-a", state="applied",
+                  prior_state={"title": "was"})])
+
+        result = Actions(store, _FakeStash()).batch_apply("refresh", ["fp-a"])
+
+        self.assertEqual(result.applied, ("fp-a",))
+        self.assertEqual(store.calls, [("superseded", "fp-a")])
+
+
+class BatchApplyPartialFailure(unittest.TestCase):
+    def test_one_failing_approve_is_reported_as_partial_not_success(self):
+        store = _FakeMultiItemStore([
+            _bulk_tag_item("fp-ok", "1", "Lantern Work"),
+            _bulk_tag_item("fp-bad", "2", "Passenger Boat"),
+        ])
+        stash = _FakeMultiKindStash(fail_tag_ids={"2"})
+
+        result = Actions(store, stash).batch_apply(
+            "approve", ["fp-ok", "fp-bad"])
+
+        self.assertFalse(result.complete)
+        self.assertEqual(result.applied, ("fp-ok",))
+        self.assertEqual(len(result.failed), 1)
+        self.assertEqual(result.failed[0]["fingerprint"], "fp-bad")
+        self.assertIn("could not apply", result.failed[0]["reason"])
+        self.assertEqual(store.item("fp-ok")["state"], "applied")
+        self.assertEqual(store.item("fp-bad")["state"], "failed")
+
+    def test_every_other_row_is_still_attempted_after_one_failure(self):
+        store = _FakeMultiItemStore([
+            _bulk_tag_item("fp-bad", "1", "Lantern Work"),
+            _bulk_tag_item("fp-ok", "2", "Passenger Boat"),
+        ])
+        stash = _FakeMultiKindStash(fail_tag_ids={"1"})
+
+        result = Actions(store, stash).batch_apply(
+            "approve", ["fp-bad", "fp-ok"])
+
+        self.assertEqual(result.applied, ("fp-ok",))
+        self.assertEqual([f["fingerprint"] for f in result.failed], ["fp-bad"])
+
+    def test_an_unexpected_exception_from_a_single_row_does_not_abort_the_batch(self):
+        # Neither `dismiss` nor `mute` is documented to raise anything but
+        # `UnknownProposal` -- this proves the batch survives one that does
+        # anyway, rather than only ever exercising the two documented,
+        # narrower failure paths.
+        class _ExplodingStore(_FakeMultiItemStore):
+            def mute(self, subject_type, subject_id, reason=None):
+                if subject_id == "explode":
+                    raise RuntimeError("the database vanished")
+                super().mute(subject_type, subject_id, reason=reason)
+
+        store = _ExplodingStore([
+            _item(fingerprint="fp-bad", subject_id="explode"),
+            _item(fingerprint="fp-ok", subject_id="43"),
+        ])
+
+        result = Actions(store, _FakeStash()).batch_apply(
+            "mute", ["fp-bad", "fp-ok"])
+
+        self.assertEqual(result.applied, ("fp-ok",))
+        self.assertEqual([f["fingerprint"] for f in result.failed], ["fp-bad"])
+        self.assertIn("RuntimeError", result.failed[0]["reason"])
+
+
+class BatchApplyUnknownVerdict(unittest.TestCase):
+    def test_an_unrecognised_verdict_raises_rather_than_silently_doing_nothing(self):
+        store = _FakeMultiItemStore([_item()])
+        with self.assertRaises(ValueError):
+            Actions(store, _FakeStash()).batch_apply("delete", ["fp-1"])

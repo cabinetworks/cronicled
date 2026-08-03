@@ -139,6 +139,26 @@
      words per line, which is worse than reading them in order. */
   @media (max-width: 42rem) { .diff { grid-template-columns: 1fr; } }
 
+  /* A row's own checkbox, ticked for the shared batch form below. Sits to
+     the left of the row's own block rather than inside it, so it is never
+     mistaken for one of that row's OWN controls (Approve/Dismiss/Mute/
+     Refresh) -- those act on this row alone; this one feeds a verdict a
+     person applies to several rows at once. */
+  .row-wrap { display: flex; align-items: flex-start; gap: 0.5rem; }
+  .row-wrap .proposal { flex: 1 1 auto; min-width: 0; }
+  .pick { flex: 0 0 auto; padding-top: 0.95rem; }
+  .pick input { width: 1.05rem; height: 1.05rem; }
+  /* Present for a screen reader, invisible on the page -- the checkbox
+     itself has no visible label text of its own. */
+  .visually-hidden { position: absolute; width: 1px; height: 1px;
+                     overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .batch-bar { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center;
+               border: 1px solid var(--line); border-radius: 6px;
+               background: var(--panel); padding: 0.6rem 0.9rem; margin: 0 0 0.6rem; }
+  .batch-bar button { font: inherit; font-size: 0.85rem; padding: 0.3rem 0.7rem;
+                       border: 1px solid var(--line); border-radius: 4px;
+                       background: var(--bg); color: var(--fg); cursor: pointer; }
+
   /* The persistent navigation (`_sidebar.html`), included above the page's
      own `<h1>` on every page this server serves. Plain nested lists rather
      than a layout grid: this page has no second column to share with it, so

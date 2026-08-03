@@ -12,6 +12,7 @@ from cronicled import performer_tags, tag_hygiene, tags
 from cronicled.descriptions import SUBJECT_TYPE as DESCRIPTION_SUBJECT
 from cronicled.tag_descriptions import SUBJECT_TYPE as TAG_DESCRIPTION_SUBJECT
 from cronicled.runscan import build_producer
+from cronicled.scan import SUBJECT_TYPE as SCENE_SUBJECT
 from cronicled.scan import catalogue_link
 from cronicled.store import GONE
 from cronicled.web.rows import carries_cover
@@ -61,6 +62,61 @@ class BulkApplyResult:
         as a success -- see `web.app`'s redirect, which reports the two
         counts rather than collapsing them into one boolean of its own."""
         return len(self.applied) == len(self.requested)
+
+
+@dataclass(frozen=True)
+class BatchResult:
+    """The outcome of one `Actions.batch_apply` call -- the same shape
+    `BulkApplyResult` established (see its own docstring for why `requested`
+    is verbatim and `applied`/`failed` partition it exactly), widened to name
+    which VERDICT this batch carried out. `bulk_apply_tag_descriptions` only
+    ever means one verb (fill a blank description); this one is shared by
+    four (`BATCH_VERDICTS`), so the outcome has to say which."""
+    verdict: str
+    requested: tuple
+    applied: tuple
+    failed: tuple
+
+    @property
+    def complete(self):
+        """True only when every requested fingerprint went through. See
+        `BulkApplyResult.complete` for why this must never collapse a
+        partial batch into looking like a full one."""
+        return len(self.applied) == len(self.requested)
+
+
+# The four verdicts a ticked selection may carry out -- named here, once, so
+# `web.app` (which decides which of the four needs a confirmation step
+# before it fires) and this module (which is the only place any of the four
+# is actually performed) read the same list rather than two that could drift
+# apart.
+BATCH_VERDICTS = ("approve", "dismiss", "mute", "refresh")
+
+# Verdicts `batch_apply`'s own guard refuses for a row already `applied`.
+# `refresh` is deliberately absent: staleness is a property of WHEN a
+# proposal was made, not of its current state (see `refresh`'s own
+# docstring, and `Refresh.test_refresh_reaches_an_applied_rows_fingerprint_too`
+# in the single-row tests) -- an applied row has exactly the same reason to
+# be refreshed as any other, and it is the ticket this whole control started
+# from: an applied row has no other way off the block it leaves in
+# `scan.select`.
+_BATCH_BLOCKS_APPLIED = ("approve", "dismiss", "mute")
+
+# The only subject types a batch verdict may ever reach -- exactly the three
+# `web.rows.to_rows` builds a row (and so a checkbox on the generic list) for.
+# A tag merge, a tag/performer reconciliation or a tag deletion is refused
+# here even if its fingerprint reaches this call some other way (a stale
+# link, a crafted request): none of the three is ever shown with a checkbox
+# on the page (see inbox.html -- the checkbox lives only on the rows the main
+# `{% for row in rows %}` loop draws), and each of the three has its own
+# undecided/ambiguous/expected-count refusal built into `approve`'s own
+# dispatch that a blind batch call must never bypass. Refusing here is what
+# keeps "no bulk delete" (`tag_hygiene.SUBJECT_TYPE`) and "no bulk merge"/
+# "no bulk reconcile" true for THIS action specifically, the same way the
+# tag-description-only guard keeps them true for
+# `bulk_apply_tag_descriptions` above.
+_BATCH_SUBJECT_TYPES = frozenset(
+    (SCENE_SUBJECT, DESCRIPTION_SUBJECT, TAG_DESCRIPTION_SUBJECT))
 
 
 _NO_STASH = ("no media server is configured -- start cronicled with "
@@ -290,6 +346,119 @@ class Actions:
             applied.append(fp)
         return BulkApplyResult(requested=tuple(fingerprints),
                                applied=tuple(applied), failed=tuple(failed))
+
+    def batch_apply(self, verdict, fingerprints):
+        """Apply ONE verdict -- `approve`, `dismiss`, `mute` or `refresh`,
+        see `BATCH_VERDICTS` -- to every fingerprint in `fingerprints`, and
+        only those.
+
+        This is the general sibling of `bulk_apply_tag_descriptions` above,
+        and everything that method's own docstring says about WHY the
+        submitted set is used exactly as given applies here without change:
+        `fingerprints` is iterated once, in order, each looked up
+        individually -- nothing here queries the store for "everything a
+        checkbox might have meant" and applies that instead. The caller
+        (`web.app`'s handler) is expected to pass exactly the fingerprints a
+        rendered page's own checkboxes carried; see `web.pagination`'s module
+        docstring for the guarantee that makes that possible at all: a page's
+        own row window carries its own fingerprints, round-tripped through
+        the rendered form, never reconstructed by re-querying the store.
+
+        THE GUARD THAT MAKES A GENERAL VERDICT DEFENSIBLE HERE, where
+        `bulk_apply_tag_descriptions` needed a narrower one because its own
+        write is not additive: a fingerprint is refused, never acted on,
+        unless its OWN stored proposal is both
+
+        * for a subject type this action may ever reach at all
+          (`_BATCH_SUBJECT_TYPES` -- scene, performer-description or
+          tag-description; never a tag merge, a tag/performer reconciliation
+          or a tag deletion, each of which has its own refusal logic that a
+          blind batch call must not bypass -- see that constant's own
+          comment); and
+        * not already `applied`, for `approve`/`dismiss`/`mute`
+          (`_BATCH_BLOCKS_APPLIED`) -- `refresh` is deliberately exempt, on
+          the same terms the single-row control is (see `refresh`'s own
+          docstring).
+
+        Both conditions are checked from the row's OWN stored state, read
+        fresh via `_find` for each fingerprint -- never assumed from the
+        verdict alone. A single refusal never stops the batch: every other
+        fingerprint is still attempted, and the refused one is recorded in
+        `failed`, on the same terms `bulk_apply_tag_descriptions` already
+        guarantees.
+
+        THE WRITE ITSELF is always one of `approve`/`dismiss`/`mute`/
+        `refresh` -- the exact methods a single row's own click already
+        uses, called here unchanged by name (`getattr(self, verdict)`) -- so
+        there is only one implementation of what each verdict means for this
+        module to ever drift out of.
+
+        Any exception the underlying call raises -- `UnknownProposal` (the
+        row was decided by someone else between this call's own `_find` and
+        the dispatch below), `ApplyFailed` (the write itself failed), or
+        anything else no branch here anticipated -- is caught and recorded
+        as a failure for that ONE fingerprint rather than allowed to abort
+        whatever of the batch has not been attempted yet. A partial batch
+        must always be reported as partial (see `BatchResult.complete`), and
+        it must never be a batch that stopped partway through and never said
+        so.
+        """
+        if verdict not in BATCH_VERDICTS:
+            raise ValueError("unknown batch verdict: %r" % (verdict,))
+        applied = []
+        failed = []
+        for fp in fingerprints:
+            try:
+                item = self._find(fp)
+            except UnknownProposal:
+                failed.append({
+                    "fingerprint": fp,
+                    "reason": "no longer waiting -- it may already have "
+                              "been decided",
+                })
+                continue
+            if item["subject_type"] not in _BATCH_SUBJECT_TYPES:
+                failed.append({
+                    "fingerprint": fp,
+                    "reason": "not a scene, performer-description or "
+                              "tag-description proposal -- a batch verdict "
+                              "only reaches the generic row list",
+                })
+                continue
+            if (verdict in _BATCH_BLOCKS_APPLIED
+                    and item["state"] == "applied"):
+                failed.append({
+                    "fingerprint": fp,
+                    "reason": "already applied -- nothing left to %s"
+                              % verdict,
+                })
+                continue
+            try:
+                getattr(self, verdict)(fp)
+            except UnknownProposal:
+                failed.append({
+                    "fingerprint": fp,
+                    "reason": "no longer waiting -- it may already have "
+                              "been decided",
+                })
+                continue
+            except ApplyFailed as exc:
+                failed.append({"fingerprint": fp, "reason": str(exc)})
+                continue
+            except Exception as exc:
+                # A defensive last resort, not the ordinary path: neither
+                # `dismiss`/`mute`/`refresh` is documented to raise anything
+                # but the two caught above. If one ever does, ONE row's
+                # unexpected failure still must not abort every fingerprint
+                # after it in the same batch.
+                failed.append({
+                    "fingerprint": fp,
+                    "reason": "%s: %s" % (type(exc).__name__, exc),
+                })
+                continue
+            applied.append(fp)
+        return BatchResult(verdict=verdict, requested=tuple(fingerprints),
+                           applied=tuple(applied), failed=tuple(failed))
 
     def _approve_merge(self, fp, item):
         """Perform one tag merge: move every item off the losing spellings

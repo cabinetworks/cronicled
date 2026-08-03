@@ -510,6 +510,44 @@
 {% endif %}
 {% endif %}
 
+{# The two counts `/batch` redirected here with, plus which of the four
+   verdicts they belong to -- the same "state both counts, never collapse
+   into one flag" reasoning `bulk_result` above already follows, so a
+   partial ticked batch reads as partial rather than as a plain success.
+   `batch_result` is `None` on the same "stale or foreign value shows
+   nothing" terms as `bulk_result`/`just_applied` -- see web/app.py's own
+   parsing, which also checks the verdict itself against the four this
+   server actually knows. #}
+{% set batch_result = batch_result | default(None) %}
+{% if batch_result %}
+{% set batch_complete = (batch_result.applied == batch_result.requested) %}
+{% if batch_result.verdict == "approve" %}
+{% if batch_complete %}
+<p class="note">Applied all {{ batch_result.applied }} ticked rows.</p>
+{% else %}
+<div class="warn">Applied {{ batch_result.applied }} of {{ batch_result.requested }} ticked rows -- the rest were refused or could not be written; see each row's own state below.</div>
+{% endif %}
+{% elif batch_result.verdict == "dismiss" %}
+{% if batch_complete %}
+<p class="note">Dismissed all {{ batch_result.applied }} ticked rows.</p>
+{% else %}
+<div class="warn">Dismissed {{ batch_result.applied }} of {{ batch_result.requested }} ticked rows -- the rest were refused; see each row's own state below.</div>
+{% endif %}
+{% elif batch_result.verdict == "mute" %}
+{% if batch_complete %}
+<p class="note">Muted all {{ batch_result.applied }} ticked rows.</p>
+{% else %}
+<div class="warn">Muted {{ batch_result.applied }} of {{ batch_result.requested }} ticked rows -- the rest were refused; see each row's own state below.</div>
+{% endif %}
+{% else %}
+{% if batch_complete %}
+<p class="note">Refreshed all {{ batch_result.applied }} ticked rows.</p>
+{% else %}
+<div class="warn">Refreshed {{ batch_result.applied }} of {{ batch_result.requested }} ticked rows -- the rest were refused; see each row's own state below.</div>
+{% endif %}
+{% endif %}
+{% endif %}
+
 {% if not rows %}
 <p class="empty">Nothing waiting. Proposals appear here after a scan.</p>
 {% endif %}
@@ -537,10 +575,64 @@
 </form>
 {% endif %}
 
+{# One verdict, applied to every row ticked below -- never carried past this
+   render: a selection does not survive moving between pages (see
+   `cronicled.web.pagination`'s own module docstring on why a page's row
+   window is what may ever be submitted back, and nothing else). The four
+   buttons share ONE form (`#batch-form`) so ticking is done once regardless
+   of which verdict is pressed; each row's own checkbox lives INSIDE that
+   row's block below and is associated with this form by the HTML `form`
+   attribute rather than by nesting -- a row's own Approve/Dismiss/Mute/
+   Refresh buttons are each already their own `<form>`, and a `<form>` inside
+   another `<form>` is invalid HTML and would be dropped by the parser, not
+   merely untidy.
+
+   `approve` and `refresh` do not act immediately from this form -- `/batch`
+   answers with a confirmation page stating the exact count first (see
+   `batch_confirm.html`); `dismiss`/`mute` act at once, on the same terms a
+   single row's own click already does (see `web/app.py`'s
+   `_BATCH_CONFIRM_VERDICTS`). #}
+{% if rows %}
+<form id="batch-form" method="post" action="/batch">
+  <div class="batch-bar">
+    <span class="note">Apply to every row ticked below (this page only):</span>
+    <button name="verdict" value="approve">Approve ticked</button>
+    <button name="verdict" value="dismiss">Dismiss ticked</button>
+    <button name="verdict" value="mute">Mute ticked</button>
+    <button name="verdict" value="refresh">Refresh ticked</button>
+  </div>
+</form>
+{% endif %}
+
 {% for row in rows %}
-{{ row_block(row) }}
+<div class="row-wrap">
+  <label class="pick"><input type="checkbox" name="fp" value="{{ row.fingerprint }}" form="batch-form"><span class="visually-hidden">select this row</span></label>
+  {{ row_block(row) }}
+</div>
 {% endfor %}
 {{ pager_nav(pagination.rows) }}
+
+{# "Select all" means every row THIS page rendered, and only those -- never
+   the whole waiting queue. Built the same way `bulk_tag_rows`'s own form
+   above is: hidden fields filled in from `rows` at render time, never from a
+   re-query, and never dependent on which checkboxes above happen to be
+   ticked -- so it works with no JavaScript. Placed AFTER the row loop so
+   the fingerprints named here are never a row's FIRST appearance in the
+   page (its own Approve/Dismiss/Mute/Refresh forms already are), which
+   keeps this an additional way to submit the same set rather than a
+   competing source of truth for it. #}
+{% if rows %}
+<form method="post" action="/batch">
+  {% for row in rows %}
+  <input type="hidden" name="fp" value="{{ row.fingerprint }}">
+  {% endfor %}
+  <p class="note">Or apply to all {{ rows | length }} rows on this page, ticked or not:
+  <button name="verdict" value="approve">Approve all {{ rows | length }} on this page</button>
+  <button name="verdict" value="dismiss">Dismiss all {{ rows | length }} on this page</button>
+  <button name="verdict" value="mute">Mute all {{ rows | length }} on this page</button>
+  <button name="verdict" value="refresh">Refresh all {{ rows | length }} on this page</button></p>
+</form>
+{% endif %}
 
 {# `merges`/`reconciles`/`unused` are rendered only when the CALLER passed
    them -- `is defined`, checked before either is coerced with `default([])`
