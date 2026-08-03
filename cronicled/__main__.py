@@ -75,6 +75,18 @@ from .web.rows import (to_merge_rows, to_mute_rows, to_reconcile_rows,
 _OWN_SECTION_SUBJECTS = (tags.SUBJECT_TYPE, performer_tags.SUBJECT_TYPE,
                          tag_hygiene.SUBJECT_TYPE)
 
+# The complement -- every subject type the generic row list CAN draw a row
+# for -- computed from `inboxes.ALL_SUBJECT_TYPES` rather than declared a
+# second time, for the same reason `WAITING_SECTIONS` below reads `INBOXES`
+# instead of re-listing its keys: one set subtracted in two places is free
+# to drift, and `_inbox_rows` needs exactly this set to ask the store for a
+# bounded window through `Store.items(subject_types=)` at the SQL level,
+# rather than fetching everything and filtering the three special kinds out
+# in Python AFTER a page's own bound has already been applied -- which would
+# leave a page short of its own bound for no reason a reader would see.
+_SCENE_SUBJECT_TYPES = tuple(t for t in inboxes.ALL_SUBJECT_TYPES
+                            if t not in _OWN_SECTION_SUBJECTS)
+
 # Which heading on the summary page each producer's proposals are counted
 # under, and what that heading is called. SIX subject types across three
 # headings: a reviewer thinks in terms of the thing being changed -- a scene, a
@@ -535,25 +547,49 @@ def main(argv=None):
     actions = Actions(store, stash, runner=runner, adapters=adapters,
                       marker=marker)
 
-    def _inbox_rows():
+    def _inbox_rows(limit=None, offset=0):
         # Applied proposals get their own section below (ticket 98) -- the
         # inbox itself only ever shows what still needs a decision, and an
         # applied row does not. `items()`'s own default already hides
-        # `dismissed`/`muted`/`superseded`; this excludes the one further
-        # state the inbox list has to earn its own way out of, on top of
-        # that -- see `Actions._find`'s docstring for why that default
-        # itself is left untouched: `undo` still needs `items(state=None)`
-        # to include an applied row, and this filtering happens here, not
-        # by narrowing what `items()` returns.
-        # Tag-merge proposals are excluded here and rendered by
-        # `_merge_rows` below instead. Not tidiness: `to_row` INDEXES
-        # `payload["path"]` and `payload["candidate"]`, which a merge payload
-        # has neither of, so a single tag cluster in the store would take the
-        # whole page down with a KeyError rather than render oddly.
-        return to_rows([item for item in store.items()
-                        if item["state"] != "applied"
-                        and item["subject_type"] not in _OWN_SECTION_SUBJECTS],
-                       base_url=base_url)
+        # `dismissed`/`muted`/`superseded`; `exclude_states` widens that by
+        # the one further state the inbox list has to earn its own way out
+        # of -- see `Actions._find`'s docstring for why that default itself
+        # is left untouched: `undo` still needs `items(state=None)` to
+        # include an applied row.
+        #
+        # Tag-merge (and tag/performer, and low-count-tag) proposals are
+        # excluded here, via `_SCENE_SUBJECT_TYPES`, and rendered by
+        # `_merge_rows` and neighbours below instead. Not tidiness: `to_row`
+        # INDEXES `payload["path"]` and `payload["candidate"]`, which a
+        # merge payload has neither of, so a single tag cluster reaching
+        # this list would take the whole page down with a `KeyError` rather
+        # than render oddly.
+        #
+        # Both exclusions are now store-level arguments, not a Python
+        # filter applied to whatever `items()` happened to return -- the
+        # difference that matters once this is called with `limit`/
+        # `offset`: filtering AFTER a bounded fetch could leave a page
+        # short of its own bound (or, worse, of `limit` rows fetched, fewer
+        # still after excluding some), for no reason a reader would see. See
+        # `Store.items`'s own `exclude_states` docstring.
+        items = store.items(subject_types=_SCENE_SUBJECT_TYPES,
+                           exclude_states=("applied",),
+                           limit=limit, offset=offset)
+        return to_rows(items, base_url=base_url)
+
+    def _inbox_rows_count():
+        """The total `_inbox_rows` is a bounded WINDOW of -- read straight
+        from the store (`Store.item_count`), never `len(_inbox_rows())`
+        with no bound, which is exactly the whole-queue fetch a bounded page
+        exists to avoid. This is what the sidebar's own count must NOT be
+        confused with: this answers for the generic row list alone (already
+        narrowed to `_SCENE_SUBJECT_TYPES`), while `_sidebar_context` (see
+        `cronicled.web.app`) answers per INBOX, across every subject type
+        that inbox owns, straight from `store.counts()`. The two are
+        different questions and this ticket must not make them one.
+        """
+        return store.item_count(subject_types=_SCENE_SUBJECT_TYPES,
+                                exclude_states=("applied",))
 
     def _scene_items(state):
         return [item for item in store.items(state=state)
@@ -636,6 +672,7 @@ def main(argv=None):
         # answers to neither, so one cluster in the wrong list is a KeyError
         # that takes the whole page down.
         serve(rows=_inbox_rows,
+              rows_count=_inbox_rows_count,
               merges=_merge_rows,
               reconciles=_reconcile_rows,
               unused=_unused_groups,

@@ -859,7 +859,8 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
 def serve(rows, actions, scan_status=None, muted=None, dismissed=None,
          refused=None, superseded=None, applied=None, schedule_status=None,
          merges=None, reconciles=None, unused=None, gone=None, summary=None,
-         store=None, base_url=None, host=DEFAULT_HOST, port=DEFAULT_PORT):
+         store=None, base_url=None, host=DEFAULT_HOST, port=DEFAULT_PORT,
+         rows_count=None):
     # `HTTPServer` is single-threaded: one connection wedged on a slow read
     # or a slow downstream call (a media server taking its whole configured
     # timeout to answer an Approve, say) stalls every other request -- an
@@ -907,7 +908,7 @@ def serve(rows, actions, scan_status=None, muted=None, dismissed=None,
         refused=refused, superseded=superseded, applied=applied,
         schedule_status=schedule_status, merges=merges,
         reconciles=reconciles, unused=unused, gone=gone, summary=summary,
-        store=store, base_url=base_url))
+        store=store, base_url=base_url, rows_count=rows_count))
     # Names what is actually at that address. It said "inbox" when the inbox
     # was the landing page; a start-up line that keeps naming the page that
     # used to be there sends the one person reading it to the wrong place.
