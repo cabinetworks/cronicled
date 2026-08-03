@@ -488,6 +488,63 @@ class Reads(_StoreCase):
         self.assertEqual(self.store.counts(), {"new": 1, "seen": 1})
 
 
+class TheOrderIsAStableTotalOrder(unittest.TestCase):
+    """A bounded page's own reachability depends on `items()`'s order being
+    a genuine total order -- see `items()`'s own docstring for why
+    `created_at, fingerprint` is that (oldest first, ties broken by a
+    fingerprint that is itself fixed for a row's whole life). The risk this
+    pins is specifically the coarse resolution of `created_at`: `_utcnow()`
+    only has one-second precision (see the module docstring above
+    `record_run`), so a batch of proposals recorded inside one second --
+    ordinary for a scan -- ties on `created_at` entirely and the ORDER BY's
+    second column is the only thing keeping their relative order fixed. A
+    fixture that gives every row a distinct timestamp (as most of this
+    file's fixtures do, via `now=`) cannot exercise this at all.
+    """
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self.store = Store(os.path.join(self._dir, "s.db"))
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        self.store.close()
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+    def test_rows_sharing_one_created_at_still_come_back_in_one_fixed_order(self):
+        # The SAME `now=` for every row -- forcing the exact tie a fast
+        # scan produces in production (every proposal from one run landing
+        # in the same `_utcnow()` second), deterministically rather than
+        # hoping this process is fast enough for it to happen on its own.
+        fps = [self.store.record(
+            folder="library", subject_type="scene", subject_id=str(i),
+            summary="s", payload={"i": i}, producer="p",
+            now="2026-07-01T00:00:00")
+            for i in range(50)]
+        first_read = [i["fingerprint"] for i in self.store.items()]
+        second_read = [i["fingerprint"] for i in self.store.items()]
+        self.assertEqual(first_read, second_read)
+        # And the order IS the fingerprint order -- not merely "some order
+        # SQLite happens to repeat" -- which is what `, fingerprint` in the
+        # `ORDER BY` clause is actually for.
+        self.assertEqual(first_read, sorted(fps))
+
+    def test_the_same_holds_with_pagination(self):
+        whole_ids = [self.store.record(
+            folder="library", subject_type="scene", subject_id=str(i),
+            summary="s", payload={"i": i}, producer="p",
+            now="2026-07-01T00:00:00")
+            for i in range(250)]
+        whole = [i["fingerprint"] for i in self.store.items(limit=10_000)]
+        self.assertEqual(whole, sorted(whole_ids))
+        first_page = [i["fingerprint"]
+                     for i in self.store.items(limit=100, offset=0)]
+        second_page = [i["fingerprint"]
+                      for i in self.store.items(limit=100, offset=100)]
+        self.assertEqual(first_page, whole[:100])
+        self.assertEqual(second_page, whole[100:200])
+
+
 class ItemCount(_StoreCase):
     """`item_count` answers the same question `len(items(...))` would, for a
     caller that cannot afford to fetch a page's whole population just to
