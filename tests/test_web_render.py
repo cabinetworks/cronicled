@@ -283,6 +283,22 @@ class BatchCheckboxRendering(unittest.TestCase):
                               match.group("body"))
         self.assertEqual(verdicts, ["approve", "dismiss", "mute", "refresh"])
 
+    def test_every_select_all_buttons_own_label_says_this_page(self):
+        # Not just the paragraph beside it: "all" meaning "all 1,903,
+        # including the ones nobody has seen" is the general bulk apply
+        # this project chose not to build, arriving through a checkbox --
+        # each BUTTON'S OWN label must say the narrower thing itself.
+        html = render("inbox.html", rows=[_row()], counts={})
+        match = re.search(
+            r'<form method="post" action="/batch">(?P<body>.*?)</form>',
+            html, re.DOTALL)
+        self.assertIsNotNone(match)
+        labels = re.findall(r'<button name="verdict" value="[^"]+">'
+                            r'([^<]+)</button>', match.group("body"))
+        self.assertEqual(len(labels), 4)
+        for label in labels:
+            self.assertIn("on this page", label)
+
     def test_no_rows_means_no_batch_controls_at_all(self):
         html = render("inbox.html", rows=[], counts={})
         self.assertNotIn("batch-form", html)

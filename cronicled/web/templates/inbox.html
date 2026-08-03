@@ -627,10 +627,10 @@
   <input type="hidden" name="fp" value="{{ row.fingerprint }}">
   {% endfor %}
   <p class="note">Or apply to all {{ rows | length }} rows on this page, ticked or not:
-  <button name="verdict" value="approve">Approve all {{ rows | length }}</button>
-  <button name="verdict" value="dismiss">Dismiss all {{ rows | length }}</button>
-  <button name="verdict" value="mute">Mute all {{ rows | length }}</button>
-  <button name="verdict" value="refresh">Refresh all {{ rows | length }}</button></p>
+  <button name="verdict" value="approve">Approve all {{ rows | length }} on this page</button>
+  <button name="verdict" value="dismiss">Dismiss all {{ rows | length }} on this page</button>
+  <button name="verdict" value="mute">Mute all {{ rows | length }} on this page</button>
+  <button name="verdict" value="refresh">Refresh all {{ rows | length }} on this page</button></p>
 </form>
 {% endif %}
 
