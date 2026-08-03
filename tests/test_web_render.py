@@ -2252,3 +2252,105 @@ class EveryTimeOnThePageReadsInTheConfiguredZone(unittest.TestCase):
         self.assertIn("muted %s" % self.WINTER_LOCAL, html)
         self.assertIn("last tick %s" % self.SUMMER_LOCAL, html)
         self.assertIn("last ran 2026-07-15T01:30:00+02:00", html)
+
+
+class ThePagerControl(unittest.TestCase):
+    """The Prev/Next control a bounded section draws -- see web/app.py's
+    `_pager` for what builds the dict this reads (`page`, `total_pages`,
+    `total`, `prev_href`, `next_href`) and `inbox.html`'s `pager_nav`/
+    `section` macros for what reads it. Exercised directly against the
+    template, with a hand-built `pagination` dict, rather than through the
+    whole store/app stack -- this is the layer this project's own audit
+    found no mutation had ever reached.
+    """
+
+    def test_no_pager_at_all_draws_nothing(self):
+        # The ordinary case for every render in this file that predates
+        # pagination: no `pagination=` context at all.
+        html = render("inbox.html", rows=[], counts={})
+        self.assertNotIn('class="pager"', html)
+
+    def test_a_single_page_draws_no_pager_either(self):
+        # A pager on a section with only one page to show is a control
+        # that does nothing -- worse than none, because it invites a click
+        # that goes nowhere.
+        html = render("inbox.html", rows=[], counts={},
+                      pagination={"rows": {"total": 3, "page": 1,
+                                          "total_pages": 1,
+                                          "prev_href": None,
+                                          "next_href": None}})
+        self.assertNotIn('class="pager"', html)
+
+    def test_more_than_one_page_draws_the_pager_with_both_controls(self):
+        html = render("inbox.html", rows=[], counts={},
+                      pagination={"rows": {"total": 450, "page": 2,
+                                          "total_pages": 3,
+                                          "prev_href": "/inbox?page=1",
+                                          "next_href": "/inbox?page=3"}})
+        self.assertIn('class="pager"', html)
+        self.assertIn("Page 2 of 3", html)
+        self.assertIn('href="/inbox?page=1"', html)
+        self.assertIn('href="/inbox?page=3"', html)
+
+    def test_the_first_page_draws_no_prev_link(self):
+        html = render("inbox.html", rows=[], counts={},
+                      pagination={"rows": {"total": 450, "page": 1,
+                                          "total_pages": 3,
+                                          "prev_href": None,
+                                          "next_href": "/inbox?page=2"}})
+        # A disabled marker instead -- never a link back to the same page.
+        self.assertIn('class="pager-disabled"', html)
+        self.assertNotIn('href="/inbox?page=1"', html)
+        self.assertIn('href="/inbox?page=2"', html)
+
+    def test_the_last_page_draws_no_next_link(self):
+        html = render("inbox.html", rows=[], counts={},
+                      pagination={"rows": {"total": 450, "page": 3,
+                                          "total_pages": 3,
+                                          "prev_href": "/inbox?page=2",
+                                          "next_href": None}})
+        self.assertIn('href="/inbox?page=2"', html)
+        self.assertNotIn('href="/inbox?page=3"', html)
+
+    def test_a_sections_count_badge_reads_the_pagers_total_not_the_entries(self):
+        # The exact bug a rendered-row count would introduce: three rows
+        # were HANDED to the template (already windowed to one page), but
+        # the section's own true population is 450 -- the badge must say
+        # 450, never 3.
+        html = render(
+            "inbox.html", rows=[], counts={},
+            applied=[_row(state="applied") for _ in range(3)],
+            pagination={"applied": {"total": 450, "page": 1,
+                                    "total_pages": 3,
+                                    "prev_href": None,
+                                    "next_href": "/x?applied_page=2"}})
+        self.assertIn("Applied (450)", html)
+        self.assertNotIn("Applied (3)", html)
+
+    def test_a_section_with_no_pager_wired_falls_back_to_entries_length(self):
+        # The pre-pagination behaviour, unchanged for a caller that renders
+        # a short, complete list directly and never wires `pagination=` at
+        # all -- most of this file's own tests.
+        html = render("inbox.html", rows=[], counts={},
+                      applied=[_row(state="applied") for _ in range(3)])
+        self.assertIn("Applied (3)", html)
+
+    def test_each_sections_pager_is_independent_of_the_others(self):
+        # Two DIFFERENT pagers on one render -- a shared implementation bug
+        # (one pager object reused, or a key collision) would make them
+        # agree when they should not.
+        html = render(
+            "inbox.html", rows=[], counts={},
+            applied=[_row(state="applied")],
+            dismissed=[_row(state="dismissed")],
+            pagination={
+                "applied": {"total": 450, "page": 1, "total_pages": 3,
+                           "prev_href": None, "next_href": "/x?applied_page=2"},
+                "dismissed": {"total": 900, "page": 2, "total_pages": 5,
+                             "prev_href": "/x?dismissed_page=1",
+                             "next_href": "/x?dismissed_page=3"},
+            })
+        self.assertIn("Applied (450)", html)
+        self.assertIn("Dismissed (900)", html)
+        self.assertIn("Page 1 of 3", html)
+        self.assertIn("Page 2 of 5", html)

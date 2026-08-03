@@ -20,7 +20,8 @@ from cronicled.tag_hygiene import proposal as unused_proposal
 from cronicled.tags import cluster_tags
 from cronicled.tags import proposal as tag_merge_proposal
 from cronicled.web.actions import ApplyFailed, BulkApplyResult, UnknownProposal
-from cronicled.web.app import PAGE_SIZE, build_handler, serve, DEFAULT_HOST
+from cronicled.web.app import (PAGE_SIZE, _current_pages, _pager,
+                                build_handler, serve, DEFAULT_HOST)
 from cronicled.web.rows import (to_merge_rows, to_reconcile_rows,
                                 to_rows, to_schedule_view, to_summary_view,
                                 to_unused_groups)
@@ -1932,6 +1933,79 @@ class TheOrderIsStableAcrossRenders(unittest.TestCase):
         self.assertEqual(page_one | page_two,
                          set(self.fingerprints[1:]))
         self.assertEqual(page_one & page_two, set())
+
+
+class ThePagerHelper(unittest.TestCase):
+    """`web.app._pager`/`_current_pages` -- the Python side of the pager
+    context a template reads (see `tests.test_web_render.ThePagerControl`
+    for the template side). Exercised directly so a mistake in the href
+    arithmetic is caught here rather than only by a rendered-page assertion
+    that happens to include the right substring for the wrong reason.
+    """
+
+    def test_current_pages_reads_every_known_key(self):
+        qs = {"page": ["3"], "applied_page": ["2"]}
+        current = _current_pages(qs)
+        self.assertEqual(current["page"], 3)
+        self.assertEqual(current["applied_page"], 2)
+        # Every OTHER key defaults to page 1, not merely the ones present.
+        self.assertEqual(current["dismissed_page"], 1)
+        self.assertEqual(current["muted_page"], 1)
+
+    def test_a_malformed_value_reads_as_page_one(self):
+        current = _current_pages({"page": ["not-a-number"]})
+        self.assertEqual(current["page"], 1)
+
+    def test_the_next_href_advances_only_the_named_key(self):
+        current = _current_pages({"page": ["1"], "applied_page": ["4"]})
+        pager = _pager("/inbox", current, "page", total=450)
+        self.assertEqual(pager["next_href"], "/inbox?page=2&applied_page=4")
+
+    def test_the_prev_href_goes_back_only_the_named_key(self):
+        current = _current_pages({"page": ["2"]})
+        pager = _pager("/inbox", current, "page", total=450)
+        self.assertEqual(pager["prev_href"], "/inbox")
+
+    def test_a_key_at_its_default_is_dropped_from_the_href(self):
+        # `applied_page` sits at 1 (its default), so it is left out of the
+        # query string entirely -- a page with nothing else paginated keeps
+        # a plain, bookmarkable URL.
+        current = _current_pages({"page": ["1"], "applied_page": ["1"]})
+        pager = _pager("/inbox", current, "page", total=450)
+        self.assertEqual(pager["next_href"], "/inbox?page=2")
+
+    def test_no_prev_on_page_one(self):
+        current = _current_pages({"page": ["1"]})
+        pager = _pager("/inbox", current, "page", total=450)
+        self.assertIsNone(pager["prev_href"])
+
+    def test_no_next_on_the_last_page(self):
+        current = _current_pages({"page": ["3"]})
+        # 450 rows at the default PAGE_SIZE (200) is exactly 3 pages.
+        pager = _pager("/inbox", current, "page", total=450)
+        self.assertEqual(pager["total_pages"], 3)
+        self.assertIsNone(pager["next_href"])
+
+    def test_the_total_is_carried_through_unchanged(self):
+        current = _current_pages({})
+        pager = _pager("/inbox", current, "page", total=450)
+        self.assertEqual(pager["total"], 450)
+
+    def test_two_different_sections_pagers_do_not_interfere(self):
+        current = _current_pages({"page": ["5"], "applied_page": ["2"]})
+        # 1200, not 1000: page 5 of 1000-at-200/page is the LAST page (5),
+        # which would have no `next_href` at all and defeat this test's own
+        # assertion below for a reason unrelated to what it is pinning.
+        rows_pager = _pager("/inbox", current, "page", total=1200)
+        # Also more than one page past `applied_page`'s own current value
+        # (2), for the same reason.
+        applied_pager = _pager("/inbox", current, "applied_page", total=800)
+        self.assertEqual(rows_pager["page"], 5)
+        self.assertEqual(applied_pager["page"], 2)
+        # Paging `rows` forward carries `applied_page` along unchanged, and
+        # vice versa.
+        self.assertIn("applied_page=2", rows_pager["next_href"])
+        self.assertIn("page=5", applied_pager["next_href"])
 
 
 class BulkApplySubmitsExactlyThePagesOwnFingerprints(unittest.TestCase):
