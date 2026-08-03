@@ -1153,7 +1153,7 @@ class ThePage(unittest.TestCase):
         # passing it would render a blank paragraph rather than raise. Driven
         # through `build_handler`'s own GET, with no socket: `do_GET` reads
         # `self.path` and calls `self._send`, and nothing else.
-        handler = build_handler(rows=lambda: [], actions=None,
+        handler = build_handler(rows=lambda **_: [], actions=None,
                                 unused=lambda: self._groups())
         instance = object.__new__(handler)
         instance.path = "/inbox"

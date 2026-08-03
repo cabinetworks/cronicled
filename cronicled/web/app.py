@@ -15,8 +15,9 @@ from cronicled.tag_hygiene import SUBJECT_TYPE as _UNUSED_TAG_SUBJECT
 from cronicled.tags import SUBJECT_TYPE as _MERGE_SUBJECT
 
 from .inboxes import INBOXES, TITLES
+from .pagination import PAGE_SIZE, offset_for, page_number, total_pages, window
 from .render import render
-from .rows import to_rows, to_summary_view
+from .rows import to_rows, to_summary_view, windowed_unused_groups
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8571
@@ -227,11 +228,93 @@ def _origin_matches_host(origin, host_header):
     return origin[idx + len(marker):] == host_header
 
 
+# Query-string keys naming which page of a bounded section to show. One
+# name per section the combined `/inbox` page composes; a per-inbox page
+# reuses `_ROWS_PAGE_KEY` for its one generic list and, only when it owns
+# the corresponding subject type, the three special-section keys -- see
+# `Handler._inbox_page`.
+_ROWS_PAGE_KEY = "page"
+_SECTION_PAGE_KEYS = {
+    "applied": "applied_page", "dismissed": "dismissed_page",
+    "muted": "muted_page", "superseded": "superseded_page",
+    "gone": "gone_page", "refused": "refused_page",
+    "merges": "merges_page", "reconciles": "reconciles_page",
+    "unused": "unused_page",
+}
+_ALL_PAGE_KEYS = (_ROWS_PAGE_KEY,) + tuple(_SECTION_PAGE_KEYS.values())
+
+
+def _current_pages(qs):
+    """Every pagination query key this module knows, read from `qs`
+    (`urllib.parse.parse_qs`'s own dict shape) as a 1-based page number --
+    `pagination.page_number` is what turns a missing or malformed value into
+    page 1, so a link built from this dict never carries a foreign or
+    negative page forward.
+    """
+    return {key: page_number((qs.get(key) or [None])[0])
+            for key in _ALL_PAGE_KEYS}
+
+
+def _pager(path, current_pages, key, total, page_size=PAGE_SIZE):
+    """The pagination context one bounded section hands its template: the
+    TRUE total this section has (see `cronicled.store.Store.item_count`'s
+    own docstring for why that must never be `len` of whatever was
+    rendered), its current page, how many pages that total makes, and
+    Prev/Next hrefs.
+
+    `total` is carried through into the returned dict UNCHANGED, so a
+    template reads a section's stated count (`pagination.<name>.total`)
+    from the exact same place it reads the pager -- one context value per
+    section, rather than a second `<name>_total` beside it that a future
+    edit could update without noticing this one.
+
+    The hrefs carry every OTHER pagination key in `current_pages` forward
+    UNCHANGED, so paging through one section never silently resets where a
+    person was in another -- the two are independent, and a link that reset
+    the rest to page 1 would make one click undo several others.
+
+    `prev_href`/`next_href` are `None` when there is nowhere to go in that
+    direction, which is what the template reads to decide whether to draw
+    the control at all -- never a link back to the same page.
+    """
+    page = current_pages[key]
+    pages = total_pages(total, page_size)
+
+    def href(target):
+        params = dict(current_pages)
+        params[key] = target
+        # A key sitting at its default (page 1) is dropped, so a page with
+        # nothing else paginated keeps a plain, bookmarkable URL instead of
+        # carrying every section's `_page=1` on every link.
+        kept = {k: v for k, v in params.items() if v != 1}
+        query = urllib.parse.urlencode(kept)
+        return path + ("?" + query if query else "")
+
+    return {
+        "total": total, "page": page, "total_pages": pages,
+        "prev_href": href(page - 1) if page > 1 else None,
+        "next_href": href(page + 1) if page < pages else None,
+    }
+
+
 def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                   refused=None, superseded=None, applied=None,
                   schedule_status=None, merges=None, reconciles=None,
                   unused=None, gone=None, summary=None, store=None,
-                  base_url=None):
+                  base_url=None, rows_count=None):
+    # `rows` is called as `rows(limit=, offset=)`, never bare -- it answers
+    # for exactly ONE bounded window of the generic row list, the same shape
+    # `Store.items(limit=, offset=)` already takes (see
+    # `cronicled.__main__._inbox_rows`, the real caller). `rows_count`
+    # answers the total that window is drawn from -- the same total/window
+    # split `Store.item_count`'s own docstring explains, kept here rather
+    # than derived by calling `rows` with no bound and taking `len`, which
+    # is exactly the whole-page fetch a bound exists to avoid. Defaulted to
+    # reporting zero for the same reason every callable below defaults to an
+    # empty answer: an existing test's double for `rows` has no opinion
+    # about a total, and a page with nothing wired renders as genuinely
+    # empty rather than raising.
+    _rows_count = rows_count or (lambda: 0)
     # A separate callable rather than always reaching through `actions`:
     # every existing action-path test builds its own recording double for
     # `actions` and none of them implement `scan_status`, so defaulting it
@@ -311,8 +394,9 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                            [("Content-Type", "text/html; charset=utf-8")])
                 return
             if path != INBOX_PATH:
-                self._serve_inbox_route(path)
+                self._serve_inbox_route(path, parsed.query)
                 return
+            qs = urllib.parse.parse_qs(parsed.query)
             # `applied` in the query string names the fingerprint a
             # successful /approve just redirected here with (see
             # `do_POST`'s own `applied` branch below) -- read-only, and
@@ -324,8 +408,7 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
             # banner and its own `just_applied_rows` guard, which is also
             # what keeps a stale or foreign value from producing a
             # confirmation for a row that is not (or no longer) there.
-            just_applied = (urllib.parse.parse_qs(parsed.query)
-                            .get("applied") or [None])[0]
+            just_applied = (qs.get("applied") or [None])[0]
             # `opened` names the COLLAPSED section a reversal (`/unmute`,
             # `/undismiss`) just redirected here from, so that section
             # re-opens instead of every write closing it again -- see
@@ -335,8 +418,7 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
             # actually knows how to reopen, so a stray or foreign query value
             # opens nothing rather than being handed to the template as a
             # section name it has never heard of.
-            opened = (urllib.parse.parse_qs(parsed.query)
-                     .get("opened") or [None])[0]
+            opened = (qs.get("opened") or [None])[0]
             if opened not in _OPENABLE_SECTIONS:
                 opened = None
             # `bulk_requested`/`bulk_applied` name the two counts
@@ -349,7 +431,6 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
             # means no banner at all -- a stray or foreign query value must
             # not invent a count that was never reported.
             bulk_result = None
-            qs = urllib.parse.parse_qs(parsed.query)
             raw_requested = (qs.get("bulk_requested") or [None])[0]
             raw_applied = (qs.get("bulk_applied") or [None])[0]
             if raw_requested is not None and raw_applied is not None:
@@ -362,16 +443,66 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                                   "applied": applied_n}
                 except ValueError:
                     bulk_result = None
-            body = render("inbox.html", rows=rows(), counts={},
+
+            # Every pagination query key this page knows, read once so a
+            # link built for one section can carry every other section's
+            # own current page forward unchanged -- see `_pager`.
+            current_pages = _current_pages(qs)
+
+            # THE GENERIC ROW LIST. `rows(limit=, offset=)` fetches exactly
+            # this page's own window -- never the whole waiting queue just
+            # to slice it in Python -- and `_rows_count()` answers the total
+            # it is a window OF, which is a separate question from what got
+            # rendered (see `build_handler`'s own comment on `rows_count`).
+            # THIS WINDOW, in this exact order, is "the rows this page
+            # rendered": every row object it contains keeps its own
+            # `fingerprint` (see `cronicled.web.pagination`'s module
+            # docstring), so nothing downstream has to re-derive that set by
+            # asking the store again.
+            rows_page = current_pages[_ROWS_PAGE_KEY]
+            rows_window = rows(limit=PAGE_SIZE, offset=offset_for(rows_page))
+            rows_pager = _pager(INBOX_PATH, current_pages, _ROWS_PAGE_KEY,
+                               _rows_count())
+
+            # Every other section is fetched WHOLE (as it always was -- see
+            # `cronicled.web.pagination`'s module docstring for why these,
+            # unlike the generic list, are windowed here rather than at the
+            # store) and then bounded to its own page's window; `_pager`
+            # carries the section's TRUE total through for its count badge,
+            # never `len(<the window>)`.
+            sections = {}
+            pagers = {}
+            for name, fetch in (("applied", _applied),
+                                ("dismissed", _dismissed),
+                                ("muted", _muted),
+                                ("superseded", _superseded),
+                                ("gone", _gone),
+                                ("refused", _refused),
+                                ("merges", _merges),
+                                ("reconciles", _reconciles)):
+                full = fetch()
+                key = _SECTION_PAGE_KEYS[name]
+                sections[name] = window(full, current_pages[key])
+                pagers[name] = _pager(INBOX_PATH, current_pages, key,
+                                      len(full))
+
+            unused_key = _SECTION_PAGE_KEYS["unused"]
+            unused_windowed, unused_total = windowed_unused_groups(
+                _unused(), current_pages[unused_key])
+            pagers["unused"] = _pager(INBOX_PATH, current_pages, unused_key,
+                                      unused_total)
+
+            body = render("inbox.html", rows=rows_window, counts={},
                          bulk_result=bulk_result,
-                         muted=_muted(), dismissed=_dismissed(),
-                         refused=_refused(),
-                         superseded=_superseded(),
-                         applied=_applied(),
-                         merges=_merges(),
-                         reconciles=_reconciles(),
-                         unused=_unused(),
-                         gone=_gone(),
+                         muted=sections["muted"],
+                         dismissed=sections["dismissed"],
+                         refused=sections["refused"],
+                         superseded=sections["superseded"],
+                         applied=sections["applied"],
+                         merges=sections["merges"],
+                         reconciles=sections["reconciles"],
+                         unused=unused_windowed,
+                         gone=sections["gone"],
                          # Read off the module that owns the claim rather than
                          # typed into the template, for the reason
                          # `MergeRow.warning` reads `tags
@@ -381,7 +512,8 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                          schedule=_schedule_status(),
                          just_applied=just_applied,
                          sidebar=_sidebar_context(_store),
-                         opened=opened).encode()
+                         opened=opened,
+                         pagination=dict(rows=rows_pager, **pagers)).encode()
             self._send(200, body,
                        [("Content-Type", "text/html; charset=utf-8")])
 
@@ -400,7 +532,7 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                           scan_default_limit=DEFAULT_SCAN_LIMIT,
                           sidebar=_sidebar_context(_store)).encode()
 
-        def _serve_inbox_route(self, path):
+        def _serve_inbox_route(self, path, query):
             """`/{inbox}` and `/{inbox}/{state}` -- everything that is
             neither the summary nor the combined inbox.
 
@@ -424,17 +556,22 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
             if _store is None:
                 self._send(404, b"not found")
                 return
-            body = self._inbox_page(segments[0], state).encode()
+            body = self._inbox_page(segments[0], state, query).encode()
             self._send(200, body, [("Content-Type", "text/html; charset=utf-8")])
 
-        def _inbox_page(self, name, state):
+        def _inbox_page(self, name, state, query):
             """The body of `/{name}` (`state` is `None`) or `/{name}/{state}`.
 
             The GENERIC row list -- everything `to_rows` can build a row
             for -- is narrowed to `name`'s own subject types minus
             `_SECTION_SUBJECTS` (see `_scene_subject_types`) via `Store.items
             (subject_types=)`, and, for a terminal-state page, further to
-            `state`.
+            `state`. It is fetched a PAGE at a time straight from the store
+            (`limit`/`offset`, and `Store.item_count` for the total this
+            window is drawn from) -- the same `?page=` key the combined
+            `/inbox` page's own generic list uses, reused rather than a
+            second name, because on this page there is exactly one list to
+            paginate and no ambiguity about which section it means.
 
             The three subject types `_SECTION_SUBJECTS` names are composed
             SEPARATELY, as their own sections, and only on the working-queue
@@ -453,25 +590,37 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
             this page, with its Undismiss/Unmute control, exactly as it does
             on the combined page -- INLINE in its own section, never via the
             terminal `/{name}/dismissed` or `/{name}/muted` route, which only
-            ever draws the generic list above.
+            ever draws the generic list above. Each of the three is bounded
+            the same way the combined page bounds it -- windowed in Python
+            over the list those closures already build whole -- under its
+            own `?{name}_page=` key.
 
             Only included when `name`'s OWN inbox owns that subject type
             (checked against the full, unnarrowed `INBOXES[name]`) -- `/tags`
             gets all three, `/scenes` and `/performers` get none, because
             `inboxes.INBOXES` maps each of the three to `tags` alone.
             """
+            current_pages = _current_pages(urllib.parse.parse_qs(query))
+            path = "/" + "/".join(s for s in (name, state) if s)
             types = INBOXES[name]
             scene_types = _scene_subject_types(types)
-            items = _store.items(subject_types=scene_types, state=state)
-            if state is None:
-                # `items()`'s own default excludes `dismissed`/`muted`/
-                # `superseded`/`gone` (see `Store._HIDDEN_STATES`) but NOT
-                # `applied` -- an applied proposal is a decision already
-                # made, and the working queue is not where it belongs.
-                # `cronicled.__main__._inbox_rows` filters the same way,
-                # for the same reason, against the combined inbox.
-                items = [item for item in items if item["state"] != "applied"]
+            # `state is None` (the working queue) also excludes `applied` --
+            # a decision already made does not belong there -- the same
+            # exclusion the combined page's own generic list makes; see
+            # `Store.items`'s own `exclude_states` docstring for why this is
+            # a store-level argument now rather than a Python filter applied
+            # AFTER a page's already-bounded fetch, which could leave a page
+            # short of its own bound for no reason a reader would see.
+            exclude = ("applied",) if state is None else ()
+            rows_page = current_pages[_ROWS_PAGE_KEY]
+            total = _store.item_count(subject_types=scene_types, state=state,
+                                      exclude_states=exclude)
+            items = _store.items(subject_types=scene_types, state=state,
+                                 exclude_states=exclude, limit=PAGE_SIZE,
+                                 offset=offset_for(rows_page))
             built = to_rows(items, base_url=_base_url)
+            pagers = {"rows": _pager(path, current_pages, _ROWS_PAGE_KEY,
+                                    total)}
             context = {"rows": [], "applied": [], "dismissed": [], "muted": []}
             if state is None:
                 context["rows"] = built
@@ -504,11 +653,24 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
             extra = {}
             if state is None:
                 if _MERGE_SUBJECT in types:
-                    extra["merges"] = _merges()
+                    full = _merges()
+                    key = _SECTION_PAGE_KEYS["merges"]
+                    extra["merges"] = window(full, current_pages[key])
+                    pagers["merges"] = _pager(path, current_pages, key,
+                                              len(full))
                 if _RECONCILE_SUBJECT in types:
-                    extra["reconciles"] = _reconciles()
+                    full = _reconciles()
+                    key = _SECTION_PAGE_KEYS["reconciles"]
+                    extra["reconciles"] = window(full, current_pages[key])
+                    pagers["reconciles"] = _pager(path, current_pages, key,
+                                                  len(full))
                 if _UNUSED_TAG_SUBJECT in types:
-                    extra["unused"] = _unused()
+                    key = _SECTION_PAGE_KEYS["unused"]
+                    windowed, utotal = windowed_unused_groups(
+                        _unused(), current_pages[key])
+                    extra["unused"] = windowed
+                    pagers["unused"] = _pager(path, current_pages, key,
+                                              utotal)
             return render(
                 "inbox.html", title=TITLES[name],
                 rows=context["rows"], applied=context["applied"],
@@ -517,6 +679,7 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                 low_count_is_not_proof=LOW_COUNT_IS_NOT_PROOF,
                 schedule=None, just_applied=None,
                 sidebar=_sidebar_context(_store),
+                pagination=pagers,
                 **extra)
 
         def _cross_origin_write(self):

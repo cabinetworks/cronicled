@@ -106,7 +106,7 @@ class _Server:
     def __enter__(self):
         self.actions = _RecordingActions(fail=self._fail,
                                          bulk_result=self._bulk_result)
-        handler = build_handler(rows=lambda: [], actions=self.actions)
+        handler = build_handler(rows=lambda **_: [], actions=self.actions)
         self.httpd = HTTPServer(("127.0.0.1", 0), handler)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
         return self
@@ -391,7 +391,7 @@ class MutedDismissedRefusedRendering(unittest.TestCase):
 
     def _get(self, path="/inbox", **callables):
         actions = _RecordingActions()
-        handler = build_handler(rows=lambda: [], actions=actions, **callables)
+        handler = build_handler(rows=lambda **_: [], actions=actions, **callables)
         httpd = HTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
@@ -768,7 +768,7 @@ class ServeWarnsOnNonDefaultHost(unittest.TestCase):
         out = io.StringIO()
         with patch("cronicled.web.app.HTTPServer", _NoopServer):
             with redirect_stdout(out):
-                serve(rows=lambda: [], actions=_RecordingActions(),
+                serve(rows=lambda **_: [], actions=_RecordingActions(),
                       host="0.0.0.0", port=0)
         self.assertIn("WARNING", out.getvalue())
 
@@ -776,7 +776,7 @@ class ServeWarnsOnNonDefaultHost(unittest.TestCase):
         out = io.StringIO()
         with patch("cronicled.web.app.HTTPServer", _NoopServer):
             with redirect_stdout(out):
-                serve(rows=lambda: [], actions=_RecordingActions(),
+                serve(rows=lambda **_: [], actions=_RecordingActions(),
                       host=DEFAULT_HOST, port=0)
         self.assertNotIn("WARNING", out.getvalue())
 
@@ -791,7 +791,7 @@ def _drive(method, path, body=b"", headers=None, **callables):
     `tests/test_tag_hygiene.py`.
     """
     actions = callables.pop("actions", None) or _RecordingActions()
-    handler = build_handler(rows=lambda: [], actions=actions, **callables)
+    handler = build_handler(rows=lambda **_: [], actions=actions, **callables)
     instance = object.__new__(handler)
     instance.path = path
     instance.headers = email.message.Message()
@@ -972,12 +972,13 @@ class TheScanControlOnItsNewPageStillRefusesCrossOrigin(unittest.TestCase):
 
 
 class _FakeStore:
-    """A minimal stand-in for `Store.items`, filtering an in-memory list the
-    same way the real one filters SQL rows: `subject_types` is checked with
-    `is not None`, never truthiness (an empty tuple is a real "select
-    nothing", not "no filter given"), and a `state=None` call excludes the
-    same four states `Store._HIDDEN_STATES` names -- everything else asks
-    for exactly one state.
+    """A minimal stand-in for `Store.items`/`Store.item_count`, filtering an
+    in-memory list the same way the real one filters SQL rows:
+    `subject_types` is checked with `is not None`, never truthiness (an
+    empty tuple is a real "select nothing", not "no filter given"), and a
+    `state=None` call excludes the same four states `Store._HIDDEN_STATES`
+    names, widened by `exclude_states` -- everything else asks for exactly
+    one state.
     """
 
     _HIDDEN_STATES = ("dismissed", "muted", "superseded", "gone")
@@ -985,17 +986,28 @@ class _FakeStore:
     def __init__(self, items):
         self._items = items
 
-    def items(self, folder=None, state=None, limit=None, offset=0,
-             subject_types=None):
+    def _filtered(self, folder, state, subject_types, exclude_states):
         result = self._items
         if subject_types is not None:
             result = [i for i in result if i["subject_type"] in subject_types]
         if state is not None:
             result = [i for i in result if i["state"] == state]
         else:
-            result = [i for i in result
-                     if i["state"] not in self._HIDDEN_STATES]
+            hidden = self._HIDDEN_STATES + tuple(exclude_states)
+            result = [i for i in result if i["state"] not in hidden]
         return result
+
+    def items(self, folder=None, state=None, limit=None, offset=0,
+             subject_types=None, exclude_states=()):
+        result = self._filtered(folder, state, subject_types, exclude_states)
+        if limit is not None:
+            result = result[offset:offset + limit]
+        return result
+
+    def item_count(self, folder=None, state=None, subject_types=None,
+                  exclude_states=()):
+        return len(self._filtered(folder, state, subject_types,
+                                  exclude_states))
 
     def counts(self, folder=None, subject_types=None):
         """Mirrors `Store.counts`: grouped by state, the same
@@ -1257,14 +1269,12 @@ def _unused_item(fp="fp-unused", state="new"):
 
 class _StoreWithDetachedCounts:
     """A store double whose `.counts()` answers from a number handed to it
-    directly, wholly independent of what `.items()` would return for the same
-    request -- so a sidebar built from `store.counts()` and one built by
-    counting `items()` (paginated or not) give two DIFFERENT, distinguishable
-    answers. `.items()` still filters for real, the same way `_FakeStore`
-    does, so the page beneath the sidebar renders its own true (small) set of
-    rows while the sidebar is handed a larger, invented total -- the shape a
-    real paginated page would have, without this project's `Store` actually
-    supporting pagination on this route yet.
+    directly, wholly independent of what `.items()`/`.item_count()` would
+    return for the same request -- so a sidebar built from `store.counts()`
+    and one built from a paginated page's own total give two DIFFERENT,
+    distinguishable answers. `.items()` still filters for real, the same way
+    `_FakeStore` does, so the page beneath the sidebar renders its own true
+    (small) set of rows while the sidebar is handed a larger, invented total.
     """
 
     _HIDDEN_STATES = ("dismissed", "muted", "superseded", "gone")
@@ -1273,17 +1283,28 @@ class _StoreWithDetachedCounts:
         self._items = items
         self._waiting_count = waiting_count
 
-    def items(self, folder=None, state=None, limit=None, offset=0,
-             subject_types=None):
+    def _filtered(self, folder, state, subject_types, exclude_states):
         result = self._items
         if subject_types is not None:
             result = [i for i in result if i["subject_type"] in subject_types]
         if state is not None:
             result = [i for i in result if i["state"] == state]
         else:
-            result = [i for i in result
-                     if i["state"] not in self._HIDDEN_STATES]
+            hidden = self._HIDDEN_STATES + tuple(exclude_states)
+            result = [i for i in result if i["state"] not in hidden]
         return result
+
+    def items(self, folder=None, state=None, limit=None, offset=0,
+             subject_types=None, exclude_states=()):
+        result = self._filtered(folder, state, subject_types, exclude_states)
+        if limit is not None:
+            result = result[offset:offset + limit]
+        return result
+
+    def item_count(self, folder=None, state=None, subject_types=None,
+                  exclude_states=()):
+        return len(self._filtered(folder, state, subject_types,
+                                  exclude_states))
 
     def counts(self, folder=None, subject_types=None):
         return {"new": self._waiting_count}

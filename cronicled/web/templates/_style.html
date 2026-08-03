@@ -104,6 +104,16 @@
   details.section .proposal:first-of-type { border-top: 1px solid var(--line); }
   details.section p.empty { margin: 0; padding: 0.7rem 0.9rem; }
 
+  /* The Prev/Next control a bounded section draws when it has more than
+     one page -- see web/app.py's `_pager`. Understated, the same reasoning
+     as `.file a`/`.title a` above: it is navigation, not a decision, and
+     must not compete visually with Approve/Dismiss/Mute. */
+  .pager { display: flex; gap: 0.9rem; align-items: center;
+           padding: 0.6rem 0.9rem; font-size: 0.85rem; color: var(--muted);
+           border-top: 1px solid var(--line); }
+  .pager a { color: inherit; }
+  .pager .pager-disabled { color: var(--line); }
+
   /* The row an Approve just produced. Marked wherever it renders: once above
      the fold in the confirmation banner (never inside a `details.section`,
      since nothing here forces Applied open any more), and again inside the
