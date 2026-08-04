@@ -2270,6 +2270,120 @@ class TheOneZoneSetting(unittest.TestCase):
                          "2026-07-27T07:00:00+00:00")
 
 
+class ZonesAgree(unittest.TestCase):
+    """`schedule._zones_agree`: whether two zone specifications are the same
+    zone, decided by what they DO rather than by the string that names them.
+    """
+
+    def test_the_same_object_agrees_with_itself(self):
+        self.assertTrue(schedule._zones_agree(ZONE, ZONE))
+
+    def test_the_same_name_read_twice_agrees(self):
+        self.assertTrue(
+            schedule._zones_agree(ZoneInfo(ZONE_NAME), ZoneInfo(ZONE_NAME)))
+
+    def test_a_retired_alias_agrees_with_the_name_that_replaced_it(self):
+        # Same zone, two spellings -- exactly the case that must NOT become a
+        # refusal. "UTC" and "Etc/UTC" are two names for one entry in the
+        # IANA database.
+        self.assertTrue(
+            schedule._zones_agree(ZoneInfo("UTC"), ZoneInfo("Etc/UTC")))
+
+    def test_two_unrelated_zones_disagree(self):
+        self.assertFalse(schedule._zones_agree(ZONE, OTHER_ZONE))
+
+    def test_sharing_todays_offset_is_not_agreement(self):
+        # New York and Santiago read the same offset in July -- one on
+        # daylight saving, the other on standard time, from opposite
+        # hemispheres -- and a rule that stopped at "today" would call them
+        # the same zone. They part ways every January.
+        new_york = ZoneInfo("America/New_York")
+        santiago = ZoneInfo("America/Santiago")
+        july = datetime(2026, 7, 26, 12, 0, 0)
+        self.assertEqual(july.replace(tzinfo=new_york).utcoffset(),
+                         july.replace(tzinfo=santiago).utcoffset())
+        self.assertFalse(schedule._zones_agree(new_york, santiago))
+
+    def test_a_fixed_offset_agrees_only_with_an_identical_fixed_offset(self):
+        one = timezone(timedelta(hours=2))
+        other = timezone(timedelta(hours=2))
+        self.assertTrue(schedule._zones_agree(one, other))
+        self.assertFalse(
+            schedule._zones_agree(one, timezone(timedelta(hours=3))))
+
+
+class AnOverrideMayNotSecondGuessTheDeploymentsZone(unittest.TestCase):
+    """`resolve`'s `deployment_zone` parameter closes the hole
+    `cronicled.__main__.build_scheduler`'s docstring names: an override's own
+    `zone` key is a second place deciding the zone, reachable through
+    ordinary configuration -- a schedule override naming a zone per entry,
+    with no deployment-wide zone setting of its own, keeps its appointments
+    in that zone while the page (reading the deployment's) renders every
+    timestamp hours away, with nothing said.
+    """
+
+    def test_omitting_deployment_zone_leaves_every_existing_behaviour_alone(self):
+        # The default. Every OTHER test in this file calls `resolve` this
+        # way, and none of them is exercising this rule.
+        entries = resolve(
+            [FakeProducer("nightly")],
+            {"nightly": {"at": "03:00", "zone": OTHER_ZONE_NAME}})
+        self.assertEqual(entries["nightly"].zone, OTHER_ZONE)
+
+    def test_an_override_naming_a_genuinely_different_zone_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "different zone"):
+            resolve(
+                [FakeProducer("nightly")],
+                {"nightly": {"at": "03:00", "zone": OTHER_ZONE_NAME}},
+                deployment_zone=ZONE)
+
+    def test_the_refusal_names_the_producer_and_both_zones(self):
+        with self.assertRaisesRegex(
+                ValueError,
+                r"nightly.*%s.*%s" % (OTHER_ZONE_NAME, ZONE_NAME)):
+            resolve(
+                [FakeProducer("nightly")],
+                {"nightly": {"at": "03:00", "zone": OTHER_ZONE_NAME}},
+                deployment_zone=ZONE)
+
+    def test_an_override_naming_the_deployments_own_zone_still_works(self):
+        # Agreement, and it must not become a start-up failure.
+        entries = resolve(
+            [FakeProducer("nightly")],
+            {"nightly": {"at": "03:00", "zone": ZONE_NAME}},
+            deployment_zone=ZONE)
+        self.assertEqual(entries["nightly"].zone, ZONE)
+
+    def test_an_override_naming_the_same_zone_by_a_different_spelling_still_works(self):
+        # THE point of the whole rule: agreement is not string equality.
+        entries = resolve(
+            [FakeProducer("nightly")],
+            {"nightly": {"at": "03:00", "zone": "Etc/UTC"}},
+            deployment_zone=ZoneInfo("UTC"))
+        self.assertEqual(entries["nightly"].zone, ZoneInfo("Etc/UTC"))
+
+    def test_a_producers_own_declared_zone_is_never_the_disagreeing_side(self):
+        # No override at all: the zone travels straight from
+        # `deployment_zone` to the producer's own declaration, the way
+        # `build_scheduler` wires the three real producers -- so a producer
+        # that merely declares what it was handed can never be the side that
+        # disagrees.
+        entries = resolve(
+            [FakeProducer("nightly", at=time(3, 0), zone=ZONE)],
+            deployment_zone=ZONE)
+        self.assertIs(entries["nightly"].zone, ZONE)
+
+    def test_an_override_changing_only_the_time_must_still_agree_on_zone(self):
+        # An override that names 'at' without repeating 'zone' is already
+        # refused for a different reason (no zone to read it in) -- this is
+        # the case where it DOES repeat 'zone', but repeats the wrong one.
+        with self.assertRaisesRegex(ValueError, "different zone"):
+            resolve(
+                [FakeProducer("nightly", at=time(3, 0), zone=ZONE)],
+                {"nightly": {"at": "04:00", "zone": OTHER_ZONE_NAME}},
+                deployment_zone=ZONE)
+
+
 class TheRuleTheStoreAndThePageShareForReadingATimestamp(unittest.TestCase):
     """`as_utc` is public so the page can convert the same stamps the schedule
     compares, by the same rule. A second reader would be free to disagree with

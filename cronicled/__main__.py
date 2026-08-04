@@ -276,6 +276,18 @@ def build_scheduler(runner, store, stash, adapters, *, zone, env=None,
     schedule an operator was trying to check. No default here: a second place
     deciding the zone is the disagreement itself.
 
+    That reasoning does not, on its own, stop a schedule override naming its
+    OWN `zone` for one of these three -- ordinary configuration, not misuse,
+    and exactly the second place the paragraph above rules out. So `zone` is
+    passed to `Scheduler` below as `deployment_zone`, and `resolve` refuses an
+    override whose zone disagrees with it (agreement decided by
+    `cronicled.schedule._zones_agree`, not by the written string -- two
+    spellings of one zone must keep working). A disagreeing override is a
+    start-up failure for the same reason an unknown zone name already is: the
+    alternative is exactly the state this function's docstring above
+    describes as worse than either half being wrong alone, reached through a
+    config file the schema already accepts.
+
     Returns `None`, having said why, only when there is nothing to schedule at
     all, which is an install with no media server: every producer here reads
     something from one. Printed rather than silently skipped in either case,
@@ -328,7 +340,8 @@ def build_scheduler(runner, store, stash, adapters, *, zone, env=None,
     # declared cadence off it. Overrides come from the operator's own config
     # and are validated by `resolve`, at this line, where a typo is a start-up
     # stack trace rather than a producer that quietly never runs.
-    return Scheduler(runner, store, overrides=load_schedule(env=env))
+    return Scheduler(runner, store, overrides=load_schedule(env=env),
+                     deployment_zone=zone)
 
 
 def main(argv=None):
