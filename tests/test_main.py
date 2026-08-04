@@ -2308,6 +2308,47 @@ class AScheduleOverrideMayNotNameADisagreeingZone(_Base):
         self.assertIsNotNone(captured.kwargs)
         self.assertIn("zone: UTC", out)
 
+    def _refusal_message(self, schedule_overrides, zone_name=None):
+        try:
+            self._run_main(schedule_overrides, zone_name=zone_name)
+            self.fail("the disagreeing override was not refused")
+        except ValueError as exc:
+            return str(exc)
+
+    def test_the_live_shape_names_no_repr_and_all_three_remedies(self):
+        # The exact incident reported live: every unattended producer given
+        # the same zone deliberately, and $CRONICLED_ZONE never set -- so the
+        # deployment's zone is the unset default, not a choice, and the
+        # message reaching the operator must say so in a form they can act
+        # on rather than a `repr` of the `tzinfo` object.
+        overrides = {name: {"at": "03:00", "zone": "America/New_York"}
+                    for name in ALL_PRODUCERS}
+        message = self._refusal_message(overrides, zone_name=None)
+        self.assertNotIn("ZoneInfo(", message, message)
+        self.assertNotIn("zoneinfo.", message, message)
+        self.assertIn("configured for (UTC)", message, message)
+        self.assertIn(
+            "set $CRONICLED_ZONE to 'America/New_York' so the deployment "
+            "reads the zone this override already does", message, message)
+        self.assertIn(
+            "drop 'zone' from this override so it reads the deployment's "
+            "zone instead", message, message)
+        self.assertIn(
+            "change this override's 'zone' to name the deployment's (UTC)",
+            message, message)
+        self.assertIn("most likely wanted", message, message)
+
+    def test_an_explicitly_chosen_deployment_zone_does_not_get_the_same_hint(self):
+        # The mirror image, through the whole entry point rather than
+        # `resolve()` directly: the deployment's zone here was set on
+        # purpose ($CRONICLED_ZONE=UTC), so the message must not tell the
+        # operator their own choice is the less likely truth.
+        overrides = {name: {"at": "03:00", "zone": "America/New_York"}
+                    for name in ALL_PRODUCERS}
+        message = self._refusal_message(overrides, zone_name="UTC")
+        self.assertNotIn("most likely wanted", message, message)
+        self.assertNotIn("unset default", message, message)
+
 
 class StoredTimestampsStayUtc(_Base):
     """The expensive direction, guarded on the raw database rather than

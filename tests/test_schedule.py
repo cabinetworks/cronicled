@@ -2397,6 +2397,80 @@ class AnOverrideMayNotSecondGuessTheDeploymentsZone(unittest.TestCase):
                 {"nightly": {"at": "04:00", "zone": OTHER_ZONE_NAME}},
                 deployment_zone=ZONE)
 
+    def _disagreement(self, deployment_zone_is_default=False):
+        try:
+            resolve(
+                [FakeProducer("nightly")],
+                {"nightly": {"at": "03:00", "zone": "America/New_York"}},
+                deployment_zone=ZoneInfo("UTC"),
+                deployment_zone_is_default=deployment_zone_is_default)
+            self.fail("the disagreeing override was not refused")
+        except ValueError as exc:
+            return str(exc)
+
+    def test_the_refusal_shows_the_deployments_zone_by_name_not_by_repr(self):
+        # `repr(ZoneInfo("UTC"))` is "zoneinfo.ZoneInfo(key='UTC')" -- a
+        # developer's view of the object, not a value an operator could type
+        # back into $CRONICLED_ZONE or a schedule override. Checked both
+        # ways deliberately: a message with the repr merely deleted, and
+        # nothing put in its place, would pass a test that only looked for
+        # the repr's absence.
+        message = self._disagreement()
+        self.assertNotIn("ZoneInfo(", message, message)
+        self.assertNotIn("zoneinfo.", message, message)
+        self.assertIn("configured for (UTC)", message, message)
+
+    def test_the_refusal_names_all_three_remedies(self):
+        # The operator wrote this override deliberately; the message must
+        # not assume the override is the mistake, so it names every way out
+        # rather than picking one.
+        message = self._disagreement()
+        self.assertIn(
+            "set $CRONICLED_ZONE to 'America/New_York' so the deployment "
+            "reads the zone this override already does", message, message)
+        self.assertIn(
+            "drop 'zone' from this override so it reads the deployment's "
+            "zone instead", message, message)
+        self.assertIn(
+            "change this override's 'zone' to name the deployment's (UTC)",
+            message, message)
+
+    def test_the_refusal_says_which_remedy_is_likely_wanted_when_the_deployment_zone_is_the_unset_default(self):
+        # The live shape: an operator named the same zone in every override
+        # and never set a deployment-wide one. UTC here is the fallback
+        # nobody chose, not a decision -- so the message must say the
+        # override's own zone is the more likely truth, and name the remedy
+        # that has not been offered by the other two (both of which move the
+        # producer TO the unset default).
+        message = self._disagreement(deployment_zone_is_default=True)
+        self.assertIn(
+            "This deployment has not set $CRONICLED_ZONE — UTC above is "
+            "the unset default, not a choice made on purpose, so the "
+            "first of those three is the one most likely wanted",
+            message, message)
+
+    def test_the_refusal_does_not_single_out_a_remedy_when_the_deployment_zone_was_chosen(self):
+        # The mirror image: the SAME disagreement, but the deployment's zone
+        # was an explicit setting rather than a default. A default and a
+        # choice must not read alike -- singling out "set $CRONICLED_ZONE"
+        # here would tell an operator who deliberately chose UTC to abandon
+        # their own choice in favour of one override's.
+        message = self._disagreement(deployment_zone_is_default=False)
+        self.assertNotIn("most likely wanted", message, message)
+        self.assertNotIn("unset default", message, message)
+
+    def test_the_remedy_named_first_actually_is_first(self):
+        # The default-case sentence claims "the first of those three" without
+        # repeating which one -- so the ENUMERATION order has to put
+        # $CRONICLED_ZONE ahead of the other two, or the claim is false on its
+        # own terms. Pinned by position, not just by presence.
+        message = self._disagreement(deployment_zone_is_default=True)
+        set_env = message.index("set $CRONICLED_ZONE")
+        drop_zone = message.index("drop 'zone' from this override")
+        change_zone = message.index("change this override's 'zone'")
+        self.assertLess(set_env, drop_zone, message)
+        self.assertLess(drop_zone, change_zone, message)
+
 
 class TheRuleTheStoreAndThePageShareForReadingATimestamp(unittest.TestCase):
     """`as_utc` is public so the page can convert the same stamps the schedule
