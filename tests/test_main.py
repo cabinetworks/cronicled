@@ -2410,13 +2410,56 @@ class TheScheduledJobsAreNamedForWhatTheyCover(unittest.TestCase):
         self.assertEqual(sorted(set(RENAMED_JOBS.values())), ALL_PRODUCERS)
 
 
-def _item(subject_type, state="proposed"):
-    return {"subject_type": subject_type, "state": state}
+class _ItemsSpy:
+    """Wraps a real `Store`, recording every call to `items` -- the method
+    `waiting_counts` used to be handed the (already fetched) result of, and
+    must never call again now that it counts through `counts_by_subject_type`
+    instead. A timing assertion is what a slow machine trips and a fast one
+    hides; this is a call-shape assertion instead, which neither can dodge.
+    """
+
+    def __init__(self, store):
+        self._store = store
+        self.items_calls = 0
+
+    def items(self, *args, **kwargs):
+        self.items_calls += 1
+        return self._store.items(*args, **kwargs)
+
+    def counts_by_subject_type(self, *args, **kwargs):
+        return self._store.counts_by_subject_type(*args, **kwargs)
 
 
 class WhatIsWaitingIsCountedPerInbox(unittest.TestCase):
     """`waiting_counts` turns a store's proposals into the numbers beside the
     links on the summary page."""
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self.store = Store(os.path.join(self._dir, "waiting.sqlite3"))
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        self.store.close()
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+    def _add(self, subject_type, subject_id, state=None, folder="library"):
+        """One proposal, real enough to go through the store's own state
+        machine -- `state=None` leaves it at the store's own default (`new`,
+        i.e. still waiting); any other name is reached the same way a
+        reviewer's decision reaches it in production (`mark_applied`,
+        `dismiss`, `mute`), not by writing the column directly."""
+        fp = self.store.record(
+            folder=folder, subject_type=subject_type, subject_id=subject_id,
+            summary="a proposal", payload={"invented": subject_id},
+            producer="test-producer")
+        if state == "applied":
+            self.store.mark_applied(fp)
+        elif state == "dismissed":
+            self.store.dismiss(fp)
+        elif state == "muted":
+            self.store.mute(subject_type, subject_id)
+        return fp
 
     def test_every_subject_type_this_package_declares_has_a_heading(self):
         """Discovered by IMPORT, not by a list written here.
@@ -2458,35 +2501,53 @@ class WhatIsWaitingIsCountedPerInbox(unittest.TestCase):
         # Every producer this project registers, one of each, so a subject
         # type routed to the wrong heading -- or to none -- is visible as a
         # number in the wrong place rather than as a total that still adds up.
-        counts = waiting_counts([
-            _item(scan.SUBJECT_TYPE),
-            _item(tags.SUBJECT_TYPE),
-            _item(tag_descriptions.SUBJECT_TYPE),
-            _item(performer_tags.SUBJECT_TYPE),
-            _item(tag_hygiene.SUBJECT_TYPE),
-            _item(descriptions.SUBJECT_TYPE),
-        ])
+        self._add(scan.SUBJECT_TYPE, "1")
+        self._add(tags.SUBJECT_TYPE, "2")
+        self._add(tag_descriptions.SUBJECT_TYPE, "3")
+        self._add(performer_tags.SUBJECT_TYPE, "4")
+        self._add(tag_hygiene.SUBJECT_TYPE, "5")
+        self._add(descriptions.SUBJECT_TYPE, "6")
+        counts = waiting_counts(self.store)
         self.assertEqual(counts, {"scenes": 1, "tags": 4, "performers": 1})
 
     def test_it_accumulates_rather_than_recording_that_there_was_one(self):
         # Asymmetric and greater than one: `+= 1` and `= 1` agree on a fixture
         # of one, and the two headings differ so "counted them all into the
         # first bucket" cannot pass either.
-        counts = waiting_counts([_item(scan.SUBJECT_TYPE)] * 3
-                                + [_item(tags.SUBJECT_TYPE)] * 5)
+        for i in range(3):
+            self._add(scan.SUBJECT_TYPE, "scene-%d" % i)
+        for i in range(5):
+            self._add(tags.SUBJECT_TYPE, "tag-%d" % i)
+        counts = waiting_counts(self.store)
         self.assertEqual(counts, {"scenes": 3, "tags": 5, "performers": 0})
 
     def test_a_decision_already_made_is_not_still_waiting(self):
         # A number that never comes down is a number a reader stops believing.
-        counts = waiting_counts([_item(scan.SUBJECT_TYPE, state="applied"),
-                                 _item(scan.SUBJECT_TYPE, state="applied"),
-                                 _item(scan.SUBJECT_TYPE)])
+        self._add(scan.SUBJECT_TYPE, "a", state="applied")
+        self._add(scan.SUBJECT_TYPE, "b", state="applied")
+        self._add(scan.SUBJECT_TYPE, "c")
+        counts = waiting_counts(self.store)
+        self.assertEqual(counts, {"scenes": 1, "tags": 0, "performers": 0})
+
+    def test_a_reviewers_own_dismissal_is_not_still_waiting(self):
+        # Same shape as the `applied` guard above, for the other two states
+        # `Store.items()`'s default view has always hidden: a reviewer's own
+        # rejection is not outstanding work either.
+        self._add(scan.SUBJECT_TYPE, "a", state="dismissed")
+        self._add(scan.SUBJECT_TYPE, "b")
+        counts = waiting_counts(self.store)
+        self.assertEqual(counts, {"scenes": 1, "tags": 0, "performers": 0})
+
+    def test_a_muted_subject_is_not_still_waiting(self):
+        self._add(scan.SUBJECT_TYPE, "a", state="muted")
+        self._add(scan.SUBJECT_TYPE, "b")
+        counts = waiting_counts(self.store)
         self.assertEqual(counts, {"scenes": 1, "tags": 0, "performers": 0})
 
     def test_every_heading_is_reported_even_at_zero(self):
         # An absent heading and one reading zero are different claims: the
         # first says nothing about that inbox, the second says it is clear.
-        self.assertEqual(waiting_counts([]),
+        self.assertEqual(waiting_counts(self.store),
                          {"scenes": 0, "tags": 0, "performers": 0})
 
     def test_a_subject_no_heading_claims_gets_one_of_its_own(self):
@@ -2494,11 +2555,24 @@ class WhatIsWaitingIsCountedPerInbox(unittest.TestCase):
         # counted nowhere, and the summary would report an empty install while
         # a full inbox sat behind the link -- the exact failure this page is
         # supposed to catch. Ugly and visible beats invisible.
-        counts = waiting_counts([_item("something-new"),
-                                 _item("something-new"),
-                                 _item(scan.SUBJECT_TYPE)])
+        self._add("something-new", "a")
+        self._add("something-new", "b")
+        self._add(scan.SUBJECT_TYPE, "c")
+        counts = waiting_counts(self.store)
         self.assertEqual(counts, {"scenes": 1, "tags": 0, "performers": 0,
                                   "something-new": 2})
+
+    def test_the_page_counts_rather_than_fetches(self):
+        # The whole point of this ticket: `items()` decodes every payload
+        # just to have the count throw the result away immediately, and
+        # scales with the size of the backlog rather than the size of the
+        # answer. Asserted on the call actually made, not on elapsed time --
+        # a threshold a slow machine trips and a fast one hides.
+        self._add(scan.SUBJECT_TYPE, "a")
+        self._add(tags.SUBJECT_TYPE, "b", state="dismissed")
+        spy = _ItemsSpy(self.store)
+        waiting_counts(spy)
+        self.assertEqual(spy.items_calls, 0)
 
 
 class TheSummaryIsWiredToTheStoreAndTheLoop(_Base):

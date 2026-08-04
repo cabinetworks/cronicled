@@ -1593,6 +1593,42 @@ class Store:
             rows = self._conn.execute(query, params).fetchall()
         return {state: n for state, n in rows}
 
+    def counts_by_subject_type(self, folder=None):
+        """Number of proposals still WAITING on a person -- not `dismissed`,
+        `muted`, `superseded` or `gone` (see `_HIDDEN_STATES`), and not
+        `applied` either, since an applied proposal is a decision already
+        made -- grouped by `subject_type` instead of by state.
+
+        This exists for exactly one caller,
+        `cronicled.__main__.waiting_counts`, and the reason is what `counts`
+        above cannot do: `counts(subject_types=...)` answers "how many, per
+        state, among the subject types I already named" -- it has no way to
+        say "and anything I did not think to ask about". A subject type
+        nobody has written a heading for yet still has to show up somewhere,
+        which means it has to show up in the RESULT rather than be looked up
+        by name, so this groups by subject_type across the whole store (or
+        one folder) and lets the caller discover what came back.
+
+        `applied` is excluded here, in the query, rather than left to the
+        caller to subtract state-by-state the way `counts()`'s callers do --
+        every caller of THIS method wants the same thing counted (waiting
+        work), where `counts()` is also used to answer other questions
+        (`_sidebar_context` still needs `applied` broken out on its own, to
+        decide whether to show a link to it).
+        """
+        hidden = self._HIDDEN_STATES + ("applied",)
+        placeholders = ", ".join("?" for _ in hidden)
+        query = (f"SELECT subject_type, COUNT(*) FROM item "
+                f"WHERE state NOT IN ({placeholders})")
+        params = list(hidden)
+        if folder is not None:
+            query += " AND folder = ?"
+            params.append(folder)
+        query += " GROUP BY subject_type"
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return {subject_type: n for subject_type, n in rows}
+
     # When each producer last ran
     # ---------------------------
     # A scheduler decides what is due by comparing a producer's cadence against
