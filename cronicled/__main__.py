@@ -132,14 +132,17 @@ WAITING_SECTIONS = tuple(inboxes.INBOXES.items())
 SUMMARY_RUN_HISTORY = RUN_HISTORY_LIMIT
 
 
-def waiting_counts(items):
+def waiting_counts(store):
     """How many proposals are still waiting on a person, per summary heading.
 
-    `items` is `Store.items()`: its default view already hides a reviewer's own
-    dismissals and mutes, and `applied` is dropped here for the reason
-    `_inbox_rows` drops it -- an applied proposal is a decision that has been
-    made, and counting it as outstanding work would put a number on the page
-    that never comes down.
+    Counts rather than fetches: `store.counts_by_subject_type()` answers this
+    with one aggregate query, grouped by subject type, and never decodes a
+    single payload -- unlike the `store.items()` this used to be handed,
+    which materialised and JSON-decoded every non-hidden row just to have its
+    answer thrown away immediately after. `applied` is excluded by that query
+    itself, for the reason `_inbox_rows` drops it too -- an applied proposal
+    is a decision that has been made, and counting it as outstanding work
+    would put a number on the page that never comes down.
 
     A subject type NO HEADING CLAIMS gets a heading of its own, named after the
     type itself, and this deliberately does NOT raise. The choice is between
@@ -150,6 +153,16 @@ def waiting_counts(items):
     - raising takes down the landing page on every render -- including the link
       to the inbox where those proposals are -- because a producer was added.
       The reader loses the whole front page and gets no way to reach the work.
+
+    That fallback is the entire reason this asks `counts_by_subject_type` for
+    a breakdown BY subject type rather than asking `Store.counts` for a total
+    among the subject types `WAITING_SECTIONS` already names: `counts()`
+    can only answer about a subject type the caller thought to ask about, so
+    building this from it directly would make the unmapped type -- the one
+    nobody thought to ask about -- silently vanish from the count instead of
+    landing under a heading of its own. Discovering the full set of subject
+    types actually present, rather than assuming `WAITING_SECTIONS` is
+    exhaustive, is what keeps this fallback real.
 
     So the guard is moved earlier rather than made louder:
     `tests/test_main.py::test_every_subject_type_this_package_declares_has_a_heading`
@@ -163,11 +176,9 @@ def waiting_counts(items):
     heading = {subject: name
                for name, subjects in WAITING_SECTIONS
                for subject in subjects}
-    for item in items:
-        if item["state"] == "applied":
-            continue
-        name = heading.get(item["subject_type"], item["subject_type"])
-        counts[name] = counts.get(name, 0) + 1
+    for subject_type, n in store.counts_by_subject_type().items():
+        name = heading.get(subject_type, subject_type)
+        counts[name] = counts.get(name, 0) + n
     return counts
 
 # How long shutdown waits for the loop to come out of a tick. Bounded rather
@@ -719,7 +730,7 @@ def main(argv=None):
               # page cannot end up in two different zones.
               summary=lambda: to_summary_view(
                   store.recent_runs(limit=SUMMARY_RUN_HISTORY),
-                  waiting_counts(store.items()),
+                  waiting_counts(store),
                   None if scheduler is None else scheduler.status(),
                   zone=zone),
               # The per-inbox routes (`/{inbox}`, `/{inbox}/{state}`) narrow

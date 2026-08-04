@@ -1206,6 +1206,17 @@ class _FakeStore:
             counts[i["state"]] = counts.get(i["state"], 0) + 1
         return counts
 
+    def counts_by_subject_type(self, folder=None):
+        """Mirrors `Store.counts_by_subject_type`: the same `_HIDDEN_STATES`
+        excluded, `applied` excluded too, grouped by subject type instead of
+        by state."""
+        hidden = self._HIDDEN_STATES + ("applied",)
+        result = [i for i in self._items if i["state"] not in hidden]
+        counts = {}
+        for i in result:
+            counts[i["subject_type"]] = counts.get(i["subject_type"], 0) + 1
+        return counts
+
 
 # Three invented fixtures, one per inbox, each carrying its own fingerprint
 # inside a field its own row builder actually renders -- a scene's filename,
@@ -1683,7 +1694,7 @@ class TheSidebarTotalAgreesWithTheSummarysWaitingTotal(unittest.TestCase):
         body = _drive(
             "GET", "/", store=store,
             summary=lambda: to_summary_view(
-                [], waiting_counts(store.items()), None, zone=timezone.utc),
+                [], waiting_counts(store), None, zone=timezone.utc),
         )["body"].decode()
 
         sidebar_match = self._SIDEBAR_RE.search(body)
