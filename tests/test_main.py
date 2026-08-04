@@ -2215,6 +2215,100 @@ class OneZoneForTheScheduleAndForThePage(_Base):
             store.close()
 
 
+class AScheduleOverrideMayNotNameADisagreeingZone(_Base):
+    """The live incident this covers: a schedule override naming a zone for
+    each of its entries, and no deployment-wide zone setting of its own.
+    Before this, the three appointments were kept in the override's zone
+    while the page -- reading the deployment's -- rendered every timestamp in
+    a different one, with nothing said.
+
+    Exercised through the whole of `main()`, the same way
+    `OneZoneForTheScheduleAndForThePage` is: the bug is only visible end to
+    end, because `resolve()` alone has no notion of what the page renders in
+    and `build_scheduler` is what hands the two the same setting.
+    """
+
+    def _run_main(self, schedule_overrides, zone_name=None, db=None):
+        db = self.db_path if db is None else db
+        conf = os.path.join(self._dir, "conf")
+        os.makedirs(conf, exist_ok=True)
+        with open(os.path.join(conf, "adapters.json"), "w") as fh:
+            json.dump({"adapters": [_ADAPTER_SPEC]}, fh)
+        with open(os.path.join(conf, "schedule.json"), "w") as fh:
+            json.dump(schedule_overrides, fh)
+        captured = _CapturedServe()
+        out = io.StringIO()
+        environ = {} if zone_name is None else {ZONE_ENV_VAR: zone_name}
+        with patch.dict(os.environ, environ):
+            if zone_name is None:
+                os.environ.pop(ZONE_ENV_VAR, None)
+            with patch("cronicled.__main__.Stash", _ReadOnlyStash):
+                with patch("cronicled.__main__.serve", captured):
+                    with redirect_stdout(out):
+                        main(["--db", db, "--config-dir", conf,
+                              "--server", "http://media.invalid"])
+        return captured, out.getvalue()
+
+    def test_a_disagreeing_override_zone_stops_the_service_starting(self):
+        # The exact shape observed live: every unattended producer named,
+        # every one given a zone, none of them the deployment's -- which here
+        # is left unset and so defaults to UTC. Startup must refuse rather
+        # than start a service that keeps its appointments in one zone and
+        # renders its page in another.
+        overrides = {name: {"at": "03:00", "zone": OTHER_ZONE_NAME}
+                    for name in ALL_PRODUCERS}
+        conf = os.path.join(self._dir, "conf")
+        os.makedirs(conf, exist_ok=True)
+        with open(os.path.join(conf, "adapters.json"), "w") as fh:
+            json.dump({"adapters": [_ADAPTER_SPEC]}, fh)
+        with open(os.path.join(conf, "schedule.json"), "w") as fh:
+            json.dump(overrides, fh)
+        captured = _CapturedServe()
+        with patch("cronicled.__main__.Stash", _ReadOnlyStash):
+            with patch("cronicled.__main__.serve", captured):
+                with redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(ValueError, "different zone"):
+                        main(["--db", self.db_path, "--config-dir", conf,
+                              "--server", "http://media.invalid"])
+        # `serve` must never have been reached: this is a start-up failure,
+        # not a service that started and rendered something wrong.
+        self.assertIsNone(captured.kwargs)
+
+    def test_a_disagreeing_override_zone_stops_startup_even_against_a_configured_deployment_zone(self):
+        # The disagreement does not need an UNSET deployment zone to matter --
+        # naming any deployment zone and an override that disagrees with it
+        # must refuse the same way.
+        overrides = {SCHEDULED_SCAN_NAME: {"at": "03:00",
+                                           "zone": OTHER_ZONE_NAME}}
+        with self.assertRaisesRegex(ValueError, "different zone"):
+            self._run_main(overrides, zone_name=ZONE_NAME)
+
+    def test_an_override_naming_the_deployments_own_zone_keeps_working(self):
+        # Agreement -- the exact same zone, same spelling -- must not become
+        # a start-up failure. `serve` having been reached at all is the
+        # assertion: `build_scheduler`, `Scheduler.__init__` and `resolve` all
+        # sit between this override being read and `serve` being called, and
+        # any of them raising would leave `captured.kwargs` unset the same
+        # way it stays unset in the disagreement tests above.
+        overrides = {name: {"at": "03:00", "zone": ZONE_NAME}
+                    for name in ALL_PRODUCERS}
+        captured, out = self._run_main(overrides, zone_name=ZONE_NAME)
+        self.assertIsNotNone(captured.kwargs)
+        self.assertIn("zone: %s" % ZONE_NAME, out)
+
+    def test_an_override_naming_the_same_zone_by_a_different_spelling_keeps_working(self):
+        # THE point of the whole rule: two spellings of one zone are
+        # agreement, not disagreement, and must not stop the service. Same
+        # shape as the test above, spelling the override's zone the other
+        # way `check_zone`/`resolve` already accept for the deployment's own
+        # setting.
+        overrides = {name: {"at": "03:00", "zone": "Etc/UTC"}
+                    for name in ALL_PRODUCERS}
+        captured, out = self._run_main(overrides, zone_name="UTC")
+        self.assertIsNotNone(captured.kwargs)
+        self.assertIn("zone: UTC", out)
+
+
 class StoredTimestampsStayUtc(_Base):
     """The expensive direction, guarded on the raw database rather than
     through any reader.

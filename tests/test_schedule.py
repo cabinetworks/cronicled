@@ -2304,6 +2304,20 @@ class ZonesAgree(unittest.TestCase):
                          july.replace(tzinfo=santiago).utcoffset())
         self.assertFalse(schedule._zones_agree(new_york, santiago))
 
+    def test_agreeing_at_the_start_of_the_window_is_not_agreement_either(self):
+        # The mirror image of the test above, and the one that pins the
+        # SWEEP rather than any single sample: Kathmandu kept Kolkata's own
+        # offset (+05:30) until 1986, then moved permanently to +05:45. A
+        # comparison that stopped at the first sample -- or anywhere before
+        # 1986 -- would call these the same zone; they have not been for
+        # decades of the window this function actually covers.
+        kolkata = ZoneInfo("Asia/Kolkata")
+        kathmandu = ZoneInfo("Asia/Kathmandu")
+        start = datetime(1970, 1, 1)
+        self.assertEqual(start.replace(tzinfo=kolkata).utcoffset(),
+                         start.replace(tzinfo=kathmandu).utcoffset())
+        self.assertFalse(schedule._zones_agree(kolkata, kathmandu))
+
     def test_a_fixed_offset_agrees_only_with_an_identical_fixed_offset(self):
         one = timezone(timedelta(hours=2))
         other = timezone(timedelta(hours=2))
