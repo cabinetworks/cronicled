@@ -2323,6 +2323,18 @@ class ScanProducer:
         being searched for them at all. Only what is left goes to the pool
         below. See this class's own `identify` paragraph for why that order
         is the point.
+
+        Every file, from either path, gets its own `ctx.progress` line the
+        moment it completes -- `position/total`, its subject, and what came
+        of it -- so a person watching `docker logs` during a run that is
+        still going can see which file is next, spot the one that is taking
+        too long, and see where a run stopped if it stops. It is deliberately
+        `progress`, not `log`: the job's own status keeps one field, so a
+        per-file line written through `log` would flicker across the page and
+        leave `docker logs` exactly as silent as before this existed. Nothing
+        keeps a second copy at this level, either -- `progress` is not read
+        back, so the cost of one line per file is one `print`, not memory
+        that grows with the batch.
         """
         # No alias validation here: `__init__` built the index, which is where
         # the map is now checked. Doing it again on the first line of a run
@@ -2435,8 +2447,15 @@ class ScanProducer:
                                           folder=self._folder)
             tally[self._record(scene, outcome)] += 1
             done += 1
-            ctx.log("%d/%d scene %s: %s" % (
-                done, len(selected), str(scene["id"]), outcome.reason))
+            # `progress`, never `log`: this is the line an operator watches
+            # `docker logs` for while the pass is still running, and `log`'s
+            # single field would just be overwritten by the next file before
+            # anyone reads it. Prefixed with this producer's own name so two
+            # passes writing to the same stream at once -- a scan and a tag
+            # pass, say -- can be told apart line by line.
+            ctx.progress("%s %d/%d scene %s: %s" % (
+                self.name, done, len(selected), str(scene["id"]),
+                outcome.reason))
             if outcome.proposal is not None:
                 yield outcome.proposal
 
@@ -2451,8 +2470,12 @@ class ScanProducer:
                 tally[self._record(scene, outcome)] += 1
                 fallbacks += outcome.fallback_queries
                 done += 1
-                ctx.log("%d/%d scene %s: %s" % (
-                    done, len(selected), str(scene["id"]), outcome.reason))
+                # See the identical comment in the fingerprint loop above:
+                # per-file progress belongs on stdout, not on the job's own
+                # single-message status.
+                ctx.progress("%s %d/%d scene %s: %s" % (
+                    self.name, done, len(selected), str(scene["id"]),
+                    outcome.reason))
                 if outcome.proposal is not None:
                     yield outcome.proposal
         finally:

@@ -2810,35 +2810,47 @@ class ScriptedSearch:
 
 
 class FakeCtx:
-    """What the runner gives a producer: somewhere to log progress.
+    """What the runner gives a producer: `log` for its own status and
+    `progress` for stdout -- see `cronicled.jobs`'s module docstring for why
+    the two are not interchangeable.
 
-    `message` is what production RETAINS. `JobRunner._log` assigns
-    `state.message = message` — one field, no history — so the last line a
-    producer logs is the whole of what the job record says once the run is
-    over. Every assertion about what a user reads off a finished job belongs
-    against `message`, and against nothing else: asserting an earlier line
-    proves a property the real collaborator does not keep, which is how the
-    scan came to report a fully-suppressed batch and an empty library in
+    `message` is what production RETAINS through `log`. `JobRunner._log`
+    assigns `state.message = message` — one field, no history — so the last
+    line a producer logs is the whole of what the job record says once the
+    run is over. Every assertion about what a user reads off a finished job
+    belongs against `message`, and against nothing else: asserting an earlier
+    line proves a property the real collaborator does not keep, which is how
+    the scan came to report a fully-suppressed batch and an empty library in
     byte-identical terms while this file was green.
 
-    `messages` is the stream as it was logged, in order. It is kept because
-    the per-file lines are real behaviour worth pinning — every file gets its
-    own line, naming the file it is about, as it completes — but it is a
-    recording of a stream, NOT what survives the run, and no conclusion about
-    a job's record may be drawn from it. The property that matters is pinned
-    against the real `JobRunner` instead; see
-    `test_the_closing_line_tells_a_suppressed_batch_from_an_empty_one`.
+    `messages` is the `log` stream as it was called, in order — every opening
+    and closing line a real job keeps exactly one of, kept here only so a test
+    can check the SEQUENCE of status calls, never to claim a middle one
+    survives to the page.
+
+    `progress_messages` is the OTHER channel: every line the producer wrote
+    for `docker logs`, append-only, matching what the real sink actually is —
+    unlike `log`, production itself never throws these away, so accumulating
+    them here does not hand a test a capability the real collaborator lacks.
+    This is where a per-file line lives now; asserting one against `messages`
+    would be asserting it survives to the page, which is exactly the claim
+    this ticket exists to stop anyone making by accident.
     """
 
     def __init__(self):
         self.message = ""
         self.messages = []
+        self.progress_messages = []
         self._lock = threading.Lock()
 
     def log(self, message):
         with self._lock:
             self.message = message
             self.messages.append(message)
+
+    def progress(self, message):
+        with self._lock:
+            self.progress_messages.append(message)
 
 
 class MuteSpy:
@@ -3659,7 +3671,7 @@ class ScanProducerTest(unittest.TestCase):
         self.assertEqual(proposals, [])
         self.assertEqual(self.store.muted_subjects(), set())
         self.assertEqual(
-            len([m for m in self.ctx.messages
+            len([m for m in self.ctx.progress_messages
                  if "RuntimeError: connection reset" in m]), 3)
 
     def test_work_already_yielded_survives_a_later_failure(self):
@@ -4214,11 +4226,11 @@ class ScanProducerTest(unittest.TestCase):
 
         self.assertEqual(spy.mute_calls, [(SUBJECT_TYPE, "1", MUTE_NO_CANDIDATES)])
         self.assertEqual(self.store.muted_subjects(), {(SUBJECT_TYPE, "1")})
-        # The same binding as the log sees it: the file that finished first
+        # The same binding as stdout sees it: the file that finished first
         # is named first, and each line names the file it is about.
-        self.assertEqual(self.ctx.messages[1:3], [
-            "1/2 scene 2: chosen with score 1.000",
-            "2/2 scene 1: " + MUTE_NO_CANDIDATES,
+        self.assertEqual(self.ctx.progress_messages, [
+            "library-scan 1/2 scene 2: chosen with score 1.000",
+            "library-scan 2/2 scene 1: " + MUTE_NO_CANDIDATES,
         ])
         # Without this the test passes for the wrong reason: a gate that gave
         # up would make scene 1 an error rather than a mute, and an empty
@@ -4246,8 +4258,9 @@ class ScanProducerTest(unittest.TestCase):
         # Reported as an error, not a mute: a malformed row is evidence about
         # the catalogue, not a verdict that the file is unidentifiable.
         self.assertEqual(self.store.muted_subjects(), set())
-        self.assertTrue(any("KeyError: 'title'" in m for m in self.ctx.messages),
-                        self.ctx.messages)
+        self.assertTrue(any("KeyError: 'title'" in m
+                            for m in self.ctx.progress_messages),
+                        self.ctx.progress_messages)
         self.assertEqual(
             self.ctx.message,
             "finished: 1 proposed, 0 muted, 0 refused, 1 errors, 2 lookups, 0 per-title fallback queries; selected 2 "
@@ -4266,7 +4279,8 @@ class ScanProducerTest(unittest.TestCase):
         self.assertEqual(self.ids(proposals), ["2"])
         self.assertEqual(self.store.muted_subjects(), set())
         self.assertTrue(any("TimeoutError: timed out" in m
-                            for m in self.ctx.messages), self.ctx.messages)
+                            for m in self.ctx.progress_messages),
+                        self.ctx.progress_messages)
 
     def test_an_ambiguous_file_is_neither_proposed_nor_muted(self):
         """A tie means a human should look. Muting it would silently hide a
@@ -4278,8 +4292,8 @@ class ScanProducerTest(unittest.TestCase):
 
         self.assertEqual(proposals, [])
         self.assertEqual(self.store.muted_subjects(), set())
-        self.assertTrue(any("ambiguous" in m for m in self.ctx.messages),
-                        self.ctx.messages)
+        self.assertTrue(any("ambiguous" in m for m in self.ctx.progress_messages),
+                        self.ctx.progress_messages)
 
     def test_a_refusal_is_recorded_with_its_reason_and_file(self):
         """Not muted and not thrown away either: a refusal is the one
@@ -4297,6 +4311,34 @@ class ScanProducerTest(unittest.TestCase):
         self.assertEqual(refusals[0]["subject_id"], "1")
         self.assertEqual(refusals[0]["path"], self.MORNING_PATH)
         self.assertIn("ambiguous", refusals[0]["reason"])
+
+    def test_every_progress_line_maps_to_one_bucket_the_closing_tally_counts(self):
+        """The identity the closing summary rests on: a proposed file, a
+        muted one, a refused one and an errored one -- one of each -- must
+        produce exactly four progress lines, never three (a silent skip)
+        and never five (a double report). Whatever granularity a pass
+        chooses, what it counted and what it showed on stdout have to be the
+        same number, or neither can be trusted."""
+        search = ScriptedSearch({
+            "Ivy Kingsley": [self.LEDGER],
+            "Velvet Crane": [],
+            "Rowan Ashworth": RuntimeError("connection reset"),
+        })
+        proposals = self.scan(
+            [scene(1, self.LEDGER_PATH),
+             scene(2, "/library/Velvet Crane/Nothing Here.mp4"),
+             scene(3, self.UNNAMED_PATH),
+             scene(4, "/library/Rowan Ashworth/Storm Warning.mp4")],
+            search)
+
+        self.assertEqual(len(proposals), 1)
+        self.assertEqual(self.store.muted_subjects(), {(SUBJECT_TYPE, "2")})
+        self.assertEqual(len(self.store.refusals()), 1)
+        # Four files in, four progress lines out -- proposed, muted, refused
+        # and errored are each exactly one line, never zero and never two.
+        self.assertEqual(len(self.ctx.progress_messages), 4)
+        # And the closing summary's own tally has to name the same four.
+        self.assertIn("1 proposed, 1 muted, 1 refused, 1 errors", self.ctx.message)
 
     # -- what every store returned, all the way through the store ---------- #
 
@@ -4394,8 +4436,8 @@ class ScanProducerTest(unittest.TestCase):
 
         self.assertEqual(self.ids(proposals), ["2"])
         self.assertEqual(self.store.muted_subjects(), set())
-        self.assertTrue(any("ValueError" in m for m in self.ctx.messages),
-                        self.ctx.messages)
+        self.assertTrue(any("ValueError" in m for m in self.ctx.progress_messages),
+                        self.ctx.progress_messages)
 
     def test_a_malformed_alias_map_is_refused_before_a_producer_exists(self):
         """A duplicated alias line is a wiring mistake, wrong for every file.
@@ -4654,12 +4696,17 @@ class ScanProducerTest(unittest.TestCase):
         self.assertEqual(sorted(beta.queries), ["Ivy Kingsley", "Velvet Crane"])
         self.assertIn("4 lookups", self.ctx.message)
 
-    # -- what the log says -------------------------------------------------- #
+    # -- what the log says, and what stdout says ---------------------------- #
 
-    def test_the_log_reports_the_batch_and_then_each_file_as_it_completes(self):
+    def test_the_log_reports_only_the_batchs_open_and_close(self):
         """`skipped` on the job says "your earlier decision suppressed this";
         the scan's own log is what says how the batch was chosen, and it has
-        to be honest that muted files were dropped rather than absent."""
+        to be honest that muted files were dropped rather than absent.
+
+        Exactly two calls, opening and closing — never one per file. A per-
+        file line reaching `log` would flicker across the page while a run is
+        going and leave `docker logs` no better off; see `progress` below for
+        where those lines actually belong."""
         self.store.mute(SUBJECT_TYPE, "4")
         search = ScriptedSearch(self.SCRIPT)
         self.scan([scene(1, self.MORNING_PATH), scene(2, self.LEDGER_PATH),
@@ -4667,12 +4714,11 @@ class ScanProducerTest(unittest.TestCase):
                    scene(5, self.UNNAMED_PATH)],
                   search, name_filter="library", limit=2)
 
+        self.assertEqual(len(self.ctx.messages), 2)
         self.assertEqual(
             self.ctx.messages[0],
             "selected 2 of 5 files (0 already proposed, 1 already muted, "
             "1 outside the filter, 1 deferred)")
-        self.assertEqual([m.split(" ", 1)[0] for m in self.ctx.messages[1:3]],
-                         ["1/2", "2/2"])
         # The last message, because the last message is the only one the
         # runner keeps — so the breakdown has to be in it, not only in the
         # opening line above.
@@ -4682,16 +4728,33 @@ class ScanProducerTest(unittest.TestCase):
             "selected 2 of 5 files (0 already proposed, 1 already muted, "
             "1 outside the filter, 1 deferred); 0 marked gone")
 
-    def test_each_completed_file_is_logged_with_what_it_concluded(self):
+    def test_progress_reports_the_batch_and_then_each_file_as_it_completes(self):
+        """The per-file lines this test used to find on `ctx.messages` live on
+        `progress` instead — the channel `docker logs` actually shows while a
+        run is still going."""
+        self.store.mute(SUBJECT_TYPE, "4")
+        search = ScriptedSearch(self.SCRIPT)
+        self.scan([scene(1, self.MORNING_PATH), scene(2, self.LEDGER_PATH),
+                   scene(3, self.EVENING_PATH), scene(4, self.MORNING_PATH),
+                   scene(5, self.UNNAMED_PATH)],
+                  search, name_filter="library", limit=2)
+
+        self.assertEqual(
+            [m.split(" ", 2)[1] for m in self.ctx.progress_messages],
+            ["1/2", "2/2"])
+
+    def test_each_completed_file_is_reported_on_stdout_with_what_it_concluded(self):
         self.scan([scene(9, self.LEDGER_PATH)], ScriptedSearch(self.SCRIPT))
 
         self.assertEqual(self.ctx.messages, [
             "selected 1 of 1 files (0 already proposed, 0 already muted, "
             "0 outside the filter, 0 deferred)",
-            "1/1 scene 9: chosen with score 1.000",
             "finished: 1 proposed, 0 muted, 0 refused, 0 errors, 1 lookups, 0 per-title fallback queries; "
             "selected 1 of 1 files (0 already proposed, 0 already muted, "
             "0 outside the filter, 0 deferred); 0 marked gone",
+        ])
+        self.assertEqual(self.ctx.progress_messages, [
+            "library-scan 1/1 scene 9: chosen with score 1.000",
         ])
 
     def test_the_closing_line_tells_a_suppressed_batch_from_an_empty_one(self):
@@ -5436,10 +5499,12 @@ class ScanProducerFingerprintTest(unittest.TestCase):
                                                    candidate=self.BOX_LEDGER,
                                                    remote_site_id="r-77")}))
 
-        numbered = [m for m in self.ctx.messages if m.startswith(("1/", "2/"))]
+        numbered = self.ctx.progress_messages
         self.assertEqual(len(numbered), 2)
-        self.assertTrue(numbered[0].startswith("1/2 scene 7:"), numbered)
-        self.assertTrue(numbered[1].startswith("2/2 scene 8:"), numbered)
+        self.assertTrue(numbered[0].startswith("library-scan 1/2 scene 7:"),
+                        numbered)
+        self.assertTrue(numbered[1].startswith("library-scan 2/2 scene 8:"),
+                        numbered)
 
     def test_an_identified_proposal_is_recorded_by_the_real_runner(self):
         # Through `JobRunner` and the real `Store`, because a proposal with no
