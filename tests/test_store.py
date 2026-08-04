@@ -2834,3 +2834,66 @@ class SubjectTypeFiltering(_StoreCase):
         got = {i["subject_id"] for i in
                self.store.items(folder="tag-matches", subject_types=("tag",))}
         self.assertEqual(got, {"t1"})
+
+
+class CountsGroupedBySubjectType(_StoreCase):
+    """`counts_by_subject_type` is what `cronicled.__main__.waiting_counts`
+    uses to find a subject type nobody named up front: unlike `counts()`,
+    which only answers about subject types the caller already knows to ask
+    about, this groups by subject type itself, so an uninvited one still
+    turns up as a key in the result.
+    """
+
+    def _tag(self, subject_id):
+        return self.store.record(folder="tag-matches", subject_type="tag",
+                                 subject_id=subject_id, summary="a tag",
+                                 payload={"key": "kettle"}, producer="tags")
+
+    def test_groups_by_subject_type_not_by_state(self):
+        self._record(subject_id="s1")
+        self._record(subject_id="s2")
+        self._tag("t1")
+        self.assertEqual(self.store.counts_by_subject_type(),
+                         {"scene": 2, "tag": 1})
+
+    def test_excludes_dismissed_and_muted(self):
+        dismissed_fp = self._record(subject_id="1")
+        self.store.dismiss(dismissed_fp)
+        self._record(subject_id="2")
+        self.store.mute("scene", "2")
+        self._record(subject_id="3")
+        self.assertEqual(self.store.counts_by_subject_type(), {"scene": 1})
+
+    def test_excludes_applied_even_though_counts_would_include_it(self):
+        # The one place this deliberately diverges from `counts()`: an
+        # applied proposal is a decision already made, not still waiting, so
+        # it is dropped here in the query itself rather than left for the
+        # caller to subtract state by state.
+        applied_fp = self._record(subject_id="1")
+        self.store.mark_applied(applied_fp)
+        self._record(subject_id="2")
+        self.assertEqual(self.store.counts(), {"applied": 1, "new": 1})
+        self.assertEqual(self.store.counts_by_subject_type(), {"scene": 1})
+
+    def test_an_unmapped_subject_type_still_appears_as_its_own_key(self):
+        # No `subject_types` argument was given, and nothing here has to be
+        # named in advance -- unlike `counts(subject_types=...)`, which can
+        # only ever answer about the types it was asked about.
+        self._record(subject_id="s1")
+        self.store.record(folder="library", subject_type="something-new",
+                          subject_id="x1", summary="s", payload={},
+                          producer="test")
+        self.assertEqual(self.store.counts_by_subject_type(),
+                         {"scene": 1, "something-new": 1})
+
+    def test_scoped_to_a_folder(self):
+        self._record(subject_id="s1", folder="scene-matches")
+        self.store.record(folder="cleanups", subject_type="scene",
+                          subject_id="s2", summary="s",
+                          payload={"title": "elsewhere"}, producer="test")
+        self.assertEqual(
+            self.store.counts_by_subject_type(folder="scene-matches"),
+            {"scene": 1})
+
+    def test_an_empty_store_reports_nothing(self):
+        self.assertEqual(self.store.counts_by_subject_type(), {})
