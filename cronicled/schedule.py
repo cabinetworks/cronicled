@@ -225,7 +225,7 @@ def check_zone(value, source):
 # Reused rather than invented: `_DAYS_BACK`/`_DAYS_FORWARD` above already
 # treat 1970-2040 as this project's "real world" span for a zone's own
 # transitions, so a second window here would be a second number to defend
-# for no reason -- one zone's transitions are the same data this reads.
+# for no reason — one zone's transitions are the same data this reads.
 _ZONE_AGREEMENT_FROM = datetime(1970, 1, 1)
 _ZONE_AGREEMENT_TO = datetime(2040, 1, 1)
 
@@ -493,8 +493,8 @@ def resolve(producers, overrides=None, *, deployment_zone=None):
                     f"its stated time in {timing['zone']!r}, which is a "
                     f"different zone from the one this deployment is "
                     f"configured for ({deployment_zone!r}). One zone is read "
-                    "for two things -- the hour every unattended pass keeps, "
-                    "and the hour the page shows every timestamp in -- "
+                    "for two things — the hour every unattended pass keeps, "
+                    "and the hour the page shows every timestamp in — "
                     "precisely so the two cannot say different things about "
                     "the same appointment; a second place naming a "
                     "different zone reopens exactly that. Drop 'zone' here "
