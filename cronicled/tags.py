@@ -574,11 +574,21 @@ class TagMergeProducer:
 
         `dropped_keys` travels back for the same reason and not merely for
         symmetry. `JobRunner._log` keeps only the LAST message a job wrote, so
-        every line logged in this loop is overwritten before the job finishes;
-        a count that stayed here would be a number the code computes, states a
-        reason for, and no operator can ever read. The per-source lines are
-        kept for anyone watching a run live, and the total is returned so the
-        closing line can carry it.
+        every line logged in this loop through `ctx.log` is overwritten before
+        the job finishes; a count that stayed here would be a number the code
+        computes, states a reason for, and no operator can ever read. The
+        total is returned so the closing line can carry it.
+
+        Each box ALSO gets one `ctx.progress` line -- stdout, for `docker
+        logs` -- naming it and what its own read concluded, whether or not
+        anything about it was worth a `ctx.log` line too. A full catalogue
+        read is exactly the kind of round trip against a rate-limited public
+        service this ticket exists to make watchable, the same reasoning
+        `ScanProducer.produce` applies per file; the number of configured
+        boxes is small (an operator names a handful, not thousands), so one
+        line per box costs nothing worth economising and its absence would
+        leave "which box is this pass stuck on" unanswerable from `docker
+        logs` alone.
         """
         indexes, unread, dropped_keys = [], 0, 0
         for box in self._stash.stash_box_credentials():
@@ -592,18 +602,25 @@ class TagMergeProducer:
                         "this pass, and nothing here says a tag it might "
                         "describe has no description"
                         % (name, type(exc).__name__, exc))
+                ctx.progress("%s box %s: could not be read (%s: %s)"
+                             % (self.name, name, type(exc).__name__, exc))
                 continue
+            outcome = "read %d tag(s)" % len(catalogue.tags)
             if not catalogue.complete:
                 unread += 1
                 ctx.log("%s was read only partly (%d tags); what it holds "
                         "beyond them is unknown, not absent"
                         % (name, len(catalogue.tags)))
+                outcome += " (partial)"
             index = tag_descriptions.index_box(name, catalogue.tags)
             if index.ambiguous:
                 dropped_keys += len(index.ambiguous)
                 ctx.log("%s: %d key(s) two of its tags claim with different "
                         "descriptions, dropped rather than guessed at"
                         % (name, len(index.ambiguous)))
+                outcome += ("; %d ambiguous key(s) dropped"
+                           % len(index.ambiguous))
+            ctx.progress("%s box %s: %s" % (self.name, name, outcome))
             indexes.append(index)
         return indexes, unread, dropped_keys
 

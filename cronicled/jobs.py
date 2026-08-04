@@ -13,11 +13,32 @@ an edge case. `start()` enforces this rather than trusting it: a `produce`
 that hands back anything but a generator is refused there, because such a
 producer would silently lose the guarantee with nothing to tell its author.
 
-`ctx` gives a producer exactly one thing: `log(message)`. It does not get the
-store. Persistence, and the dismissal/mute rules that make a reviewer's past
-decisions stick, belong to the runner alone — a producer that wrote to the
-store directly could bypass them, and could not be tested without a runner
-and a store to go with it.
+`ctx` gives a producer two things, and they answer different questions and
+must never be asked to carry each other's content:
+
+* `log(message)` — this job's OWN status, read off `Job.message` on the page.
+  `_JobState` keeps exactly one field for it, so every call OVERWRITES the
+  last; nothing here can accumulate a history. It answers "what is this job's
+  state right now", which for a long pass is usually "what it opened with"
+  and then "how it closed" — the two calls worth losing every line in between
+  for.
+* `progress(message)` — one line per item, written to stdout as it happens,
+  for whoever runs `docker logs` against a pass that is still going. Append-
+  only, and never read back by this module: nothing here keeps a copy, which
+  is what makes it safe to call once per file over a batch of thousands
+  without growing anything the runner holds for the life of the process.
+
+Confusing the two has already cost this project a real defect: per-item text
+logged through `log` instead of `progress` reaches nobody, because the next
+line -- often the very next file -- overwrites it before a human ever reads
+the job's message, and the closing summary overwrites whatever was there
+before that. A claim that a line "was logged" is not a claim that anyone saw
+it; only `progress` is built to be seen while the job is still running.
+
+It does not get the store. Persistence, and the dismissal/mute rules that make
+a reviewer's past decisions stick, belong to the runner alone — a producer
+that wrote to the store directly could bypass them, and could not be tested
+without a runner and a store to go with it.
 
 A runner is built to outlive the work it is handed, which costs it two things
 that a process living for minutes never notices. It forgets finished jobs past
@@ -30,6 +51,7 @@ and nothing asks one to stop early.
 """
 import collections
 import inspect
+import sys
 import threading
 import time
 import traceback
@@ -193,16 +215,43 @@ class Job:
     traceback: Optional[str]
 
 
-class _JobContext:
-    """What a producer receives as `ctx`: a place to log progress, nothing
-    more. Built fresh per job so a producer cannot hold onto anything that
-    outlives its own run."""
+def _write_progress(message):
+    """The real `progress` sink: one line to stdout, flushed immediately.
 
-    def __init__(self, on_log):
+    `flush=True` is not decoration. The running image sets `PYTHONUNBUFFERED`,
+    which is what actually keeps a normal `print` call from sitting in a block
+    buffer until the process exits -- but that is an environment variable, not
+    a property of this line, and nothing here should depend on a caller having
+    set it. A future change that captures stdout through something buffered
+    (a wrapped stream, a logging handler with its own buffer) would make this
+    feature silently stop reaching `docker logs` while every test that only
+    checks the TEXT of a line would still pass. Flushing here, explicitly,
+    means the guarantee holds regardless of what wraps `sys.stdout` later.
+    """
+    print(message, file=sys.stdout, flush=True)
+
+
+class _JobContext:
+    """What a producer receives as `ctx`: `log` for the job's own status and
+    `progress` for stdout, and nothing more. See this module's own docstring
+    for why the two are not interchangeable. Built fresh per job so a
+    producer cannot hold onto anything that outlives its own run.
+
+    `on_progress` is injectable, the same reason `on_log` always has been:
+    a test can capture it without writing to the real stream, and production
+    never passes one, so every real job writes progress through
+    `_write_progress` exactly as described there.
+    """
+
+    def __init__(self, on_log, on_progress=None):
         self._on_log = on_log
+        self._on_progress = on_progress if on_progress is not None else _write_progress
 
     def log(self, message):
         self._on_log(message)
+
+    def progress(self, message):
+        self._on_progress(message)
 
 
 class _JobState:

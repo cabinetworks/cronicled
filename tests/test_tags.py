@@ -36,19 +36,29 @@ def tag(id, name, scene_count=0, aliases=(), description=None):
 
 
 class FakeCtx:
-    """What the runner gives a producer: somewhere to log progress.
+    """What the runner gives a producer: `log` for its own status and
+    `progress` for stdout -- see `cronicled.jobs`'s module docstring.
 
-    Keeps only the LAST message, because that is all the real collaborator
-    keeps: `JobRunner._log` assigns `state.message`, one field, no history.
-    A double that accumulated a list would let an assertion pass against a
-    property production does not have.
+    `message` keeps only the LAST value logged, because that is all the real
+    collaborator keeps: `JobRunner._log` assigns `state.message`, one field,
+    no history. A double that accumulated a list would let an assertion pass
+    against a property production does not have.
+
+    `progress_messages` is the other channel, and accumulating it here is
+    NOT the same mistake: the real sink is stdout, which is genuinely
+    append-only, so a list here matches what production itself keeps (all of
+    it), not a capability the real collaborator lacks.
     """
 
     def __init__(self):
         self.message = None
+        self.progress_messages = []
 
     def log(self, message):
         self.message = message
+
+    def progress(self, message):
+        self.progress_messages.append(message)
 
 
 class FakeStash:
@@ -990,6 +1000,49 @@ class WhenASourceCannotBeRead(unittest.TestCase):
 
         self.assertIn("7", [p["subject_id"] for p in proposals
                             if p["subject_type"] == TAG_SUBJECT])
+
+    def test_a_failed_read_gets_its_own_stdout_line_naming_the_box(self):
+        """Reading a box's whole catalogue is exactly the kind of round trip
+        against a rate-limited public service `docker logs` needs to show
+        live, the same reasoning a scan's per-file line rests on. `ctx.log`
+        alone cannot serve that: the next box (or the closing summary)
+        overwrites it before a person watching the job's own status field
+        ever sees it."""
+        self.run_with(StashError("host wedged", transient=True))
+
+        self.assertTrue(
+            any("box first: could not be read" in m
+                and "host wedged" in m
+                for m in self.ctx.progress_messages),
+            self.ctx.progress_messages)
+
+    def test_every_configured_box_gets_exactly_one_progress_line(self):
+        """The count has to add up here too: two configured boxes, one that
+        fails and one that answers, is two progress lines -- never one (the
+        failure swallowed) and never a variable number depending on what a
+        box happened to say."""
+        self.run_with(StashError("host wedged", transient=True))
+
+        self.assertEqual(len(self.ctx.progress_messages), 2)
+        self.assertTrue(
+            any(m.startswith("tag-scan box first:")
+                for m in self.ctx.progress_messages),
+            self.ctx.progress_messages)
+        self.assertTrue(
+            any(m.startswith("tag-scan box second:")
+                for m in self.ctx.progress_messages),
+            self.ctx.progress_messages)
+
+    def test_a_successful_read_is_reported_too_not_only_a_failed_one(self):
+        """An absent progress line for a box that read fine would make
+        "nothing to report" and "this pass never got to it" indistinguishable
+        from stdout alone."""
+        self.run_with(catalogue([box_tag("Lantern Work", LANTERN)]))
+
+        second = [m for m in self.ctx.progress_messages
+                  if m.startswith("tag-scan box second:")]
+        self.assertEqual(len(second), 1)
+        self.assertIn("read 1 tag(s)", second[0])
 
 
 class TheBacklogFigure(unittest.TestCase):

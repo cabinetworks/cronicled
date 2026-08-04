@@ -1,7 +1,9 @@
 """The runner drives producers in the background so a long scan cannot block the
 interface, and records what they yield as they yield it."""
+import io
 import os
 import shutil
+import sys
 import tempfile
 import threading
 import unittest
@@ -27,6 +29,9 @@ class _Producer:
             if self._gate is not None:
                 self._gate.wait(5)
             ctx.log("processing item %d" % i)
+            # A separate channel, worded so a test can tell the two apart:
+            # `log` overwrites `state.message` and `progress` never does.
+            ctx.progress("stdout progress %d" % i)
             yield {"folder": "f", "subject_type": "scene", "subject_id": str(i),
                    "summary": "proposal %d" % i, "payload": {"n": i}}
         if self._boom:
@@ -64,13 +69,23 @@ class _StartedInterrupted:
 
 
 class _RunnerCase(unittest.TestCase):
+    """`self.stdout` captures every real `ctx.progress` line a producer under
+    the real runner writes -- redirected here, once, so the ordinary tests in
+    this file that do not care about it stay quiet rather than printing one
+    line per fixture item on every run. Tests that DO care read it back
+    through `self.stdout.getvalue()`; see `ProgressChannel` below."""
+
     def setUp(self):
         self._dir = tempfile.mkdtemp()
         self.store = Store(os.path.join(self._dir, "s.db"))
         self.runner = JobRunner(self.store)
+        self.stdout = io.StringIO()
+        self._stdout_patch = mock.patch("sys.stdout", self.stdout)
+        self._stdout_patch.start()
         self.addCleanup(self._cleanup)
 
     def _cleanup(self):
+        self._stdout_patch.stop()
         self.store.close()
         shutil.rmtree(self._dir, ignore_errors=True)
 
@@ -111,6 +126,100 @@ class RunningAJob(_RunnerCase):
     def test_starting_an_unregistered_producer_raises(self):
         with self.assertRaises(KeyError):
             self.runner.start("nosuchproducer", trigger="manual")
+
+
+class ProgressChannel(_RunnerCase):
+    """`ctx.progress` is the OTHER thing a producer can say -- stdout, for
+    `docker logs`, distinct from `ctx.log`'s single `state.message` field. See
+    `cronicled.jobs`'s own module docstring for why the two must never carry
+    each other's content; `_Producer` above calls both, worded differently,
+    so a test here can tell which channel actually carried which line."""
+
+    def test_progress_reaches_stdout(self):
+        self.runner.register(_Producer(count=3))
+        job = self.runner.start("test-producer", trigger="manual")
+        self.runner.wait(job.id, timeout=5)
+
+        written = self.stdout.getvalue()
+        for i in range(3):
+            self.assertIn("stdout progress %d" % i, written)
+
+    def test_progress_never_reaches_the_jobs_own_message(self):
+        """A per-item line written through `progress` must never overwrite
+        `state.message` -- that field is `log`'s alone. If a future change
+        routed `progress` through the same sink as `log` (or `log` through
+        `progress`), this would be the only thing to notice: the OTHER
+        channel's wording would leak into the field a person actually reads
+        off a finished job."""
+        self.runner.register(_Producer(count=3))
+        job = self.runner.start("test-producer", trigger="manual")
+        self.runner.wait(job.id, timeout=5)
+
+        message = self.runner.job(job.id).message
+        self.assertNotIn("stdout progress", message)
+        self.assertIn("processing item 2", message)
+
+    def test_the_jobs_message_never_reaches_stdout_either(self):
+        """The same guarantee, the other direction: `log`'s wording must not
+        leak onto stdout, or the two channels have quietly become one and
+        `docker logs` would show the flickering status line this ticket
+        exists to keep off it."""
+        self.runner.register(_Producer(count=3))
+        job = self.runner.start("test-producer", trigger="manual")
+        self.runner.wait(job.id, timeout=5)
+
+        self.assertNotIn("processing item", self.stdout.getvalue())
+
+
+class DefaultProgressSink(unittest.TestCase):
+    """The real `progress` sink production uses -- `cronicled.jobs._write_progress`
+    -- tested on its own, against a fake stream that only reveals what a
+    reader would see once something is actually flushed to it.
+
+    The running container sets `PYTHONUNBUFFERED`, which is what genuinely
+    keeps a plain `print` from sitting in Python's own block buffer -- but
+    that is an environment variable, not a property of this function, and a
+    change that stopped flushing explicitly would pass every test that only
+    checks a line's TEXT while making `docker logs` go silent again. This is
+    the test that would catch that change regardless of what the environment
+    happens to be."""
+
+    class _BlockBufferedStream:
+        """A minimal stand-in for a real block-buffered stream: `write`
+        only queues text, and `flush` is the one thing that makes it visible
+        to a reader -- exactly the distinction between "was printed" and
+        "reached `docker logs`" that this module exists to preserve."""
+
+        def __init__(self):
+            self._pending = []
+            self.visible = []
+
+        def write(self, text):
+            self._pending.append(text)
+
+        def flush(self):
+            self.visible.extend(self._pending)
+            self._pending = []
+
+    def test_a_written_line_is_visible_only_once_flushed(self):
+        stream = self._BlockBufferedStream()
+        with mock.patch("sys.stdout", stream):
+            from cronicled import jobs
+            jobs._write_progress("scene 9: chosen with score 1.000")
+
+        self.assertEqual(
+            "".join(stream.visible), "scene 9: chosen with score 1.000\n")
+
+    def test_nothing_reaches_a_reader_before_the_sink_flushes(self):
+        """The sharper half of the same property: text sitting only in
+        `_pending`, never moved across by a `flush` this test never calls,
+        is exactly what an un-flushed `print` would leave behind -- proof
+        that `visible` is truly gated on flushing and not populated by
+        `write` alone."""
+        stream = self._BlockBufferedStream()
+        stream.write("something a reader must not see yet")
+
+        self.assertEqual(stream.visible, [])
 
 
 class Duration(_RunnerCase):
@@ -752,9 +861,15 @@ class TheRunIsClosedBeforeTheWaitReturns(unittest.TestCase):
         self._dir = tempfile.mkdtemp()
         self.store = _StoreWatchingTheRunner(os.path.join(self._dir, "s.db"))
         self.runner = JobRunner(self.store)
+        # `_Producer` also calls `ctx.progress`, which writes to the real
+        # stdout unless something stands in for it; captured and discarded
+        # here since this suite has nothing to say about that channel.
+        self._stdout_patch = mock.patch("sys.stdout", io.StringIO())
+        self._stdout_patch.start()
         self.addCleanup(self._cleanup)
 
     def _cleanup(self):
+        self._stdout_patch.stop()
         self.store.close()
         shutil.rmtree(self._dir, ignore_errors=True)
 
