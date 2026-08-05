@@ -18,6 +18,12 @@
 {% include "_style.html" %}
 {% include "_sidebar.html" %}
 
+{% set return_inbox = return_inbox | default('') %}
+{% set return_state = return_state | default('') %}
+{% set return_page_key = return_page_key | default('page') %}
+{% set return_page = return_page | default(1) %}
+{% set cancel_href = cancel_href | default('/inbox') %}
+
 {% if verdict == "approve" %}
 <h1>Confirm: apply {{ count }} row{% if count != 1 %}s{% endif %}</h1>
 <p>This writes to your library. Approving overwrites any field on these
@@ -43,6 +49,10 @@
   {% endfor %}
   <input type="hidden" name="verdict" value="{{ verdict }}">
   <input type="hidden" name="confirmed" value="1">
+  <input type="hidden" name="return_inbox" value="{{ return_inbox }}">
+  <input type="hidden" name="return_state" value="{{ return_state }}">
+  <input type="hidden" name="return_page_key" value="{{ return_page_key }}">
+  <input type="hidden" name="return_page" value="{{ return_page }}">
   <button>Confirm</button>
 </form>
-<p><a href="/inbox">Cancel -- back to the inbox</a></p>
+<p><a href="{{ cancel_href }}">Cancel -- back to the inbox</a></p>

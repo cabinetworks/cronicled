@@ -67,7 +67,28 @@
    an empty href, which looks like a link and goes to the page itself. #}
 {% macro identifier(text, url) %}{% if url %}<a href="{{ url }}" target="_blank" rel="noopener noreferrer">{{ text }}</a>{% else %}{{ text }}{% endif %}{% endmacro %}
 
-{% macro proposal_block(row, highlight=False) %}
+{# The one place a write's own form says where it was shown, so `do_POST`
+   can rebuild a validated redirect back to that same page (ticket: acting
+   on a row must return the reviewer to the page they acted on, never to
+   the combined inbox regardless of which per-inbox page or section a row
+   was shown in). `return_inbox`/`return_state` name a KNOWN page --
+   checked against `INBOXES`/`_INBOX_STATES` again on the way back in,
+   never trusted as a path -- and `return_page_key`/`return_page` are a
+   pagination key this app already knows (`_ALL_PAGE_KEYS`) and a bounded
+   page number, so a write from row 3 of page 7 returns to page 7, not
+   page 1.
+
+   Rendered as NOTHING at all -- not even empty-valued hidden inputs --
+   when `return_inbox` is empty and `return_page` is 1 (the ordinary,
+   pre-this-ticket case: the combined inbox, page one of whichever section
+   a row lives in). `do_POST` reads a missing field exactly like an empty
+   one, so this omission changes no behaviour; it exists so a form's shape
+   is untouched by this feature whenever there is nothing new to say,
+   which is what keeps every pre-existing "this form offers exactly these
+   controls" test still true. #}
+{% macro return_fields(return_inbox, return_state, return_page_key, return_page) %}{% if return_inbox or return_page != 1 %}<input type="hidden" name="return_inbox" value="{{ return_inbox }}"><input type="hidden" name="return_state" value="{{ return_state }}"><input type="hidden" name="return_page_key" value="{{ return_page_key }}"><input type="hidden" name="return_page" value="{{ return_page }}">{% endif %}{% endmacro %}
+
+{% macro proposal_block(row, highlight=False, return_inbox='', return_state='', return_page_key='page', return_page=1) %}
 <div class="proposal{% if highlight %} just-applied{% endif %}">
   <div class="head">
     <div class="what">
@@ -82,11 +103,11 @@
     <div class="score">{{ row.score_text }}</div>
     <div class="acts">
       {% if row.undoable %}
-      <form method="post" action="/undo"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Undo</button></form>
+      <form method="post" action="/undo"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Undo</button></form>
       {% elif row.actionable %}
-      <form method="post" action="/approve"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>{% if row.error %}Try again{% else %}Approve{% endif %}</button></form>
-      <form method="post" action="/dismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Dismiss</button></form>
-      <form method="post" action="/mute"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Mute</button></form>
+      <form method="post" action="/approve"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>{% if row.error %}Try again{% else %}Approve{% endif %}</button></form>
+      <form method="post" action="/dismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Dismiss</button></form>
+      <form method="post" action="/mute"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Mute</button></form>
       {% endif %}
       {# Offered on every row here, whatever its own state: staleness is a
          property of WHEN a proposal was made, which nothing here can detect
@@ -95,7 +116,7 @@
          are -- an applied row with no snapshot, which otherwise offers no
          control at all, still needs a way off the block it would otherwise
          leave forever. #}
-      <form method="post" action="/refresh"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Refresh</button></form>
+      <form method="post" action="/refresh"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Refresh</button></form>
     </div>
   </div>
   {% if row.error %}
@@ -128,7 +149,7 @@
    version would be asking them to approve a write to a field whose previous
    contents they cannot see. Both are rendered with the same type and the
    same width for the same reason. #}
-{% macro description_block(row, highlight=False) %}
+{% macro description_block(row, highlight=False, return_inbox='', return_state='', return_page_key='page', return_page=1) %}
 <div class="proposal{% if highlight %} just-applied{% endif %}">
   <div class="head">
     <div class="what">
@@ -138,13 +159,13 @@
     </div>
     <div class="acts">
       {% if row.undoable %}
-      <form method="post" action="/undo"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Undo</button></form>
+      <form method="post" action="/undo"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Undo</button></form>
       {% elif row.actionable %}
-      <form method="post" action="/approve"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>{% if row.error %}Try again{% else %}Approve{% endif %}</button></form>
-      <form method="post" action="/dismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Dismiss</button></form>
-      <form method="post" action="/mute"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Mute</button></form>
+      <form method="post" action="/approve"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>{% if row.error %}Try again{% else %}Approve{% endif %}</button></form>
+      <form method="post" action="/dismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Dismiss</button></form>
+      <form method="post" action="/mute"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Mute</button></form>
       {% endif %}
-      <form method="post" action="/refresh"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Refresh</button></form>
+      <form method="post" action="/refresh"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Refresh</button></form>
     </div>
   </div>
   {% if row.error %}
@@ -170,7 +191,7 @@
    than skipped, so it is visible that this fills a blank instead of replacing
    something -- and so the refusal that follows a tag described in the
    meantime reads as the guard it is. #}
-{% macro tag_description_block(row, highlight=False) %}
+{% macro tag_description_block(row, highlight=False, return_inbox='', return_state='', return_page_key='page', return_page=1) %}
 <div class="proposal{% if highlight %} just-applied{% endif %}">
   <div class="head">
     <div class="what">
@@ -180,13 +201,13 @@
     </div>
     <div class="acts">
       {% if row.undoable %}
-      <form method="post" action="/undo"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Undo</button></form>
+      <form method="post" action="/undo"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Undo</button></form>
       {% elif row.actionable %}
-      <form method="post" action="/approve"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>{% if row.error %}Try again{% else %}Approve{% endif %}</button></form>
-      <form method="post" action="/dismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Dismiss</button></form>
-      <form method="post" action="/mute"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Mute</button></form>
+      <form method="post" action="/approve"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>{% if row.error %}Try again{% else %}Approve{% endif %}</button></form>
+      <form method="post" action="/dismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Dismiss</button></form>
+      <form method="post" action="/mute"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Mute</button></form>
       {% endif %}
-      <form method="post" action="/refresh"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Refresh</button></form>
+      <form method="post" action="/refresh"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Refresh</button></form>
     </div>
   </div>
   {% if row.error %}
@@ -199,7 +220,7 @@
 </div>
 {% endmacro %}
 
-{% macro row_block(row, highlight=False) %}{% if row.kind == 'performer-description' %}{{ description_block(row, highlight) }}{% elif row.kind == 'tag-description' %}{{ tag_description_block(row, highlight) }}{% else %}{{ proposal_block(row, highlight) }}{% endif %}{% endmacro %}
+{% macro row_block(row, highlight=False, return_inbox='', return_state='', return_page_key='page', return_page=1) %}{% if row.kind == 'performer-description' %}{{ description_block(row, highlight, return_inbox, return_state, return_page_key, return_page) }}{% elif row.kind == 'tag-description' %}{{ tag_description_block(row, highlight, return_inbox, return_state, return_page_key, return_page) }}{% else %}{{ proposal_block(row, highlight, return_inbox, return_state, return_page_key, return_page) }}{% endif %}{% endmacro %}
 
 {# The compact identifying line these two closed sections show for a row.
    Branched on `row.kind` for the same reason `row_block` is: a description
@@ -233,7 +254,7 @@
    would leave a person hunting for the Undo that is not there. There is no
    Undo control anywhere in this macro, and `MergeRow` carries no `undoable`
    field for one to read. #}
-{% macro merge_block(row) %}
+{% macro merge_block(row, return_inbox='', return_state='', return_page_key='merges_page', return_page=1) %}
 <div class="proposal">
   <div class="head">
     <div class="what">
@@ -254,17 +275,17 @@
     <div class="score">{{ row.total_scenes }}<div class="note">{{ row.counts_cover }}</div></div>
     <div class="acts">
       {% if row.appliable %}
-      <form method="post" action="/approve"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Merge</button></form>
+      <form method="post" action="/approve"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Merge</button></form>
       {% endif %}
       {% if row.actionable %}
-      <form method="post" action="/dismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Dismiss</button></form>
-      <form method="post" action="/mute"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Mute</button></form>
+      <form method="post" action="/dismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Dismiss</button></form>
+      <form method="post" action="/mute"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Mute</button></form>
       {% endif %}
       {% if row.undismissable %}
-      <form method="post" action="/undismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Undismiss</button></form>
+      <form method="post" action="/undismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Undismiss</button></form>
       {% endif %}
       {% if row.unmutable %}
-      <form method="post" action="/unmute"><input type="hidden" name="subject_type" value="{{ row.subject_type }}"><input type="hidden" name="subject_id" value="{{ row.subject_id }}"><button>Unmute</button></form>
+      <form method="post" action="/unmute"><input type="hidden" name="subject_type" value="{{ row.subject_type }}"><input type="hidden" name="subject_id" value="{{ row.subject_id }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Unmute</button></form>
       {% endif %}
     </div>
   </div>
@@ -304,7 +325,7 @@
    as well as an applied one: a run that stopped partway really did change the
    scenes it reached, and the snapshot behind that button is the only record of
    which. When it is offered, Approve is not -- see `web.rows.ReconcileRow`. #}
-{% macro reconcile_block(row) %}
+{% macro reconcile_block(row, return_inbox='', return_state='', return_page_key='reconciles_page', return_page=1) %}
 <div class="proposal">
   <div class="head">
     <div class="what">
@@ -328,20 +349,20 @@
     <div class="score">{{ row.total_scenes }}<div class="note">{{ row.counts_cover }}</div></div>
     <div class="acts">
       {% if row.undoable %}
-      <form method="post" action="/undo"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Undo</button></form>
+      <form method="post" action="/undo"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Undo</button></form>
       {% endif %}
       {% if row.appliable %}
-      <form method="post" action="/approve"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>{% if row.error %}Try again{% else %}Reconcile{% endif %}</button></form>
+      <form method="post" action="/approve"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>{% if row.error %}Try again{% else %}Reconcile{% endif %}</button></form>
       {% endif %}
       {% if row.actionable %}
-      <form method="post" action="/dismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Dismiss</button></form>
-      <form method="post" action="/mute"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Mute</button></form>
+      <form method="post" action="/dismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Dismiss</button></form>
+      <form method="post" action="/mute"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Mute</button></form>
       {% endif %}
       {% if row.undismissable %}
-      <form method="post" action="/undismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Undismiss</button></form>
+      <form method="post" action="/undismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Undismiss</button></form>
       {% endif %}
       {% if row.unmutable %}
-      <form method="post" action="/unmute"><input type="hidden" name="subject_type" value="{{ row.subject_type }}"><input type="hidden" name="subject_id" value="{{ row.subject_id }}"><button>Unmute</button></form>
+      <form method="post" action="/unmute"><input type="hidden" name="subject_type" value="{{ row.subject_type }}"><input type="hidden" name="subject_id" value="{{ row.subject_id }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Unmute</button></form>
       {% endif %}
     </div>
   </div>
@@ -377,7 +398,7 @@
 
    No Undo control anywhere in this macro, and `UnusedTagRow` carries no
    `undoable` field for one to read: a deletion cannot be taken back. #}
-{% macro unused_block(row) %}
+{% macro unused_block(row, return_inbox='', return_state='', return_page_key='unused_page', return_page=1) %}
 <div class="proposal">
   <div class="head">
     <div class="what">
@@ -387,17 +408,17 @@
     <div class="score">{{ row.scene_count }}<div class="note">{{ row.counts_cover }}</div></div>
     <div class="acts">
       {% if row.appliable %}
-      <form method="post" action="/approve"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>{% if row.error %}Try again{% else %}Delete{% endif %}</button></form>
+      <form method="post" action="/approve"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>{% if row.error %}Try again{% else %}Delete{% endif %}</button></form>
       {% endif %}
       {% if row.actionable %}
-      <form method="post" action="/dismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Not now</button></form>
-      <form method="post" action="/mute"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Keep</button></form>
+      <form method="post" action="/dismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Not now</button></form>
+      <form method="post" action="/mute"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Keep</button></form>
       {% endif %}
       {% if row.undismissable %}
-      <form method="post" action="/undismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Undismiss</button></form>
+      <form method="post" action="/undismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Undismiss</button></form>
       {% endif %}
       {% if row.unmutable %}
-      <form method="post" action="/unmute"><input type="hidden" name="subject_type" value="{{ row.subject_type }}"><input type="hidden" name="subject_id" value="{{ row.subject_id }}"><button>Stop keeping</button></form>
+      <form method="post" action="/unmute"><input type="hidden" name="subject_type" value="{{ row.subject_type }}"><input type="hidden" name="subject_id" value="{{ row.subject_id }}">{{ return_fields(return_inbox, return_state, return_page_key, return_page) }}<button>Stop keeping</button></form>
       {% endif %}
     </div>
   </div>
@@ -411,12 +432,12 @@
 {# One group, one summary line, expandable -- the whole shape this section
    exists for. The summary carries the label and the count and NOTHING a person
    can press. #}
-{% macro unused_group_block(group) %}
+{% macro unused_group_block(group, return_inbox='', return_state='', return_page_key='unused_page', return_page=1) %}
 <details class="group">
   <summary>{{ group.label }} ({{ group.count }})</summary>
   <p class="note">{{ group.note }}</p>
   {% for row in group.rows %}
-  {{ unused_block(row) }}
+  {{ unused_block(row, return_inbox, return_state, return_page_key, return_page) }}
   {% endfor %}
 </details>
 {% endmacro %}
@@ -481,6 +502,35 @@
    whenever the fingerprint does not actually match a current row, and the
    banner below renders nothing in that case. #}
 {% set just_applied_rows = (applied | selectattr("fingerprint", "equalto", just_applied) | list) if just_applied else [] %}
+{# `just_applied_row` is `_inbox_page`'s own fallback (see web/app.py): a
+   per-inbox WORKING-QUEUE page never fetches an `applied` bucket at all
+   (a decision already made does not belong on that list), so the row
+   `?applied=` names can never be found by searching `applied` there --
+   `just_applied_rows` above would always be empty on that page, which is
+   exactly the "a parameter that arrives and is ignored" trap. `_inbox_page`
+   does its own bounded, by-fingerprint read instead and hands the ONE row
+   it found (or `None`) here. The combined inbox never passes this --
+   `just_applied_rows`, found inside the real `applied` section, is enough
+   there, exactly as before this ticket. #}
+{% set just_applied_row = just_applied_row | default(None) %}
+{% set just_applied_render = just_applied_rows[0] if just_applied_rows else just_applied_row %}
+{# The page this render is FOR, in the terms `do_POST` can validate on the
+   way back in -- `return_inbox` against `INBOXES`, `return_state` against
+   `_INBOX_STATES`. Empty means the combined inbox, exactly as every write
+   already behaved before this ticket. See `return_fields` for how these
+   reach a row's own form, and `return_pages` below for the per-SECTION
+   page number that travels alongside them. #}
+{% set return_inbox = return_inbox | default('') %}
+{% set return_state = return_state | default('') %}
+{% set return_pages = return_pages | default({
+    'rows': {'key': 'page', 'page': 1},
+    'applied': {'key': 'applied_page', 'page': 1},
+    'dismissed': {'key': 'dismissed_page', 'page': 1},
+    'muted': {'key': 'muted_page', 'page': 1},
+    'merges': {'key': 'merges_page', 'page': 1},
+    'reconciles': {'key': 'reconciles_page', 'page': 1},
+    'unused': {'key': 'unused_page', 'page': 1},
+}) %}
 
 {# Ticket: the Applied section is collapsed like every other one and NOTHING
    here forces it open -- an approve used to spring it open on every single
@@ -492,9 +542,9 @@
    scene proposal, a performer-description or a tag-description proposal
    (see `cronicled.web.rows.to_rows`), and only `row_block`'s own dispatch on
    `row.kind` knows which fields each one actually has. #}
-{% if just_applied_rows %}
+{% if just_applied_render %}
 <p class="note">Just applied:</p>
-{{ row_block(just_applied_rows[0], highlight=True) }}
+{{ row_block(just_applied_render, highlight=True, return_inbox=return_inbox, return_state=return_state, return_page_key=return_pages.applied.key, return_page=return_pages.applied.page) }}
 {% endif %}
 
 {# The two counts `/bulk_apply_tag_descriptions` redirected here with (see
@@ -574,6 +624,7 @@
   {% for row in bulk_tag_rows %}
   <input type="hidden" name="fp" value="{{ row.fingerprint }}">
   {% endfor %}
+  {{ return_fields(return_inbox, return_state, return_pages.rows.key, return_pages.rows.page) }}
   <button>Apply all {{ bulk_tag_rows | length }}</button></p>
 </form>
 {% endif %}
@@ -597,6 +648,7 @@
    `_BATCH_CONFIRM_VERDICTS`). #}
 {% if rows %}
 <form id="batch-form" method="post" action="/batch">
+  {{ return_fields(return_inbox, return_state, return_pages.rows.key, return_pages.rows.page) }}
   <div class="batch-bar">
     <span class="note">Apply to every row ticked below (this page only):</span>
     <button name="verdict" value="approve">Approve ticked</button>
@@ -610,7 +662,7 @@
 {% for row in rows %}
 <div class="row-wrap">
   <label class="pick"><input type="checkbox" name="fp" value="{{ row.fingerprint }}" form="batch-form"><span class="visually-hidden">select this row</span></label>
-  {{ row_block(row) }}
+  {{ row_block(row, return_inbox=return_inbox, return_state=return_state, return_page_key=return_pages.rows.key, return_page=return_pages.rows.page) }}
 </div>
 {% endfor %}
 {{ pager_nav(pagination.rows) }}
@@ -629,6 +681,7 @@
   {% for row in rows %}
   <input type="hidden" name="fp" value="{{ row.fingerprint }}">
   {% endfor %}
+  {{ return_fields(return_inbox, return_state, return_pages.rows.key, return_pages.rows.page) }}
   <p class="note">Or apply to all {{ rows | length }} rows on this page, ticked or not:
   <button name="verdict" value="approve">Approve all {{ rows | length }} on this page</button>
   <button name="verdict" value="dismiss">Dismiss all {{ rows | length }} on this page</button>
@@ -656,7 +709,7 @@
 {% call section("Tag merges", merges, "No duplicate tag spellings found.",
                 pager=pagination.merges) %}
   {% for row in merges %}
-  {{ merge_block(row) }}
+  {{ merge_block(row, return_inbox=return_inbox, return_state=return_state, return_page_key=return_pages.merges.key, return_page=return_pages.merges.page) }}
   {% endfor %}
 {% endcall %}
 {% endif %}
@@ -666,7 +719,7 @@
 {% call section("Tags that are a performer", reconciles, "No tag matches a performer's name.",
                 pager=pagination.reconciles) %}
   {% for row in reconciles %}
-  {{ reconcile_block(row) }}
+  {{ reconcile_block(row, return_inbox=return_inbox, return_state=return_state, return_page_key=return_pages.reconciles.key, return_page=return_pages.reconciles.page) }}
   {% endfor %}
 {% endcall %}
 {% endif %}
@@ -687,7 +740,7 @@
   <p class="note">{{ low_count_is_not_proof }}</p>
   {% endif %}
   {% for group in unused %}
-  {{ unused_group_block(group) }}
+  {{ unused_group_block(group, return_inbox=return_inbox, return_state=return_state, return_page_key=return_pages.unused.key, return_page=return_pages.unused.page) }}
   {% endfor %}
 {% endcall %}
 {% endif %}
@@ -707,7 +760,7 @@
    page. #}
 {% call section("Applied", applied, "Nothing applied yet.", pager=pagination.applied) %}
   {% for row in applied %}
-  {{ row_block(row, highlight=(row.fingerprint == just_applied)) }}
+  {{ row_block(row, highlight=(row.fingerprint == just_applied), return_inbox=return_inbox, return_state=return_state, return_page_key=return_pages.applied.key, return_page=return_pages.applied.page) }}
   {% endfor %}
 {% endcall %}
 
@@ -739,7 +792,7 @@
       </div>
       {% if m.row %}{{ compact_score(m.row) }}{% endif %}
       <div class="acts">
-        <form method="post" action="/unmute"><input type="hidden" name="subject_type" value="{{ m.subject_type }}"><input type="hidden" name="subject_id" value="{{ m.subject_id }}"><button>Unmute</button></form>
+        <form method="post" action="/unmute"><input type="hidden" name="subject_type" value="{{ m.subject_type }}"><input type="hidden" name="subject_id" value="{{ m.subject_id }}">{{ return_fields(return_inbox, return_state, return_pages.muted.key, return_pages.muted.page) }}<button>Unmute</button></form>
       </div>
     </div>
   </div>
@@ -756,7 +809,7 @@
 {{ compact_identity(row) }}      </div>
       {{ compact_score(row) }}
       <div class="acts">
-        <form method="post" action="/undismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Undismiss</button></form>
+        <form method="post" action="/undismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}">{{ return_fields(return_inbox, return_state, return_pages.dismissed.key, return_pages.dismissed.page) }}<button>Undismiss</button></form>
       </div>
     </div>
   </div>
