@@ -37,6 +37,7 @@ from datetime import datetime, time, timedelta, timezone, tzinfo
 from typing import Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .config import ZONE_ENV_VAR
 from .jobs import JobRejected
 
 # What a schedule override may say. Anything else is a typo — see `resolve`.
@@ -220,6 +221,85 @@ def check_zone(value, source):
     return _check_zone(value, f"configured for this deployment ({source})")
 
 
+# The window `_zones_agree` sweeps when two zone spellings are not the same
+# string and it has to decide whether they are nonetheless the same zone.
+# Reused rather than invented: `_DAYS_BACK`/`_DAYS_FORWARD` above already
+# treat 1970-2040 as this project's "real world" span for a zone's own
+# transitions, so a second window here would be a second number to defend
+# for no reason — one zone's transitions are the same data this reads.
+_ZONE_AGREEMENT_FROM = datetime(1970, 1, 1)
+_ZONE_AGREEMENT_TO = datetime(2040, 1, 1)
+
+
+def _zones_agree(a, b):
+    """Whether two zone specifications are THE SAME ZONE, as opposed to two
+    spellings of it, or two different zones that merely share an offset
+    today.
+
+    This is the equivalence `resolve` needs for an override's `zone`: an
+    operator who writes "Etc/UTC" where the deployment is configured
+    "UTC", or a retired alias `zoneinfo` still resolves next to the name that
+    replaced it, has not created a second zone. Refusing that as a
+    disagreement would be the same mistake this project has already made and
+    fixed twice — two stash-boxes recognising one file, two config entries
+    naming one job — arriving a third time as two spellings naming one zone.
+
+    Comparing the written strings, or the two `tzinfo` objects by identity,
+    both fail this: neither survives a rename tzdata makes upstream, and
+    identity fails even the same name resolved twice (`ZoneInfo` caches, but
+    nothing here may assume it always will). Comparing behaviour is the only
+    comparison that cannot be fooled by spelling, because behaviour — the
+    UTC offset a stated wall-clock time resolves to — is the ONLY thing an
+    appointment or a rendered timestamp can ever observe a zone doing. Two
+    zones that agree everywhere they could be asked cannot disagree in a way
+    this project's schedule or its page would ever see.
+
+    So: sampled daily, wall-clock midnight, from `_ZONE_AGREEMENT_FROM` to
+    `_ZONE_AGREEMENT_TO`. Daily rather than by the second: every transition
+    this module's own tests rely on (`AZoneThatGoesBackJustAfterMidnight` and
+    its neighbours) changes an offset for a season, never for under a day, so
+    a coarser sample would still cross every transition and a finer one would
+    only add cost for nothing observable. A cheap fast path covers the two
+    common cases first — the identical object a producer's own declared zone
+    always is, and the identical string two independent config reads of the
+    same name produce — so the sweep below only runs for a spelling that
+    genuinely differs, which is the rare case it exists for.
+
+    Not exhaustive over every zone `zoneinfo` knows, and not proof: a rule
+    change dated after 2040, or one before 1970, is invisible to this. That
+    residual is the same one `_DAYS_BACK`/`_DAYS_FORWARD` above already
+    accept for the same window, for the same reason — political law is not
+    knowable indefinitely far from now, in either direction.
+    """
+    if a is b or str(a) == str(b):
+        return True
+    moment = _ZONE_AGREEMENT_FROM
+    step = timedelta(days=1)
+    while moment < _ZONE_AGREEMENT_TO:
+        if (moment.replace(tzinfo=a).utcoffset()
+                != moment.replace(tzinfo=b).utcoffset()):
+            return False
+        moment += step
+    return True
+
+
+def _zone_label(zone):
+    """The name to show an OPERATOR for a zone, as opposed to what `repr`
+    shows a developer.
+
+    `repr(ZoneInfo("UTC"))` is `"zoneinfo.ZoneInfo(key='UTC')"` -- accurate,
+    and useless in a refusal an operator has to act on: it is not a value
+    that can be typed back into `$CRONICLED_ZONE` or a schedule override, and
+    it looks like a stack trace rather than an instruction. `str()` is what
+    an operator would actually write: a `ZoneInfo`'s key ("UTC",
+    "America/New_York"), or a fixed offset's own readable form
+    ("UTC+01:00"). Same family as an id leaking into text written for a
+    person to read, elsewhere in this project -- the fix is the same,
+    show the name, not the object.
+    """
+    return str(zone)
+
+
 def _check_interval(value):
     """The loop's wait between ticks: a number of seconds, never negative.
 
@@ -243,7 +323,8 @@ def _check_interval(value):
     return value
 
 
-def resolve(producers, overrides=None):
+def resolve(producers, overrides=None, *, deployment_zone=None,
+           deployment_zone_is_default=False):
     """Work out each producer's schedule, as `{name: Entry}`.
 
     A producer declares its own cadence as `every` (seconds). An override,
@@ -256,6 +337,25 @@ def resolve(producers, overrides=None):
     forms exist because both are right for something: an interval for a pass
     that should run every few minutes, a stated time for a nightly one, which
     on an interval drifts to whichever hour the process last restarted at.
+
+    `deployment_zone`, when given, is the one zone this whole deployment is
+    configured for (`cronicled.config.load_zone`, validated by `check_zone`).
+    Passing it makes an override's own `zone` key answerable to it: see the
+    refusal below for what disagreeing means and `_zones_agree` for what
+    agreeing means. Omit it (the default) for a `resolve()` call with no such
+    notion — every test in this module that exercises a schedule with no
+    surrounding deployment does, and none of them is asserting anything about
+    this rule.
+
+    `deployment_zone_is_default` says whether `deployment_zone` is a setting
+    an operator actually wrote, or the value this deployment falls back to
+    because nobody set one (`cronicled.config.DEFAULT_ZONE`). It changes
+    nothing about whether the refusal below fires — a default is a real zone
+    and an override can disagree with it exactly as it can with a chosen one
+    — but it changes what the refusal recommends: an override naming a zone
+    on purpose, next to a deployment that has not chosen one at all, is
+    evidence about which side is wrong. See the refusal for what it does with
+    that evidence.
 
     **An override naming both `every` and `at` is refused.** It is a
     contradiction, not a preference to resolve by precedence, and it belongs
@@ -314,6 +414,32 @@ def resolve(producers, overrides=None):
     - **An `enabled` that is not a boolean.** The string `"false"` is true.
     - **Two producers claiming one name**, which would silently drop one
       schedule.
+    - **A zone — from either source — that disagrees with `deployment_zone`,
+      when one is given.** `cronicled.__main__.build_scheduler` states the
+      reason: `zone` is read once, for the hour every unattended pass keeps
+      AND the hour the page shows every timestamp in, and a second place
+      naming a different one is the disagreement that setting exists to rule
+      out — reachable here because an override's own `zone` key is exactly
+      that second place, through ordinary configuration rather than any
+      misuse. "Disagrees" is decided by `_zones_agree`, not by comparing the
+      written string: two spellings of one zone are agreement, and refusing
+      those would repeat a mistake this project has already made and fixed
+      twice elsewhere (see `_zones_agree`'s own docstring). A producer's own
+      declared zone is never the disagreeing side in practice — it is the
+      very object `deployment_zone` names, handed down rather than reread —
+      so this bites only an override that names its own, different, zone.
+
+      The refusal names all three ways out, because the operator reading it
+      wrote the override deliberately and the message must not assume the
+      override is the mistake: set the deployment's own zone setting to what
+      the override already names, drop the override's `zone` to read the
+      deployment's, or change the override's `zone` to match it. When
+      `deployment_zone_is_default` is true, a fourth sentence says which of
+      those three is likely wanted — the deployment's zone was never chosen,
+      so the override's own zone is the more probable truth, and the fix
+      that has not been offered by the other two remedies (both of which
+      move the producer to the unset default) is the one worth naming
+      first.
     """
     overrides = {} if overrides is None else dict(overrides)
 
@@ -401,6 +527,35 @@ def resolve(producers, overrides=None):
                 )
             zone = _check_zone(timing["zone"],
                                f"for producer {name!r} ({source})")
+            if (deployment_zone is not None
+                    and not _zones_agree(zone, deployment_zone)):
+                deployment_label = _zone_label(deployment_zone)
+                remedies = (
+                    f"Three ways to resolve it: set ${ZONE_ENV_VAR} to "
+                    f"{timing['zone']!r} so the deployment reads the zone "
+                    "this override already does; drop 'zone' from this "
+                    "override so it reads the deployment's zone instead; "
+                    "or change this override's 'zone' to name the "
+                    f"deployment's ({deployment_label})."
+                )
+                if deployment_zone_is_default:
+                    remedies += (
+                        f" This deployment has not set ${ZONE_ENV_VAR} — "
+                        f"{deployment_label} above is the unset default, not "
+                        "a choice made on purpose, so the first of those "
+                        "three is the one most likely wanted."
+                    )
+                raise ValueError(
+                    f"the schedule for producer {name!r} ({source}) reads "
+                    f"its stated time in {timing['zone']!r}, which is a "
+                    f"different zone from the one this deployment is "
+                    f"configured for ({deployment_label}). One zone is read "
+                    "for two things — the hour every unattended pass keeps, "
+                    "and the hour the page shows every timestamp in — "
+                    "precisely so the two cannot say different things about "
+                    "the same appointment; a second place naming a "
+                    f"different zone reopens exactly that. {remedies}"
+                )
         elif "zone" in timing:
             raise ValueError(
                 f"the schedule for producer {name!r} ({source}) names a zone "
@@ -853,9 +1008,15 @@ class Scheduler:
     The schedule is resolved once, in the constructor, from the producers the
     runner has registered. Everything `resolve` refuses is refused there — a
     producer nothing schedules, an override naming both a cadence and a stated
-    time, a stated time with no zone or a zone this system does not know — at
-    start-up, where an operator reads it as a stack trace, rather than at 3am as
-    a producer that quietly never ran or ran in the wrong hour.
+    time, a stated time with no zone or a zone this system does not know, an
+    override's zone that disagrees with `deployment_zone` — at start-up, where
+    an operator reads it as a stack trace, rather than at 3am as a producer
+    that quietly never ran or ran in the wrong hour.
+
+    `deployment_zone` and `deployment_zone_is_default`, passed straight
+    through to `resolve`, are the ONE zone this deployment is configured for
+    and whether that is a setting or the fallback nobody chose (see
+    `resolve`'s own docstring for what passing them does).
 
     The consequence is that **a producer registered after the scheduler was
     built is not in the schedule**, so `start()` refuses to run a loop while
@@ -876,11 +1037,14 @@ class Scheduler:
     """
 
     def __init__(self, runner, store, *, overrides=None, clock=None,
-                 interval=DEFAULT_INTERVAL):
+                 interval=DEFAULT_INTERVAL, deployment_zone=None,
+                 deployment_zone_is_default=False):
         self._runner = runner
         self._store = store
         self._clock = _utcnow if clock is None else clock
-        self._entries = resolve(runner.producers(), overrides)
+        self._entries = resolve(
+            runner.producers(), overrides, deployment_zone=deployment_zone,
+            deployment_zone_is_default=deployment_zone_is_default)
         self._interval = _check_interval(interval)
 
         # Held for the whole of a tick, so two ticks cannot run at once. See

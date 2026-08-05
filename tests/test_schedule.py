@@ -2270,6 +2270,208 @@ class TheOneZoneSetting(unittest.TestCase):
                          "2026-07-27T07:00:00+00:00")
 
 
+class ZonesAgree(unittest.TestCase):
+    """`schedule._zones_agree`: whether two zone specifications are the same
+    zone, decided by what they DO rather than by the string that names them.
+    """
+
+    def test_the_same_object_agrees_with_itself(self):
+        self.assertTrue(schedule._zones_agree(ZONE, ZONE))
+
+    def test_the_same_name_read_twice_agrees(self):
+        self.assertTrue(
+            schedule._zones_agree(ZoneInfo(ZONE_NAME), ZoneInfo(ZONE_NAME)))
+
+    def test_a_retired_alias_agrees_with_the_name_that_replaced_it(self):
+        # Same zone, two spellings -- exactly the case that must NOT become a
+        # refusal. "UTC" and "Etc/UTC" are two names for one entry in the
+        # IANA database.
+        self.assertTrue(
+            schedule._zones_agree(ZoneInfo("UTC"), ZoneInfo("Etc/UTC")))
+
+    def test_two_unrelated_zones_disagree(self):
+        self.assertFalse(schedule._zones_agree(ZONE, OTHER_ZONE))
+
+    def test_sharing_todays_offset_is_not_agreement(self):
+        # New York and Santiago read the same offset in July -- one on
+        # daylight saving, the other on standard time, from opposite
+        # hemispheres -- and a rule that stopped at "today" would call them
+        # the same zone. They part ways every January.
+        new_york = ZoneInfo("America/New_York")
+        santiago = ZoneInfo("America/Santiago")
+        july = datetime(2026, 7, 26, 12, 0, 0)
+        self.assertEqual(july.replace(tzinfo=new_york).utcoffset(),
+                         july.replace(tzinfo=santiago).utcoffset())
+        self.assertFalse(schedule._zones_agree(new_york, santiago))
+
+    def test_agreeing_at_the_start_of_the_window_is_not_agreement_either(self):
+        # The mirror image of the test above, and the one that pins the
+        # SWEEP rather than any single sample: Kathmandu kept Kolkata's own
+        # offset (+05:30) until 1986, then moved permanently to +05:45. A
+        # comparison that stopped at the first sample -- or anywhere before
+        # 1986 -- would call these the same zone; they have not been for
+        # decades of the window this function actually covers.
+        kolkata = ZoneInfo("Asia/Kolkata")
+        kathmandu = ZoneInfo("Asia/Kathmandu")
+        start = datetime(1970, 1, 1)
+        self.assertEqual(start.replace(tzinfo=kolkata).utcoffset(),
+                         start.replace(tzinfo=kathmandu).utcoffset())
+        self.assertFalse(schedule._zones_agree(kolkata, kathmandu))
+
+    def test_a_fixed_offset_agrees_only_with_an_identical_fixed_offset(self):
+        one = timezone(timedelta(hours=2))
+        other = timezone(timedelta(hours=2))
+        self.assertTrue(schedule._zones_agree(one, other))
+        self.assertFalse(
+            schedule._zones_agree(one, timezone(timedelta(hours=3))))
+
+
+class AnOverrideMayNotSecondGuessTheDeploymentsZone(unittest.TestCase):
+    """`resolve`'s `deployment_zone` parameter closes the hole
+    `cronicled.__main__.build_scheduler`'s docstring names: an override's own
+    `zone` key is a second place deciding the zone, reachable through
+    ordinary configuration -- a schedule override naming a zone per entry,
+    with no deployment-wide zone setting of its own, keeps its appointments
+    in that zone while the page (reading the deployment's) renders every
+    timestamp hours away, with nothing said.
+    """
+
+    def test_omitting_deployment_zone_leaves_every_existing_behaviour_alone(self):
+        # The default. Every OTHER test in this file calls `resolve` this
+        # way, and none of them is exercising this rule.
+        entries = resolve(
+            [FakeProducer("nightly")],
+            {"nightly": {"at": "03:00", "zone": OTHER_ZONE_NAME}})
+        self.assertEqual(entries["nightly"].zone, OTHER_ZONE)
+
+    def test_an_override_naming_a_genuinely_different_zone_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "different zone"):
+            resolve(
+                [FakeProducer("nightly")],
+                {"nightly": {"at": "03:00", "zone": OTHER_ZONE_NAME}},
+                deployment_zone=ZONE)
+
+    def test_the_refusal_names_the_producer_and_both_zones(self):
+        with self.assertRaisesRegex(
+                ValueError,
+                r"nightly.*%s.*%s" % (OTHER_ZONE_NAME, ZONE_NAME)):
+            resolve(
+                [FakeProducer("nightly")],
+                {"nightly": {"at": "03:00", "zone": OTHER_ZONE_NAME}},
+                deployment_zone=ZONE)
+
+    def test_an_override_naming_the_deployments_own_zone_still_works(self):
+        # Agreement, and it must not become a start-up failure.
+        entries = resolve(
+            [FakeProducer("nightly")],
+            {"nightly": {"at": "03:00", "zone": ZONE_NAME}},
+            deployment_zone=ZONE)
+        self.assertEqual(entries["nightly"].zone, ZONE)
+
+    def test_an_override_naming_the_same_zone_by_a_different_spelling_still_works(self):
+        # THE point of the whole rule: agreement is not string equality.
+        entries = resolve(
+            [FakeProducer("nightly")],
+            {"nightly": {"at": "03:00", "zone": "Etc/UTC"}},
+            deployment_zone=ZoneInfo("UTC"))
+        self.assertEqual(entries["nightly"].zone, ZoneInfo("Etc/UTC"))
+
+    def test_a_producers_own_declared_zone_is_never_the_disagreeing_side(self):
+        # No override at all: the zone travels straight from
+        # `deployment_zone` to the producer's own declaration, the way
+        # `build_scheduler` wires the three real producers -- so a producer
+        # that merely declares what it was handed can never be the side that
+        # disagrees.
+        entries = resolve(
+            [FakeProducer("nightly", at=time(3, 0), zone=ZONE)],
+            deployment_zone=ZONE)
+        self.assertIs(entries["nightly"].zone, ZONE)
+
+    def test_an_override_changing_only_the_time_must_still_agree_on_zone(self):
+        # An override that names 'at' without repeating 'zone' is already
+        # refused for a different reason (no zone to read it in) -- this is
+        # the case where it DOES repeat 'zone', but repeats the wrong one.
+        with self.assertRaisesRegex(ValueError, "different zone"):
+            resolve(
+                [FakeProducer("nightly", at=time(3, 0), zone=ZONE)],
+                {"nightly": {"at": "04:00", "zone": OTHER_ZONE_NAME}},
+                deployment_zone=ZONE)
+
+    def _disagreement(self, deployment_zone_is_default=False):
+        try:
+            resolve(
+                [FakeProducer("nightly")],
+                {"nightly": {"at": "03:00", "zone": "America/New_York"}},
+                deployment_zone=ZoneInfo("UTC"),
+                deployment_zone_is_default=deployment_zone_is_default)
+            self.fail("the disagreeing override was not refused")
+        except ValueError as exc:
+            return str(exc)
+
+    def test_the_refusal_shows_the_deployments_zone_by_name_not_by_repr(self):
+        # `repr(ZoneInfo("UTC"))` is "zoneinfo.ZoneInfo(key='UTC')" -- a
+        # developer's view of the object, not a value an operator could type
+        # back into $CRONICLED_ZONE or a schedule override. Checked both
+        # ways deliberately: a message with the repr merely deleted, and
+        # nothing put in its place, would pass a test that only looked for
+        # the repr's absence.
+        message = self._disagreement()
+        self.assertNotIn("ZoneInfo(", message, message)
+        self.assertNotIn("zoneinfo.", message, message)
+        self.assertIn("configured for (UTC)", message, message)
+
+    def test_the_refusal_names_all_three_remedies(self):
+        # The operator wrote this override deliberately; the message must
+        # not assume the override is the mistake, so it names every way out
+        # rather than picking one.
+        message = self._disagreement()
+        self.assertIn(
+            "set $CRONICLED_ZONE to 'America/New_York' so the deployment "
+            "reads the zone this override already does", message, message)
+        self.assertIn(
+            "drop 'zone' from this override so it reads the deployment's "
+            "zone instead", message, message)
+        self.assertIn(
+            "change this override's 'zone' to name the deployment's (UTC)",
+            message, message)
+
+    def test_the_refusal_says_which_remedy_is_likely_wanted_when_the_deployment_zone_is_the_unset_default(self):
+        # The live shape: an operator named the same zone in every override
+        # and never set a deployment-wide one. UTC here is the fallback
+        # nobody chose, not a decision -- so the message must say the
+        # override's own zone is the more likely truth, and name the remedy
+        # that has not been offered by the other two (both of which move the
+        # producer TO the unset default).
+        message = self._disagreement(deployment_zone_is_default=True)
+        self.assertIn(
+            "This deployment has not set $CRONICLED_ZONE — UTC above is "
+            "the unset default, not a choice made on purpose, so the "
+            "first of those three is the one most likely wanted",
+            message, message)
+
+    def test_the_refusal_does_not_single_out_a_remedy_when_the_deployment_zone_was_chosen(self):
+        # The mirror image: the SAME disagreement, but the deployment's zone
+        # was an explicit setting rather than a default. A default and a
+        # choice must not read alike -- singling out "set $CRONICLED_ZONE"
+        # here would tell an operator who deliberately chose UTC to abandon
+        # their own choice in favour of one override's.
+        message = self._disagreement(deployment_zone_is_default=False)
+        self.assertNotIn("most likely wanted", message, message)
+        self.assertNotIn("unset default", message, message)
+
+    def test_the_remedy_named_first_actually_is_first(self):
+        # The default-case sentence claims "the first of those three" without
+        # repeating which one -- so the ENUMERATION order has to put
+        # $CRONICLED_ZONE ahead of the other two, or the claim is false on its
+        # own terms. Pinned by position, not just by presence.
+        message = self._disagreement(deployment_zone_is_default=True)
+        set_env = message.index("set $CRONICLED_ZONE")
+        drop_zone = message.index("drop 'zone' from this override")
+        change_zone = message.index("change this override's 'zone'")
+        self.assertLess(set_env, drop_zone, message)
+        self.assertLess(drop_zone, change_zone, message)
+
+
 class TheRuleTheStoreAndThePageShareForReadingATimestamp(unittest.TestCase):
     """`as_utc` is public so the page can convert the same stamps the schedule
     compares, by the same rule. A second reader would be free to disagree with

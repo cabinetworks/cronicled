@@ -212,7 +212,7 @@ TAG_MERGE_AT = time(3, 40)
 
 
 def build_scheduler(runner, store, stash, adapters, *, zone, env=None,
-                    marker=None):
+                    marker=None, zone_is_default=False):
     """Register the unattended producers, then resolve a schedule over them.
 
     **The order of the two statements below is the whole of this function.**
@@ -287,6 +287,27 @@ def build_scheduler(runner, store, stash, adapters, *, zone, env=None,
     schedule an operator was trying to check. No default here: a second place
     deciding the zone is the disagreement itself.
 
+    That reasoning does not, on its own, stop a schedule override naming its
+    OWN `zone` for one of these three -- ordinary configuration, not misuse,
+    and exactly the second place the paragraph above rules out. So `zone` is
+    passed to `Scheduler` below as `deployment_zone`, and `resolve` refuses an
+    override whose zone disagrees with it (agreement decided by
+    `cronicled.schedule._zones_agree`, not by the written string -- two
+    spellings of one zone must keep working). A disagreeing override is a
+    start-up failure for the same reason an unknown zone name already is: the
+    alternative is exactly the state this function's docstring above
+    describes as worse than either half being wrong alone, reached through a
+    config file the schema already accepts.
+
+    `zone_is_default` says whether `zone` is a setting or the fallback this
+    deployment reads because `$CRONICLED_ZONE` was never set (see `main`
+    below, which is the one place that distinction is knowable -- by the time
+    `zone` is a `tzinfo` here, a chosen "UTC" and a defaulted one are the same
+    object). Passed straight through to `Scheduler` as
+    `deployment_zone_is_default`, and it changes only what a disagreement's
+    refusal recommends, never whether it fires -- see `resolve`'s own
+    docstring.
+
     Returns `None`, having said why, only when there is nothing to schedule at
     all, which is an install with no media server: every producer here reads
     something from one. Printed rather than silently skipped in either case,
@@ -339,7 +360,9 @@ def build_scheduler(runner, store, stash, adapters, *, zone, env=None,
     # declared cadence off it. Overrides come from the operator's own config
     # and are validated by `resolve`, at this line, where a typo is a start-up
     # stack trace rather than a producer that quietly never runs.
-    return Scheduler(runner, store, overrides=load_schedule(env=env))
+    return Scheduler(runner, store, overrides=load_schedule(env=env),
+                     deployment_zone=zone,
+                     deployment_zone_is_default=zone_is_default)
 
 
 def main(argv=None):
@@ -450,6 +473,13 @@ def main(argv=None):
     # would be unchecked on exactly the install that has no schedule to check
     # it.
     zone = check_zone(load_zone(env=env), "$%s" % ZONE_ENV_VAR)
+    # Whether `zone` above is a setting or the fallback nobody chose. Read
+    # here, and only here: `load_zone` already folded "absent" and "UTC" into
+    # the same returned string, so this is the one remaining place that can
+    # still tell an operator's deliberate "UTC" from nobody having set
+    # anything -- see `build_scheduler`'s `zone_is_default` for what the
+    # difference is used for.
+    zone_is_default = env.get(ZONE_ENV_VAR) is None
 
     # AFTER the load, and reporting what the load produced. Printed before
     # it, this line announced a config directory in good health on every one
@@ -671,7 +701,8 @@ def main(argv=None):
         return to_unused_groups(seen, base_url=base_url)
 
     scheduler = build_scheduler(runner, store, stash, adapters, env=env,
-                                marker=marker, zone=zone)
+                                marker=marker, zone=zone,
+                                zone_is_default=zone_is_default)
     if scheduler is not None:
         scheduler.start()
 
