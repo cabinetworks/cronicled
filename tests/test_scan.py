@@ -41,12 +41,14 @@ from cronicled.adapters.declarative import DeclarativeAdapter
 from cronicled.artist import Aliases
 from cronicled.jobs import COST_CLASS_LIMITS, JobRunner
 from cronicled.scan import (
-    Conflict, Counts, DEFAULT_THRESHOLD, FingerprintPass, IDENTIFIED_BY_FINGERPRINT, Identified,
+    Conflict, Counts, DEFAULT_THRESHOLD, EXACT_FINGERPRINT_ALGORITHMS,
+    FingerprintPass, IDENTIFIED_BY_FINGERPRINT, Identified,
     MAX_RUNNERS_UP, MUTE_NO_CANDIDATES, Outcome, REFUSED_REJECTED_FOLDER,
     REFUSED_UNCONFIRMED_CANDIDATE, REFUSED_UNRESOLVED_CREATOR,
     RETIRED_MUTE_UNRESOLVED_CREATOR,
     GONE_READ_EMPTY, GONE_READ_FAILED, GONE_READ_PARTIAL,
-    ScanProducer, Source, SUBJECT_TYPE, _SingleFlight, catalogue_link, examine,
+    ScanProducer, Source, SUBJECT_TYPE, _SingleFlight, _is_exact_hit,
+    catalogue_link, examine,
     examine_sources, fingerprint_outcome, identify_by_fingerprint,
     release_auto_mutes, select, sweep_gone,
 )
@@ -4864,6 +4866,70 @@ def phash_only_match(title, remote_site_id, **over):
                      **over)
 
 
+class IsExactHitTest(unittest.TestCase):
+    """The rule that decides whether a box's match may identify a file at
+    all -- the whole fix this ticket makes, isolated from the batch
+    machinery built on top of it."""
+
+    def test_an_oshash_match_is_exact(self):
+        self.assertTrue(_is_exact_hit(
+            box_match("Winter Ledger", "r-77",
+                      fingerprints=[{"algorithm": "OSHASH", "hash": "h"}])))
+
+    def test_an_md5_match_is_exact(self):
+        self.assertTrue(_is_exact_hit(
+            box_match("Winter Ledger", "r-77",
+                      fingerprints=[{"algorithm": "MD5", "hash": "h"}])))
+
+    def test_a_phash_only_match_is_not_exact(self):
+        # THE property this ticket exists to establish: a perceptual hash
+        # is designed to also match a DIFFERENT file that merely looks
+        # similar, so it must never count as identity on its own.
+        self.assertFalse(_is_exact_hit(phash_only_match("Winter Ledger",
+                                                         "r-77")))
+
+    def test_one_exact_fingerprint_among_several_perceptual_ones_is_still_exact(self):
+        # One match, several fingerprints computed off the SAME file -- the
+        # ordinary shape when a match is genuine. One exact hash among
+        # perceptual ones is still identity: the perceptual entries neither
+        # add to nor subtract from what the exact one already establishes.
+        match = box_match("Winter Ledger", "r-77", fingerprints=[
+            {"algorithm": "PHASH", "hash": "p1"},
+            {"algorithm": "OSHASH", "hash": "o1"},
+            {"algorithm": "PHASH", "hash": "p2"},
+        ])
+        self.assertTrue(_is_exact_hit(match))
+
+    def test_no_fingerprints_at_all_is_not_exact(self):
+        self.assertFalse(_is_exact_hit(
+            box_match("Winter Ledger", "r-77", fingerprints=[])))
+
+    def test_a_missing_fingerprints_key_is_not_exact(self):
+        # HARM: defaulting a missing list to "exact, as every hit was
+        # treated before this rule existed" would silently restore the
+        # defect this rule exists to close.
+        match = box_match("Winter Ledger", "r-77")
+        del match["fingerprints"]
+        self.assertFalse(_is_exact_hit(match))
+
+    def test_an_unrecognised_algorithm_spelling_does_not_count_as_exact(self):
+        # Uncertainty about what a match rests on may withhold evidence, it
+        # may never supply it -- an algorithm this client does not
+        # recognise is not evidence of anything.
+        match = box_match("Winter Ledger", "r-77",
+                          fingerprints=[{"algorithm": "SHA256", "hash": "h"}])
+        self.assertFalse(_is_exact_hit(match))
+
+    def test_every_hit_counting_as_exact_is_the_regression_this_guards(self):
+        # Restated from the mutation's own point of view: `EXACT_
+        # FINGERPRINT_ALGORITHMS` must name a strict, non-universal set --
+        # if it grew to cover every algorithm the source accepts, nothing
+        # here would tell a perceptual-only match apart from an exact one.
+        self.assertNotIn("PHASH", EXACT_FINGERPRINT_ALGORITHMS)
+        self.assertIn("MD5", EXACT_FINGERPRINT_ALGORITHMS)
+        self.assertIn("OSHASH", EXACT_FINGERPRINT_ALGORITHMS)
+
+
 BOXES_BY_NAME = {box["name"]: box for box in (NORTH, SOUTH)}
 
 
@@ -5093,6 +5159,99 @@ class IdentifyByFingerprintTest(unittest.TestCase):
 
         self.assertEqual(result.errors, ())
         self.assertEqual(list(result.identified), ["2"])
+
+    # -- a perceptual hash is evidence, never identity ---------------------- #
+
+    def test_a_phash_only_hit_does_not_identify_and_falls_through(self):
+        # THE core property this ticket adds: a perceptual hash is evidence
+        # that a box's comparison matched SOMETHING, never evidence of WHICH
+        # file -- so a batch backed by nothing else must come back exactly
+        # as if no box recognised the file at all, and reach the text path.
+        lookup = ScriptedBoxes(
+            {NORTH["endpoint"]: {"1": [phash_only_match("Winter Ledger",
+                                                        "r-77")]}})
+        result = identify_by_fingerprint(["1"], boxes=[NORTH], lookup=lookup)
+
+        self.assertEqual(result.identified, {})
+        self.assertEqual(result.errors, ())
+
+    def test_a_single_box_naming_only_a_perceptual_match_identifies_nothing(self):
+        # The single-claim shortcut that identifies on the strength of one
+        # box's word alone must NOT fire for a claim with no exact evidence
+        # in it -- that shortcut is exactly what let a perceptual hit through
+        # before this ticket.
+        anonymous_phash = phash_only_match("Winter Ledger", None)
+        lookup = ScriptedBoxes({NORTH["endpoint"]: {"1": [anonymous_phash]}})
+        result = identify_by_fingerprint(["1"], boxes=[NORTH], lookup=lookup)
+
+        self.assertNotIn("1", result.identified)
+
+    def test_an_exact_hit_wins_over_a_disagreeing_perceptual_one_either_order(self):
+        # A fixture whose REVERSAL is visibly different, run both ways: a
+        # symmetric one could not catch an order mutation, and the acceptance
+        # here is specifically that which box answers first must not change
+        # which scene wins.
+        exact = box_match("Winter Ledger", "r-77")
+        perceptual = phash_only_match("Morning Ritual", "r-12")
+        forward = ScriptedBoxes({NORTH["endpoint"]: {"1": [exact]},
+                                 SOUTH["endpoint"]: {"1": [perceptual]}})
+        backward = ScriptedBoxes({NORTH["endpoint"]: {"1": [perceptual]},
+                                  SOUTH["endpoint"]: {"1": [exact]}})
+
+        for lookup in (forward, backward):
+            result = identify_by_fingerprint(["1"], boxes=[NORTH, SOUTH],
+                                             lookup=lookup)
+            winner = result.identified["1"]
+            self.assertIsInstance(winner, Identified)
+            self.assertEqual(winner.remote_site_id, "r-77")
+            self.assertEqual(winner.candidate["title"], "Winter Ledger")
+            self.assertEqual(len(winner.perceptual_disagreement), 1)
+            self.assertEqual(winner.perceptual_disagreement[0][1], "r-12")
+
+    def test_a_perceptual_claim_agreeing_with_the_exact_one_is_no_disagreement(self):
+        # Corroboration, not a warning: a perceptual hash naming the SAME
+        # scene the exact claim did has nothing to disagree about.
+        exact = box_match("Winter Ledger", "r-77")
+        agreeing_perceptual = phash_only_match("Winter Ledger", "r-77")
+        lookup = ScriptedBoxes({NORTH["endpoint"]: {"1": [exact]},
+                                SOUTH["endpoint"]: {"1": [agreeing_perceptual]}})
+        result = identify_by_fingerprint(["1"], boxes=[NORTH, SOUTH],
+                                         lookup=lookup)
+
+        self.assertEqual(result.identified["1"].perceptual_disagreement, ())
+
+    def test_a_perceptual_claim_naming_no_scene_is_no_disagreement(self):
+        # An anonymous perceptual hit withholds evidence; it must not be
+        # read as disagreeing with anything either.
+        exact = box_match("Winter Ledger", "r-77")
+        anonymous_perceptual = phash_only_match("Morning Ritual", None)
+        lookup = ScriptedBoxes({NORTH["endpoint"]: {"1": [exact]},
+                                SOUTH["endpoint"]: {"1": [anonymous_perceptual]}})
+        result = identify_by_fingerprint(["1"], boxes=[NORTH, SOUTH],
+                                         lookup=lookup)
+
+        self.assertEqual(result.identified["1"].perceptual_disagreement, ())
+
+    def test_two_exact_boxes_agreeing_are_unaffected_by_a_third_perceptual_guess(self):
+        # A disagreeing perceptual claim rides alongside an ordinary
+        # exact-agreement result without disturbing `agreeing`, which is
+        # reserved for other EXACT claims -- boxes and algorithms are two
+        # different kinds of corroboration and must not be mixed into one
+        # field.
+        exact_a = box_match("Winter Ledger", "r-77")
+        exact_b = box_match("Winter Ledger", "r-77", date="2021-03-04")
+        perceptual = phash_only_match("Morning Ritual", "r-12")
+        lookup = ScriptedBoxes({
+            NORTH["endpoint"]: {"1": [exact_a]},
+            SOUTH["endpoint"]: {"1": [exact_b, perceptual]},
+        })
+        result = identify_by_fingerprint(["1"], boxes=[NORTH, SOUTH],
+                                         lookup=lookup)
+
+        winner = result.identified["1"]
+        self.assertEqual(winner.agreeing, ("south-box",))
+        self.assertEqual(len(winner.perceptual_disagreement), 1)
+        self.assertEqual(winner.perceptual_disagreement[0][1], "r-12")
 
 
 class FingerprintOutcomeTest(unittest.TestCase):

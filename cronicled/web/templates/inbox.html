@@ -57,7 +57,7 @@
    naming one scene is the strongest text evidence this tool produces, and
    putting it where warnings live would teach a reviewer to read past the
    warnings. #}
-{% macro attribution(row) %}{% if row.identifying_box %}identified by fingerprint (<b>{{ row.identifying_box }}</b>){% else %}<b>{{ row.creator }}</b> (from the {{ row.creator_source }}){% if row.agreeing_stores %} &middot; corroborated by <b>{% for s in row.agreeing_stores %}{{ s }}{% if not loop.last %}, {% endif %}{% endfor %}</b>{% endif %}{% endif %}{% endmacro %}
+{% macro attribution(row) %}{% if row.identifying_box %}identified by {% if row.identified_by_algorithm %}{{ row.identified_by_algorithm }} {% endif %}fingerprint (<b>{{ row.identifying_box }}</b>){% else %}<b>{{ row.creator }}</b> (from the {{ row.creator_source }}){% if row.agreeing_stores %} &middot; corroborated by <b>{% for s in row.agreeing_stores %}{{ s }}{% if not loop.last %}, {% endif %}{% endfor %}</b>{% endif %}{% endif %}{% endmacro %}
 
 {# One rule for "show this text, and make it a link when there is somewhere
    to go". Used for BOTH addresses a row carries and they are not the same
@@ -103,6 +103,9 @@
   {% endif %}
   {% if row.contested %}
   <div class="warn">Attribution is contested: {{ row.disagreement }}</div>
+  {% endif %}
+  {% if row.perceptual_disagreement %}
+  <div class="warn">A perceptual-only match also named a different scene, which did not win: {{ row.perceptual_disagreement }}</div>
   {% endif %}
   {% if row.carries_cover and row.state == 'new' %}
   <div class="warn">Approving this proposal writes a cover image. Undo cannot restore a scene's previous cover, so this write cannot be fully undone.</div>
