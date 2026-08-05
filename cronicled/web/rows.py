@@ -26,6 +26,7 @@ from dataclasses import dataclass, replace
 
 from cronicled import tag_hygiene
 from cronicled.descriptions import SUBJECT_TYPE as DESCRIPTION_SUBJECT
+from cronicled.enrichment import SUBJECT_TYPE as ENRICHMENT_SUBJECT
 from cronicled.scan import candidate_url
 from cronicled.schedule import as_utc
 from cronicled.tag_descriptions import SUBJECT_TYPE as TAG_DESCRIPTION_SUBJECT
@@ -109,6 +110,7 @@ def local_times(text, zone):
 # whose buttons write to a library is the failure mode to design out.
 KIND_SCENE = "scene"
 KIND_DESCRIPTION = "performer-description"
+KIND_ENRICHMENT = "performer-enrichment"
 KIND_TAG_DESCRIPTION = "tag-description"
 KIND_UNUSED_TAG = "unused-tag"
 
@@ -260,6 +262,44 @@ class DescriptionRow:
     faults: tuple
     original: str
     cleaned: str
+    undoable: bool
+    actionable: bool
+    error: str | None
+
+
+@dataclass(frozen=True)
+class EnrichmentRow:
+    """What the inbox shows for a proposed set of blank-field values.
+
+    Deliberately NOT a `DescriptionRow`: that row is a diff between two
+    versions of ONE field, and this one has no "before" at all -- every field
+    it shows was blank, which is the whole precondition of the proposal
+    existing (see `cronicled.enrichment.missing_fields`). `fields` therefore
+    carries only NAME/value pairs to fill in, never a before-and-after pair.
+
+    `source` names where the values came from ("stash-box (by id)",
+    "stash-box (by name)") -- the same reason `TagDescriptionRow.source_box`
+    is never omitted: a value with no visible provenance is a claim a
+    reviewer cannot check, whether it turns out to be right or not.
+
+    `fields` is a tuple of `(name, value)` pairs, in the order
+    `cronicled.enrichment.missing_fields` produced them -- stable across a
+    render rather than re-sorted by the template, so two renders of one
+    unchanged proposal show fields in the same order.
+
+    No score, for the same reason `DescriptionRow` has none: nothing here
+    scored a candidate, so there is no number to show in the column real
+    scores use.
+    """
+
+    kind: str
+    fingerprint: str
+    state: str
+    subject_id: str
+    name: str
+    performer_url: str | None
+    source: str
+    fields: tuple
     undoable: bool
     actionable: bool
     error: str | None
@@ -634,6 +674,37 @@ def to_description_row(item, base_url=None):
     )
 
 
+def to_enrichment_row(item, base_url=None):
+    """One stored enrichment proposal -> what the inbox shows for it.
+
+    Every payload field is INDEXED, not `.get`: `cronicled.enrichment
+    .proposal` writes all three on every proposal it makes, so a payload
+    missing one is malformed rather than an enrichment with (say) no source.
+    `fields` is a dict on the payload (the shape `Store.record` stored it
+    in) and is turned into an ordered tuple of pairs here -- see
+    `EnrichmentRow`'s own docstring for why the order is preserved rather
+    than re-sorted.
+    """
+    payload = item["payload"]
+    return EnrichmentRow(
+        kind=KIND_ENRICHMENT,
+        fingerprint=item["fingerprint"],
+        state=item["state"],
+        subject_id=item["subject_id"],
+        name=payload["name"],
+        performer_url=performer_url(base_url, item["subject_id"]),
+        source=payload["source"],
+        fields=tuple(payload["fields"].items()),
+        # An applied row with no snapshot cannot be reverted --
+        # `revert_performer_enrichment` raises on an empty one. The same rule
+        # `to_row`/`to_description_row` apply, for the same reason.
+        undoable=(item["state"] == "applied"
+                  and bool(item.get("prior_state"))),
+        actionable=item["state"] != "applied",
+        error=item.get("error"),
+    )
+
+
 def to_tag_description_row(item, base_url=None):
     """One stored tag-description proposal -> what the inbox shows for it.
 
@@ -686,6 +757,8 @@ def to_rows(items, base_url=None):
     for item in items:
         if item["subject_type"] == DESCRIPTION_SUBJECT:
             built.append(to_description_row(item, base_url=base_url))
+        elif item["subject_type"] == ENRICHMENT_SUBJECT:
+            built.append(to_enrichment_row(item, base_url=base_url))
         elif item["subject_type"] == TAG_DESCRIPTION_SUBJECT:
             built.append(to_tag_description_row(item, base_url=base_url))
         else:
@@ -1300,7 +1373,7 @@ def to_mute_row(entry, base_url=None, *, zone):
     a description proposal's Mute button puts a performer in this list, and
     a performer's page is not a scene's.
     """
-    performer = entry["subject_type"] == DESCRIPTION_SUBJECT
+    performer = entry["subject_type"] in (DESCRIPTION_SUBJECT, ENRICHMENT_SUBJECT)
     item = entry["item"]
     return {
         "subject_type": entry["subject_type"],

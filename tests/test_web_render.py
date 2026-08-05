@@ -12,8 +12,9 @@ from cronicled.tags import cluster_tags
 from cronicled.tags import proposal as tag_proposal
 from cronicled.web.render import environment, render
 from cronicled.web.rows import (
-    to_description_row, to_merge_row, to_mute_row, to_refusal_row, to_row,
-    to_schedule_view, to_summary_view, to_tag_description_row,
+    to_description_row, to_enrichment_row, to_merge_row, to_mute_row,
+    to_refusal_row, to_row, to_schedule_view, to_summary_view,
+    to_tag_description_row,
 )
 
 _HOSTILE = '<script>alert("x")</script>'
@@ -1999,6 +2000,90 @@ class DescriptionBlock(unittest.TestCase):
         # same type, as numbers the scorer really produced.
         html = self._html(_description_row())
         self.assertNotIn('<div class="score">', html)
+
+
+# -- enrichment proposals ---------------------------------------------------- #
+
+
+def _enrichment_row(**over):
+    item = {"fingerprint": "fp-e", "state": "new",
+            "subject_type": "performer-enrichment", "subject_id": "9",
+            "summary": "s", "confidence": None, "prior_state": None,
+            "payload": {"name": "Wren Alderly",
+                        "source": "stash-box (by name)",
+                        "fields": {"gender": "FEMALE",
+                                   "country": "Freedonia"}}}
+    item.update(over)
+    return to_enrichment_row(item, base_url=over.pop("base_url", None))
+
+
+class EnrichmentBlock(unittest.TestCase):
+    _FORM_RE = re.compile(
+        r'<form method="post" action="(?P<action>[^"]+)">'
+        r'<input type="hidden" name="fp" value="(?P<fp>[^"]*)">'
+        r'<button>(?P<label>[^<]+)</button></form>')
+
+    def _html(self, row, **kwargs):
+        return render("inbox.html", rows=[row], counts={}, **kwargs)
+
+    def test_every_proposed_field_and_its_value_is_shown(self):
+        html = self._html(_enrichment_row())
+
+        self.assertIn("gender", html)
+        self.assertIn("FEMALE", html)
+        self.assertIn("country", html)
+        self.assertIn("Freedonia", html)
+
+    def test_the_source_is_named_on_the_page(self):
+        # HARM: a value with no visible provenance is a claim nobody can
+        # check, whether it turns out to be right or not.
+        html = self._html(_enrichment_row())
+        self.assertIn("stash-box (by name)", html)
+
+    def test_the_performer_is_named_and_linked(self):
+        html = self._html(_enrichment_row(base_url="http://media.example"))
+        self.assertIn("Wren Alderly", html)
+        self.assertIn("http://media.example/performers/9", html)
+
+    def test_a_new_row_offers_exactly_approve_dismiss_mute_refresh(self):
+        html = self._html(_enrichment_row(state="new"))
+        self.assertEqual(
+            [(m.group("action"), m.group("label"), m.group("fp"))
+             for m in self._FORM_RE.finditer(html)],
+            [("/approve", "Approve", "fp-e"),
+             ("/dismiss", "Dismiss", "fp-e"),
+             ("/mute", "Mute", "fp-e"),
+             ("/refresh", "Refresh", "fp-e")])
+
+    def test_an_applied_row_with_a_snapshot_offers_undo_and_refresh(self):
+        html = self._html(_enrichment_row(
+            state="applied", prior_state={"gender": None, "country": None}))
+        self.assertEqual(
+            [(m.group("action"), m.group("label"))
+             for m in self._FORM_RE.finditer(html)],
+            [("/undo", "Undo"), ("/refresh", "Refresh")])
+
+    def test_the_row_carries_no_invented_score(self):
+        html = self._html(_enrichment_row())
+        self.assertNotIn('<div class="score">', html)
+
+    def test_a_checkbox_is_drawn_for_this_row_same_as_any_other(self):
+        # The generic `{% for row in rows %}` loop draws a checkbox for
+        # every row it iterates, regardless of kind -- this is the
+        # acceptance property the operator asked for: an enrichment
+        # proposal must be tickable in a batch, the same as a scene or a
+        # description proposal, with nothing extra required of the template
+        # loop itself.
+        html = self._html(_enrichment_row())
+        self.assertIn('name="fp" value="fp-e"', html)
+
+    def test_three_kinds_of_proposal_render_side_by_side_on_one_page(self):
+        html = render("inbox.html", counts={},
+                      rows=[_row(), _description_row(), _enrichment_row()])
+
+        self.assertIn("Wren Alderly", html)
+        self.assertIn("0.812", html)
+        self.assertIn("stash-box (by name)", html)
 
 
 # -- tag-description proposals ---------------------------------------------- #

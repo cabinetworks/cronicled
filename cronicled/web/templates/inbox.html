@@ -154,6 +154,44 @@
 </div>
 {% endmacro %}
 
+{# A proposed set of blank-field values -- not a diff like `description_block`
+   above: every field shown here was blank, which is the whole precondition
+   of the proposal existing at all (see `cronicled.enrichment
+   .missing_fields`), so there is no "Now" panel to show beside it. Each
+   field is listed with its own name so a reviewer can tell which of a
+   performer's many blank fields this fills, and the source is shown
+   prominently for the same reason `tag_description_block`'s is: a value
+   with no visible provenance is a claim nobody can check. #}
+{% macro enrichment_block(row, highlight=False) %}
+<div class="proposal{% if highlight %} just-applied{% endif %}">
+  <div class="head">
+    <div class="what">
+      <p class="file">{{ identifier("performer " ~ row.subject_id, row.performer_url) }}</p>
+      <p class="title">{{ row.name }}</p>
+      <div class="meta">{{ row.fields | length }} field{% if row.fields | length != 1 %}s{% endif %} from <b>{{ row.source }}</b></div>
+    </div>
+    <div class="acts">
+      {% if row.undoable %}
+      <form method="post" action="/undo"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Undo</button></form>
+      {% elif row.actionable %}
+      <form method="post" action="/approve"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>{% if row.error %}Try again{% else %}Approve{% endif %}</button></form>
+      <form method="post" action="/dismiss"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Dismiss</button></form>
+      <form method="post" action="/mute"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Mute</button></form>
+      {% endif %}
+      <form method="post" action="/refresh"><input type="hidden" name="fp" value="{{ row.fingerprint }}"><button>Refresh</button></form>
+    </div>
+  </div>
+  {% if row.error %}
+  <div class="warn">The last attempt to apply this failed, and nothing was written: {{ row.error }}</div>
+  {% endif %}
+  <div class="diff">
+    {% for name, value in row.fields %}
+    <div><h3>{{ name }}</h3><p class="text">{{ value }}</p></div>
+    {% endfor %}
+  </div>
+</div>
+{% endmacro %}
+
 {# One entry point for "draw whatever kind of row this is", so every place a
    list of proposals is rendered picks the same way. Branching on `row.kind`
    rather than on whether some field exists: Jinja renders an undefined
@@ -196,7 +234,7 @@
 </div>
 {% endmacro %}
 
-{% macro row_block(row, highlight=False) %}{% if row.kind == 'performer-description' %}{{ description_block(row, highlight) }}{% elif row.kind == 'tag-description' %}{{ tag_description_block(row, highlight) }}{% else %}{{ proposal_block(row, highlight) }}{% endif %}{% endmacro %}
+{% macro row_block(row, highlight=False) %}{% if row.kind == 'performer-description' %}{{ description_block(row, highlight) }}{% elif row.kind == 'performer-enrichment' %}{{ enrichment_block(row, highlight) }}{% elif row.kind == 'tag-description' %}{{ tag_description_block(row, highlight) }}{% else %}{{ proposal_block(row, highlight) }}{% endif %}{% endmacro %}
 
 {# The compact identifying line these two closed sections show for a row.
    Branched on `row.kind` for the same reason `row_block` is: a description
@@ -206,6 +244,10 @@
         <p class="file">{{ identifier("performer " ~ row.subject_id, row.performer_url) }}</p>
         <p class="title">{{ row.name }}</p>
         <div class="meta">description contains <b>{% for f in row.faults %}{{ f }}{% if not loop.last %} and {% endif %}{% endfor %}</b></div>
+{% elif row.kind == 'performer-enrichment' %}
+        <p class="file">{{ identifier("performer " ~ row.subject_id, row.performer_url) }}</p>
+        <p class="title">{{ row.name }}</p>
+        <div class="meta">{{ row.fields | length }} field{% if row.fields | length != 1 %}s{% endif %} from <b>{{ row.source }}</b></div>
 {% elif row.kind == 'tag-description' %}
         <p class="file">{{ identifier("tag " ~ row.subject_id, row.tag_url) }}</p>
         <p class="title">{{ row.name }}</p>
@@ -216,7 +258,7 @@
         <div class="meta">{{ attribution(row) }}</div>
 {% endif %}{% endmacro %}
 
-{% macro compact_score(row) %}{% if row.kind != 'performer-description' and row.kind != 'tag-description' %}<div class="score">{{ row.score_text }}</div>{% endif %}{% endmacro %}
+{% macro compact_score(row) %}{% if row.kind != 'performer-description' and row.kind != 'performer-enrichment' and row.kind != 'tag-description' %}<div class="score">{{ row.score_text }}</div>{% endif %}{% endmacro %}
 
 {# A tag merge is not a scene proposal and deliberately does not render
    through `proposal_block`. It has no filename, no score and no candidate;

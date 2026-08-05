@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 from cronicled import performer_tags, tag_hygiene, tags
 from cronicled.descriptions import SUBJECT_TYPE as DESCRIPTION_SUBJECT
+from cronicled.enrichment import SUBJECT_TYPE as ENRICHMENT_SUBJECT
 from cronicled.tag_descriptions import SUBJECT_TYPE as TAG_DESCRIPTION_SUBJECT
 from cronicled.runscan import build_producer
 from cronicled.scan import SUBJECT_TYPE as SCENE_SUBJECT
@@ -102,7 +103,7 @@ BATCH_VERDICTS = ("approve", "dismiss", "mute", "refresh")
 # `scan.select`.
 _BATCH_BLOCKS_APPLIED = ("approve", "dismiss", "mute")
 
-# The only subject types a batch verdict may ever reach -- exactly the three
+# The only subject types a batch verdict may ever reach -- exactly the four
 # `web.rows.to_rows` builds a row (and so a checkbox on the generic list) for.
 # A tag merge, a tag/performer reconciliation or a tag deletion is refused
 # here even if its fingerprint reaches this call some other way (a stale
@@ -115,8 +116,20 @@ _BATCH_BLOCKS_APPLIED = ("approve", "dismiss", "mute")
 # "no bulk reconcile" true for THIS action specifically, the same way the
 # tag-description-only guard keeps them true for
 # `bulk_apply_tag_descriptions` above.
+#
+# `ENRICHMENT_SUBJECT` belongs beside `DESCRIPTION_SUBJECT` here rather than
+# being left out by default: its own `approve` (below) is additive-only in
+# exactly the shape `bulk_apply_tag_descriptions` required a NARROWER guard
+# for -- every field it writes was confirmed still blank immediately before
+# the write, and the whole apply refuses rather than overwriting one that is
+# not (see `Stash.apply_performer_enrichment`) -- so it carries none of the
+# "this write is not additive" risk that keeps a merge, a reconciliation or a
+# tag deletion off this list. Widening this set is never a default; it is
+# only ever safe because the write behind it was checked, here, for exactly
+# that.
 _BATCH_SUBJECT_TYPES = frozenset(
-    (SCENE_SUBJECT, DESCRIPTION_SUBJECT, TAG_DESCRIPTION_SUBJECT))
+    (SCENE_SUBJECT, DESCRIPTION_SUBJECT, ENRICHMENT_SUBJECT,
+     TAG_DESCRIPTION_SUBJECT))
 
 
 _NO_STASH = ("no media server is configured -- start cronicled with "
@@ -238,6 +251,15 @@ class Actions:
                 result = self._stash.apply_performer_description(
                     subject_id, payload["cleaned"],
                     expected=payload["original"])
+            elif item["subject_type"] == ENRICHMENT_SUBJECT:
+                # No `expected=` to pass: the precondition for every field in
+                # an additive proposal is the same one value, "still blank",
+                # and `apply_performer_enrichment` checks that itself against
+                # a fresh read -- see that method's own docstring for why a
+                # description's arbitrary-text `expected` argument has no
+                # equivalent here.
+                result = self._stash.apply_performer_enrichment(
+                    subject_id, item["payload"]["fields"])
             elif item["subject_type"] == TAG_DESCRIPTION_SUBJECT:
                 payload = item["payload"]
                 # `expected` is the payload's `original` VERBATIM -- the value
@@ -370,10 +392,11 @@ class Actions:
         unless its OWN stored proposal is both
 
         * for a subject type this action may ever reach at all
-          (`_BATCH_SUBJECT_TYPES` -- scene, performer-description or
-          tag-description; never a tag merge, a tag/performer reconciliation
-          or a tag deletion, each of which has its own refusal logic that a
-          blind batch call must not bypass -- see that constant's own
+          (`_BATCH_SUBJECT_TYPES` -- scene, performer-description,
+          performer-enrichment or tag-description; never a tag merge, a
+          tag/performer reconciliation or a tag deletion, each of which has
+          its own refusal logic that a blind batch call must not bypass --
+          see that constant's own
           comment); and
         * not already `applied`, for `approve`/`dismiss`/`mute`
           (`_BATCH_BLOCKS_APPLIED`) -- `refresh` is deliberately exempt, on
@@ -420,9 +443,10 @@ class Actions:
             if item["subject_type"] not in _BATCH_SUBJECT_TYPES:
                 failed.append({
                     "fingerprint": fp,
-                    "reason": "not a scene, performer-description or "
-                              "tag-description proposal -- a batch verdict "
-                              "only reaches the generic row list",
+                    "reason": "not a scene, performer-description, "
+                              "performer-enrichment or tag-description "
+                              "proposal -- a batch verdict only reaches the "
+                              "generic row list",
                 })
                 continue
             if (verdict in _BATCH_BLOCKS_APPLIED
@@ -744,6 +768,15 @@ class Actions:
             # apply writing something its snapshot has no way to represent,
             # and reaching for `carries_cover` here would raise on a payload
             # that has no candidate at all.
+            return "reverted"
+        if item["subject_type"] == ENRICHMENT_SUBJECT:
+            self._stash.revert_performer_enrichment(item["subject_id"], prior)
+            # Recorded only AFTER the revert succeeds, exactly as above. A
+            # plain "reverted" is the whole truth here too: every field the
+            # apply wrote is a field the snapshot names back to its blank
+            # value, so there is nothing an additive write could have left
+            # that this does not undo.
+            self._store.mark_reverted(fp)
             return "reverted"
         self._stash.revert_scene(item["subject_id"], prior)
         # Recorded only AFTER the revert succeeds. Marking first and then
