@@ -4837,13 +4837,31 @@ SOUTH = {"name": "south-box", "endpoint": "https://two.example.invalid/gql"}
 
 def box_match(title, remote_site_id, **over):
     """One `ScrapedScene` as a stash-box returns it: the fields an apply
-    writes, plus the box's own id for the scene it recognised."""
+    writes, the box's own id for the scene it recognised, and an OSHASH
+    fingerprint.
+
+    OSHASH by default, deliberately -- an EXACT algorithm -- because most of
+    what this section pins is the path that already works: a box match that
+    may identify a file. A test for the `PHASH`-only path this ticket adds
+    passes `fingerprints=[...]` as an override to get one that may not.
+    """
     row = {"title": title, "code": None, "details": None, "director": None,
            "urls": [], "url": None, "date": None, "image": None,
            "studio": None, "tags": [], "performers": [],
-           "remote_site_id": remote_site_id}
+           "remote_site_id": remote_site_id,
+           "fingerprints": [{"algorithm": "OSHASH", "hash": "fixture-hash"}]}
     row.update(over)
     return row
+
+
+def phash_only_match(title, remote_site_id, **over):
+    """One `ScrapedScene` a box matched on a perceptual hash ALONE -- no
+    exact algorithm anywhere in its fingerprints. This is the shape that may
+    not identify a file; see `_is_exact_hit`."""
+    return box_match(title, remote_site_id,
+                     fingerprints=[{"algorithm": "PHASH",
+                                   "hash": "fixture-phash"}],
+                     **over)
 
 
 BOXES_BY_NAME = {box["name"]: box for box in (NORTH, SOUTH)}
@@ -5102,7 +5120,7 @@ class FingerprintOutcomeTest(unittest.TestCase):
             "subject_type": SUBJECT_TYPE,
             "subject_id": "7",
             "summary": 'Winter Ledger.mp4 -> "Winter Ledger" identified by '
-                       'fingerprint (north-box)',
+                       'OSHASH fingerprint (north-box)',
             "payload": {
                 "path": self.PATH,
                 "candidate": self.LEDGER,
@@ -5110,6 +5128,7 @@ class FingerprintOutcomeTest(unittest.TestCase):
                 "box": "north-box",
                 "endpoint": NORTH["endpoint"],
                 "remote_site_id": "r-77",
+                "algorithms": ["OSHASH"],
             },
         })
 
