@@ -27,11 +27,28 @@ class _FakeStash:
         self._prior = prior if prior is not None else {"title": "old"}
         self._fail = fail
 
-    def apply_scene(self, scene_id, match):
-        self.calls.append(("apply", scene_id))
+    def apply_scene(self, scene_id, match, drop_tag_ids=()):
+        # `drop_tag_ids` is recorded, not acted on: this fake has no scene
+        # state to drop a tag out of, unlike `_MarkerAwareStash` below, whose
+        # whole point is to model that write. Every test built on THIS fake
+        # constructs `Actions` with no marker configured, so the argument
+        # this call ever actually receives is `()` -- see `Approve
+        # .test_with_no_marker_configured_the_write_is_unchanged` for the one
+        # place that is asserted rather than assumed.
+        self.calls.append(("apply", scene_id, tuple(drop_tag_ids)))
         if self._fail:
             raise RuntimeError("server said no")
         return {"prior": self._prior}
+
+    def tag_id_by_name(self, name):
+        # Never legitimately called by any test built on this fake: every one
+        # constructs `Actions` with no marker, and `Actions._marker_tag_ids`
+        # returns `()` without reaching the stash at all in that case. Raising
+        # here (rather than answering something plausible) is what would turn
+        # a mutation that skipped the `self._marker is None` guard into a
+        # loud failure instead of a silently-passing extra network read.
+        raise AssertionError(
+            "tag_id_by_name was called with no marker configured")
 
     def revert_scene(self, scene_id, prior):
         # Refuses an empty snapshot exactly as the real client does, and
@@ -1860,11 +1877,18 @@ class _FakeMultiKindStash:
         self._fail_scene_ids = set(fail_scene_ids)
         self._fail_tag_ids = set(fail_tag_ids)
 
-    def apply_scene(self, scene_id, match):
+    def apply_scene(self, scene_id, match, drop_tag_ids=()):
         if scene_id in self._fail_scene_ids:
             raise RuntimeError("the media server refused scene %s" % scene_id)
         self.calls.append(("apply-scene", scene_id))
         return {"prior": self._prior}
+
+    def tag_id_by_name(self, name):
+        # No test built on this fake configures a marker -- see
+        # `_FakeStash.tag_id_by_name` above for why this raises rather than
+        # answering something plausible.
+        raise AssertionError(
+            "tag_id_by_name was called with no marker configured")
 
     def apply_performer_description(self, performer_id, description, *,
                                     expected):
