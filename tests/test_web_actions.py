@@ -500,14 +500,22 @@ class _ScanStash:
     exactly as it is there, which is the whole reason a marker tag exists.
     """
 
-    def __init__(self, scenes=(), organized=(), tag_ids=None):
+    def __init__(self, scenes=(), organized=(), tag_ids=None, performers=None):
         self._scenes = list(scenes)
         self._organized = {str(scene_id) for scene_id in organized}
         self._tag_ids = dict(tag_ids or {})
+        # No performer carries an alias by default -- an empty library, the
+        # same answer every other read here gives for a fixture set that
+        # never mentions performers at all.
+        self._performers = list(performers or [])
         self.calls = []
 
     def _page(self, scenes, limit):
         return len(scenes), list(scenes if limit is None else scenes[:limit])
+
+    def performers_with_aliases(self):
+        self.calls.append(("performers_with_aliases",))
+        return [dict(row) for row in self._performers]
 
     def unorganized_scenes(self, limit):
         self.calls.append(("unorganized_scenes", limit))
@@ -620,7 +628,8 @@ class Scan(unittest.TestCase):
         self.assertGreater(len(stash.calls), 0)
         for call in stash.calls:
             self.assertIn(call[0],
-                         ("unorganized_scenes", "scrape_scenes_by_query"))
+                         ("unorganized_scenes", "scrape_scenes_by_query",
+                          "performers_with_aliases"))
 
     def test_a_scan_from_the_page_is_recorded_as_a_manual_run(self):
         # HARM: this control is the button, and the scheduler's pass is the

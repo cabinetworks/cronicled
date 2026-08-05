@@ -89,7 +89,7 @@ class _FakeStash:
     """
 
     def __init__(self, scenes, script=None, by_url=None, boxes=None,
-                 by_fingerprint=None):
+                 by_fingerprint=None, performers=None):
         self._scenes = list(scenes)
         self._script = dict(script or {})
         self._by_url = dict(by_url or {})
@@ -100,11 +100,20 @@ class _FakeStash:
         # fingerprints exercises exactly the path it did before.
         self._boxes = list(boxes or [])
         self._by_fingerprint = dict(by_fingerprint or {})
+        # No performer carries an alias by default -- an empty library, the
+        # same answer `stash_boxes` gives above -- so every test in this
+        # file that is not about the library's own aliases pools exactly the
+        # map it always did.
+        self._performers = list(performers or [])
         self.calls = []
 
     def stash_boxes(self):
         self.calls.append(("stash_boxes",))
         return [dict(box) for box in self._boxes]
+
+    def performers_with_aliases(self):
+        self.calls.append(("performers_with_aliases",))
+        return [dict(row) for row in self._performers]
 
     def scrape_scenes_by_fingerprint(self, endpoint, scene_ids):
         self.calls.append(("scrape_scenes_by_fingerprint", endpoint,
@@ -413,7 +422,8 @@ class BuildProducerWiring(unittest.TestCase):
                                     "scrape_scenes_by_query",
                                     "scrape_scene_url",
                                     "stash_boxes",
-                                    "scrape_scenes_by_fingerprint"))
+                                    "scrape_scenes_by_fingerprint",
+                                    "performers_with_aliases"))
 
 
 class BuildProducerOwnerOfWiring(unittest.TestCase):
@@ -1064,7 +1074,14 @@ class BuildProducerFingerprintWiring(unittest.TestCase):
     def test_the_boxes_are_read_at_scan_time_not_at_build_time(self):
         # A producer built once and run twice must not hold a stale list, and
         # a box added to the server between the two must be asked.
+        #
+        # The one call `build_producer` DOES make eagerly is
+        # `performers_with_aliases` -- the library's own alias map is pooled
+        # at the same moment the configured one is (see
+        # `cronicled.runscan.pooled_aliases`), which is deliberately NOT the
+        # scan-time closure `stash_boxes` gets. So this asserts the boxes are
+        # untouched at build time, not that the stash saw no call at all.
         stash = _FakeStash([], boxes=[BOX])
         build_producer(stash, {"store": _Adapter()}, self.store, limit=10)
 
-        self.assertEqual(stash.calls, [])
+        self.assertEqual(stash.calls, [("performers_with_aliases",)])
