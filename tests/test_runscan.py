@@ -25,12 +25,12 @@ from zoneinfo import ZoneInfo
 
 from cronicled.adapters.base import SiteAdapter
 from cronicled.adapters.declarative import DeclarativeAdapter
-from cronicled.artist import Aliases
+from cronicled.artist import Aliases, resolve
 from cronicled.jobs import COST_CLASS_LIMITS, JobRunner
 from cronicled.scan import IDENTIFIED_BY_FINGERPRINT
-from cronicled.runscan import (EVERY_FILE, build_producer,
+from cronicled.runscan import (EVERY_FILE, AliasReport, build_producer,
                                build_scheduled_producer, configured_adapters,
-                               configured_aliases, main)
+                               configured_aliases, main, pooled_aliases)
 from cronicled.store import Store
 from tests.fixtures.cast import CENSORSHIP
 
@@ -89,7 +89,7 @@ class _FakeStash:
     """
 
     def __init__(self, scenes, script=None, by_url=None, boxes=None,
-                 by_fingerprint=None):
+                 by_fingerprint=None, performers=None):
         self._scenes = list(scenes)
         self._script = dict(script or {})
         self._by_url = dict(by_url or {})
@@ -100,11 +100,20 @@ class _FakeStash:
         # fingerprints exercises exactly the path it did before.
         self._boxes = list(boxes or [])
         self._by_fingerprint = dict(by_fingerprint or {})
+        # No performer carries an alias by default -- an empty library, the
+        # same answer `stash_boxes` gives above -- so every test in this
+        # file that is not about the library's own aliases pools exactly the
+        # map it always did.
+        self._performers = list(performers or [])
         self.calls = []
 
     def stash_boxes(self):
         self.calls.append(("stash_boxes",))
         return [dict(box) for box in self._boxes]
+
+    def performers_with_aliases(self):
+        self.calls.append(("performers_with_aliases",))
+        return [dict(row) for row in self._performers]
 
     def scrape_scenes_by_fingerprint(self, endpoint, scene_ids):
         self.calls.append(("scrape_scenes_by_fingerprint", endpoint,
@@ -413,7 +422,8 @@ class BuildProducerWiring(unittest.TestCase):
                                     "scrape_scenes_by_query",
                                     "scrape_scene_url",
                                     "stash_boxes",
-                                    "scrape_scenes_by_fingerprint"))
+                                    "scrape_scenes_by_fingerprint",
+                                    "performers_with_aliases"))
 
 
 class BuildProducerOwnerOfWiring(unittest.TestCase):
@@ -978,6 +988,256 @@ class TheAliasesReachTheResolver(unittest.TestCase):
         self.assertEqual(item["payload"]["score"], 1.0)
 
 
+def performer(performer_id, name, aliases=()):
+    """One `Stash.performers_with_aliases()` row -- the shape
+    `pooled_aliases`/`library_aliases` reads: `id`, `name`, and
+    `alias_list`, the field the media server records other spellings in."""
+    return {"id": performer_id, "name": name, "alias_list": list(aliases)}
+
+
+class LibraryAliasesReachThePooledMap(unittest.TestCase):
+    """`pooled_aliases` is where the library's own performer aliases and an
+    operator's configured ones actually meet -- unit-level, on the merge
+    itself, rather than through a whole scan: precedence and the two
+    refusals below are the substance of this ticket, and asserting them
+    here is cheaper and sharper than asserting them through a proposal a
+    whole `ScanProducer` run happens to produce.
+    """
+
+    def setUp(self):
+        self.stash = _FakeStash([])
+
+    def test_a_library_alias_with_no_configured_entry_reaches_the_map(self):
+        # HARM: a pooling that consulted only the configured map would
+        # leave the library's own knowledge -- the overwhelming majority of
+        # the alias coverage a real deployment holds -- unreachable by any
+        # scan, silently.
+        self.stash._performers = [
+            performer("1", "Ivory Larkspur", ["Ashgrove Wren"])]
+        aliases, report = pooled_aliases(self.stash, {})
+        self.assertEqual(aliases.full_name("Ashgrove Wren"), "Ivory Larkspur")
+        self.assertEqual(report.configured, 0)
+        self.assertEqual(report.library, 1)
+
+    def test_the_built_producer_carries_the_alias_report(self):
+        # HARM: `main` prints `producer.alias_report.summary()` -- if
+        # `build_producer` built the report and threw it away instead of
+        # attaching it, that would be an `AttributeError` on every real
+        # scan, caught by no test that mocks `build_producer` out.
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        self.stash._performers = [
+            performer("1", "Ivory Larkspur", ["Ashgrove Wren"])]
+        producer = build_producer(self.stash, {"store": _Adapter()}, store,
+                                  limit=10)
+        self.assertIsInstance(producer.alias_report, AliasReport)
+        self.assertEqual(producer.alias_report.library, 1)
+        self.assertEqual(producer.alias_report.configured, 0)
+
+    def test_configured_wins_over_a_library_entry_for_the_same_folder(self):
+        # The fixture is asymmetric on purpose -- the configured and the
+        # library name are two different strings -- so this test can only
+        # pass if the CONFIGURED spelling wins; reversing the merge order
+        # would make it read "Coral Vantage" instead and fail here.
+        self.stash._performers = [
+            performer("1", "Coral Vantage", ["Marigold Hex"])]
+        adapters = {"store": DeclarativeAdapter(
+            alias_spec("store", {"Marigold Hex": "Thistle Rowan"}))}
+        aliases, report = pooled_aliases(self.stash, adapters)
+        self.assertEqual(aliases.full_name("Marigold Hex"), "Thistle Rowan")
+        # Not a conflict: an operator's line beats what the library thinks,
+        # and a scan does not treat that as a finding to report.
+        self.assertEqual(report.collisions, ())
+        self.assertEqual(report.shadowed, ())
+        self.assertEqual(report.overridden, 1)
+        self.assertEqual(report.configured, 1)
+        # The library entry is accounted for (it was read and considered)
+        # without being double-counted as a second, separate contribution.
+        self.assertEqual(report.library, 0)
+
+    def test_reversing_the_merge_order_would_change_the_answer(self):
+        # The companion to the test above, stated as its own case so a
+        # driver mutating the merge direction has a fixture built
+        # specifically to catch it: swapping which side is applied last
+        # flips this from "Sable Wintergreen" to "Foxglove Ash", a visibly
+        # different string either way -- not a symmetric fixture a reversal
+        # could pass unchanged.
+        self.stash._performers = [
+            performer("1", "Foxglove Ash", ["shared folder"])]
+        adapters = {"store": DeclarativeAdapter(
+            alias_spec("store", {"shared folder": "Sable Wintergreen"}))}
+        aliases, _report = pooled_aliases(self.stash, adapters)
+        self.assertEqual(aliases.full_name("shared folder"), "Sable Wintergreen")
+
+    def test_an_alias_claimed_by_two_performers_contributes_nothing(self):
+        # Which of the two a folder named "Quill Somerled" belongs to is
+        # genuinely unknown from this alone. A test asserting a single
+        # winner would pass under first-match-wins; this asserts NEITHER
+        # wins.
+        self.stash._performers = [
+            performer("1", "Bramble Osprey", ["Quill Somerled"]),
+            performer("2", "Nettle Corvid", ["Quill Somerled"])]
+        aliases, report = pooled_aliases(self.stash, {})
+        self.assertIsNone(aliases.full_name("Quill Somerled"))
+
+    def test_the_collision_is_reported_not_silently_dropped(self):
+        self.stash._performers = [
+            performer("1", "Bramble Osprey", ["Quill Somerled"]),
+            performer("2", "Nettle Corvid", ["Quill Somerled"])]
+        _aliases, report = pooled_aliases(self.stash, {})
+        self.assertIn("Quill Somerled", report.collisions)
+        self.assertEqual(report.shadowed, ())
+
+    def test_two_performers_sharing_an_alias_that_names_one_person_agree(self):
+        # Two performer RECORDS answering to the SAME full name through one
+        # alias is agreement, not ambiguity -- the same distinction
+        # `_configured_alias_map` draws between two adapters that name one
+        # folder alike. Must not be reported as a collision.
+        self.stash._performers = [
+            performer("1", "Hollow Cormorant", ["HC"]),
+            performer("2", "Hollow Cormorant", ["HC"])]
+        aliases, report = pooled_aliases(self.stash, {})
+        self.assertEqual(aliases.full_name("HC"), "Hollow Cormorant")
+        self.assertEqual(report.collisions, ())
+
+    def test_a_performer_with_a_blank_name_contributes_nothing(self):
+        # A malformed-in-the-ordinary-sense record -- Stash can hold a
+        # performer nobody has named -- must be skipped rather than
+        # pooled as an alias to nothing at all, which is what an empty or
+        # `None` full name would be. Skipped here rather than left for
+        # `Aliases` to refuse: a single such record must not take an
+        # entire scan down with it.
+        self.stash._performers = [
+            performer("1", "", ["Some Folder"]),
+            performer("2", None, ["Another Folder"])]
+        aliases, report = pooled_aliases(self.stash, {})
+        self.assertIsNone(aliases.full_name("Some Folder"))
+        self.assertIsNone(aliases.full_name("Another Folder"))
+        self.assertEqual(report.library, 0)
+
+    def test_an_alias_that_is_another_performers_own_name_loses(self):
+        # Performer B lists "Juniper Kestrel" -- performer A's actual own
+        # name -- as one of B's aliases. A folder called "Juniper Kestrel"
+        # more likely means A, the performer actually called that, so the
+        # derived reading (B) must not reach the pooled map at all.
+        self.stash._performers = [
+            performer("1", "Juniper Kestrel"),
+            performer("2", "Ember Thrush", ["Juniper Kestrel"])]
+        aliases, report = pooled_aliases(self.stash, {})
+        self.assertIsNone(aliases.full_name("Juniper Kestrel"))
+        self.assertIn("Juniper Kestrel", report.shadowed)
+        self.assertEqual(report.collisions, ())
+
+    def test_the_shadowed_alias_still_lets_the_primary_name_resolve(self):
+        # The practical consequence of the guard above, through `resolve`
+        # itself: a folder literally named "Juniper Kestrel" must still
+        # resolve to Juniper Kestrel -- via the ordinary folder-is-a-name
+        # path, since the alias map no longer mentions the text at all --
+        # not fail, and not resolve to Ember Thrush.
+        self.stash._performers = [
+            performer("1", "Juniper Kestrel"),
+            performer("2", "Ember Thrush", ["Juniper Kestrel"])]
+        aliases, _report = pooled_aliases(self.stash, {})
+        result = resolve("clip01.mp4", "Juniper Kestrel", aliases=aliases)
+        self.assertEqual(result.name, "Juniper Kestrel")
+        self.assertEqual(result.source, "folder")
+
+    def test_configuration_is_never_written_to_by_pooling(self):
+        # A scan augments the resolved map in memory; it must never rewrite
+        # the one file an operator reads to know what they configured.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "adapters.json")
+            with open(path, "w") as fh:
+                json.dump({"adapters": [
+                    {"name": "store", "owner_source": "none",
+                     "title_match_counts_as_ownership": True,
+                     "aliases": {"Marigold Hex": "Thistle Rowan"}}]}, fh)
+            with open(path, "rb") as fh:
+                before = fh.read()
+            before_mtime = os.stat(path).st_mtime_ns
+            adapters = configured_adapters(env={"CRONICLED_CONFIG_DIR": d})
+
+            self.stash._performers = [
+                performer("1", "Coral Vantage", ["Marigold Hex"]),
+                performer("2", "Foxglove Ash", ["Some Other Folder"])]
+            pooled_aliases(self.stash, adapters)
+
+            with open(path, "rb") as fh:
+                after = fh.read()
+            after_mtime = os.stat(path).st_mtime_ns
+        self.assertEqual(before, after)
+        self.assertEqual(before_mtime, after_mtime)
+
+    def test_the_library_is_read_exactly_once(self):
+        # Assert the CALL COUNT on the client, not the elapsed time of a
+        # scan: this is what pins "once per run", never once per file.
+        self.stash._performers = [performer("1", "Ivory Larkspur", ["AW"])]
+        pooled_aliases(self.stash, {})
+        self.assertEqual(
+            [c for c in self.stash.calls if c[0] == "performers_with_aliases"],
+            [("performers_with_aliases",)])
+
+    def test_the_library_is_read_once_per_run_not_once_per_file(self):
+        # The same read count however many files a scan actually examines --
+        # through the whole `build_producer` wiring, not the pooling
+        # function alone, since that is the one place a per-file call could
+        # be introduced without this unit ever seeing it.
+        stash = _FakeStash(
+            [scene(1, "/library/Ashgrove Wren/a.mp4"),
+             scene(2, "/library/Ashgrove Wren/b.mp4"),
+             scene(3, "/library/Ashgrove Wren/c.mp4")],
+            performers=[performer("1", "Ivory Larkspur", ["Ashgrove Wren"])])
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        adapter = _Adapter(scraper_id="scraper-alpha")
+        producer = build_producer(stash, {"store": adapter}, store, limit=10)
+        runner = JobRunner(store)
+        self.addCleanup(runner.close)
+        runner.register(producer)
+        job = runner.start(producer.name, trigger="manual")
+        self.assertTrue(runner.wait(job.id, WAIT))
+        self.assertEqual(
+            [c for c in stash.calls if c[0] == "performers_with_aliases"],
+            [("performers_with_aliases",)])
+
+
+class LibraryAliasesReachTheResolverEndToEnd(unittest.TestCase):
+    """`TheAliasesReachTheResolver`'s companion: the same whole-wiring
+    assertion, but for an alias sourced from the media server's own
+    performer records rather than typed into `adapters.json`. Every cheaper
+    assertion above already passed while `build_producer` still ignored
+    `stash.performers_with_aliases()` entirely.
+    """
+
+    PATH = "/library/Ashgrove Wren/Morning Ritual.mp4"
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+
+    def test_the_scan_searches_under_the_librarys_own_full_name(self):
+        candidate = row("Morning Ritual", "https://example.invalid/clip/x")
+        stash = _FakeStash(
+            [scene(1, self.PATH)],
+            script={("scraper-alpha", "Ivory Larkspur"): [candidate]},
+            performers=[performer("1", "Ivory Larkspur", ["Ashgrove Wren"])])
+        adapters = {"store": _Adapter(scraper_id="scraper-alpha")}
+
+        producer = build_producer(stash, adapters, self.store, limit=10)
+        runner = JobRunner(self.store)
+        self.addCleanup(runner.close)
+        runner.register(producer)
+        job = runner.start(producer.name, trigger="manual")
+        self.assertTrue(runner.wait(job.id, WAIT))
+
+        queries = [call for call in stash.calls
+                  if call[0] == "scrape_scenes_by_query"]
+        self.assertEqual(queries, [("scrape_scenes_by_query", "scraper-alpha",
+                                   "Ivory Larkspur")])
+        item = self.store.items(folder="library")[0]
+        self.assertEqual(item["payload"]["score"], 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -1069,7 +1329,14 @@ class BuildProducerFingerprintWiring(unittest.TestCase):
     def test_the_boxes_are_read_at_scan_time_not_at_build_time(self):
         # A producer built once and run twice must not hold a stale list, and
         # a box added to the server between the two must be asked.
+        #
+        # The one call `build_producer` DOES make eagerly is
+        # `performers_with_aliases` -- the library's own alias map is pooled
+        # at the same moment the configured one is (see
+        # `cronicled.runscan.pooled_aliases`), which is deliberately NOT the
+        # scan-time closure `stash_boxes` gets. So this asserts the boxes are
+        # untouched at build time, not that the stash saw no call at all.
         stash = _FakeStash([], boxes=[BOX])
         build_producer(stash, {"store": _Adapter()}, self.store, limit=10)
 
-        self.assertEqual(stash.calls, [])
+        self.assertEqual(stash.calls, [("performers_with_aliases",)])
