@@ -28,7 +28,7 @@ from cronicled.adapters.declarative import DeclarativeAdapter
 from cronicled.artist import Aliases, resolve
 from cronicled.jobs import COST_CLASS_LIMITS, JobRunner
 from cronicled.scan import IDENTIFIED_BY_FINGERPRINT
-from cronicled.runscan import (EVERY_FILE, build_producer,
+from cronicled.runscan import (EVERY_FILE, AliasReport, build_producer,
                                build_scheduled_producer, configured_adapters,
                                configured_aliases, main, pooled_aliases)
 from cronicled.store import Store
@@ -1019,6 +1019,21 @@ class LibraryAliasesReachThePooledMap(unittest.TestCase):
         self.assertEqual(report.configured, 0)
         self.assertEqual(report.library, 1)
 
+    def test_the_built_producer_carries_the_alias_report(self):
+        # HARM: `main` prints `producer.alias_report.summary()` -- if
+        # `build_producer` built the report and threw it away instead of
+        # attaching it, that would be an `AttributeError` on every real
+        # scan, caught by no test that mocks `build_producer` out.
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        self.stash._performers = [
+            performer("1", "Ivory Larkspur", ["Ashgrove Wren"])]
+        producer = build_producer(self.stash, {"store": _Adapter()}, store,
+                                  limit=10)
+        self.assertIsInstance(producer.alias_report, AliasReport)
+        self.assertEqual(producer.alias_report.library, 1)
+        self.assertEqual(producer.alias_report.configured, 0)
+
     def test_configured_wins_over_a_library_entry_for_the_same_folder(self):
         # The fixture is asymmetric on purpose -- the configured and the
         # library name are two different strings -- so this test can only
@@ -1084,6 +1099,21 @@ class LibraryAliasesReachThePooledMap(unittest.TestCase):
         aliases, report = pooled_aliases(self.stash, {})
         self.assertEqual(aliases.full_name("HC"), "Hollow Cormorant")
         self.assertEqual(report.collisions, ())
+
+    def test_a_performer_with_a_blank_name_contributes_nothing(self):
+        # A malformed-in-the-ordinary-sense record -- Stash can hold a
+        # performer nobody has named -- must be skipped rather than
+        # pooled as an alias to nothing at all, which is what an empty or
+        # `None` full name would be. Skipped here rather than left for
+        # `Aliases` to refuse: a single such record must not take an
+        # entire scan down with it.
+        self.stash._performers = [
+            performer("1", "", ["Some Folder"]),
+            performer("2", None, ["Another Folder"])]
+        aliases, report = pooled_aliases(self.stash, {})
+        self.assertIsNone(aliases.full_name("Some Folder"))
+        self.assertIsNone(aliases.full_name("Another Folder"))
+        self.assertEqual(report.library, 0)
 
     def test_an_alias_that_is_another_performers_own_name_loses(self):
         # Performer B lists "Juniper Kestrel" -- performer A's actual own

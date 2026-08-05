@@ -261,29 +261,42 @@ def _library_alias_map(performers):
       pooled. This is checked before collisions are counted, so an alias
       shadowed this way is never also reported as a collision.
 
+    `name` and `alias_list` are INDEXED, never `.get` -- the same rule
+    `cronicled.performer_tags._performer`/`index_performers` apply to this
+    SAME query's rows, for the same reason: the query selects both on every
+    row it returns, so a row missing either is a malformed answer (a
+    wiring mistake, a test double built by hand) rather than a performer
+    with nothing to say, and ought to raise loudly rather than be read as
+    the ordinary "no alias" case. A blank NAME, in contrast, is an ordinary
+    answer a real performer record can hold -- so it is checked for and
+    skipped rather than indexed, the same way `index_performers` drops a
+    surface that normalises to nothing: pooling `None` or `""` as a full
+    name would either manufacture the empty key every unnamed performer
+    would collide under, or reach `Aliases`, which refuses a non-string or
+    empty value anyway, just later and less clearly than skipping it here.
+
     An alias that normalises to nothing is dropped without comment, the
     same rule `Aliases` itself applies to a configured key -- it can never
     match, so counting it as a library contribution or a collision would
-    be counting an entry with no lookup behind it. A performer with no name
-    to give (a malformed row) is skipped the same way; this module has no
-    guard for a performer *record* being junk beyond that -- see this
-    ticket's own notes on the library's data quality being inherited as-is,
-    pending whatever a name-quality ticket settles on.
+    be counting an entry with no lookup behind it. This module has no
+    guard for a performer *record* being junk beyond a blank name -- see
+    this ticket's own notes on the library's data quality being inherited
+    as-is, pending whatever a name-quality ticket settles on.
     """
     primary_slugs = {spaceless(row["name"]) for row in performers
-                     if row.get("name") and spaceless(row["name"])}
+                     if spaceless(row["name"])}
 
     claims = {}     # slug -> {full name, ...}
     shadowed = set()
     for row in performers:
-        for alias in row.get("alias_list") or ():
+        for alias in row["alias_list"]:
             slug = spaceless(alias)
             if not slug:
                 continue
             if slug in primary_slugs:
                 shadowed.add(alias)
                 continue
-            full = row.get("name")
+            full = row["name"]
             if not full:
                 continue
             claims.setdefault(slug, {}).setdefault(full, alias)
