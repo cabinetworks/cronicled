@@ -5,10 +5,10 @@ from cronicled.artist import Resolution
 from cronicled.scoring import Decision, Match, decide
 from cronicled.stash import StashError
 from cronicled.stashbox import (
-    BOX_TAGS, PERFORMER_FIELDS, PERFORMER_PROFILE, PERFORMER_SCENES,
-    PERFORMER_SEARCH, QUERY_PERFORMERS_RESULT_FIELDS, SCENES_BY_FINGERPRINT,
-    SourceListing, StashBox, _career_length, _joined_modifications, base_url,
-    check, listing_verdict)
+    BOX_TAGS, FIND_PERFORMER_ARGS, PERFORMER_FIELDS, PERFORMER_PROFILE,
+    PERFORMER_SCENES, PERFORMER_SEARCH, QUERY_PERFORMERS_RESULT_FIELDS,
+    SCENES_BY_FINGERPRINT, SEARCH_PERFORMERS_ARGS, SourceListing, StashBox,
+    _career_length, _joined_modifications, base_url, check, listing_verdict)
 
 
 def _transport(responses):
@@ -1524,6 +1524,9 @@ class PerformerSearch(unittest.TestCase):
         # are not interchangeable.
         self.assertEqual(t.calls[0][0]["variables"]["term"], "Wren Alderly")
         self.assertNotIn("input", t.calls[0][0]["variables"])
+        # No `page` sent at all -- this client reads one page only, and
+        # `PERFORMER_SEARCH` no longer declares the variable to bind it to.
+        self.assertNotIn("page", t.calls[0][0]["variables"])
 
     def test_every_row_the_source_offers_comes_back_mapped(self):
         rows = [_box_performer(id="pf-1", name="Wren Alderly"),
@@ -1692,7 +1695,7 @@ class PerformerQueriesSelectOnlyRealFields(unittest.TestCase):
         # block -- never the fields nested inside it.
         selected = _selected_top_level_fields(_selection_between(
             PERFORMER_SEARCH,
-            "searchPerformers(term: $term, page: $page, per_page: $per_page)"))
+            "searchPerformers(term: $term, per_page: $per_page)"))
         self.assertTrue(selected.issubset(QUERY_PERFORMERS_RESULT_FIELDS),
                         selected - QUERY_PERFORMERS_RESULT_FIELDS)
         self.assertEqual(selected, {"count", "performers"})
@@ -1706,8 +1709,107 @@ class PerformerQueriesSelectOnlyRealFields(unittest.TestCase):
         self.assertIn("facets", QUERY_PERFORMERS_RESULT_FIELDS)
         selected = _selected_top_level_fields(_selection_between(
             PERFORMER_SEARCH,
-            "searchPerformers(term: $term, page: $page, per_page: $per_page)"))
+            "searchPerformers(term: $term, per_page: $per_page)"))
         self.assertNotIn("facets", selected)
+
+
+_VAR_DECL_RE = re.compile(r"\$(\w+)\s*:\s*([^\s,)]+)")
+_ARG_BINDING_RE = re.compile(r"(\w+)\s*:\s*\$(\w+)")
+
+
+def _declared_variables(query):
+    """`{variable_name: declared_type}` for every `$name: Type` declaration
+    in `query`'s own `query(...)` header -- e.g. `{"term": "String!",
+    "per_page": "Int"}` for `PERFORMER_SEARCH`.
+
+    A FIELD-NAME check (`PerformerQueriesSelectOnlyRealFields`, above) cannot
+    see this: `$term: String` and `$term: String!` select exactly the same
+    fields and read identically to a check that only looks at selections.
+    Nullability is a property of the DECLARATION, in the query's header, and
+    has to be read from there specifically -- which is the whole reason this
+    function exists rather than folding into `_selected_top_level_fields`.
+    """
+    header = query[:query.index("{")]
+    return dict(_VAR_DECL_RE.findall(header))
+
+
+def _argument_bindings(query, call):
+    """`{argument_name: variable_name}` for every `arg: $var` pair inside
+    `call`'s own parenthesised argument list in `query` -- e.g.
+    `call="searchPerformers"` against `PERFORMER_SEARCH` finds
+    `searchPerformers(term: $term, per_page: $per_page)` and returns
+    `{"term": "term", "per_page": "per_page"}`.
+
+    Found by counting parentheses from the first `(` after `call` to its
+    matching close, the same depth-counting `_selection_between` uses for
+    braces, so this does not depend on how many parens happen to follow
+    elsewhere in the query.
+    """
+    start = query.index(call)
+    open_paren = query.index("(", start)
+    depth = 0
+    for i in range(open_paren, len(query)):
+        if query[i] == "(":
+            depth += 1
+        elif query[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return dict(_ARG_BINDING_RE.findall(
+                    query[open_paren + 1:i]))
+    raise ValueError("unbalanced parens after %r" % (call,))
+
+
+class QueryVariablesMatchRealArgumentNullability(unittest.TestCase):
+    """The gap `PerformerQueriesSelectOnlyRealFields` cannot see: a field
+    name check has nothing to say about a variable DECLARATION's own
+    nullability, which is exactly how `$term: String` (nullable) shipped
+    against a real argument that is `String!` -- every field-name test here
+    stayed green, and the query raised on its first real call anyway.
+
+    `SEARCH_PERFORMERS_ARGS`/`FIND_PERFORMER_ARGS` are the real, recorded
+    signatures -- independently sourced from the query text, the same
+    discipline `PERFORMER_FIELDS` already applies to field names. For every
+    argument a query actually BINDS a variable to, this checks that
+    variable's declared type in the query's own header against the
+    recorded signature -- so a variable declared with the wrong
+    nullability, in either direction, fails here rather than only at the
+    first real call.
+    """
+
+    def test_performer_search_declares_every_bound_variable_correctly(self):
+        declared = _declared_variables(PERFORMER_SEARCH)
+        bindings = _argument_bindings(PERFORMER_SEARCH, "searchPerformers")
+        # Not vacuous: this query really does bind more than nothing.
+        self.assertTrue(bindings)
+        for argument, variable in bindings.items():
+            with self.subTest(argument=argument):
+                self.assertEqual(declared[variable],
+                                 SEARCH_PERFORMERS_ARGS[argument])
+
+    def test_performer_profile_declares_every_bound_variable_correctly(self):
+        declared = _declared_variables(PERFORMER_PROFILE)
+        bindings = _argument_bindings(PERFORMER_PROFILE, "findPerformer")
+        self.assertTrue(bindings)
+        for argument, variable in bindings.items():
+            with self.subTest(argument=argument):
+                self.assertEqual(declared[variable],
+                                 FIND_PERFORMER_ARGS[argument])
+
+    def test_term_is_declared_non_null(self):
+        # The literal regression, pinned directly rather than only through
+        # the generic loop above: `$term`'s declared type must be `String!`,
+        # not `String`.
+        self.assertEqual(_declared_variables(PERFORMER_SEARCH)["term"],
+                         "String!")
+
+    def test_page_is_not_bound_at_all(self):
+        # The other half of the correction: this module reads one page only
+        # and never sends a `page` argument -- see `PERFORMER_SEARCH`'s own
+        # docstring. A `$page` variable reappearing here (bound or not)
+        # would be exactly the kind of drift a looser check could miss.
+        self.assertNotIn("page", _declared_variables(PERFORMER_SEARCH))
+        self.assertNotIn(
+            "page", _argument_bindings(PERFORMER_SEARCH, "searchPerformers"))
 
 
 class JoinedModifications(unittest.TestCase):

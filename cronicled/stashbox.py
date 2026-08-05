@@ -137,6 +137,37 @@ PERFORMER_FIELDS = frozenset({
 # reader.
 QUERY_PERFORMERS_RESULT_FIELDS = frozenset({"count", "performers", "facets"})
 
+# The declared argument signatures of the two entry points this module
+# calls, independently of any query text -- introspected against a live
+# instance on 2026-08-04. `tests/test_stashbox.py` checks every `$variable:
+# Type` declaration these queries carry against this recorded signature,
+# never against the query text itself, for the same reason `PERFORMER_FIELDS`
+# is checked independently of the selection that reads it.
+#
+# `SEARCH_PERFORMERS_ARGS` was WRONG once already, and not from a schema
+# change: an earlier report of it (from a different introspection helper)
+# silently unwrapped `NON_NULL` before printing, so `term: String!` was
+# reported as `term: String`, and this file's own `PERFORMER_SEARCH` was
+# written to match the wrong report and shipped a query that raises on
+# every real call ("Variable $term of type String used in position expecting
+# type String!"). Re-confirmed directly against the live instance's own
+# introspection, not against that report, before being recorded here.
+SEARCH_PERFORMERS_ARGS = {
+    "term": "String!",
+    "limit": "Int",
+    "page": "Int",
+    "per_page": "Int",
+    "filter": "PerformerSearchFilter",
+}
+
+# `findPerformer`'s own declared argument signature -- correct on the first
+# check, and recorded anyway rather than left implicit, so it has the same
+# independent ground truth `SEARCH_PERFORMERS_ARGS` does rather than being
+# the one argument this module trusts without a record to check it against.
+FIND_PERFORMER_ARGS = {
+    "id": "ID!",
+}
+
 # A performer's own profile, read by the source's own id -- the strongest
 # link this module can ask with, and the one `cronicled.enrichment` reaches
 # for first (see that module's docstring for why the id path is built even
@@ -152,6 +183,10 @@ QUERY_PERFORMERS_RESULT_FIELDS = frozenset({"count", "performers", "facets"})
 # time they were written. `location`/`description` (on `tattoos`/`piercings`)
 # and `url` (on `urls`/`images`) were confirmed too, as the nested types'
 # own fields -- see `PERFORMER_FIELDS`, which covers `Performer` itself only.
+# `$id: ID!` -- the variable declaration, not only the fields -- is also
+# confirmed correct against `FIND_PERFORMER_ARGS`, the same independent
+# ground truth `PERFORMER_SEARCH`'s own `$term` is checked against below,
+# rather than assumed right because the fields around it were.
 PERFORMER_PROFILE = """
 query($id: ID!) {
   findPerformer(id: $id) {
@@ -171,16 +206,26 @@ query($id: ID!) {
 # the same date as `PERFORMER_PROFILE` above, through the same
 # `_performer_from_box`.
 #
-# `searchPerformers(term:, limit:, page:, per_page:, filter:)` -- flat
+# `searchPerformers(term: String!, limit:, page:, per_page:, filter:)` -- flat
 # arguments, confirmed against the live instance's own introspection -- NOT
 # `queryPerformers(input: PerformerQueryInput)`, which this query used before
 # being corrected. The two are different entry points on the same schema:
 # `queryPerformers` takes a structured filter object (the same shape
 # `PERFORMER_SCENES`'s own `queryScenes` uses for scenes), while
 # `searchPerformers` takes a plain text `term` -- the free-text name search
-# this module actually wants. `limit`/`filter` are left unset: `limit` is a
-# separate cap this module has no use for alongside `per_page`, and `filter`'s
-# shape is unconfirmed and unneeded for an exact-name search.
+# this module actually wants. `limit`/`filter` are left unset and unbound:
+# `limit` is a separate cap this module has no use for alongside `per_page`,
+# and `filter`'s shape is unconfirmed and unneeded for an exact-name search.
+#
+# `$term` IS NON-NULL (`String!`) -- see `SEARCH_PERFORMERS_ARGS`. An earlier
+# version of this query declared `$term: String` (nullable) against a
+# reported signature that had silently dropped every `!` (a different
+# introspection helper unwrapped `NON_NULL` before printing), and it raised
+# on every real call: "Variable $term of type String used in position
+# expecting type String!". `$page` is dropped entirely here, matching the
+# real working call this was corrected against, which never declared or
+# bound it -- this module only ever reads ONE page (see
+# `StashBox.search_performers`), so there was never a second value to send.
 #
 # THE REPLY SHAPE IS CONFIRMED, as of 2026-08-04: `searchPerformers` returns
 # `QueryPerformersResultType` (`count`, `performers`, `facets`), the SAME
@@ -196,14 +241,17 @@ query($id: ID!) {
 #
 # `count` IS THE SEARCH'S TOTAL MATCH COUNT, never the number of rows this
 # page actually carries -- confirmed by the same real reply (1903 with 2
-# rows back). `StashBox.search_performers` does not read it at all: this
-# module only ever wants the ONE PAGE of candidates to name-match against
-# (see that method's own docstring), never a claim about how many total
-# performers share a search term, so `count` is deliberately left on the
-# reply, unread.
+# rows back; two sampled performers there also carried `eye_color`,
+# `career_start_year` and `images` populated with `birth_date`/`tattoos`
+# null, an ordinary partial record rather than an edge case -- exactly why
+# this proposes a SET of fields, never an all-or-nothing record).
+# `StashBox.search_performers` does not read `count` at all: this module
+# only ever wants the ONE PAGE of candidates to name-match against (see that
+# method's own docstring), never a claim about how many total performers
+# share a search term, so `count` is deliberately left on the reply, unread.
 PERFORMER_SEARCH = """
-query($term: String, $page: Int, $per_page: Int) {
-  searchPerformers(term: $term, page: $page, per_page: $per_page) {
+query($term: String!, $per_page: Int) {
+  searchPerformers(term: $term, per_page: $per_page) {
     count
     performers {
       id name disambiguation aliases gender ethnicity country eye_color
@@ -924,6 +972,6 @@ class StashBox:
         library evidence, not about what this client fetched.
         """
         result = self._client.gql(
-            PERFORMER_SEARCH, {"term": name, "page": 1, "per_page": per_page},
+            PERFORMER_SEARCH, {"term": name, "per_page": per_page},
             timeout=timeout)["searchPerformers"]
         return [_performer_from_box(row) for row in result["performers"]]
