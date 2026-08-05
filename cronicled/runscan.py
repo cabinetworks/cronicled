@@ -22,6 +22,7 @@ that decides scans are due on its own.
 import argparse
 import os
 import sys
+from dataclasses import dataclass
 from datetime import time
 
 from cronicled.adapters.registry import load_adapters
@@ -151,6 +152,16 @@ def configured_aliases(adapters):
     about the attribution is decided by order; what is lost is the tidiness
     complaint, not a guard.
     """
+    return Aliases(_configured_alias_map(adapters))
+
+
+def _configured_alias_map(adapters):
+    """The plain `{as-written key -> full name}` mapping `configured_aliases`
+    checks and wraps -- split out so `pooled_aliases` can merge it against
+    the library's own alias map at the same normalised granularity `Aliases`
+    itself matches on, without reaching into that class's index directly.
+    See `configured_aliases` for what the checks below mean and why.
+    """
     pooled = {}
     declared_by = {}
     for adapter_name, adapter in sorted(adapters.items()):
@@ -174,7 +185,226 @@ def configured_aliases(adapters):
                 continue
             declared_by[slug] = (adapter_name, full)
             pooled[key] = full
-    return Aliases(pooled)
+    return pooled
+
+
+@dataclass(frozen=True)
+class AliasReport:
+    """How many entries the pooled alias map a scan actually resolves
+    against holds, and where each came from -- what an operator sees in
+    place of the map itself, since a scan never writes the library's
+    aliases into `adapters.json` (see `pooled_aliases`).
+
+    `configured` and `library` are entries that made it into the pooled
+    map, split by source -- `library` counts only entries the configured
+    map did NOT already claim the same folder text for, so the two sum to
+    the map's own `len()` and neither double-counts an override.
+
+    `overridden` is a library entry that named the same folder text as a
+    configured one and lost -- see `pooled_aliases` for why silently, and
+    why this is a count rather than a refusal: an operator's line is a
+    decision, and this is what confirms it was actually applied rather than
+    quietly shadowed by whatever the library happens to think.
+
+    `collisions` and `shadowed` are folder texts (as the library spelled
+    them, one per distinct normalised form) a library alias contributed
+    NOTHING for, and the two reasons are kept apart because they are
+    different findings: `collisions` is two performers answering to the
+    one alias, with no way to tell which the folder means; `shadowed` is an
+    alias that reads as ANOTHER performer's own name, where that other
+    performer is the more likely reading and wins by not being an alias at
+    all. Neither is silently dropped -- both are named here so a person
+    can look at the media server's own performer records rather than at a
+    map this run never persists anywhere.
+    """
+    configured: int
+    library: int
+    overridden: int
+    collisions: tuple = ()
+    shadowed: tuple = ()
+
+    def summary(self):
+        """One line for an operator, naming every count above -- the
+        report `pooled_aliases`'s own docstring promises in place of a
+        rewritten configuration file."""
+        return ("aliases: %d configured, %d from the library (%d library "
+                "entr%s overridden by a configured one, %d dropped as "
+                "claimed by two performers, %d dropped as another "
+                "performer's own name)"
+                % (self.configured, self.library, self.overridden,
+                   "y" if self.overridden == 1 else "ies",
+                   len(self.collisions), len(self.shadowed)))
+
+
+def _library_alias_map(performers):
+    """`({slug -> full name}, collisions, shadowed)` derived from every
+    `Stash.performers_with_aliases()` row -- the library's own knowledge of
+    who a folder named for an alias really is, before it is pooled with an
+    operator's configured map (see `pooled_aliases`).
+
+    Two things a real library measurably contains are refused rather than
+    guessed at, and neither is resolved by picking whichever performer the
+    server happened to list first:
+
+    * **an alias two different performers carry.** Which of them a folder
+      of that name belongs to is genuinely unknown from this alone, so the
+      entry contributes nothing. Two performers sharing an alias but
+      answering to the SAME full name (a duplicated performer record, say)
+      is agreement, not a collision -- the same distinction
+      `_configured_alias_map` draws between two adapters that name one
+      folder the same way and two that disagree.
+    * **an alias that is also some OTHER performer's own name.** A folder
+      named that way more likely means the performer actually called that,
+      not the one who merely listed it as another spelling -- so the
+      derived reading loses to the primary one across the whole library,
+      not just where the two happen to collide, and is dropped rather than
+      pooled. This is checked before collisions are counted, so an alias
+      shadowed this way is never also reported as a collision.
+
+    `name` and `alias_list` are INDEXED, never `.get` -- the same rule
+    `cronicled.performer_tags._performer`/`index_performers` apply to this
+    SAME query's rows, for the same reason: the query selects both on every
+    row it returns, so a row missing either is a malformed answer (a
+    wiring mistake, a test double built by hand) rather than a performer
+    with nothing to say, and ought to raise loudly rather than be read as
+    the ordinary "no alias" case. A blank NAME, in contrast, is an ordinary
+    answer a real performer record can hold -- so it is checked for and
+    skipped rather than indexed, the same way `index_performers` drops a
+    surface that normalises to nothing: pooling `None` or `""` as a full
+    name would either manufacture the empty key every unnamed performer
+    would collide under, or reach `Aliases`, which refuses a non-string or
+    empty value anyway, just later and less clearly than skipping it here.
+
+    An alias that normalises to nothing is dropped without comment, the
+    same rule `Aliases` itself applies to a configured key -- it can never
+    match, so counting it as a library contribution or a collision would
+    be counting an entry with no lookup behind it. This module has no
+    guard for a performer *record* being junk beyond a blank name -- see
+    this ticket's own notes on the library's data quality being inherited
+    as-is, pending whatever a name-quality ticket settles on.
+    """
+    primary_slugs = {spaceless(row["name"]) for row in performers
+                     if spaceless(row["name"])}
+
+    claims = {}     # slug -> {full name, ...}
+    shadowed = set()
+    for row in performers:
+        for alias in row["alias_list"]:
+            slug = spaceless(alias)
+            if not slug:
+                continue
+            if slug in primary_slugs:
+                shadowed.add(alias)
+                continue
+            full = row["name"]
+            if not full:
+                continue
+            claims.setdefault(slug, {}).setdefault(full, alias)
+
+    pooled = {}
+    collisions = set()
+    for slug, names in claims.items():
+        if len(names) == 1:
+            (full,) = names.keys()
+            pooled[slug] = full
+        else:
+            # Two or more DISTINCT performers answer to this one alias --
+            # reported by whichever as-written spelling was seen for it,
+            # for a person to look the folder up on the media server by.
+            collisions.add(next(iter(names.values())))
+
+    return pooled, tuple(sorted(collisions)), tuple(sorted(shadowed))
+
+
+def library_aliases(stash):
+    """`(pooled slug -> name map, collisions, shadowed)` read from the
+    media server's own performer records, in the ONE read
+    `Stash.performers_with_aliases()` already offers -- see
+    `_library_alias_map` for how a performer's aliases become that map and
+    what is refused rather than guessed at.
+
+    Split out from `pooled_aliases` so the one call this makes against the
+    media server is easy to find and to count in a test -- assert the call
+    count on `stash`, not on the elapsed time of a scan, to pin that this
+    runs once per scan and never once per file.
+    """
+    return _library_alias_map(stash.performers_with_aliases())
+
+
+def pooled_aliases(stash, adapters):
+    """The `Aliases` a scan actually resolves against, and an `AliasReport`
+    describing it: every configured adapter's own alias map (see
+    `configured_aliases`), pooled with what the media server's own performer
+    records already know (see `library_aliases`) -- read once, here, before
+    a scan examines a single file.
+
+    CONFIGURED WINS. Where a configured entry and a library entry name the
+    same folder text, the configured one is used and this is NOT counted as
+    a collision or a shadow -- an operator's line is a decision made for
+    this tool, the library's is data curated for the media server's own
+    purposes, and an operator overriding what the server thinks is the
+    entire point of being able to write one. The merge is therefore never a
+    `dict.update` in either direction where the two might disagree by
+    accident: the library map is built first, complete, and the configured
+    map is then applied on top of it, unconditionally, at the NORMALISED
+    key -- the one granularity two spellings of one folder agree at, and the
+    only one a lookup ever matches on. Reversing that order -- letting a
+    library entry overwrite a configured one -- would let a stray alias on a
+    performer record silently overrule a line an operator wrote on purpose,
+    which is the worse failure and the harder one to notice.
+
+    Nothing here writes to `adapters.json` or to any other file an operator
+    maintains. "Pool it with the configured map" is a merge held in memory
+    for this run, not a rewrite of the one artifact an operator can read to
+    know what they configured -- augmenting that file on a schedule would
+    take away exactly that. What an operator sees instead is `AliasReport`,
+    returned alongside the map: how many entries came from where, without a
+    single line of `adapters.json` changing.
+
+    Read ONCE per run, at the same moment `configured_aliases` already
+    builds its own map -- not per file, and not on any page-render path.
+    That means a scan sees a snapshot of the library's aliases as they stood
+    when it started: an alias added to a performer mid-run is not picked up
+    until the next run builds a fresh map. That is the same snapshot
+    `configured_aliases` has always taken of `adapters.json`, and is fine
+    for the same reason -- a run that is already under way finishing against
+    the answer it started with is more predictable than one whose alias map
+    could change under it.
+    """
+    configured_map = _configured_alias_map(adapters)
+    library_map, collisions, shadowed = library_aliases(stash)
+
+    # `library_map` is already keyed by the normalised slug (see
+    # `_library_alias_map`); `configured_map` is keyed by the operator's
+    # AS-WRITTEN text, which normalises the same way but is not the same
+    # string ("V-Crane" against "vcrane"). Merging by `dict.update` on the
+    # raw keys would leave BOTH in the result -- a library entry at the slug
+    # and a configured entry at the original spelling -- which `Aliases`
+    # would then see as two keys normalising alike and refuse as a wiring
+    # mistake that was never made. So the slug a configured key resolves to
+    # is what actually gets overridden here; the configured entry is added
+    # back afterwards under its own original spelling, which is what lets a
+    # deliberately duplicated adapter declaration (see
+    # `_configured_alias_map`'s own residual paragraph) still reach `Aliases`
+    # to be refused there, exactly as it is today.
+    merged = dict(library_map)
+    overridden = 0
+    for key in configured_map:
+        slug = spaceless(key)
+        if slug in merged:
+            del merged[slug]
+            overridden += 1
+    library_count = len(merged)
+    merged.update(configured_map)
+
+    report = AliasReport(
+        configured=len(configured_map),
+        library=library_count,
+        overridden=overridden,
+        collisions=collisions,
+        shadowed=shadowed,
+    )
+    return Aliases(merged), report
 
 
 def build_producer(stash, adapters, store, *, limit, folder="library",
@@ -254,18 +484,22 @@ def build_producer(stash, adapters, store, *, limit, folder="library",
     answers `[]`, the closure asks nobody, and every file takes the text
     path exactly as it does today.
 
-    The operator's ALIASES are read off those same adapters and pooled into
-    one map for the run — see `configured_aliases` for why one and not one
-    per store. There is deliberately no `aliases` parameter to pass them in
-    by: every caller here already holds the adapters, and an argument a
-    caller can omit is exactly how this arrived. Configuring an alias had no
-    effect at all, on any scan any of the three entry points started, because
-    the one that mattered — the page's Scan button, through
+    The operator's ALIASES are read off those same adapters and pooled with
+    what the media server's own performer records already know -- see
+    `pooled_aliases` for how the two are merged and which wins where they
+    disagree. There is deliberately no `aliases` parameter to pass them in
+    by: every caller here already holds the adapters and `stash`, and an
+    argument a caller can omit is exactly how this arrived. Configuring an
+    alias had no effect at all, on any scan any of the three entry points
+    started, because the one that mattered — the page's Scan button, through
     `cronicled.web.actions.Actions.scan` — passed only `limit`, and a test
     that called this function with an explicit map went on passing. Derived
     here, the scheduled scan, the page's scan and the command line get the
     same map without any of them saying so, and no fourth call site can
-    forget it.
+    forget it. The `AliasReport` describing where the pooled map's entries
+    came from travels back on the built producer as `.alias_report`, for a
+    caller that wants to tell an operator what a scan actually resolved
+    against -- see `main`, below, for the one that does.
 
     `marker` is the name of the tag that says a scene was organized
     PROVISIONALLY — see `cronicled.scan.ScanProducer` for what it pools and
@@ -309,7 +543,7 @@ def build_producer(stash, adapters, store, *, limit, folder="library",
             "file it selects spends a lookup against a rate-limited "
             "scraper. Pass an explicit limit (0 runs the selection "
             "accounting with no lookups spent, if that is what is wanted).")
-    aliases = configured_aliases(adapters)
+    aliases, alias_report = pooled_aliases(stash, adapters)
     sources = [
         Source(name=name, search=catalog_search(stash, adapter),
               owner_of=(adapter.owner_of if adapter.catalog_resolvable
@@ -325,11 +559,18 @@ def build_producer(stash, adapters, store, *, limit, folder="library",
             scene_ids, boxes=stash.stash_boxes(),
             lookup=stash.scrape_scenes_by_fingerprint)
 
-    return ScanProducer(
+    producer = ScanProducer(
         stash, sources, store=store, folder=folder, limit=limit,
         name_filter=name_filter, threshold=threshold, aliases=aliases,
         workers=workers, enrich=stash.scrape_scene_url, identify=identify,
         marker=marker, name=producer_name, every=every, at=at, zone=zone)
+    # Not a `ScanProducer` field: that class's shape is `scan.py`'s to define,
+    # and every one of its callers builds it through THIS function, so
+    # attaching the report here rather than threading a new constructor
+    # argument through `ScanProducer` keeps the merge this ticket adds out of
+    # a module a separate, concurrent piece of work is also changing.
+    producer.alias_report = alias_report
+    return producer
 
 
 def build_scheduled_producer(stash, adapters, store, *, zone,
@@ -454,6 +695,11 @@ def main(argv=None):
             workers=args.workers, marker=marker)
         runner.register(producer)
 
+        # Printed once, at start-up, rather than left for an operator to
+        # infer from `adapters.json` -- which a scan never rewrites (see
+        # `pooled_aliases`), so this line is the only place the library's
+        # own contribution to the resolved map is visible at all.
+        print(producer.alias_report.summary())
         job = runner.start(producer.name, trigger="manual")
         print("scan %s started against stores %s"
              % (job.id, ", ".join(sorted(adapters))))

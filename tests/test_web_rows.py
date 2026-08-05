@@ -1013,6 +1013,46 @@ class IdentifiedRow(unittest.TestCase):
             (identified.score, identified.score_text,
              identified.identifying_box, identified.creator))
 
+    def test_it_names_the_algorithm_that_grounded_the_identification(self):
+        # HARM: "identified by fingerprint" alone covers a byte-identical
+        # match and a perceptual one alike, which is the whole defect this
+        # field exists to close. A reviewer reads this row, not the payload.
+        row = to_row(_identified_item(
+            payload={"algorithms": ["OSHASH"]}))
+        self.assertEqual(row.identified_by_algorithm, "OSHASH")
+
+    def test_several_exact_algorithms_are_all_named(self):
+        row = to_row(_identified_item(
+            payload={"algorithms": ["MD5", "OSHASH"]}))
+        self.assertEqual(row.identified_by_algorithm, "MD5/OSHASH")
+
+    def test_a_payload_recorded_before_this_field_existed_names_none(self):
+        # `.get`, not indexed: `_identified_item`'s own default payload has
+        # no `algorithms` key at all -- exactly what every payload recorded
+        # before this field existed looks like -- and absence must read as
+        # "not stated", never guessed at either extreme.
+        row = to_row(_identified_item())
+        self.assertIsNone(row.identified_by_algorithm)
+
+    def test_a_scored_row_names_no_algorithm(self):
+        row = to_row(_item())
+        self.assertIsNone(row.identified_by_algorithm)
+
+    def test_a_perceptual_disagreement_is_carried_onto_the_row(self):
+        row = to_row(_identified_item(payload={
+            "perceptual_disagreement":
+                "south-box says r-12 ('A Different Scene')"}))
+        self.assertEqual(row.perceptual_disagreement,
+                         "south-box says r-12 ('A Different Scene')")
+
+    def test_the_ordinary_identified_row_names_no_disagreement(self):
+        row = to_row(_identified_item())
+        self.assertIsNone(row.perceptual_disagreement)
+
+    def test_a_scored_row_never_carries_a_perceptual_disagreement(self):
+        row = to_row(_item())
+        self.assertIsNone(row.perceptual_disagreement)
+
     def test_a_payload_that_claims_identification_but_names_no_box_raises(self):
         # HARM: "identified by nobody" is precisely the row a person would
         # approve without noticing anything was missing.

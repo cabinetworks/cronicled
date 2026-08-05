@@ -27,11 +27,28 @@ class _FakeStash:
         self._prior = prior if prior is not None else {"title": "old"}
         self._fail = fail
 
-    def apply_scene(self, scene_id, match):
-        self.calls.append(("apply", scene_id))
+    def apply_scene(self, scene_id, match, drop_tag_ids=()):
+        # `drop_tag_ids` is recorded, not acted on: this fake has no scene
+        # state to drop a tag out of, unlike `_MarkerAwareStash` below, whose
+        # whole point is to model that write. Every test built on THIS fake
+        # constructs `Actions` with no marker configured, so the argument
+        # this call ever actually receives is `()` -- see `Approve
+        # .test_with_no_marker_configured_the_write_is_unchanged` for the one
+        # place that is asserted rather than assumed.
+        self.calls.append(("apply", scene_id, tuple(drop_tag_ids)))
         if self._fail:
             raise RuntimeError("server said no")
         return {"prior": self._prior}
+
+    def tag_id_by_name(self, name):
+        # Never legitimately called by any test built on this fake: every one
+        # constructs `Actions` with no marker, and `Actions._marker_tag_ids`
+        # returns `()` without reaching the stash at all in that case. Raising
+        # here (rather than answering something plausible) is what would turn
+        # a mutation that skipped the `self._marker is None` guard into a
+        # loud failure instead of a silently-passing extra network read.
+        raise AssertionError(
+            "tag_id_by_name was called with no marker configured")
 
     def revert_scene(self, scene_id, prior):
         # Refuses an empty snapshot exactly as the real client does, and
@@ -483,14 +500,22 @@ class _ScanStash:
     exactly as it is there, which is the whole reason a marker tag exists.
     """
 
-    def __init__(self, scenes=(), organized=(), tag_ids=None):
+    def __init__(self, scenes=(), organized=(), tag_ids=None, performers=None):
         self._scenes = list(scenes)
         self._organized = {str(scene_id) for scene_id in organized}
         self._tag_ids = dict(tag_ids or {})
+        # No performer carries an alias by default -- an empty library, the
+        # same answer every other read here gives for a fixture set that
+        # never mentions performers at all.
+        self._performers = list(performers or [])
         self.calls = []
 
     def _page(self, scenes, limit):
         return len(scenes), list(scenes if limit is None else scenes[:limit])
+
+    def performers_with_aliases(self):
+        self.calls.append(("performers_with_aliases",))
+        return [dict(row) for row in self._performers]
 
     def unorganized_scenes(self, limit):
         self.calls.append(("unorganized_scenes", limit))
@@ -603,7 +628,8 @@ class Scan(unittest.TestCase):
         self.assertGreater(len(stash.calls), 0)
         for call in stash.calls:
             self.assertIn(call[0],
-                         ("unorganized_scenes", "scrape_scenes_by_query"))
+                         ("unorganized_scenes", "scrape_scenes_by_query",
+                          "performers_with_aliases"))
 
     def test_a_scan_from_the_page_is_recorded_as_a_manual_run(self):
         # HARM: this control is the button, and the scheduler's pass is the
@@ -2003,11 +2029,18 @@ class _FakeMultiKindStash:
         self._fail_scene_ids = set(fail_scene_ids)
         self._fail_tag_ids = set(fail_tag_ids)
 
-    def apply_scene(self, scene_id, match):
+    def apply_scene(self, scene_id, match, drop_tag_ids=()):
         if scene_id in self._fail_scene_ids:
             raise RuntimeError("the media server refused scene %s" % scene_id)
         self.calls.append(("apply-scene", scene_id))
         return {"prior": self._prior}
+
+    def tag_id_by_name(self, name):
+        # No test built on this fake configures a marker -- see
+        # `_FakeStash.tag_id_by_name` above for why this raises rather than
+        # answering something plausible.
+        raise AssertionError(
+            "tag_id_by_name was called with no marker configured")
 
     def apply_performer_description(self, performer_id, description, *,
                                     expected):
@@ -2335,3 +2368,232 @@ class BatchApplyUnknownVerdict(unittest.TestCase):
         store = _FakeMultiItemStore([_item()])
         with self.assertRaises(ValueError):
             Actions(store, _FakeStash()).batch_apply("delete", ["fp-1"])
+
+
+# -- the marker tag: approve takes it off, nothing else does --------------- #
+#
+# These go through the REAL `Stash.apply_scene`/`revert_scene`, not
+# `_FakeStash`, because the acceptance this ticket cares about most --
+# "assert the whole set of tags written, not that the marker is absent" --
+# is a claim about what `Stash` actually puts in a sceneUpdate's `tag_ids`
+# once `Actions.approve` hands it a `drop_tag_ids`. A hand-rolled double for
+# `apply_scene` could only ever echo back whatever this suite decided to put
+# in it; the real merge/drop logic is what could genuinely blank every tag
+# instead of the one meant to go, and that logic already has its own direct
+# tests in test_stash.py -- what is untested until now is that `approve`
+# actually reaches it with the right id.
+
+MARKER = "needs review"
+
+
+class _MarkerAwareTransport:
+    """Fake GraphQL transport serving exactly the three operations these
+    tests need: `findScene` (the one read `apply_scene` takes its snapshot
+    from), `findTags(tag_filter:...)` -- the shape `Stash.tag_id_by_name`
+    queries with, distinct from the `findTags(filter:...)` find-or-create
+    shape `tests/test_stash.py`'s own fakes already answer -- and
+    `sceneUpdate`. Every fixture scene here carries no performers and no
+    proposal here names a tag to ADD, so `apply_scene`'s find-or-create path
+    is never exercised and does not need modelling.
+
+    Records the LAST `sceneUpdate` input verbatim (`scene_update_input`) and
+    every tag name asked about (`tag_lookups`), so a test can assert on
+    both what was written and whether the marker was even looked up.
+    """
+
+    def __init__(self, existing_tags, tag_registry, fail_lookup=False,
+                fail_write=False):
+        self.existing = {
+            "id": "42", "title": "T", "details": None, "date": None,
+            "urls": [], "organized": False, "rating100": None,
+            "code": None, "director": None, "stash_ids": [],
+            "studio": None, "performers": [],
+            "tags": [dict(t) for t in existing_tags],
+        }
+        self._tag_registry = dict(tag_registry)
+        self._fail_lookup = fail_lookup
+        self._fail_write = fail_write
+        self.scene_update_input = None
+        self.tag_lookups = []
+
+    def __call__(self, body, timeout):
+        q = body["query"]
+        if "tag_filter" in q:
+            if self._fail_lookup:
+                return {"errors": [{"message": "tag lookup exploded"}]}
+            name = body["variables"]["f"]["name"]["value"]
+            self.tag_lookups.append(name)
+            tag_id = self._tag_registry.get(name)
+            rows = ([{"id": tag_id, "name": name, "scene_count": 0}]
+                    if tag_id is not None else [])
+            return {"data": {"findTags": {"tags": rows}}}
+        if "findScene(" in q:
+            return {"data": {"findScene": self.existing}}
+        if "sceneUpdate" in q:
+            if self._fail_write:
+                return {"errors": [{"message": "the server refused the write"}]}
+            self.scene_update_input = body["variables"]["in"]
+            return {"data": {"sceneUpdate":
+                             {"id": self.scene_update_input["id"]}}}
+        raise AssertionError(
+            "marker test transport does not recognize query: %s" % q)
+
+
+class _MarkerGuardStash:
+    """Raises on any write or lookup a marker-removal mutation could reach
+    for -- used to prove a verdict that must never touch the marker really
+    does not reach the stash at all, rather than merely producing no
+    OBSERVABLE difference today. A mutation that added a marker-removal call
+    to `dismiss`/`mute`/`refresh` would hit one of these and fail loudly
+    instead of leaving the row's own state untouched by coincidence."""
+
+    def apply_scene(self, *args, **kwargs):
+        raise AssertionError(
+            "this verdict must never write to the media server at all")
+
+    def tag_id_by_name(self, name):
+        raise AssertionError(
+            "this verdict must never look up the marker tag at all")
+
+
+class ApproveRemovesTheMarkerTag(unittest.TestCase):
+    def test_approve_drops_only_the_marker_from_the_written_tag_set(self):
+        transport = _MarkerAwareTransport(
+            existing_tags=[{"id": "77", "name": MARKER},
+                          {"id": "5", "name": "Keep This One"}],
+            tag_registry={MARKER: "77"})
+        stash = Stash("http://example.test", "k", transport=transport)
+        store = _FakeStore(_item(subject_id="42"))
+
+        Actions(store, stash, marker=MARKER).approve("fp-1")
+
+        # The WHOLE set actually written, not merely that the marker's id is
+        # missing from it -- an apply that dropped every tag from the scene
+        # would also satisfy "the marker is gone", and be the far worse bug.
+        self.assertEqual(transport.scene_update_input["tag_ids"], ["5"])
+
+    def test_a_scene_not_carrying_the_marker_writes_its_tags_unchanged(self):
+        # Nothing to drop: the marker tag exists on the server but this
+        # scene never had it, so the write must look exactly as it would
+        # with no marker configured at all.
+        transport = _MarkerAwareTransport(
+            existing_tags=[{"id": "5", "name": "Keep This One"}],
+            tag_registry={MARKER: "77"})
+        stash = Stash("http://example.test", "k", transport=transport)
+        store = _FakeStore(_item(subject_id="42"))
+
+        Actions(store, stash, marker=MARKER).approve("fp-1")
+
+        self.assertNotIn("tag_ids", transport.scene_update_input or {})
+
+    def test_a_failed_tag_lookup_fails_the_whole_apply(self):
+        # New code this ticket adds: resolving the marker's id is itself a
+        # network call, and its failure must read exactly like any other
+        # apply failure -- recorded failed, never applied, and the scene
+        # never written to at all.
+        transport = _MarkerAwareTransport(
+            existing_tags=[{"id": "77", "name": MARKER}],
+            tag_registry={MARKER: "77"}, fail_lookup=True)
+        stash = Stash("http://example.test", "k", transport=transport)
+        store = _FakeStore(_item(subject_id="42"))
+
+        with self.assertRaises(ApplyFailed):
+            Actions(store, stash, marker=MARKER).approve("fp-1")
+
+        self.assertEqual([c[0] for c in store.calls], ["failed"])
+        self.assertIsNone(transport.scene_update_input)
+
+    def test_a_failed_write_is_not_reported_as_a_successful_apply(self):
+        # The marker's removal travels in the SAME sceneUpdate as the
+        # metadata -- there is no separate "now remove the tag" call to
+        # half-fail. A failure of that one write must still read as a
+        # failed apply, not as a success that quietly kept the marker.
+        transport = _MarkerAwareTransport(
+            existing_tags=[{"id": "77", "name": MARKER},
+                          {"id": "5", "name": "Keep This One"}],
+            tag_registry={MARKER: "77"}, fail_write=True)
+        stash = Stash("http://example.test", "k", transport=transport)
+        store = _FakeStore(_item(subject_id="42"))
+
+        with self.assertRaises(ApplyFailed):
+            Actions(store, stash, marker=MARKER).approve("fp-1")
+
+        self.assertEqual([c[0] for c in store.calls], ["failed"])
+
+
+class NoMarkerConfiguredApproveIsUnaffected(unittest.TestCase):
+    def test_approve_never_looks_up_or_drops_anything(self):
+        # Acceptance: a deployment with no marker configured (the default --
+        # `Actions(store, stash)` names none) behaves exactly as it did
+        # before this ticket. A mutation that reached for the marker tag
+        # regardless of configuration would either call
+        # `tag_id_by_name` (recorded in `tag_lookups`) or write a `tag_ids`
+        # array this scene never asked for -- either is caught below.
+        transport = _MarkerAwareTransport(
+            existing_tags=[{"id": "77", "name": MARKER},
+                          {"id": "5", "name": "Keep This One"}],
+            tag_registry={MARKER: "77"})
+        stash = Stash("http://example.test", "k", transport=transport)
+        store = _FakeStore(_item(subject_id="42"))
+
+        Actions(store, stash).approve("fp-1")
+
+        self.assertEqual(transport.tag_lookups, [])
+        self.assertNotIn("tag_ids", transport.scene_update_input or {})
+
+
+class DismissMuteAndRefreshLeaveTheMarkerAlone(unittest.TestCase):
+    """Acceptance: only approve removes the marker. A dismissal is "not this
+    candidate", not "this file is settled"; mute and refresh mean something
+    else again -- see this ticket's own brief for why dropping the marker on
+    any of the three would hide a file from every future pass. Each test
+    uses `_MarkerGuardStash`, which raises if the verdict under test reaches
+    for the stash at all, so a mutation that added marker-removal to one of
+    these fails loudly rather than passing because today's code happens to
+    produce no visible difference."""
+
+    def test_dismiss_never_touches_the_stash(self):
+        store = _FakeStore(_item(subject_id="42"))
+        Actions(store, _MarkerGuardStash(), marker=MARKER).dismiss("fp-1")
+        self.assertEqual([c[0] for c in store.calls], ["dismissed"])
+
+    def test_mute_never_touches_the_stash(self):
+        store = _FakeStore(_item(subject_id="42"))
+        Actions(store, _MarkerGuardStash(), marker=MARKER).mute("fp-1")
+        self.assertEqual([c[0] for c in store.calls], ["muted"])
+
+    def test_refresh_never_touches_the_stash(self):
+        store = _FakeStore(_item(subject_id="42"))
+        Actions(store, _MarkerGuardStash(), marker=MARKER).refresh("fp-1")
+        self.assertEqual([c[0] for c in store.calls], ["superseded"])
+
+
+class UndoRestoresTheMarkerTag(unittest.TestCase):
+    def test_undoing_an_approve_puts_the_marker_back_on_the_scene(self):
+        transport = _MarkerAwareTransport(
+            existing_tags=[{"id": "77", "name": MARKER},
+                          {"id": "5", "name": "Keep This One"}],
+            tag_registry={MARKER: "77"})
+        stash = Stash("http://example.test", "k", transport=transport)
+        approve_store = _FakeStore(_item(subject_id="42"))
+
+        Actions(approve_store, stash, marker=MARKER).approve("fp-1")
+
+        # The approve itself dropped the marker from what was WRITTEN...
+        self.assertEqual(transport.scene_update_input["tag_ids"], ["5"])
+        # ...but the snapshot recorded for undo is built from the read
+        # taken BEFORE the drop, so it still names the marker. That is what
+        # makes the undo below possible at all -- if a future change moved
+        # the snapshot to be taken after the drop, this is where it would
+        # be caught, before undo ever got a chance to fail.
+        prior = next(c[2] for c in approve_store.calls if c[0] == "applied")
+        self.assertEqual(sorted(prior["tag_ids"]), ["5", "77"])
+
+        undo_store = _FakeStore(
+            _item(subject_id="42", state="applied", prior_state=prior))
+        Actions(undo_store, stash, marker=MARKER).undo("fp-1")
+
+        # The whole set restored, marker included -- not merely "the marker
+        # is present somewhere", which a partial restore could also satisfy.
+        self.assertEqual(sorted(transport.scene_update_input["tag_ids"]),
+                         ["5", "77"])

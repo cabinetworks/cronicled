@@ -1700,6 +1700,26 @@ class Stash:
     # one caller that has a use for it.
     _REMOTE_SITE_ID = "remote_site_id"
 
+    # The field that decides whether a match may identify the file at all.
+    # A hit here means the box matched one of the file's own hashes; WHICH
+    # algorithm matched is the whole of what tells an `MD5`/`OSHASH` hit
+    # (the same bytes) from a `PHASH` hit (a perceptual hash, designed to
+    # also match a re-encode or a trim of a DIFFERENT file that merely
+    # looks similar). See `cronicled.scan._resolve_claims` for the rule
+    # that reads it -- this client only carries the field back, unfiltered,
+    # for every match the box returns.
+    #
+    # Kept out of `_SCRAPED_SCENE_SELECTION` for the same reason
+    # `_REMOTE_SITE_ID` is: that constant's other caller, `scrape_scenes_by_
+    # query`, never has a file's own hash to report, so folding this in
+    # would put a `fingerprints: []` key on every text-scraped candidate --
+    # changing every scored proposal's stored payload, hence the content
+    # hash `cronicled.store.record` keys it by, hence re-proposing the
+    # whole library once for a field only this caller can use. (That
+    # stored content hash and a file's own fingerprint are two unrelated
+    # meanings of the same word; this comment means the latter throughout.)
+    _FINGERPRINTS = "fingerprints{ algorithm hash }"
+
     def stash_boxes(self):
         """Every stash-box this server is configured against, as a list of
         `{"name", "endpoint"}` dicts, in the order the SERVER lists them —
@@ -1758,11 +1778,23 @@ class Stash:
         fingerprints, and return what it recognised for each — a list of
         match lists, ONE PER REQUESTED SCENE, IN THE ORDER REQUESTED.
 
-        This is identity, not similarity. The server computes each scene's
-        hashes from the file itself and asks the box which scene those
-        belong to; nothing here searches for text and nothing here is
-        scored. An empty inner list is the box saying "I have never seen
-        this file", which is an ordinary answer — most files, most boxes.
+        Nothing here searches for text and nothing here is scored — but
+        that no longer means every match is identity. The server computes
+        each scene's own hashes and asks the box which scene THOSE belong
+        to, over three algorithms: `MD5` and `OSHASH` mean the box matched
+        the same bytes; `PHASH` is a perceptual hash, designed on purpose
+        to also match a re-encode or a trimmed copy — which means it
+        matches just as readily against a DIFFERENT file that merely looks
+        similar. A box's match names every fingerprint it matched on (see
+        `_FINGERPRINTS`), unfiltered, and it is
+        `cronicled.scan._resolve_claims` that decides whether a given match
+        may identify the file or only support a proposal a scorer weighs.
+        This method used to claim "this is identity, not similarity" here;
+        that claim is exactly what a real library disproved — a `PHASH`
+        collision between two unrelated videos was presented to a reviewer
+        as an identified file — so this docstring no longer makes it. An
+        empty inner list is the box saying "I have never seen this file",
+        which is an ordinary answer — most files, most boxes.
 
         `endpoint` is a configured box's own address (see `stash_boxes`),
         passed as `ScraperSourceInput.stash_box_endpoint`. That is the same
@@ -1789,17 +1821,19 @@ class Stash:
         The selection set is `_SCRAPED_SCENE_SELECTION` — the same fields a
         text scrape returns, so a match can be carried into a proposal's
         payload and applied by exactly the same code — plus
-        `remote_site_id`, the box's own id for the scene it recognised. See
-        `_REMOTE_SITE_ID` for why that one field is a superset here rather
-        than an addition to the shared constant.
+        `remote_site_id`, the box's own id for the scene it recognised, and
+        `fingerprints`, the algorithm/hash pairs the box matched on. See
+        `_REMOTE_SITE_ID` and `_FINGERPRINTS` for why both are supersets
+        here rather than additions to the shared constant.
         """
         ids = [str(scene_id) for scene_id in scene_ids]
         if not ids:
             return []
         q = """
         query($source: ScraperSourceInput!, $input: ScrapeMultiScenesInput!){
-          scrapeMultiScenes(source:$source, input:$input){%s %s}
-        }""" % (self._SCRAPED_SCENE_SELECTION, self._REMOTE_SITE_ID)
+          scrapeMultiScenes(source:$source, input:$input){%s %s %s}
+        }""" % (self._SCRAPED_SCENE_SELECTION, self._REMOTE_SITE_ID,
+                self._FINGERPRINTS)
         data = self.gql(q, {"source": {"stash_box_endpoint": endpoint},
                             "input": {"scene_ids": ids}})
         per_scene = data["scrapeMultiScenes"]

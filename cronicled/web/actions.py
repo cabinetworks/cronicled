@@ -205,6 +205,11 @@ class Actions:
         # a person actually presses. That is not hypothetical -- an alias map
         # was configured and ignored on exactly this path, because this
         # method did not pass it either.
+        #
+        # `approve` also reads this -- see `_marker_tag_ids` -- to take a
+        # scene's marker off as part of the same write that resolves it. No
+        # second loader is added for that: this is the one name a scan and
+        # an approve both act on, and both read it from here.
         self._marker = marker
 
     def _find(self, fp):
@@ -217,6 +222,30 @@ class Actions:
             if item["fingerprint"] == fp:
                 return item
         raise UnknownProposal(fp)
+
+    def _marker_tag_ids(self):
+        """The configured marker tag's id on THIS server, as the single-
+        element `drop_tag_ids` a scene apply passes to `Stash.apply_scene`
+        -- or an empty tuple when no marker is configured at all.
+
+        Resolved fresh on every call, never cached: tag ids are
+        installation-specific, and this reads the name the same way
+        `cronicled.scan.pool_scenes` does, against the server as it stands.
+        Called only from the scene branch of `approve` -- a marker names
+        provisional ORGANIZATION, which only a scene proposal can carry, so
+        a performer- or tag-description approval never asks this at all.
+
+        A server that no longer holds a tag by this name has nothing this
+        apply could remove, so nothing is dropped -- that is a narrower,
+        quieter question than `pool_scenes`' own check (whether a marker
+        that should be pooling files silently pools none), and this does
+        not raise for it: an approve is not the place a misconfigured
+        marker is first noticed, a scan is.
+        """
+        if self._marker is None:
+            return ()
+        tag_id = self._stash.tag_id_by_name(self._marker)
+        return (tag_id,) if tag_id is not None else ()
 
     def approve(self, fp):
         item = self._find(fp)
@@ -271,8 +300,18 @@ class Actions:
                     subject_id, payload["description"],
                     expected=payload["original"])
             else:
+                # `drop_tag_ids` carries the marker off in the SAME write
+                # that records the real metadata -- one sceneUpdate, so a
+                # transport failure drops neither half or both, never one
+                # without the other. That is what makes the ordering
+                # decision moot rather than merely convenient: there is no
+                # separate remove-the-tag call whose own failure could
+                # leave a scene updated but still marked, or marked-clean
+                # but not updated (see `Stash.apply_scene`'s own
+                # docstring for why the write is single).
                 result = self._stash.apply_scene(
-                    subject_id, _match_to_apply(item["payload"]))
+                    subject_id, _match_to_apply(item["payload"]),
+                    drop_tag_ids=self._marker_tag_ids())
         except Exception as exc:
             # Recorded as failed, never as applied: an applied row offers an
             # undo, and an undo of a write that never happened would restore

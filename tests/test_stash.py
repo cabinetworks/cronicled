@@ -4334,6 +4334,20 @@ class FingerprintLookup(unittest.TestCase):
         self.assertIn("scrapeMultiScenes", query)
         self.assertIn("remote_site_id", query)
 
+    def test_the_query_asks_which_fingerprints_a_match_was_found_on(self):
+        # `algorithm` is the only thing that tells a byte-identical match
+        # from a perceptual one apart -- see `cronicled.scan._resolve_claims`
+        # for the rule that reads it. A selection that dropped this would
+        # leave every match looking exactly like the flat "identity" this
+        # client's docstring used to (wrongly) promise.
+        t = _transport([self._reply([[]])])
+        Stash("http://example.test", "k", transport=t
+              ).scrape_scenes_by_fingerprint(BOX_ONE["endpoint"], ["1"])
+        query = t.calls[0][0]["query"]
+        self.assertIn("fingerprints", query)
+        self.assertIn("algorithm", query)
+        self.assertIn("hash", query)
+
     def test_it_selects_everything_an_apply_would_write_from_a_match(self):
         # A box match is carried into a proposal and applied by exactly the
         # same code a text-scraped candidate is, so a field missing here is a

@@ -222,6 +222,20 @@ class Row:
     # silently fall through every branch and take the controls away again --
     # which is exactly how a failed row became a dead end.
     actionable: bool
+    # Which exact algorithm(s) grounded a fingerprint identification --
+    # `None` for a scored proposal, and for a fingerprint payload recorded
+    # before this field existed. "identified by fingerprint" alone does not
+    # say whether a row rests on a byte-identical match or a perceptual
+    # one; this is what lets the template say which, beside
+    # `identifying_box` rather than folded into it, on the same terms
+    # `identifying_box` is kept apart from `creator`.
+    identified_by_algorithm: str | None = None
+    # A perceptual-only match that named a DIFFERENT scene than the one
+    # this row identifies, kept rather than silently dropped -- see
+    # `cronicled.scan.Identified.perceptual_disagreement`. `None` on every
+    # scored row, and on the ordinary identified row where no box's
+    # perceptual hash disagreed with the winning exact one.
+    perceptual_disagreement: str | None = None
     # Last, with a default, so this stays the row every existing caller
     # already builds. See KIND_SCENE.
     kind: str = KIND_SCENE
@@ -568,6 +582,11 @@ def to_row(item, base_url=None):
         score = payload["score"]
         score_text = "%.3f" % score
         identifying_box = None
+        # Both `None` on a scored proposal, on the same terms
+        # `identifying_box` is: a title match has no algorithm to name and
+        # nothing here reads a box's fingerprints at all.
+        identified_by_algorithm = None
+        perceptual_disagreement = None
         # `.get`, not indexed: every proposal made before cross-store
         # agreement existed, and every one only a single store answered,
         # legitimately has no such key. An empty tuple is the honest reading
@@ -586,10 +605,19 @@ def to_row(item, base_url=None):
         creator_name = creator_source = score = None
         score_text = IDENTIFIED_SCORE_TEXT
         identifying_box = payload["box"]
+        # `.get`, not indexed: a payload recorded before this field existed
+        # has none, and that absence must read as "not stated", never as
+        # "perceptual" or "exact" -- a guess here is exactly the ambiguity
+        # this field exists to remove.
+        identified_by_algorithm = "/".join(payload.get("algorithms") or ()) or None
+        perceptual_disagreement = payload.get("perceptual_disagreement")
         agreeing_stores = ()
-        # Nothing to contest: two boxes that disagreed never produced a
+        # Nothing to contest, in the sense `disagreement` means for a scored
+        # row: two boxes that disagreed about WHICH scene never produced a
         # proposal at all (see `scan.fingerprint_outcome`), and boxes that
-        # AGREED are agreement, which is not a warning.
+        # AGREED are agreement, which is not a warning. A perceptual match
+        # that disagreed with the winning exact one is a different kind of
+        # fact and travels on `perceptual_disagreement` instead, never here.
         disagreement = None
     return Row(
         fingerprint=item["fingerprint"],
@@ -624,6 +652,8 @@ def to_row(item, base_url=None):
         # and no precision; see IDENTIFIED_SCORE_TEXT.
         score_text=score_text,
         identifying_box=identifying_box,
+        identified_by_algorithm=identified_by_algorithm,
+        perceptual_disagreement=perceptual_disagreement,
         runners_up=tuple(_runner_up_view(r)
                          for r in (payload.get("runners_up") or ())),
         # An applied row with no snapshot cannot be reverted — revert_scene

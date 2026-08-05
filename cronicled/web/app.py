@@ -181,8 +181,11 @@ _OPENABLE_SECTIONS = tuple(_REOPEN_SECTION.values())
 # `limit` is refused there (see `do_POST`), not silently given this number.
 DEFAULT_SCAN_LIMIT = 25
 
-# Every write here posts exactly one hidden field: a fingerprint. Nothing
-# genuine comes anywhere near this many bytes -- it exists to bound
+# Every write here posts a fingerprint (or, for `unmute`, a subject pair)
+# plus, since the return-address ticket, up to four more small fields
+# naming the page it was shown on (see `return_fields` in inbox.html and
+# `_return_path` below) -- a handful of short identifiers and one small
+# integer, nowhere close to this many bytes. It exists to bound
 # `rfile.read(length)` below, not to accommodate a real form.
 #
 # `int(Content-Length)` alone only catches a non-numeric header (a
@@ -311,6 +314,181 @@ def _pager(path, current_pages, key, total, page_size=PAGE_SIZE):
     }
 
 
+# The sections a row's own form can act from and needs a return address
+# for. `superseded`/`gone`/`refused` are excluded on purpose -- see the
+# template, none of the three ever draws a form.
+_RETURN_SECTIONS = ("rows", "applied", "dismissed", "muted",
+                   "merges", "reconciles", "unused")
+
+
+def _return_pages(inbox_name, current_pages):
+    """The page-number half of a row's own return address, one entry per
+    section this page can act from (see `_RETURN_SECTIONS`) -- each a
+    `{"key": ..., "page": ...}` pair naming the pagination query key that
+    section pages under and its current value in `current_pages`.
+
+    `merges`/`reconciles`/`unused` always page under their OWN dedicated
+    key (`_SECTION_PAGE_KEYS`), identically whether this is the combined
+    inbox or a per-inbox page -- both compose them through the same
+    closures (see `_inbox_page`'s own docstring).
+
+    `rows`/`applied`/`dismissed`/`muted` differ by `inbox_name`:
+
+    - The combined inbox (`inbox_name is None`) pages each of the four
+      independently, under its own key -- `rows` under `_ROWS_PAGE_KEY`,
+      the other three under their own `_SECTION_PAGE_KEYS` entries.
+    - A per-inbox page shows exactly ONE of the four at a time (`_inbox_page`
+      fetches whichever `state` names, always through the single generic
+      `page` key -- see its own docstring), so all four collapse onto that
+      one key and page number there, regardless of which of the four a
+      particular row happens to render into.
+    """
+    pages = {}
+    for name in ("merges", "reconciles", "unused"):
+        key = _SECTION_PAGE_KEYS[name]
+        pages[name] = {"key": key, "page": current_pages[key]}
+    if inbox_name is None:
+        pages["rows"] = {"key": _ROWS_PAGE_KEY,
+                         "page": current_pages[_ROWS_PAGE_KEY]}
+        for name in ("applied", "dismissed", "muted"):
+            key = _SECTION_PAGE_KEYS[name]
+            pages[name] = {"key": key, "page": current_pages[key]}
+    else:
+        page = current_pages[_ROWS_PAGE_KEY]
+        for name in ("rows", "applied", "dismissed", "muted"):
+            pages[name] = {"key": _ROWS_PAGE_KEY, "page": page}
+    return pages
+
+
+def _return_path(form):
+    """The path (plus, when it is not page 1, a bounded `?<key>=<page>`
+    query) that a write's redirect -- and a batch confirmation's own
+    resubmit form and Cancel link -- rebuild from what THIS render's own
+    forms posted back (see inbox.html's `return_fields`). Never a path or
+    URL taken from the request as-is: every piece is checked against a
+    closed, already-known set before it is used for anything, the same
+    sets `_serve_inbox_route` itself 404s an unrecognised inbox or state
+    against.
+
+    - `return_inbox` against `INBOXES`' own keys. Missing or unrecognised
+      reads as the combined inbox -- the same page every write already
+      returned to before this feature existed.
+    - `return_state` against `_INBOX_STATES` -- consulted only once
+      `return_inbox` is itself valid; missing or unrecognised drops the
+      state segment rather than refusing the return outright.
+    - `return_page_key` against `_ALL_PAGE_KEYS` -- the fixed set of
+      pagination query keys this app understands; anything else falls
+      back to the generic `page` key.
+    - `return_page`, through `pagination.page_number` -- the same
+      sanitiser every other page number in this app already goes through,
+      so a negative, non-numeric or missing value reads as page 1.
+
+    Chose to return to the SAME page rather than always page one: acting
+    on row 3 of page 7 and landing back on page 1 is nearly as disorienting
+    as landing on the combined inbox, which is the whole complaint this
+    feature exists to fix. A page number past the list's current end is
+    deliberately NOT special-cased here -- it renders that section empty,
+    exactly the already-chosen, already-pinned behaviour every other page
+    number in this app has for the same situation (see
+    `test_a_page_past_the_end_is_simply_empty_not_an_error`); a bookmarked
+    or stale `?page=` has always resolved this way, and this feature does
+    not treat a number that arrived on a form any more specially than one
+    that arrived on a URL.
+    """
+    inbox_name = (form.get("return_inbox") or [""])[0]
+    state = (form.get("return_state") or [""])[0]
+    page_key = (form.get("return_page_key") or [""])[0]
+    raw_page = (form.get("return_page") or [""])[0]
+
+    if inbox_name in INBOXES:
+        if state not in _INBOX_STATES:
+            state = ""
+        path = "/" + "/".join(s for s in (inbox_name, state) if s)
+    else:
+        path = INBOX_PATH
+
+    if page_key not in _ALL_PAGE_KEYS:
+        page_key = _ROWS_PAGE_KEY
+    page = page_number(raw_page)
+    if page == 1:
+        return path
+    return path + "?" + urllib.parse.urlencode({page_key: page})
+
+
+def _append_query(path, extra):
+    """`path` (as `_return_path` returns it) with `extra` -- a `key=value`
+    fragment this module built itself from a fixed vocabulary (a
+    fingerprint already url-quoted, a known verdict, a plain integer --
+    never caller text placed there raw) -- appended after whatever
+    `_return_path` put there: `&` if it already carries a `?page=...`,
+    `?` if it does not.
+    """
+    return path + ("&" if "?" in path else "?") + extra
+
+
+def _parse_just_applied(qs):
+    """The fingerprint a successful `/approve` redirected here with (see
+    `do_POST`'s own `applied=` branch) -- read-only, and never trusted as
+    anything more than "try to show a one-row confirmation for exactly
+    this row". Shared by `do_GET` and `_inbox_page` so the two pages parse
+    this query value identically.
+    """
+    return (qs.get("applied") or [None])[0]
+
+
+def _parse_opened(qs):
+    """The collapsed section a reversal (`/unmute`, `/undismiss`) just
+    redirected here from (see `do_POST`'s own `_REOPEN_SECTION` use) --
+    checked against the fixed set this server actually knows how to
+    reopen, so a stray or foreign query value opens nothing.
+    """
+    opened = (qs.get("opened") or [None])[0]
+    return opened if opened in _OPENABLE_SECTIONS else None
+
+
+def _parse_bulk_result(qs):
+    """The two counts `/bulk_apply_tag_descriptions` redirected here with,
+    or `None` when either is missing or not a plain non-negative integer --
+    a stray or foreign query value must not invent a count that was never
+    reported.
+    """
+    raw_requested = (qs.get("bulk_requested") or [None])[0]
+    raw_applied = (qs.get("bulk_applied") or [None])[0]
+    if raw_requested is None or raw_applied is None:
+        return None
+    try:
+        requested_n = int(raw_requested)
+        applied_n = int(raw_applied)
+        if requested_n < 0 or applied_n < 0:
+            raise ValueError("negative count")
+    except ValueError:
+        return None
+    return {"requested": requested_n, "applied": applied_n}
+
+
+def _parse_batch_result(qs):
+    """The verdict and two counts `/batch` redirected here with, or `None`
+    when the verdict is not one of `BATCH_VERDICTS` or either count is
+    missing or not a plain non-negative integer -- the same "a stray or
+    foreign value shows nothing" rule `_parse_bulk_result` follows.
+    """
+    raw_verdict = (qs.get("batch_verdict") or [None])[0]
+    raw_batch_requested = (qs.get("batch_requested") or [None])[0]
+    raw_batch_applied = (qs.get("batch_applied") or [None])[0]
+    if (raw_verdict not in BATCH_VERDICTS or raw_batch_requested is None
+            or raw_batch_applied is None):
+        return None
+    try:
+        requested_n = int(raw_batch_requested)
+        applied_n = int(raw_batch_applied)
+        if requested_n < 0 or applied_n < 0:
+            raise ValueError("negative count")
+    except ValueError:
+        return None
+    return {"verdict": raw_verdict, "requested": requested_n,
+           "applied": applied_n}
+
+
 def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                   refused=None, superseded=None, applied=None,
                   schedule_status=None, merges=None, reconciles=None,
@@ -422,66 +600,28 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
             # banner and its own `just_applied_rows` guard, which is also
             # what keeps a stale or foreign value from producing a
             # confirmation for a row that is not (or no longer) there.
-            just_applied = (qs.get("applied") or [None])[0]
+            #
+            # This and the three parses below are shared with `_inbox_page`
+            # (see `_parse_just_applied` et al.) so a per-inbox page reads
+            # the exact same query values the same way.
+            just_applied = _parse_just_applied(qs)
             # `opened` names the COLLAPSED section a reversal (`/unmute`,
             # `/undismiss`) just redirected here from, so that section
             # re-opens instead of every write closing it again -- see
-            # `do_POST`'s own `_REOPEN_SECTION` use below. Unlike `applied`,
-            # this never names a specific row, so there is no stale-row check
-            # to make; it is still checked against the fixed set this server
-            # actually knows how to reopen, so a stray or foreign query value
-            # opens nothing rather than being handed to the template as a
-            # section name it has never heard of.
-            opened = (qs.get("opened") or [None])[0]
-            if opened not in _OPENABLE_SECTIONS:
-                opened = None
+            # `do_POST`'s own `_REOPEN_SECTION` use below.
+            opened = _parse_opened(qs)
             # `bulk_requested`/`bulk_applied` name the two counts
             # `/bulk_apply_tag_descriptions` just redirected here with (see
             # `do_POST`'s own branch for that action) -- read-only, exactly
             # like `applied` above, and shown as a banner stating both
             # numbers rather than a single "succeeded" flag, so a partial
             # batch cannot be collapsed into looking like a complete one.
-            # Either missing, or either not a plain non-negative integer,
-            # means no banner at all -- a stray or foreign query value must
-            # not invent a count that was never reported.
-            bulk_result = None
-            raw_requested = (qs.get("bulk_requested") or [None])[0]
-            raw_applied = (qs.get("bulk_applied") or [None])[0]
-            if raw_requested is not None and raw_applied is not None:
-                try:
-                    requested_n = int(raw_requested)
-                    applied_n = int(raw_applied)
-                    if requested_n < 0 or applied_n < 0:
-                        raise ValueError("negative count")
-                    bulk_result = {"requested": requested_n,
-                                  "applied": applied_n}
-                except ValueError:
-                    bulk_result = None
+            bulk_result = _parse_bulk_result(qs)
 
             # `batch_verdict`/`batch_requested`/`batch_applied` are the same
             # idea as `bulk_result` above, widened to name which of the four
-            # verdicts `/batch` just carried out -- read-only, on the same
-            # "a stray or foreign value shows nothing" terms: `batch_verdict`
-            # must also be one of `BATCH_VERDICTS`, not just any string, or a
-            # bookmarked/foreign link could claim a verdict this page never
-            # performed.
-            batch_result = None
-            raw_verdict = (qs.get("batch_verdict") or [None])[0]
-            raw_batch_requested = (qs.get("batch_requested") or [None])[0]
-            raw_batch_applied = (qs.get("batch_applied") or [None])[0]
-            if (raw_verdict in BATCH_VERDICTS
-                    and raw_batch_requested is not None
-                    and raw_batch_applied is not None):
-                try:
-                    requested_n = int(raw_batch_requested)
-                    applied_n = int(raw_batch_applied)
-                    if requested_n < 0 or applied_n < 0:
-                        raise ValueError("negative count")
-                    batch_result = {"verdict": raw_verdict,
-                                    "requested": requested_n,
-                                    "applied": applied_n}
-                except ValueError:
-                    batch_result = None
+            # verdicts `/batch` just carried out.
+            batch_result = _parse_batch_result(qs)
 
             # Every pagination query key this page knows, read once so a
             # link built for one section can carry every other section's
@@ -531,7 +671,15 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
             pagers["unused"] = _pager(INBOX_PATH, current_pages, unused_key,
                                       unused_total)
 
+            # The combined inbox's own return address: no inbox name, no
+            # state -- every write already comes back here, unchanged from
+            # before this feature existed (see `_return_pages`'s own
+            # docstring for why `None` is what selects this behaviour).
+            return_pages = _return_pages(None, current_pages)
+
             body = render("inbox.html", rows=rows_window, counts={},
+                         return_inbox="", return_state="",
+                         return_pages=return_pages,
                          bulk_result=bulk_result,
                          batch_result=batch_result,
                          muted=sections["muted"],
@@ -639,8 +787,20 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
             (checked against the full, unnarrowed `INBOXES[name]`) -- `/tags`
             gets all three, `/scenes` and `/performers` get none, because
             `inboxes.INBOXES` maps each of the three to `tags` alone.
+
+            Also parses the same four confirmation/reversal query values
+            `do_GET` does (`applied`, `opened`, the bulk and batch result
+            pairs -- see `_parse_just_applied` et al.) and carries the same
+            `return_inbox`/`return_state`/`return_pages` a row's own form
+            needs to point a later write back at THIS page (see
+            `_return_pages`, and `_return_path` on the `do_POST` side).
             """
-            current_pages = _current_pages(urllib.parse.parse_qs(query))
+            qs = urllib.parse.parse_qs(query)
+            just_applied = _parse_just_applied(qs)
+            opened = _parse_opened(qs)
+            bulk_result = _parse_bulk_result(qs)
+            batch_result = _parse_batch_result(qs)
+            current_pages = _current_pages(qs)
             path = "/" + "/".join(s for s in (name, state) if s)
             types = INBOXES[name]
             scene_types = _scene_subject_types(types)
@@ -711,14 +871,45 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                     extra["unused"] = windowed
                     pagers["unused"] = _pager(path, current_pages, key,
                                               utotal)
+
+            # The confirmation banner's fallback: a per-inbox WORKING-QUEUE
+            # page never fetches an `applied` bucket at all (see the
+            # `context` assembly above -- `state is None` only ever
+            # populates `rows`), so the row `?applied=` names can never be
+            # found by searching `context["applied"]` the way the combined
+            # inbox's own confirmation does. Found there first when it
+            # already is (the terminal `/{name}/applied` route DOES
+            # populate it, from exactly this same fetch); the bounded,
+            # by-fingerprint fallback read only runs otherwise, and only
+            # when a fingerprint was actually given.
+            just_applied_row = None
+            if just_applied:
+                for row in context["applied"]:
+                    if row.fingerprint == just_applied:
+                        just_applied_row = row
+                        break
+                if just_applied_row is None:
+                    applied_window = _store.items(
+                        subject_types=scene_types, state="applied",
+                        limit=PAGE_SIZE, offset=0)
+                    for row in to_rows(applied_window, base_url=_base_url):
+                        if row.fingerprint == just_applied:
+                            just_applied_row = row
+                            break
+
             return render(
                 "inbox.html", title=TITLES[name],
                 rows=context["rows"], applied=context["applied"],
                 dismissed=context["dismissed"], muted=context["muted"],
                 refused=[], superseded=[], gone=[], counts={},
                 low_count_is_not_proof=LOW_COUNT_IS_NOT_PROOF,
-                schedule=None, just_applied=None,
+                schedule=None, just_applied=just_applied,
+                just_applied_row=just_applied_row,
+                bulk_result=bulk_result, batch_result=batch_result,
                 sidebar=_sidebar_context(_store),
+                opened=opened,
+                return_inbox=name, return_state=(state or ""),
+                return_pages=_return_pages(name, current_pages),
                 pagination=pagers,
                 **extra)
 
@@ -799,13 +990,21 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
             # same as every other section, and a row moving into it is not
             # a reason to override that choice.
             #
-            # Back to the INBOX, not to the landing page: every one of these
-            # writes is a judgement made on a row while looking at the other
-            # rows, and a redirect to the summary would answer each decision by
-            # closing the list it was made from. `scan` is the exception and
-            # overrides this below -- its control is on the summary page, so
-            # that is the page it returns to.
-            location = INBOX_PATH
+            # Back to the page the row was shown on, not to the landing page:
+            # every one of these writes is a judgement made on a row while
+            # looking at the other rows, and a redirect to the summary would
+            # answer each decision by closing the list it was made from.
+            # `_return_path` rebuilds that page from what THIS row's own form
+            # posted back (`return_inbox`/`return_state`/`return_page_key`/
+            # `return_page` -- see inbox.html's `return_fields`), validated
+            # against the same known sets `_serve_inbox_route` itself checks
+            # a URL against -- never a path or URL taken from the request as
+            # given. Missing or unrecognised resolves to the combined inbox
+            # at page 1, exactly what every write returned to before this
+            # feature existed. `scan` is the exception and overrides this
+            # below -- its control is on the summary page, so that is the
+            # page it returns to.
+            location = _return_path(form)
             if name == "scan":
                 location = SUMMARY_PATH
                 # `limit` is required here on the same terms
@@ -847,7 +1046,8 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                     self._send(400, str(exc).encode("utf-8"),
                                [("Content-Type", "text/plain; charset=utf-8")])
                     return
-                location = "%s?opened=%s" % (INBOX_PATH, _REOPEN_SECTION[name])
+                location = _append_query(location,
+                                         "opened=%s" % _REOPEN_SECTION[name])
             elif name == "bulk_apply_tag_descriptions":
                 # Every hidden `fp` field the bulk form on the page posted --
                 # `parse_qs` already collects repeated keys into a list, so
@@ -869,8 +1069,9 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                 # "succeeded" flag: the page states "N of M applied" from
                 # both, so a partial batch cannot render as a plain success
                 # by there being nowhere on the page to say otherwise.
-                location = "%s?bulk_requested=%d&bulk_applied=%d" % (
-                    INBOX_PATH, len(result.requested), len(result.applied))
+                location = _append_query(
+                    location, "bulk_requested=%d&bulk_applied=%d" % (
+                        len(result.requested), len(result.applied)))
             elif name == "batch":
                 # Every ticked (or page-wide "select all on this page")
                 # `fp` field the page's own batch form posted -- `parse_qs`
@@ -900,9 +1101,21 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                     # fields on its own form -- never reconstructed from the
                     # store -- so the count a person reads here is the exact
                     # set `batch_apply` receives if they confirm.
+                    # Carries the same return identity forward as hidden
+                    # fields on ITS OWN resubmit form (see
+                    # `batch_confirm.html`), and rebuilds the same validated
+                    # path for its Cancel link -- both from what this row's
+                    # own batch form already posted, never a second, looser
+                    # copy of that logic in the template.
                     body = render(
                         "batch_confirm.html", verdict=verdict,
                         fingerprints=fps, count=len(fps),
+                        return_inbox=(form.get("return_inbox") or [""])[0],
+                        return_state=(form.get("return_state") or [""])[0],
+                        return_page_key=(form.get("return_page_key")
+                                        or [""])[0],
+                        return_page=(form.get("return_page") or [""])[0],
+                        cancel_href=_return_path(form),
                         sidebar=_sidebar_context(_store)).encode()
                     self._send(200, body,
                                [("Content-Type", "text/html; charset=utf-8")])
@@ -917,10 +1130,10 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                 # `bulk_apply_tag_descriptions` already applies above, plus
                 # which verdict this batch was -- the banner reads
                 # differently for "3 of 5 approved" than for "3 of 5 muted".
-                location = ("%s?batch_verdict=%s&batch_requested=%d&"
-                           "batch_applied=%d"
-                           % (INBOX_PATH, verdict, len(result.requested),
-                              len(result.applied)))
+                location = _append_query(
+                    location,
+                    "batch_verdict=%s&batch_requested=%d&batch_applied=%d"
+                    % (verdict, len(result.requested), len(result.applied)))
             else:
                 fp = (form.get("fp") or [""])[0]
                 if not fp:
@@ -933,10 +1146,12 @@ def build_handler(rows, actions, scan_status=None, muted=None, dismissed=None,
                                [("Content-Type", "text/plain; charset=utf-8")])
                     return
                 if name == "approve":
-                    location = "%s?applied=%s" % (
-                        INBOX_PATH, urllib.parse.quote(fp, safe=""))
+                    location = _append_query(
+                        location,
+                        "applied=%s" % urllib.parse.quote(fp, safe=""))
                 elif name in _REOPEN_SECTION:
-                    location = "%s?opened=%s" % (INBOX_PATH, _REOPEN_SECTION[name])
+                    location = _append_query(
+                        location, "opened=%s" % _REOPEN_SECTION[name])
             # 303 so a refresh redraws the page rather than repeating the write.
             self._send(303, b"", [("Location", location)])
 
