@@ -5,9 +5,9 @@ from cronicled.artist import Resolution
 from cronicled.scoring import Decision, Match, decide
 from cronicled.stash import StashError
 from cronicled.stashbox import (
-    BOX_TAGS, PERFORMER_PROFILE, PERFORMER_SCENES, PERFORMER_SEARCH,
-    SCENES_BY_FINGERPRINT, SourceListing, StashBox, _career_length,
-    _joined_modifications, base_url, check, listing_verdict)
+    BOX_TAGS, PERFORMER_FIELDS, PERFORMER_PROFILE, PERFORMER_SCENES,
+    PERFORMER_SEARCH, SCENES_BY_FINGERPRINT, SourceListing, StashBox,
+    _career_length, _joined_modifications, base_url, check, listing_verdict)
 
 
 def _transport(responses):
@@ -549,7 +549,7 @@ class RequestShape(unittest.TestCase):
             _blocks([[{"id": "s4"}]]),
             _tag_page(1, [_box_tag("velvet crane")]),
             _profile_reply(_box_performer(id="p1")),
-            _search_reply(0, []),
+            _search_reply([]),
         ])
         box = StashBox("https://box.test", "k", transport=t)
 
@@ -1399,8 +1399,12 @@ def _profile_reply(row):
     return {"data": {"findPerformer": row}}
 
 
-def _search_reply(count, rows):
-    return {"data": {"queryPerformers": {"count": count, "performers": rows}}}
+def _search_reply(rows):
+    # A bare list -- see `PERFORMER_SEARCH`'s own docstring for why that is
+    # a stated assumption about `searchPerformers`'s reply shape, not a
+    # confirmed fact, and `StashBox.search_performers`'s own docstring for
+    # where it is read.
+    return {"data": {"searchPerformers": rows}}
 
 
 def _box_performer(id="pf-1", name="Wren Alderly", disambiguation=None,
@@ -1408,15 +1412,17 @@ def _box_performer(id="pf-1", name="Wren Alderly", disambiguation=None,
                    eye_color=None, height=None, birth_date=None,
                    career_start=None, career_end=None, tattoos=(),
                    piercings=(), urls=(), images=()):
-    """One `findPerformer`/`queryPerformers` row, shaped the way
-    `PERFORMER_PROFILE`/`PERFORMER_SEARCH` shape it -- every fixture here is
-    invented; the names belong to nobody."""
+    """One `findPerformer`/`searchPerformers` row, shaped the way
+    `PERFORMER_PROFILE`/`PERFORMER_SEARCH` shape it -- field names verified
+    against a live stash-box instance (see `PERFORMER_PROFILE`'s own
+    docstring) -- every fixture VALUE here is invented; the names belong to
+    nobody."""
     return {
         "id": id, "name": name, "disambiguation": disambiguation,
         "aliases": list(aliases), "gender": gender, "ethnicity": ethnicity,
-        "country": country, "eyeColor": eye_color, "height": height,
-        "birthDate": birth_date, "careerStartYear": career_start,
-        "careerEndYear": career_end,
+        "country": country, "eye_color": eye_color, "height": height,
+        "birth_date": birth_date, "career_start_year": career_start,
+        "career_end_year": career_end,
         "tattoos": [dict(location=l, description=d) for l, d in tattoos],
         "piercings": [dict(location=l, description=d) for l, d in piercings],
         "urls": [{"url": u} for u in urls],
@@ -1500,19 +1506,24 @@ class PerformerProfile(unittest.TestCase):
 
 class PerformerSearch(unittest.TestCase):
     def test_the_request_names_the_search_term(self):
-        t = _transport([_search_reply(0, [])])
+        t = _transport([_search_reply([])])
         box = StashBox("https://box.test", "k", transport=t)
 
         box.search_performers("Wren Alderly")
 
         self.assertEqual(t.calls[0][0]["query"], PERFORMER_SEARCH)
-        self.assertEqual(t.calls[0][0]["variables"]["input"]["name"],
-                         "Wren Alderly")
+        # Flat arguments -- `term`, never nested under an `input` object.
+        # `queryPerformers(input: PerformerQueryInput)` takes the nested
+        # shape; `searchPerformers`, the entry point this actually calls,
+        # does not. See `PERFORMER_SEARCH`'s own docstring for why the two
+        # are not interchangeable.
+        self.assertEqual(t.calls[0][0]["variables"]["term"], "Wren Alderly")
+        self.assertNotIn("input", t.calls[0][0]["variables"])
 
     def test_every_row_the_source_offers_comes_back_mapped(self):
         rows = [_box_performer(id="pf-1", name="Wren Alderly"),
                _box_performer(id="pf-2", name="Wren Alderly Jr")]
-        t = _transport([_search_reply(2, rows)])
+        t = _transport([_search_reply(rows)])
         box = StashBox("https://box.test", "k", transport=t)
 
         got = box.search_performers("Wren")
@@ -1520,10 +1531,96 @@ class PerformerSearch(unittest.TestCase):
         self.assertEqual([p["id"] for p in got], ["pf-1", "pf-2"])
 
     def test_no_matches_is_an_empty_list_not_an_error(self):
-        t = _transport([_search_reply(0, [])])
+        t = _transport([_search_reply([])])
         box = StashBox("https://box.test", "k", transport=t)
 
         self.assertEqual(box.search_performers("Nobody Like This"), [])
+
+
+_BRACE_BLOCK_RE = re.compile(r"\{[^{}]*\}")
+
+
+def _selection_between(query, anchor):
+    """The text of the (possibly nested) selection set immediately
+    following `anchor` in `query` -- e.g. the fields asked for on
+    `Performer`, given `anchor="findPerformer(id: $id)"`.
+
+    Found by counting braces from the first `{` after `anchor` to its
+    matching close, so this does not depend on how many braces happen to
+    follow it in the rest of the query text.
+    """
+    start = query.index(anchor) + len(anchor)
+    open_brace = query.index("{", start)
+    depth = 0
+    for i in range(open_brace, len(query)):
+        if query[i] == "{":
+            depth += 1
+        elif query[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return query[open_brace + 1:i]
+    raise ValueError("unbalanced braces after %r" % (anchor,))
+
+
+def _selected_top_level_fields(selection_text):
+    """The field names selected at the TOP level of `selection_text` -- a
+    `Performer` selection set as it appears in one of this module's own
+    query constants.
+
+    A nested selection (`tattoos { location description }`) is stripped as
+    a whole block first, so `location`/`description` (fields of
+    `BodyModification`, a DIFFERENT type) and `url` (of `URL`/`Image`) are
+    never mistaken for `Performer`'s own fields -- only the name
+    introducing the block (`tattoos`, `urls`, ...) survives the strip.
+    Applied repeatedly so this would still resolve correctly one level
+    deeper, though nothing here goes that deep.
+    """
+    text = selection_text
+    while True:
+        stripped = _BRACE_BLOCK_RE.sub("", text)
+        if stripped == text:
+            return set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", stripped))
+        text = stripped
+
+
+class PerformerQueriesSelectOnlyRealFields(unittest.TestCase):
+    """The gap that let `eyeColor`/`birthDate`/`careerStartYear`/
+    `careerEndYear` ship with every OTHER test in this file green: a fake
+    transport only ever echoes back whatever a test scripted, so it cannot
+    tell a well-formed selection from one asking for a field the type does
+    not have. `PERFORMER_FIELDS` is the real schema, recorded from a live
+    stash-box instance (see `PERFORMER_PROFILE`'s own docstring for when) --
+    an INDEPENDENT source of truth from the query text itself, so the two
+    can genuinely disagree, unlike a test that builds its expectation from
+    the same constant the code sends.
+    """
+
+    def test_every_field_the_profile_query_selects_on_performer_is_real(self):
+        selected = _selected_top_level_fields(
+            _selection_between(PERFORMER_PROFILE, "findPerformer(id: $id)"))
+        self.assertTrue(selected.issubset(PERFORMER_FIELDS),
+                        selected - PERFORMER_FIELDS)
+        # Not vacuous: the selection really does name more than nothing.
+        self.assertGreaterEqual(len(selected), 10)
+
+    def test_every_field_the_search_query_selects_on_performer_is_real(self):
+        selected = _selected_top_level_fields(_selection_between(
+            PERFORMER_SEARCH,
+            "searchPerformers(term: $term, page: $page, per_page: $per_page)"))
+        self.assertTrue(selected.issubset(PERFORMER_FIELDS),
+                        selected - PERFORMER_FIELDS)
+        self.assertGreaterEqual(len(selected), 10)
+
+    def test_the_two_queries_select_the_same_performer_fields(self):
+        # The two are meant to carry an identical Performer selection --
+        # see both queries' own docstrings. A change to one that forgot the
+        # other would otherwise ship silently.
+        profile_fields = _selected_top_level_fields(_selection_between(
+            PERFORMER_PROFILE, "findPerformer(id: $id)"))
+        search_fields = _selected_top_level_fields(_selection_between(
+            PERFORMER_SEARCH,
+            "searchPerformers(term: $term, page: $page, per_page: $per_page)"))
+        self.assertEqual(profile_fields, search_fields)
 
 
 class JoinedModifications(unittest.TestCase):

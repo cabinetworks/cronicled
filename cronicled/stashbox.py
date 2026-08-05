@@ -98,27 +98,55 @@ query($input: TagQueryInput!) {
 # thing that can notice a transposed pair.
 FINGERPRINT_ALGORITHMS = ("MD5", "OSHASH", "PHASH")
 
+# Stash-box's own `Performer` type's real field names, exactly as introspected
+# against a LIVE instance on 2026-08-04 -- unlike the schema caveat this
+# module carried before that check, this is no longer a guess. `PERFORMER_FIELDS`
+# is read by `tests/test_stashbox.py`'s own schema-agreement test, which
+# extracts every field name `PERFORMER_PROFILE`/`PERFORMER_SEARCH` select on
+# `Performer` and asserts each one is a member of this set -- the check this
+# module SHOULD have had from the start: a fake transport that only ever
+# echoes back whatever a test scripted cannot tell a well-formed query from
+# one asking for a field the type does not have, and that gap is exactly how
+# `eyeColor`/`birthDate`/`careerStartYear`/`careerEndYear` shipped and passed
+# every test here before being caught against the live schema.
+#
+# `deleted`, `edits`, `scene_count`, `scenes`, `merged_ids`, `merged_into_id`,
+# `studios`, `is_favorite`, `created`, `updated`, `age`, `death_date`,
+# `hair_color`, `cup_size`, `band_size`, `waist_size`, `hip_size` and
+# `breast_type` are real fields on the type that this module does not select
+# at all -- listed here anyway because the point of this set is to be the
+# WHOLE type, not only the subset two queries happen to want, so a future
+# query added against this set is checked against the same ground truth.
+PERFORMER_FIELDS = frozenset({
+    "id", "name", "disambiguation", "aliases", "gender", "urls",
+    "birth_date", "death_date", "age", "ethnicity", "country", "eye_color",
+    "hair_color", "height", "cup_size", "band_size", "waist_size",
+    "hip_size", "breast_type", "career_start_year", "career_end_year",
+    "tattoos", "piercings", "images", "deleted", "edits", "scene_count",
+    "scenes", "merged_ids", "merged_into_id", "studios", "is_favorite",
+    "created", "updated",
+})
+
 # A performer's own profile, read by the source's own id -- the strongest
 # link this module can ask with, and the one `cronicled.enrichment` reaches
 # for first (see that module's docstring for why the id path is built even
 # though a real library measured zero performers carrying one today).
 #
-# NOT VERIFIED against a live stash-box schema: this project's other queries
-# in this file (`PERFORMER_SCENES`, `BOX_TAGS`) were shaped against a real,
-# reachable instance; this one and `PERFORMER_SEARCH` below were not -- the
-# live instance this project otherwise checks schemas against
-# (`docs/superpowers` notes one) answered every request here with 401, and
-# nothing in this repository's own fixtures encodes a profile read. The field
-# names are this module's best understanding of stash-box's own schema, kept
-# in ONE place (`_performer_from_box`, below) so a wrong name is a one-line
-# fix rather than a search-and-replace, and every test against this query
-# exercises that same contract rather than a live server -- see
-# `cronicled.enrichment`'s own docstring for the caveat this carries forward.
+# VERIFIED against a live stash-box instance on 2026-08-04, after an earlier
+# version of this query (camelCase field names -- `eyeColor`, `birthDate`,
+# `careerStartYear`, `careerEndYear`) shipped with every test here green and
+# would have raised on the FIRST real call: this project's other queries in
+# this file (`PERFORMER_SCENES`, `BOX_TAGS`) had been checked against a real,
+# reachable instance from the start; this one and `PERFORMER_SEARCH` below had
+# not, because the live instance was unreachable without credentials at the
+# time they were written. `location`/`description` (on `tattoos`/`piercings`)
+# and `url` (on `urls`/`images`) were confirmed too, as the nested types'
+# own fields -- see `PERFORMER_FIELDS`, which covers `Performer` itself only.
 PERFORMER_PROFILE = """
 query($id: ID!) {
   findPerformer(id: $id) {
-    id name disambiguation aliases gender ethnicity country eyeColor
-    height birthDate careerStartYear careerEndYear
+    id name disambiguation aliases gender ethnicity country eye_color
+    height birth_date career_start_year career_end_year
     tattoos { location description }
     piercings { location description }
     urls { url }
@@ -129,28 +157,40 @@ query($id: ID!) {
 
 # A performer's profile, by NAME rather than by id -- the path
 # `cronicled.enrichment` measured as the one that actually reaches a library's
-# performers with no box id at all. Same unverified-schema caveat as
-# `PERFORMER_PROFILE` above, and the same one place (`_performer_from_box`)
-# both queries are read through.
+# performers with no box id at all. Field names verified the same way and on
+# the same date as `PERFORMER_PROFILE` above, through the same
+# `_performer_from_box`.
 #
-# Shaped like `PERFORMER_SCENES`'s own paging, on the same reasoning: a name
-# search can answer more than one performer (two different people who share a
-# name, or one person entered twice by two contributors), and
-# `cronicled.enrichment` is the layer that decides what multiple answers mean
-# -- this module hands back everything the source offered for the name,
-# unfiltered and unranked.
+# `searchPerformers(term:, limit:, page:, per_page:, filter:)` -- flat
+# arguments, confirmed against the live instance's own introspection -- NOT
+# `queryPerformers(input: PerformerQueryInput)`, which this query used before
+# being corrected. The two are different entry points on the same schema:
+# `queryPerformers` takes a structured filter object (the same shape
+# `PERFORMER_SCENES`'s own `queryScenes` uses for scenes), while
+# `searchPerformers` takes a plain text `term` -- the free-text name search
+# this module actually wants. `limit`/`filter` are left unset: `limit` is a
+# separate cap this module has no use for alongside `per_page`, and `filter`'s
+# shape is unconfirmed and unneeded for an exact-name search.
+#
+# THE RETURN SHAPE IS NOT CONFIRMED. `queryScenes`/`queryTags`/`queryPerformers`
+# all wrap their list in `{count, <items>}`; nothing here confirms whether
+# `searchPerformers` does the same or answers a bare list -- only the
+# ARGUMENTS were checked against the live schema, not a real reply's shape,
+# because doing that needed a stash-box instance that actually held a
+# performer to search for. This module assumes a bare list (`search_performers`
+# reads `result["searchPerformers"]` directly), on the reasoning that a
+# `limit`-bearing "search" entry point commonly returns a plain truncated
+# list rather than a paginated count -- but that is a guess, stated here
+# rather than left implicit, and it is the next thing to verify.
 PERFORMER_SEARCH = """
-query($input: PerformerQueryInput!) {
-  queryPerformers(input: $input) {
-    count
-    performers {
-      id name disambiguation aliases gender ethnicity country eyeColor
-      height birthDate careerStartYear careerEndYear
-      tattoos { location description }
-      piercings { location description }
-      urls { url }
-      images { url }
-    }
+query($term: String, $page: Int, $per_page: Int) {
+  searchPerformers(term: $term, page: $page, per_page: $per_page) {
+    id name disambiguation aliases gender ethnicity country eye_color
+    height birth_date career_start_year career_end_year
+    tattoos { location description }
+    piercings { location description }
+    urls { url }
+    images { url }
   }
 }
 """
@@ -184,8 +224,9 @@ def _joined_modifications(entries):
 
 
 def _career_length(start, end):
-    """`careerStartYear`/`careerEndYear` (each an int or `None`) rendered as
-    the single string the media server's own `career_length` field holds.
+    """`career_start_year`/`career_end_year` (each an int or `None`)
+    rendered as the single string the media server's own `career_length`
+    field holds.
 
     `None` when there is no start year at all -- an end year with no start is
     not a career length this can state. An end year present alongside a start
@@ -198,24 +239,35 @@ def _career_length(start, end):
 
 
 def _performer_from_box(raw):
-    """One `findPerformer`/`queryPerformers` row -> the fields
+    """One `findPerformer`/`searchPerformers` row -> the fields
     `cronicled.enrichment` can propose, plus the name/aliases it matches a
     library performer's name against.
 
     The ONE place this module's understanding of stash-box's performer schema
-    is spelled out -- see `PERFORMER_PROFILE`'s own docstring for why that
-    understanding is not verified against a live instance, and keep it that
+    is spelled out -- see `PERFORMER_PROFILE`'s own docstring for when and how
+    that understanding was verified against a live instance, and keep it that
     way: a second, independent reading of the same raw dict is a second
     chance for the two to quietly disagree about what a field means.
+
+    `raw`'s own keys are stash-box's real field names (`eye_color`,
+    `birth_date`, `career_start_year`, `career_end_year`, ...); the dict this
+    returns is keyed by the LOCAL media server's field names for the same
+    facts (`eye_color` again, but `birthdate` -- no underscore -- and
+    `career_length`, a single derived string rather than two year fields).
+    The two schemas are not the same vocabulary and agreeing on a name for
+    one field (`eye_color`) is a coincidence, not a pattern to lean on.
 
     Two fields this project's own measurement named are deliberately absent
     from what comes back: `details` (a library's own free-text bio field,
     which nothing about a source's catalogue entry for a performer
-    corresponds to) and `measurements` (stash-box's own shape for it was not
-    confidently known and guessing at a nested structure risked writing a
-    fabricated-looking string over a blank field). Both stay missing from
-    every candidate this builds, which `cronicled.enrichment.merge_candidates`
-    reads exactly like any other field no source happened to offer.
+    corresponds to) and `measurements` (stash-box's own shape for it is a
+    nested `band_size`/`waist_size`/`hip_size`/`cup_size` set rather than the
+    media server's single string, and guessing at a rendering rule risked
+    writing a fabricated-looking value over a blank field -- see
+    `PERFORMER_FIELDS` for confirmation the four exist on the type; nothing
+    here reads them yet). Both stay missing from every candidate this builds,
+    which `cronicled.enrichment.merge_candidates` reads exactly like any
+    other field no source happened to offer.
     """
     urls = [u["url"] for u in (raw.get("urls") or []) if u.get("url")]
     images = [i["url"] for i in (raw.get("images") or []) if i.get("url")]
@@ -224,11 +276,11 @@ def _performer_from_box(raw):
         "gender": raw.get("gender") or None,
         "ethnicity": raw.get("ethnicity") or None,
         "country": raw.get("country") or None,
-        "eye_color": raw.get("eyeColor") or None,
+        "eye_color": raw.get("eye_color") or None,
         "height_cm": raw.get("height"),
-        "birthdate": raw.get("birthDate") or None,
-        "career_length": _career_length(raw.get("careerStartYear"),
-                                        raw.get("careerEndYear")),
+        "birthdate": raw.get("birth_date") or None,
+        "career_length": _career_length(raw.get("career_start_year"),
+                                        raw.get("career_end_year")),
         "tattoos": _joined_modifications(raw.get("tattoos")),
         "piercings": _joined_modifications(raw.get("piercings")),
         "alias_list": list(raw.get("aliases") or []),
@@ -822,7 +874,7 @@ class StashBox:
         The strongest of `cronicled.enrichment`'s three sources: an id is
         exact, unlike a name, which can name two different people or miss the
         one it is asked about entirely. See `PERFORMER_PROFILE`'s own
-        docstring for the schema caveat every field here carries.
+        docstring for when this was checked against a live instance.
         """
         found = self._client.gql(
             PERFORMER_PROFILE, {"id": performer_id}, timeout=timeout
@@ -843,9 +895,13 @@ class StashBox:
         performer being enriched -- `cronicled.enrichment` is the one place
         that exact-match discipline lives, because it is a decision about
         library evidence, not about what this client fetched.
+
+        Reads `result["searchPerformers"]` as a BARE LIST -- see
+        `PERFORMER_SEARCH`'s own docstring for why that is a stated
+        assumption and not a confirmed fact: the entry point's ARGUMENTS were
+        checked against a live schema, its REPLY shape was not.
         """
         result = self._client.gql(
-            PERFORMER_SEARCH, {"input": {"name": name, "page": 1,
-                                        "per_page": per_page}},
-            timeout=timeout)["queryPerformers"]
-        return [_performer_from_box(row) for row in result["performers"]]
+            PERFORMER_SEARCH, {"term": name, "page": 1, "per_page": per_page},
+            timeout=timeout)
+        return [_performer_from_box(row) for row in result["searchPerformers"]]
