@@ -1465,15 +1465,20 @@ def examine_sources(scene, *, sources, folder, threshold=DEFAULT_THRESHOLD,
 # Everything above this line identifies a file by SEARCHING for it: a creator
 # is resolved off the path, a store's catalogue is searched by that name, and
 # the results are scored against the filename. What follows does not search at
-# all. A stash-box is asked which scene a file's own fingerprints belong to,
-# and either it has seen that exact file or it has not.
+# all. A stash-box is asked which scene a file's own fingerprints belong to —
+# but a hit is only ever THIS EXACT FILE when it is found on an `MD5` or
+# `OSHASH` fingerprint. The same request also asks about `PHASH`, a
+# perceptual hash that matches a re-encode or a trim of the same video just
+# as readily as it matches a DIFFERENT video that merely looks similar, so a
+# `PHASH`-only hit is not "seen this exact file" at all — see
+# `_is_exact_hit` and `_resolve_claims` for where that distinction is made.
 #
 # The two are not alternatives and this one does not replace the other:
 # measured against a real library, fingerprints identified 13 of 23 files the
 # text path had refused, and answered nothing at all for the other 10. Absence
 # of a fingerprint hit is not evidence about a file — most files, most boxes —
 # so the text path stays exactly as it is for everything a box does not
-# recognise.
+# recognise, INCLUDING a file backed only by a perceptual hit.
 
 
 # What a proposal's payload records in place of a score when a box identified
@@ -1483,9 +1488,47 @@ def examine_sources(scene, *, sources, folder, threshold=DEFAULT_THRESHOLD,
 IDENTIFIED_BY_FINGERPRINT = "fingerprint"
 
 
+# The two algorithms whose equality means "these are the same bytes" — the
+# rest of `cronicled.stashbox.FINGERPRINT_ALGORITHMS` (`MD5`, `OSHASH`,
+# `PHASH`) minus the one left out here on purpose. `PHASH` is a perceptual
+# hash: designed so a re-encode or a trimmed copy of the SAME video still
+# matches, which means it matches just as readily against a DIFFERENT video
+# that merely looks similar — a compilation and a clip cut from similar
+# source, say. See `_is_exact_hit` for the rule this decides.
+EXACT_FINGERPRINT_ALGORITHMS = frozenset({"MD5", "OSHASH"})
+
+
+def _is_exact_hit(match):
+    """Whether `match` — one box's `ScrapedScene`, as `Stash.
+    scrape_scenes_by_fingerprint` returns it — carries at least one
+    fingerprint whose algorithm is exact.
+
+    A box match can carry SEVERAL fingerprints at once: an `MD5`, an
+    `OSHASH` and a `PHASH` computed off one file all point at the one scene
+    they came from when the match is genuine, and a box has no reason to
+    report fewer algorithms than it checked. So one exact fingerprint among
+    several perceptual ones is still identity — the perceptual entries
+    neither add to nor subtract from what the exact one already
+    establishes. The reverse does not hold: however many perceptual hashes
+    are present, none of them is bytes-identical evidence, so a match
+    naming ONLY `PHASH` — or naming nothing at all — is not exact.
+
+    A match with no `fingerprints` key, or an empty list, is deliberately
+    NOT exact. Defaulting a missing list to "exact, as every hit was
+    treated before this rule existed" would silently restore the very
+    defect this function exists to close: uncertainty about what a match
+    rests on may withhold evidence, it may never supply it.
+    """
+    fingerprints = match.get("fingerprints") or []
+    return any(fp.get("algorithm") in EXACT_FINGERPRINT_ALGORITHMS
+               for fp in fingerprints)
+
+
 @dataclass(frozen=True)
 class Identified:
-    """One file a stash-box recognised by its own fingerprints.
+    """One file a stash-box recognised by an EXACT fingerprint match — an
+    `MD5` or `OSHASH` hit. A claim naming only `PHASH` never becomes one of
+    these; see `_is_exact_hit` and `_resolve_claims`.
 
     `box` is the box that is the source of `candidate` — the whole
     `ScrapedScene` it returned, the same shape a text scrape produces, so it
@@ -1506,15 +1549,26 @@ class Identified:
     match. What such an identification must NOT produce is a link to
     nothing; see `catalogue_link`.
 
-    `agreeing` names the other boxes that returned the SAME
+    `agreeing` names the other EXACT claims that returned the SAME
     `remote_site_id`. Agreement is not a disagreement to report, but it is
     worth recording: it is the difference between one box's word and three.
+
+    `perceptual_disagreement` names claims that matched on `PHASH` alone and
+    named a DIFFERENT scene than the one above — kept rather than dropped.
+    The exact claim still wins (see `_resolve_claims`), but a perceptual hash
+    pointing somewhere else is exactly the kind of evidence a reviewer
+    benefits from seeing rather than having silently discarded on their
+    behalf. Empty is the ordinary case: most identified files carry no
+    competing perceptual guess at all. Shaped like `Conflict.claims` —
+    `(box_name, remote_site_id, candidate)` — for the same reason: a
+    reviewer needs to see what disagreed and with what.
     """
     box: str
     candidate: dict
     endpoint: str
     remote_site_id: str = None
     agreeing: tuple = ()
+    perceptual_disagreement: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -1556,44 +1610,85 @@ class FingerprintPass:
 def _resolve_claims(claims):
     """What a file's collected `(box_name, endpoint, match)` claims amount to.
 
-    `None` when nothing recognised it, an `Identified` when the claims all
-    name one scene, a `Conflict` when they do not.
+    `None` when nothing may identify the file, an `Identified` when the
+    EXACT claims (`_is_exact_hit`) all name one scene, a `Conflict` when
+    they do not.
 
-    Agreement requires every claim to carry a NON-NULL `remote_site_id` and
-    for all of them to be equal. The null half of that is the guard, not
-    bookkeeping: comparing ids with a missing one treated as a value would
-    make two boxes that each declined to name a scene look like two boxes
-    naming the SAME scene, and a default that happens to skip a guard is how
-    this project has been bitten before. Uncertainty withholds evidence; it
-    never supplies it.
+    A claim only counts toward identification when its match is exact. A
+    `PHASH`-only claim is evidence that a box's perceptual hash matched
+    something — never evidence of WHICH file it matched, which is exactly
+    why it is not scored either: nothing here knows how to weigh a box's
+    guess the way `cronicled.scoring` weighs a title. So a file backed by
+    no exact claim at all resolves to `None` and falls straight through to
+    the text path, exactly as a file no box recognised already does.
+    Refusing a perceptual-only hit outright, rather than trying to fold it
+    into the scorer's candidates, is the deliberate, fail-closed choice —
+    the one this module's own history argues for: uncertainty about a
+    match may withhold evidence, it must never supply it.
 
-    A single claim needs no comparison and is taken as it stands, id or no
-    id — there is nothing for it to disagree with.
+    Among the EXACT claims, agreement requires every one to carry a
+    NON-NULL `remote_site_id` and for all of them to be equal. The null
+    half of that is the guard, not bookkeeping: comparing ids with a
+    missing one treated as a value would make two boxes that each declined
+    to name a scene look like two boxes naming the SAME scene, and a
+    default that happens to skip a guard is how this project has been
+    bitten before. Uncertainty withholds evidence; it never supplies it.
 
-    When several claims DO agree, the first is the one carried forward. That
-    is the boxes' configured order, which is the operator's own stated
-    preference and the order the caller was told to try them in — not an
-    accident of dict iteration, and not a tie being broken: the claims agree
-    about which scene this is, so what is being chosen is only whose copy of
-    the same scene's metadata to record, and the others are recorded beside
-    it in `agreeing` rather than dropped.
+    A single exact claim needs no comparison and is taken as it stands, id
+    or no id — there is nothing for it to disagree with.
+
+    When several exact claims DO agree, the first is the one carried
+    forward. That is the boxes' configured order, which is the operator's
+    own stated preference and the order the caller was told to try them in
+    — not an accident of dict iteration, and not a tie being broken: the
+    claims agree about which scene this is, so what is being chosen is only
+    whose copy of the same scene's metadata to record, and the others are
+    recorded beside it in `agreeing` rather than dropped.
+
+    A `PHASH`-only claim that names a DIFFERENT scene than the one the
+    exact claims settled on is not a conflict — the exact evidence still
+    wins, regardless of which claim was seen first — but it is not dropped
+    either: it travels on the result's `perceptual_disagreement` instead of
+    being silently discarded. A perceptual claim naming no scene, or naming
+    the SAME scene the exact claims did, has nothing to disagree about and
+    is not recorded.
     """
     if not claims:
         return None
-    first_box, first_endpoint, first_match = claims[0]
-    ids = [match.get("remote_site_id") for _, _, match in claims]
-    if len(claims) == 1:
-        return Identified(box=first_box, candidate=first_match,
-                          endpoint=first_endpoint, remote_site_id=ids[0])
-    if None in ids or len(set(ids)) != 1:
+    exact = [claim for claim in claims if _is_exact_hit(claim[2])]
+    perceptual = [claim for claim in claims if not _is_exact_hit(claim[2])]
+    if not exact:
+        return None
+
+    first_box, first_endpoint, first_match = exact[0]
+    ids = [match.get("remote_site_id") for _, _, match in exact]
+    if len(exact) == 1:
+        resolved = Identified(box=first_box, candidate=first_match,
+                              endpoint=first_endpoint, remote_site_id=ids[0])
+    elif None in ids or len(set(ids)) != 1:
         return Conflict(claims=tuple(
             (box, match.get("remote_site_id"), match)
-            for box, _, match in claims))
-    agreeing = tuple(dict.fromkeys(box for box, _, _ in claims[1:]
-                                   if box != first_box))
-    return Identified(box=first_box, candidate=first_match,
-                      endpoint=first_endpoint, remote_site_id=ids[0],
-                      agreeing=agreeing)
+            for box, _, match in exact))
+    else:
+        agreeing = tuple(dict.fromkeys(box for box, _, _ in exact[1:]
+                                       if box != first_box))
+        resolved = Identified(box=first_box, candidate=first_match,
+                              endpoint=first_endpoint, remote_site_id=ids[0],
+                              agreeing=agreeing)
+
+    disagreeing = tuple(
+        (box, match.get("remote_site_id"), match)
+        for box, _, match in perceptual
+        if match.get("remote_site_id") is not None
+        and resolved.remote_site_id is not None
+        and match.get("remote_site_id") != resolved.remote_site_id)
+    if disagreeing:
+        resolved = Identified(box=resolved.box, candidate=resolved.candidate,
+                              endpoint=resolved.endpoint,
+                              remote_site_id=resolved.remote_site_id,
+                              agreeing=resolved.agreeing,
+                              perceptual_disagreement=disagreeing)
+    return resolved
 
 
 def identify_by_fingerprint(scene_ids, *, boxes, lookup):
@@ -1680,6 +1775,22 @@ def fingerprint_outcome(scene, identification, *, folder):
     scorer's own output. What it carries instead is `identified_by`, the box
     that identified it, and that box's own id for the scene.
 
+    `identification` only ever reaches this function as an `Identified` (or
+    a `Conflict`, handled below) built by `_resolve_claims`, which never
+    constructs one from a `PHASH`-only claim — so `identification.candidate`
+    is guaranteed to carry at least one exact fingerprint, and `algorithms`
+    below is never empty. It is recorded on the payload, and named in the
+    summary, for exactly the reason this whole ticket exists: "identified by
+    fingerprint" said nothing about WHICH kind of match backed it, and a
+    reviewer cannot judge a phrase that covers a byte-identical hit and a
+    perceptual one alike.
+
+    A `PHASH`-only claim that disagreed with the winning exact claim is not
+    silently dropped either — see `Identified.perceptual_disagreement` — it
+    is folded into both the summary and the payload, under
+    `perceptual_disagreement`, so a reviewer sees the disagreement instead
+    of a confident answer that quietly ignored it.
+
     A `Conflict` is a REFUSAL — neither a mute nor an error, the third of
     `Outcome`'s three kinds of "no proposal": a human should look, and both
     boxes' answers are in the reason so they can. It deliberately does NOT
@@ -1699,6 +1810,10 @@ def fingerprint_outcome(scene, identification, *, folder):
             % _conflict_detail(identification.claims)))
 
     candidate = identification.candidate
+    algorithms = sorted({
+        fingerprint.get("algorithm")
+        for fingerprint in candidate.get("fingerprints") or ()
+        if fingerprint.get("algorithm") in EXACT_FINGERPRINT_ALGORITHMS})
     payload = {
         "path": path,
         # The whole match as the box returned it, for the same reason a
@@ -1714,13 +1829,23 @@ def fingerprint_outcome(scene, identification, *, folder):
         # carrying only the name can be read but cannot be linked.
         "endpoint": identification.endpoint,
         "remote_site_id": identification.remote_site_id,
+        # Which exact algorithm(s) grounded this identification. See this
+        # function's own docstring for why "identified by fingerprint"
+        # alone is no longer enough to say on a row.
+        "algorithms": algorithms,
     }
-    summary = '%s -> "%s" identified by fingerprint (%s)' % (
-        name, candidate.get("title"), identification.box)
+    kind = "/".join(algorithms) if algorithms else "fingerprint"
+    summary = '%s -> "%s" identified by %s fingerprint (%s)' % (
+        name, candidate.get("title"), kind, identification.box)
     if identification.agreeing:
         payload["agreeing_boxes"] = list(identification.agreeing)
         summary += " [also identified by %s]" % ", ".join(
             identification.agreeing)
+    if identification.perceptual_disagreement:
+        detail = _conflict_detail(identification.perceptual_disagreement)
+        payload["perceptual_disagreement"] = detail
+        summary += ("; a perceptual-only match also named a different "
+                    "scene, which did not win: %s" % detail)
     return Outcome(
         proposal={
             "folder": folder,

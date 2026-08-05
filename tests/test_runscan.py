@@ -987,10 +987,15 @@ BOX = {"name": "north-box", "endpoint": "https://one.example.invalid/gql"}
 
 
 def box_match(title, remote_site_id):
+    # An OSHASH fingerprint by default -- an EXACT algorithm, per
+    # `cronicled.scan._is_exact_hit` -- so this end-to-end fixture keeps
+    # exercising the path that identifies a file, exactly as it did before
+    # a match's algorithm decided whether it could.
     return {"title": title, "code": None, "details": None, "director": None,
             "urls": [], "url": None, "date": None, "image": None,
             "studio": None, "tags": [], "performers": [],
-            "remote_site_id": remote_site_id}
+            "remote_site_id": remote_site_id,
+            "fingerprints": [{"algorithm": "OSHASH", "hash": "fixture-hash"}]}
 
 
 class BuildProducerFingerprintWiring(unittest.TestCase):
