@@ -12,12 +12,12 @@ from cronicled.tag_descriptions import proposal as tag_description_proposal
 from cronicled.tags import MERGE_IS_IRREVERSIBLE, UNDECIDED_MANY, cluster_tags
 from cronicled.tags import proposal as tag_proposal
 from cronicled.web.rows import (
-    IDENTIFIED_SCORE_TEXT, KIND_DESCRIPTION, KIND_SCENE, KIND_TAG_DESCRIPTION,
-    STORE_ANSWERED, STORE_EMPTY, STORE_FAILED, Appointments, Row,
-    ScheduledProducer, local, local_times, scene_url, tag_url,
-    to_description_row, to_merge_row, to_merge_rows, to_mute_row,
-    to_mute_rows, to_refusal_row, to_refusal_rows, to_row, to_rows,
-    to_schedule_view, to_tag_description_row,
+    IDENTIFIED_SCORE_TEXT, KIND_DESCRIPTION, KIND_ENRICHMENT, KIND_SCENE,
+    KIND_TAG_DESCRIPTION, STORE_ANSWERED, STORE_EMPTY, STORE_FAILED,
+    Appointments, Row, ScheduledProducer, local, local_times, scene_url,
+    tag_url, to_description_row, to_enrichment_row, to_merge_row,
+    to_merge_rows, to_mute_row, to_mute_rows, to_refusal_row, to_refusal_rows,
+    to_row, to_rows, to_schedule_view, to_tag_description_row,
 )
 
 # A REAL zone that observes daylight saving, and one whose offset differs from
@@ -507,6 +507,26 @@ class ToMuteRowTest(unittest.TestCase):
             zone=ZONE)
         self.assertEqual(row["subject_url"],
                          "http://media.example/performers/7")
+
+    def test_a_muted_enrichment_subject_also_links_to_the_performer_page(self):
+        # HARM: `performer-enrichment` is a SECOND subject type about a
+        # performer, and a mute reaching it with no item at all would
+        # otherwise fall through to `scene_url` -- the same mistake fixed for
+        # `descriptions.SUBJECT_TYPE` above.
+        row = to_mute_row(
+            {"subject_type": "performer-enrichment", "subject_id": "9",
+             "reason": "r", "at": "t", "item": None},
+            base_url="http://media.example", zone=ZONE)
+        self.assertEqual(row["subject_url"],
+                         "http://media.example/performers/9")
+
+    def test_a_muted_enrichment_subject_becomes_the_enrichment_row_it_is(self):
+        row = to_mute_row(
+            {"subject_type": "performer-enrichment", "subject_id": "9",
+             "reason": "r", "at": "t", "item": _enrichment_item()},
+            base_url="http://media.example", zone=ZONE)["row"]
+        self.assertEqual(row.kind, KIND_ENRICHMENT)
+        self.assertEqual(row.name, "Wren Alderly")
 
     def test_has_no_scene_url_without_a_configured_server(self):
         row = to_mute_row(self._entry(), zone=ZONE)
@@ -1240,6 +1260,74 @@ class ToDescriptionRowTest(unittest.TestCase):
         self.assertEqual(row.error, "server said no")
 
 
+def _enrichment_item(**over):
+    item = {"fingerprint": "fp-e", "state": "new",
+            "subject_type": "performer-enrichment", "subject_id": "9",
+            "summary": "Wren Alderly: 2 fields from stash-box (by name)",
+            "confidence": None, "prior_state": None,
+            "payload": {"name": "Wren Alderly",
+                        "source": "stash-box (by name)",
+                        "fields": {"gender": "FEMALE",
+                                   "country": "Freedonia"}}}
+    item.update(over)
+    return item
+
+
+class ToEnrichmentRowTest(unittest.TestCase):
+    def test_the_whole_row(self):
+        # The WHOLE dataclass, not sampled fields -- see `TagDescriptionRow
+        # Shape.test_the_whole_row`'s own reasoning for why.
+        self.assertEqual(asdict(to_enrichment_row(
+            _enrichment_item(), base_url="http://media.example")), {
+            "kind": KIND_ENRICHMENT,
+            "fingerprint": "fp-e",
+            "state": "new",
+            "subject_id": "9",
+            "name": "Wren Alderly",
+            "performer_url": "http://media.example/performers/9",
+            "source": "stash-box (by name)",
+            "fields": (("gender", "FEMALE"), ("country", "Freedonia")),
+            "undoable": False,
+            "actionable": True,
+            "error": None,
+        })
+
+    def test_it_links_to_the_performer_not_to_a_scene(self):
+        row = to_enrichment_row(_enrichment_item(),
+                                base_url="http://media.example")
+        self.assertEqual(row.performer_url,
+                         "http://media.example/performers/9")
+
+    def test_no_configured_server_leaves_the_link_out(self):
+        self.assertIsNone(to_enrichment_row(_enrichment_item()).performer_url)
+
+    def test_a_payload_missing_any_field_raises_rather_than_showing_blank(self):
+        for missing in ("name", "source", "fields"):
+            with self.subTest(missing=missing):
+                payload = dict(_enrichment_item()["payload"])
+                del payload[missing]
+                with self.assertRaises(KeyError):
+                    to_enrichment_row(_enrichment_item(payload=payload))
+
+    def test_an_applied_row_with_a_snapshot_offers_undo(self):
+        row = to_enrichment_row(_enrichment_item(
+            state="applied", prior_state={"gender": None, "country": None}))
+        self.assertTrue(row.undoable)
+        self.assertFalse(row.actionable)
+
+    def test_an_applied_row_without_a_snapshot_offers_no_undo(self):
+        # `revert_performer_enrichment` raises on an empty snapshot, so the
+        # button would promise something the code cannot do.
+        row = to_enrichment_row(_enrichment_item(state="applied"))
+        self.assertFalse(row.undoable)
+
+    def test_a_failed_row_keeps_its_controls_and_says_why(self):
+        row = to_enrichment_row(_enrichment_item(
+            state="failed", error="server said no"))
+        self.assertTrue(row.actionable)
+        self.assertEqual(row.error, "server said no")
+
+
 class ToRowsDispatch(unittest.TestCase):
     def test_each_item_becomes_the_row_its_own_subject_type_needs(self):
         # HARM: a description item put through the scene builder raises on
@@ -1249,12 +1337,23 @@ class ToRowsDispatch(unittest.TestCase):
         # a proposal a person cannot judge and can still approve.
         rows = to_rows([_item(fingerprint="fp-s"),
                         _description_item(fingerprint="fp-d"),
+                        _enrichment_item(fingerprint="fp-e"),
                         _tag_description_item(fingerprint="fp-t")])
 
         self.assertEqual([r.kind for r in rows],
-                         [KIND_SCENE, KIND_DESCRIPTION, KIND_TAG_DESCRIPTION])
+                         [KIND_SCENE, KIND_DESCRIPTION, KIND_ENRICHMENT,
+                          KIND_TAG_DESCRIPTION])
         self.assertEqual([r.fingerprint for r in rows],
-                         ["fp-s", "fp-d", "fp-t"])
+                         ["fp-s", "fp-d", "fp-e", "fp-t"])
+
+    def test_an_enrichment_item_never_falls_through_to_the_scene_builder(self):
+        # HARM: the `else` branch is the scene builder, which INDEXES
+        # `payload["path"]`. An enrichment item reaching it raises and takes
+        # out the whole page for every other row on it.
+        row = to_rows([_enrichment_item()])[0]
+
+        self.assertEqual(row.source, "stash-box (by name)")
+        self.assertFalse(hasattr(row, "filename"))
 
     def test_a_tag_description_never_falls_through_to_the_scene_builder(self):
         # HARM: the `else` branch is the scene builder, which INDEXES

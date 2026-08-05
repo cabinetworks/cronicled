@@ -18,7 +18,15 @@ shipping with no inbox.
 INBOXES = {
     "scenes": ("scene",),
     "tags": ("tag", "tag-cluster", "tag-performer", "tag-unused"),
-    "performers": ("performer",),
+    # Two producers, one page: `cronicled.descriptions` proposes a cleaned
+    # description, `cronicled.enrichment` proposes values for a performer's
+    # OTHER blank fields. Both are decisions about a performer, so both
+    # belong where a reviewer already looks for one -- unlike their subject
+    # TYPES, which stay deliberately separate (see
+    # `cronicled.enrichment.SUBJECT_TYPE`'s own docstring for why sharing one
+    # would let a mute or a refusal from one producer silently reach the
+    # other's proposals).
+    "performers": ("performer", "performer-enrichment"),
 }
 
 ALL_SUBJECT_TYPES = tuple(t for types in INBOXES.values() for t in types)

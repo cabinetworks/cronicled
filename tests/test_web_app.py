@@ -1261,6 +1261,23 @@ def _performer_item(fp, state="new"):
     }
 
 
+def _enrichment_item(fp, state="new"):
+    # A second, distinct subject type sharing the "performers" inbox with
+    # `_performer_item` above -- see `cronicled.enrichment.SUBJECT_TYPE`'s
+    # own docstring for why the two are not the same subject type despite
+    # sharing a page.
+    return {
+        "fingerprint": fp, "state": state,
+        "subject_type": "performer-enrichment",
+        "subject_id": "enrichment-%s" % fp,
+        "payload": {
+            "name": "%s Invented Performer" % fp,
+            "source": "stash-box (by name)",
+            "fields": {"gender": "FEMALE"},
+        },
+    }
+
+
 class EachInboxRouteServesOnlyItsOwnSubjectTypes(unittest.TestCase):
     """`/scenes`, `/tags` and `/performers` -- narrowed by `inboxes.INBOXES`
     through `Store.items(subject_types=)`, reusing `to_rows` unchanged."""
@@ -2396,6 +2413,29 @@ class AWriteReturnsToThePerInboxPageItWasShownOn(unittest.TestCase):
             b"return_page_key=page&return_page=1",
             store=_FakeStore([]))
         self.assertEqual(sent["headers"]["Location"], "/scenes/applied")
+
+    def test_an_enrichment_rows_own_form_also_returns_to_its_per_inbox_page(self):
+        # `enrichment_block` is a THIRD row macro beside
+        # `description_block`/`tag_description_block`, added to this
+        # project after the return-address feature and merged back into
+        # it -- exactly the shape of change where a widened `row_block`
+        # signature reaches the first two macros and silently leaves a
+        # third one rendering the combined inbox's empty defaults, because
+        # nothing here failed to import or dispatch. End to end, the same
+        # way `test_the_rendered_forms_own_fields_return_to_the_per_inbox_page`
+        # is: render `/performers`, take the row's own Approve form exactly
+        # as a browser would submit it, and confirm the round trip lands
+        # back on `/performers`, not the combined inbox.
+        store = _FakeStore([_enrichment_item("fp-1", state="new")])
+        body = _drive("GET", "/performers", store=store)["body"].decode()
+        match = self._APPROVE_FORM_RE.search(body)
+        self.assertIsNotNone(match, "no Approve form found on /performers")
+        fields = dict(self._HIDDEN_RE.findall(match.group("body")))
+        self.assertEqual(fields.get("return_inbox"), "performers")
+        post_body = "&".join("%s=%s" % (k, v) for k, v in fields.items())
+        sent = _drive("POST", "/approve", post_body.encode(),
+                      store=_FakeStore([]))
+        self.assertEqual(sent["headers"]["Location"], "/performers?applied=fp-1")
 
 
 class ActingFromTheCombinedInboxStillReturnsThere(unittest.TestCase):

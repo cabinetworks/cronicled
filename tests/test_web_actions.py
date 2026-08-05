@@ -1221,6 +1221,147 @@ class UndoADescription(unittest.TestCase):
         self.assertEqual(stash.calls, [])
 
 
+# -- enrichment proposals ----------------------------------------------------- #
+
+
+class _FakeEnrichmentStash:
+    """A media server holding one performer's enrichment fields.
+
+    Carries the real client's LIMITATIONS: `apply_performer_enrichment`
+    refuses (writing nothing) when any named field is no longer blank, and
+    `revert_performer_enrichment` refuses a snapshot that is missing or
+    empty -- both exactly as `cronicled.stash.Stash` does. A double that
+    wrote regardless would turn the missing guard into a passing test.
+
+    Every other write raises on sight, the same discipline
+    `_FakeDescriptionStash` applies to its own dispatch under test.
+    """
+
+    def __init__(self, current=None):
+        self.current = dict(current or {})
+        self.calls = []
+
+    def apply_performer_enrichment(self, performer_id, fields):
+        already_set = [f for f in fields if self.current.get(f) not in (None, [])]
+        if already_set:
+            raise RuntimeError(
+                "performer %s's %s no longer blank" % (
+                    performer_id, " and ".join(sorted(already_set))))
+        prior = {f: ([] if isinstance(v, list) else None)
+                for f, v in fields.items()}
+        self.current.update(fields)
+        self.calls.append(("apply", performer_id, dict(fields)))
+        return {"prior": prior}
+
+    def revert_performer_enrichment(self, performer_id, prior):
+        if not prior:
+            raise ValueError(
+                "cannot revert performer %s: enrichment snapshot is missing "
+                "or empty" % performer_id)
+        self.current.update(prior)
+        self.calls.append(("revert", performer_id, prior))
+        return dict(prior)
+
+    def apply_scene(self, *args, **kwargs):
+        raise AssertionError(
+            "an enrichment proposal reached the scene apply path")
+
+    def revert_scene(self, *args, **kwargs):
+        raise AssertionError(
+            "an enrichment proposal reached the scene revert path")
+
+    def apply_performer_description(self, *args, **kwargs):
+        raise AssertionError(
+            "an enrichment proposal reached the description apply path")
+
+    def revert_performer_description(self, *args, **kwargs):
+        raise AssertionError(
+            "an enrichment proposal reached the description revert path")
+
+
+def _enrichment_item(**over):
+    item = {"fingerprint": "fp-e", "state": "new",
+            "subject_type": "performer-enrichment", "subject_id": "9",
+            "prior_state": None,
+            "payload": {"name": "Wren Alderly",
+                        "source": "stash-box (by name)",
+                        "fields": {"gender": "FEMALE",
+                                   "country": "Freedonia"}}}
+    item.update(over)
+    return item
+
+
+class ApproveAnEnrichment(unittest.TestCase):
+    def test_it_writes_every_proposed_field_through_the_enrichment_path(self):
+        store, stash = _FakeStore(_enrichment_item()), _FakeEnrichmentStash()
+
+        self.assertEqual(Actions(store, stash).approve("fp-e"), "applied")
+
+        self.assertEqual(stash.calls,
+                         [("apply", "9", {"gender": "FEMALE",
+                                          "country": "Freedonia"})])
+
+    def test_the_snapshot_stored_is_the_blank_state_every_field_started_from(self):
+        store, stash = _FakeStore(_enrichment_item()), _FakeEnrichmentStash()
+
+        Actions(store, stash).approve("fp-e")
+
+        self.assertEqual(
+            store.calls,
+            [("applied", "fp-e", {"gender": None, "country": None})])
+
+    def test_a_field_filled_in_since_the_scan_fails_and_writes_nothing(self):
+        store = _FakeStore(_enrichment_item())
+        stash = _FakeEnrichmentStash(current={"gender": "already set by hand"})
+
+        with self.assertRaises(ApplyFailed):
+            Actions(store, stash).approve("fp-e")
+
+        self.assertEqual(stash.calls, [])
+        self.assertEqual([c[0] for c in store.calls], ["failed"])
+
+
+class UndoAnEnrichment(unittest.TestCase):
+    def test_it_restores_every_field_to_its_blank_snapshot(self):
+        prior = {"gender": None, "country": None}
+        store = _FakeStore(_enrichment_item(state="applied", prior_state=prior))
+        stash = _FakeEnrichmentStash(
+            current={"gender": "FEMALE", "country": "Freedonia"})
+
+        self.assertEqual(Actions(store, stash).undo("fp-e"), "reverted")
+
+        self.assertEqual(stash.calls, [("revert", "9", prior)])
+        self.assertEqual(stash.current["gender"], None)
+        self.assertEqual(stash.current["country"], None)
+        self.assertEqual(store.calls, [("reverted", "fp-e")])
+
+    def test_an_applied_enrichment_round_trips_back_to_where_it_started(self):
+        stash = _FakeEnrichmentStash()
+        item = _enrichment_item()
+        store = _FakeStore(item)
+        actions = Actions(store, stash)
+
+        actions.approve("fp-e")
+        self.assertEqual(stash.current["gender"], "FEMALE")
+        snapshot = store.calls[-1][2]
+        item["state"] = "applied"
+        item["prior_state"] = snapshot
+
+        actions.undo("fp-e")
+
+        self.assertIsNone(stash.current["gender"])
+        self.assertIsNone(stash.current["country"])
+
+    def test_an_applied_row_with_no_snapshot_refuses_rather_than_reverting(self):
+        store = _FakeStore(_enrichment_item(state="applied", prior_state=None))
+        stash = _FakeEnrichmentStash()
+
+        with self.assertRaises(ValueError):
+            Actions(store, stash).undo("fp-e")
+
+        self.assertEqual(stash.calls, [])
+
+
 _THREE_SPELLINGS = [
     {"id": "1", "name": "IvyMayKingsley", "aliases": [], "description": None, "scene_count": 1},
     {"id": "2", "name": "Ivy MayKingsley", "aliases": [], "description": None, "scene_count": 2},
@@ -1866,23 +2007,25 @@ def _reconcile_item(fp="fp-r", **over):
 
 class _FakeMultiKindStash:
     """A media server able to answer every apply path `batch_apply` may
-    LEGITIMATELY reach -- scene, performer-description, tag-description --
-    and nothing else. `merge_tags`/`delete_tag`/`reconcile_tag_to_performer`
-    all raise on sight: the guard under test in the section below is exactly
-    what must stop a merge/reconcile/deletion fingerprint from ever reaching
-    them, and a double that answered them anyway could not tell a guard that
-    fired from one that quietly let the write through -- the same reasoning
-    `_FakeMultiTagStash` above applies to `bulk_apply_tag_descriptions`,
-    widened here to the three subject types this wider action may touch.
+    LEGITIMATELY reach -- scene, performer-description, performer-enrichment,
+    tag-description -- and nothing else. `merge_tags`/`delete_tag`
+    /`reconcile_tag_to_performer` all raise on sight: the guard under test in
+    the section below is exactly what must stop a merge/reconcile/deletion
+    fingerprint from ever reaching them, and a double that answered them
+    anyway could not tell a guard that fired from one that quietly let the
+    write through -- the same reasoning `_FakeMultiTagStash` above applies to
+    `bulk_apply_tag_descriptions`, widened here to the subject types this
+    wider action may touch.
     """
 
     def __init__(self, prior=None, tag_descriptions=None,
-                performer_descriptions=None, fail_scene_ids=(),
-                fail_tag_ids=()):
+                performer_descriptions=None, enrichment_fields=None,
+                fail_scene_ids=(), fail_tag_ids=()):
         self.calls = []
         self._prior = prior if prior is not None else {"title": "old"}
         self.tag_descriptions = dict(tag_descriptions or {})
         self.performer_descriptions = dict(performer_descriptions or {})
+        self.enrichment_fields = dict(enrichment_fields or {})
         self._fail_scene_ids = set(fail_scene_ids)
         self._fail_tag_ids = set(fail_tag_ids)
 
@@ -1909,6 +2052,18 @@ class _FakeMultiKindStash:
         self.performer_descriptions[performer_id] = description
         self.calls.append(("apply-performer", performer_id, description))
         return {"prior": {"details": prior}}
+
+    def apply_performer_enrichment(self, performer_id, fields):
+        already = self.enrichment_fields.get(performer_id, {})
+        conflicting = [f for f in fields if already.get(f) not in (None, [])]
+        if conflicting:
+            raise RuntimeError(
+                "performer %s's %s no longer blank" % (
+                    performer_id, " and ".join(sorted(conflicting))))
+        self.enrichment_fields.setdefault(performer_id, {}).update(fields)
+        self.calls.append(("apply-enrichment", performer_id, dict(fields)))
+        return {"prior": {f: ([] if isinstance(v, list) else None)
+                          for f, v in fields.items()}}
 
     def apply_tag_description(self, tag_id, description, *, expected):
         if tag_id in self._fail_tag_ids:
@@ -2075,6 +2230,26 @@ class BatchApplySubjectTypeGuard(unittest.TestCase):
                     [f["fingerprint"] for f in result.failed], ["fp-h"])
                 self.assertEqual(store.calls, [])
                 self.assertEqual(store.item("fp-h")["state"], "new")
+
+    def test_an_enrichment_fingerprint_is_allowed_through_the_guard(self):
+        # The positive case beside the three refusals above: an enrichment
+        # proposal IS one of the subject types this action may reach, so a
+        # ticked batch approve on the performers inbox must actually apply
+        # it rather than refuse it alongside a merge/reconcile/deletion.
+        enrichment_item = _enrichment_item()
+        merge_item = _merge_item()
+        store = _FakeMultiItemStore([enrichment_item, merge_item])
+        stash = _FakeMultiKindStash()
+
+        result = Actions(store, stash).batch_apply(
+            "approve", [enrichment_item["fingerprint"],
+                       merge_item["fingerprint"]])
+
+        self.assertEqual(result.applied, (enrichment_item["fingerprint"],))
+        self.assertEqual([f["fingerprint"] for f in result.failed],
+                         [merge_item["fingerprint"]])
+        self.assertEqual(
+            store.item(enrichment_item["fingerprint"])["state"], "applied")
 
 
 class BatchApplyAppliedStateGuard(unittest.TestCase):

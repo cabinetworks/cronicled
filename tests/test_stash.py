@@ -4559,6 +4559,176 @@ class PerformerDescription(unittest.TestCase):
         self.assertIsNone(got)
 
 
+# -- performer enrichment ---------------------------------------------------- #
+
+def _bare_performer(id="7", name="Wren Alderly"):
+    """A performer row with every `Stash.ENRICHMENT_FIELDS` entry blank --
+    every fixture name here is invented."""
+    row = {"id": id, "name": name, "stash_ids": [],
+          "image_path": "http://example.test/performer/%s/image?default=true" % id}
+    for field in Stash.ENRICHMENT_FIELDS:
+        row[field] = [] if field in ("alias_list", "urls") else None
+    return row
+
+
+class PerformersForEnrichment(unittest.TestCase):
+    def test_the_query_asks_for_every_enrichment_field_and_the_image_marker(self):
+        t = _PerformerReadTransport(pages=[[_bare_performer()]])
+        _read_stash(t).performers_for_enrichment()
+        query, _ = t.calls[0]
+        self.assertIn("findPerformers(", query)
+        self.assertIn("image_path", query)
+        self.assertIn("stash_ids", query)
+        for field in Stash.ENRICHMENT_FIELDS:
+            self.assertIn(field, query)
+
+    def test_it_returns_every_row_the_server_gave_it_untouched(self):
+        rows = [_bare_performer(id=str(i)) for i in range(3)]
+        t = _PerformerReadTransport(pages=[rows])
+        self.assertEqual(_read_stash(t).performers_for_enrichment(), rows)
+
+    def test_it_pages_past_the_first_page(self):
+        pages = [[_bare_performer(id=str(i)) for i in range(PERFORMER_PAGE_SIZE)],
+                 [_bare_performer(id="omega")]]
+        t = _PerformerReadTransport(pages=pages)
+        got = _read_stash(t).performers_for_enrichment()
+        self.assertEqual(got, pages[0] + pages[1])
+        self.assertEqual([v["f"]["page"] for _, v in t.calls], [1, 2])
+
+
+class _EnrichmentTransport:
+    """A media server holding one performer's enrichment fields.
+
+    `current` is the `{field: value}` the READ answers; the WRITE records the
+    whole update input and updates `current` from it, mirroring
+    `_PerformerWriteTransport`'s own shape for the description path.
+    """
+
+    def __init__(self, current, performer_id="7", missing=False):
+        self.current = dict(current)
+        self.performer_id = performer_id
+        self.missing = missing
+        self.writes = []
+        self.queries = []
+        self.reads = 0
+
+    def __call__(self, body, timeout):
+        query, variables = body["query"], body["variables"]
+        self.queries.append(query)
+        if "findPerformer(" in query:
+            self.reads += 1
+            if self.missing:
+                return {"data": {"findPerformer": None}}
+            row = {"id": self.performer_id}
+            row.update(self.current)
+            return {"data": {"findPerformer": row}}
+        if "performerUpdate(" in query:
+            self.writes.append(variables["in"])
+            self.current.update(
+                {k: v for k, v in variables["in"].items() if k != "id"})
+            return {"data": {"performerUpdate": {"id": self.performer_id}}}
+        raise AssertionError("test transport does not recognize query: %s"
+                            % query)
+
+
+class PerformerEnrichmentFields(unittest.TestCase):
+    def test_it_reads_exactly_the_named_fields(self):
+        t = _EnrichmentTransport({"gender": "FEMALE", "country": None,
+                                  "image_path": "http://example.test/i?default=true"})
+        got = Stash("http://example.test", "k", transport=t).\
+            performer_enrichment_fields("7", ["gender", "country", "image"])
+        self.assertEqual(got, {"gender": "FEMALE", "country": None,
+                               "image": "http://example.test/i?default=true"})
+
+    def test_image_is_translated_to_image_path_and_back(self):
+        t = _EnrichmentTransport(
+            {"image_path": "http://example.test/photo.jpg"})
+        got = Stash("http://example.test", "k", transport=t).\
+            performer_enrichment_fields("7", ["image"])
+        # The read query must ask the server's own field name, never the
+        # write-side alias -- `image` is not a selectable field on
+        # `findPerformer` and a query asking for it would fail outright.
+        self.assertIn("image_path", t.queries[-1])
+        self.assertEqual(got, {"image": "http://example.test/photo.jpg"})
+
+    def test_an_unknown_performer_reads_every_field_as_none(self):
+        t = _EnrichmentTransport({}, missing=True)
+        got = Stash("http://example.test", "k", transport=t).\
+            performer_enrichment_fields("7", ["gender", "country"])
+        self.assertEqual(got, {"gender": None, "country": None})
+
+
+class ApplyPerformerEnrichment(unittest.TestCase):
+    def test_it_writes_exactly_the_given_fields_and_nothing_else(self):
+        t = _EnrichmentTransport({"gender": None, "country": None})
+        Stash("http://example.test", "k", transport=t).\
+            apply_performer_enrichment(
+                "7", {"gender": "FEMALE", "country": "Freedonia"})
+        self.assertEqual(t.writes,
+                         [{"id": "7", "gender": "FEMALE",
+                           "country": "Freedonia"}])
+
+    def test_it_returns_a_blank_prior_shaped_by_field_kind(self):
+        t = _EnrichmentTransport({"gender": None, "alias_list": []})
+        result = Stash("http://example.test", "k", transport=t).\
+            apply_performer_enrichment(
+                "7", {"gender": "FEMALE", "alias_list": ["Wren A."]})
+        self.assertEqual(result, {"prior": {"gender": None, "alias_list": []}})
+
+    def test_a_field_no_longer_blank_refuses_the_whole_write(self):
+        # HARM: something else filled `gender` in since the proposal was
+        # made. Writing `country` anyway and dropping `gender` would leave a
+        # proposal's own undo snapshot describing only half of what the
+        # store thinks it approved.
+        t = _EnrichmentTransport({"gender": "already set by hand",
+                                  "country": None})
+        with self.assertRaises(StashError) as ctx:
+            Stash("http://example.test", "k", transport=t).\
+                apply_performer_enrichment(
+                    "7", {"gender": "FEMALE", "country": "Freedonia"})
+        self.assertIn("gender", str(ctx.exception))
+        self.assertEqual(t.writes, [])
+
+    def test_a_non_empty_alias_list_already_present_refuses_the_write(self):
+        t = _EnrichmentTransport({"alias_list": ["Already Here"]})
+        with self.assertRaises(StashError):
+            Stash("http://example.test", "k", transport=t).\
+                apply_performer_enrichment("7", {"alias_list": ["New Alias"]})
+        self.assertEqual(t.writes, [])
+
+    def test_the_check_reads_the_server_rather_than_trusting_the_caller(self):
+        t = _EnrichmentTransport({"gender": None})
+        Stash("http://example.test", "k", transport=t).\
+            apply_performer_enrichment("7", {"gender": "FEMALE"})
+        self.assertEqual(t.reads, 1)
+
+    def test_no_fields_is_refused_outright(self):
+        t = _EnrichmentTransport({})
+        with self.assertRaises(ValueError):
+            Stash("http://example.test", "k", transport=t).\
+                apply_performer_enrichment("7", {})
+        self.assertEqual(t.writes, [])
+
+
+class RevertPerformerEnrichment(unittest.TestCase):
+    def test_it_writes_back_the_blank_snapshot_exactly(self):
+        t = _EnrichmentTransport({"gender": "FEMALE", "alias_list": ["X"]})
+        Stash("http://example.test", "k", transport=t).\
+            revert_performer_enrichment(
+                "7", {"gender": None, "alias_list": []})
+        self.assertEqual(t.writes,
+                         [{"id": "7", "gender": None, "alias_list": []}])
+
+    def test_a_missing_or_empty_snapshot_is_refused_and_nothing_is_written(self):
+        for prior in (None, {}):
+            with self.subTest(prior=prior):
+                t = _EnrichmentTransport({"gender": "FEMALE"})
+                with self.assertRaises(ValueError):
+                    Stash("http://example.test", "k", transport=t).\
+                        revert_performer_enrichment("7", prior)
+                self.assertEqual(t.writes, [])
+
+
 # -- retrying a store fault that looks transient ---------------------------- #
 #
 # THE DEFECT: a store answered a name search with a GraphQL error twice, on

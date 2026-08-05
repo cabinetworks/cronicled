@@ -5,8 +5,10 @@ from cronicled.artist import Resolution
 from cronicled.scoring import Decision, Match, decide
 from cronicled.stash import StashError
 from cronicled.stashbox import (
-    BOX_TAGS, PERFORMER_SCENES, SCENES_BY_FINGERPRINT, SourceListing, StashBox,
-    base_url, check, listing_verdict)
+    BOX_TAGS, FIND_PERFORMER_ARGS, PERFORMER_FIELDS, PERFORMER_PROFILE,
+    PERFORMER_SCENES, PERFORMER_SEARCH, QUERY_PERFORMERS_RESULT_FIELDS,
+    SCENES_BY_FINGERPRINT, SEARCH_PERFORMERS_ARGS, SourceListing, StashBox,
+    _career_length, _joined_modifications, base_url, check, listing_verdict)
 
 
 def _transport(responses):
@@ -547,17 +549,22 @@ class RequestShape(unittest.TestCase):
             _page(3, [{"id": "s3"}]),
             _blocks([[{"id": "s4"}]]),
             _tag_page(1, [_box_tag("velvet crane")]),
+            _profile_reply(_box_performer(id="p1")),
+            _search_reply([]),
         ])
         box = StashBox("https://box.test", "k", transport=t)
 
         surface = sorted(name for name in dir(box)
                          if not name.startswith("_") and callable(getattr(box, name)))
         self.assertEqual(surface,
-                         ["all_tags", "known_by_fingerprint", "performer_listing"],
+                         ["all_tags", "known_by_fingerprint", "performer_listing",
+                          "performer_profile", "search_performers"],
                          "a new call on this client must be exercised here too")
         box.performer_listing("p1", per_page=2)
         box.known_by_fingerprint([("PHASH", "aaaa1111")])
         box.all_tags(per_page=100)
+        box.performer_profile("p1")
+        box.search_performers("Wren Alderly")
 
         self.assertTrue(t.calls, "the surface was actually exercised")
         for body, _ in t.calls:
@@ -1387,6 +1394,471 @@ class Check(unittest.TestCase):
                         "Velvet Crane", Resolution(name="Velvet Crane"))
 
         self.assertIs(verdict.unlisted, False)
+
+
+def _profile_reply(row):
+    return {"data": {"findPerformer": row}}
+
+
+def _search_reply(rows, count=None):
+    # `{count, performers}` -- confirmed against a live instance, see
+    # `PERFORMER_SEARCH`'s own docstring. `count` defaults to `len(rows)`,
+    # which is deliberately the ORDINARY case for a fixture and NOT what a
+    # real reply commonly looks like (`count` is the search's total match
+    # count, `rows` is one page of it, and a real reply routinely disagrees
+    # between the two -- see `SearchReplyShape` below, which drives them
+    # apart on purpose).
+    return {"data": {"searchPerformers": {
+        "count": len(rows) if count is None else count, "performers": rows}}}
+
+
+def _box_performer(id="pf-1", name="Wren Alderly", disambiguation=None,
+                   aliases=(), gender="FEMALE", ethnicity=None, country=None,
+                   eye_color=None, height=None, birth_date=None,
+                   career_start=None, career_end=None, tattoos=(),
+                   piercings=(), urls=(), images=()):
+    """One `findPerformer`/`searchPerformers` row, shaped the way
+    `PERFORMER_PROFILE`/`PERFORMER_SEARCH` shape it -- field names verified
+    against a live stash-box instance (see `PERFORMER_PROFILE`'s own
+    docstring) -- every fixture VALUE here is invented; the names belong to
+    nobody."""
+    return {
+        "id": id, "name": name, "disambiguation": disambiguation,
+        "aliases": list(aliases), "gender": gender, "ethnicity": ethnicity,
+        "country": country, "eye_color": eye_color, "height": height,
+        "birth_date": birth_date, "career_start_year": career_start,
+        "career_end_year": career_end,
+        "tattoos": [dict(location=l, description=d) for l, d in tattoos],
+        "piercings": [dict(location=l, description=d) for l, d in piercings],
+        "urls": [{"url": u} for u in urls],
+        "images": [{"url": u} for u in images],
+    }
+
+
+class PerformerProfile(unittest.TestCase):
+    def test_a_known_id_maps_every_field_this_module_can_read(self):
+        row = _box_performer(
+            id="pf-1", name="Wren Alderly", disambiguation="the elder",
+            aliases=["Wren A."], gender="FEMALE", ethnicity="not stated",
+            country="not stated", eye_color="not stated", height=170,
+            birth_date="1990-01-01", career_start=2015, career_end=2020,
+            tattoos=[("forearm", "a wren in flight")],
+            piercings=[("ear", "single lobe")],
+            urls=["https://example.test/wren"],
+            images=["https://example.test/wren.jpg"])
+        t = _transport([_profile_reply(row)])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        profile = box.performer_profile("pf-1")
+
+        self.assertEqual(profile["id"], "pf-1")
+        self.assertEqual(profile["name"], "Wren Alderly")
+        self.assertEqual(profile["aliases"], ["Wren A."])
+        self.assertEqual(profile["fields"], {
+            "disambiguation": "the elder",
+            "gender": "FEMALE",
+            "ethnicity": "not stated",
+            "country": "not stated",
+            "eye_color": "not stated",
+            "height_cm": 170,
+            "birthdate": "1990-01-01",
+            "career_length": "2015-2020",
+            "tattoos": "forearm: a wren in flight",
+            "piercings": "ear: single lobe",
+            "alias_list": ["Wren A."],
+            "urls": ["https://example.test/wren"],
+            "image": "https://example.test/wren.jpg",
+        })
+        self.assertEqual(t.calls[0][0]["query"], PERFORMER_PROFILE)
+        self.assertEqual(t.calls[0][0]["variables"], {"id": "pf-1"})
+
+    def test_details_and_measurements_are_never_offered(self):
+        # The two fields this module's own docstring names as deliberately
+        # absent -- see `_performer_from_box`. Asserted on the whole shape,
+        # not by checking their VALUES are None: a `None` value and an absent
+        # key both read as "nothing offered" to `cronicled.enrichment`'s
+        # merge, but only the absent key is the claim this test makes.
+        row = _box_performer()
+        t = _transport([_profile_reply(row)])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        profile = box.performer_profile("pf-1")
+
+        self.assertNotIn("details", profile["fields"])
+        self.assertNotIn("measurements", profile["fields"])
+
+    def test_an_unknown_id_answers_none(self):
+        t = _transport([_profile_reply(None)])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        self.assertIsNone(box.performer_profile("pf-missing"))
+
+    def test_an_absent_optional_field_is_none_or_empty_never_missing(self):
+        row = _box_performer(aliases=[], urls=[], images=[], tattoos=[],
+                             piercings=[], career_start=None)
+        t = _transport([_profile_reply(row)])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        profile = box.performer_profile("pf-1")
+
+        self.assertEqual(profile["fields"]["alias_list"], [])
+        self.assertEqual(profile["fields"]["urls"], [])
+        self.assertIsNone(profile["fields"]["image"])
+        self.assertIsNone(profile["fields"]["tattoos"])
+        self.assertIsNone(profile["fields"]["piercings"])
+        self.assertIsNone(profile["fields"]["career_length"])
+
+
+class PerformerSearch(unittest.TestCase):
+    def test_the_request_names_the_search_term(self):
+        t = _transport([_search_reply([])])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        box.search_performers("Wren Alderly")
+
+        self.assertEqual(t.calls[0][0]["query"], PERFORMER_SEARCH)
+        # Flat arguments -- `term`, never nested under an `input` object.
+        # `queryPerformers(input: PerformerQueryInput)` takes the nested
+        # shape; `searchPerformers`, the entry point this actually calls,
+        # does not. See `PERFORMER_SEARCH`'s own docstring for why the two
+        # are not interchangeable.
+        self.assertEqual(t.calls[0][0]["variables"]["term"], "Wren Alderly")
+        self.assertNotIn("input", t.calls[0][0]["variables"])
+        # No `page` sent at all -- this client reads one page only, and
+        # `PERFORMER_SEARCH` no longer declares the variable to bind it to.
+        self.assertNotIn("page", t.calls[0][0]["variables"])
+
+    def test_every_row_the_source_offers_comes_back_mapped(self):
+        rows = [_box_performer(id="pf-1", name="Wren Alderly"),
+               _box_performer(id="pf-2", name="Wren Alderly Jr")]
+        t = _transport([_search_reply(rows)])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        got = box.search_performers("Wren")
+
+        self.assertEqual([p["id"] for p in got], ["pf-1", "pf-2"])
+
+    def test_no_matches_is_an_empty_list_not_an_error(self):
+        t = _transport([_search_reply([])])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        self.assertEqual(box.search_performers("Nobody Like This"), [])
+
+
+class SearchReplyShapeDistinguishesCountFromPageSize(unittest.TestCase):
+    """`count` is the search's TOTAL match count; `performers` is one PAGE
+    of it, and a real reply routinely disagrees between the two -- a live
+    call at `per_page: 2` returned `count: 1903` alongside exactly 2
+    `performers`. Every fixture elsewhere in this file defaults `count` to
+    `len(rows)` for convenience, which is exactly the shape that could hide
+    a client silently deriving one number from the other; this class drives
+    them apart on purpose, the way a real reply would.
+    """
+
+    def test_the_returned_candidates_are_this_pages_rows_never_derived_from_count(self):
+        rows = [_box_performer(id="pf-1", name="Wren Alderly"),
+               _box_performer(id="pf-2", name="Wren Alderly Jr")]
+        t = _transport([_search_reply(rows, count=1903)])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        got = box.search_performers("Wren Alderly", per_page=2)
+
+        # Exactly the two rows this page carried, never a count of 1903 and
+        # never zero rows because a large `count` was misread as "unread".
+        self.assertEqual([p["id"] for p in got], ["pf-1", "pf-2"])
+        self.assertEqual(len(got), 2)
+
+    def test_a_page_of_zero_rows_with_a_nonzero_count_is_still_empty(self):
+        # The other direction: a `count` that says matches exist, with no
+        # `performers` on THIS page, must never be read as "there must be
+        # rows here somewhere" -- there is nothing to map.
+        t = _transport([_search_reply([], count=1903)])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        self.assertEqual(box.search_performers("Wren Alderly"), [])
+
+    def test_a_reply_shaped_as_a_bare_list_is_no_longer_accepted(self):
+        # The shape an earlier version of this module assumed, corrected
+        # after being checked against a live instance. `search_performers`
+        # must read `result["searchPerformers"]["performers"]`, not
+        # `result["searchPerformers"]` directly -- a bare list has no
+        # `["performers"]` key, so this raises rather than silently
+        # iterating something unrelated.
+        t = _transport([{"data": {"searchPerformers": []}}])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        with self.assertRaises(TypeError):
+            box.search_performers("Wren Alderly")
+
+
+_BRACE_BLOCK_RE = re.compile(r"\{[^{}]*\}")
+
+
+def _selection_between(query, anchor):
+    """The text of the (possibly nested) selection set immediately
+    following `anchor` in `query` -- e.g. the fields asked for on
+    `Performer`, given `anchor="findPerformer(id: $id)"`.
+
+    Found by counting braces from the first `{` after `anchor` to its
+    matching close, so this does not depend on how many braces happen to
+    follow it in the rest of the query text.
+    """
+    start = query.index(anchor) + len(anchor)
+    open_brace = query.index("{", start)
+    depth = 0
+    for i in range(open_brace, len(query)):
+        if query[i] == "{":
+            depth += 1
+        elif query[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return query[open_brace + 1:i]
+    raise ValueError("unbalanced braces after %r" % (anchor,))
+
+
+def _selected_top_level_fields(selection_text):
+    """The field names selected at the TOP level of `selection_text` -- a
+    `Performer` selection set as it appears in one of this module's own
+    query constants.
+
+    A nested selection (`tattoos { location description }`) is stripped as
+    a whole block first, so `location`/`description` (fields of
+    `BodyModification`, a DIFFERENT type) and `url` (of `URL`/`Image`) are
+    never mistaken for `Performer`'s own fields -- only the name
+    introducing the block (`tattoos`, `urls`, ...) survives the strip.
+    Applied repeatedly so this would still resolve correctly one level
+    deeper, though nothing here goes that deep.
+    """
+    text = selection_text
+    while True:
+        stripped = _BRACE_BLOCK_RE.sub("", text)
+        if stripped == text:
+            return set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", stripped))
+        text = stripped
+
+
+class PerformerQueriesSelectOnlyRealFields(unittest.TestCase):
+    """The gap that let `eyeColor`/`birthDate`/`careerStartYear`/
+    `careerEndYear` ship with every OTHER test in this file green: a fake
+    transport only ever echoes back whatever a test scripted, so it cannot
+    tell a well-formed selection from one asking for a field the type does
+    not have. `PERFORMER_FIELDS`/`QUERY_PERFORMERS_RESULT_FIELDS` are the
+    real schema, recorded from a live stash-box instance (see
+    `PERFORMER_PROFILE`'s own docstring for when) -- an INDEPENDENT source of
+    truth from the query text itself, so the two can genuinely disagree,
+    unlike a test that builds its expectation from the same constant the
+    code sends.
+
+    Covers both LEVELS a query can get wrong: the leaf fields on `Performer`
+    itself (checked below against `PERFORMER_FIELDS`), and the WRAPPER
+    `searchPerformers` replies with, `QueryPerformersResultType` (checked
+    against `QUERY_PERFORMERS_RESULT_FIELDS`) -- the level an earlier version
+    of `PERFORMER_SEARCH` got wrong in a different way, by assuming no
+    wrapper existed at all.
+    """
+
+    def test_every_field_the_profile_query_selects_on_performer_is_real(self):
+        selected = _selected_top_level_fields(
+            _selection_between(PERFORMER_PROFILE, "findPerformer(id: $id)"))
+        self.assertTrue(selected.issubset(PERFORMER_FIELDS),
+                        selected - PERFORMER_FIELDS)
+        # Not vacuous: the selection really does name more than nothing.
+        self.assertGreaterEqual(len(selected), 10)
+
+    def test_every_field_the_search_query_selects_on_performer_is_real(self):
+        # One level deeper than `searchPerformers` itself: the Performer
+        # selection now sits inside `performers { ... }`, nested under the
+        # `QueryPerformersResultType` wrapper -- see
+        # `test_the_search_query_selects_only_real_wrapper_fields` for that
+        # outer level.
+        selected = _selected_top_level_fields(
+            _selection_between(PERFORMER_SEARCH, "performers"))
+        self.assertTrue(selected.issubset(PERFORMER_FIELDS),
+                        selected - PERFORMER_FIELDS)
+        self.assertGreaterEqual(len(selected), 10)
+
+    def test_the_two_queries_select_the_same_performer_fields(self):
+        # The two are meant to carry an identical Performer selection --
+        # see both queries' own docstrings. A change to one that forgot the
+        # other would otherwise ship silently.
+        profile_fields = _selected_top_level_fields(
+            _selection_between(PERFORMER_PROFILE, "findPerformer(id: $id)"))
+        search_fields = _selected_top_level_fields(
+            _selection_between(PERFORMER_SEARCH, "performers"))
+        self.assertEqual(profile_fields, search_fields)
+
+    def test_the_search_query_selects_only_real_wrapper_fields(self):
+        # The OUTER level: what `searchPerformers` itself is asked for,
+        # before descending into its own `performers { ... }` block. Stripping
+        # nested braces leaves exactly the wrapper-level field names --
+        # `count` and `performers`, the field name introducing the nested
+        # block -- never the fields nested inside it.
+        selected = _selected_top_level_fields(_selection_between(
+            PERFORMER_SEARCH,
+            "searchPerformers(term: $term, per_page: $per_page)"))
+        self.assertTrue(selected.issubset(QUERY_PERFORMERS_RESULT_FIELDS),
+                        selected - QUERY_PERFORMERS_RESULT_FIELDS)
+        self.assertEqual(selected, {"count", "performers"})
+
+    def test_facets_is_a_real_field_but_is_not_selected(self):
+        # The explicit instruction, not merely an absence: `facets` is a
+        # genuine field on `QueryPerformersResultType` (hence its place in
+        # `QUERY_PERFORMERS_RESULT_FIELDS`), and this pins that the query
+        # does not ask for it -- an unused field in a selection is a request
+        # cost with no reader.
+        self.assertIn("facets", QUERY_PERFORMERS_RESULT_FIELDS)
+        selected = _selected_top_level_fields(_selection_between(
+            PERFORMER_SEARCH,
+            "searchPerformers(term: $term, per_page: $per_page)"))
+        self.assertNotIn("facets", selected)
+
+
+_VAR_DECL_RE = re.compile(r"\$(\w+)\s*:\s*([^\s,)]+)")
+_ARG_BINDING_RE = re.compile(r"(\w+)\s*:\s*\$(\w+)")
+
+
+def _declared_variables(query):
+    """`{variable_name: declared_type}` for every `$name: Type` declaration
+    in `query`'s own `query(...)` header -- e.g. `{"term": "String!",
+    "per_page": "Int"}` for `PERFORMER_SEARCH`.
+
+    A FIELD-NAME check (`PerformerQueriesSelectOnlyRealFields`, above) cannot
+    see this: `$term: String` and `$term: String!` select exactly the same
+    fields and read identically to a check that only looks at selections.
+    Nullability is a property of the DECLARATION, in the query's header, and
+    has to be read from there specifically -- which is the whole reason this
+    function exists rather than folding into `_selected_top_level_fields`.
+    """
+    header = query[:query.index("{")]
+    return dict(_VAR_DECL_RE.findall(header))
+
+
+def _argument_bindings(query, call):
+    """`{argument_name: variable_name}` for every `arg: $var` pair inside
+    `call`'s own parenthesised argument list in `query` -- e.g.
+    `call="searchPerformers"` against `PERFORMER_SEARCH` finds
+    `searchPerformers(term: $term, per_page: $per_page)` and returns
+    `{"term": "term", "per_page": "per_page"}`.
+
+    Found by counting parentheses from the first `(` after `call` to its
+    matching close, the same depth-counting `_selection_between` uses for
+    braces, so this does not depend on how many parens happen to follow
+    elsewhere in the query.
+    """
+    start = query.index(call)
+    open_paren = query.index("(", start)
+    depth = 0
+    for i in range(open_paren, len(query)):
+        if query[i] == "(":
+            depth += 1
+        elif query[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return dict(_ARG_BINDING_RE.findall(
+                    query[open_paren + 1:i]))
+    raise ValueError("unbalanced parens after %r" % (call,))
+
+
+class QueryVariablesMatchRealArgumentNullability(unittest.TestCase):
+    """The gap `PerformerQueriesSelectOnlyRealFields` cannot see: a field
+    name check has nothing to say about a variable DECLARATION's own
+    nullability, which is exactly how `$term: String` (nullable) shipped
+    against a real argument that is `String!` -- every field-name test here
+    stayed green, and the query raised on its first real call anyway.
+
+    `SEARCH_PERFORMERS_ARGS`/`FIND_PERFORMER_ARGS` are the real, recorded
+    signatures -- independently sourced from the query text, the same
+    discipline `PERFORMER_FIELDS` already applies to field names. For every
+    argument a query actually BINDS a variable to, this checks that
+    variable's declared type in the query's own header against the
+    recorded signature -- so a variable declared with the wrong
+    nullability, in either direction, fails here rather than only at the
+    first real call.
+    """
+
+    def test_performer_search_declares_every_bound_variable_correctly(self):
+        declared = _declared_variables(PERFORMER_SEARCH)
+        bindings = _argument_bindings(PERFORMER_SEARCH, "searchPerformers")
+        # Not vacuous: this query really does bind more than nothing.
+        self.assertTrue(bindings)
+        for argument, variable in bindings.items():
+            with self.subTest(argument=argument):
+                self.assertEqual(declared[variable],
+                                 SEARCH_PERFORMERS_ARGS[argument])
+
+    def test_performer_profile_declares_every_bound_variable_correctly(self):
+        declared = _declared_variables(PERFORMER_PROFILE)
+        bindings = _argument_bindings(PERFORMER_PROFILE, "findPerformer")
+        self.assertTrue(bindings)
+        for argument, variable in bindings.items():
+            with self.subTest(argument=argument):
+                self.assertEqual(declared[variable],
+                                 FIND_PERFORMER_ARGS[argument])
+
+    def test_term_is_declared_non_null(self):
+        # The literal regression, pinned directly rather than only through
+        # the generic loop above: `$term`'s declared type must be `String!`,
+        # not `String`.
+        self.assertEqual(_declared_variables(PERFORMER_SEARCH)["term"],
+                         "String!")
+
+    def test_page_is_not_bound_at_all(self):
+        # The other half of the correction: this module reads one page only
+        # and never sends a `page` argument -- see `PERFORMER_SEARCH`'s own
+        # docstring. A `$page` variable reappearing here (bound or not)
+        # would be exactly the kind of drift a looser check could miss.
+        self.assertNotIn("page", _declared_variables(PERFORMER_SEARCH))
+        self.assertNotIn(
+            "page", _argument_bindings(PERFORMER_SEARCH, "searchPerformers"))
+
+
+class JoinedModifications(unittest.TestCase):
+    def test_location_and_description_are_joined(self):
+        self.assertEqual(
+            _joined_modifications([{"location": "forearm",
+                                   "description": "a wren in flight"}]),
+            "forearm: a wren in flight")
+
+    def test_location_alone_is_kept(self):
+        self.assertEqual(
+            _joined_modifications([{"location": "forearm",
+                                   "description": None}]),
+            "forearm")
+
+    def test_description_alone_is_kept(self):
+        self.assertEqual(
+            _joined_modifications([{"location": None,
+                                   "description": "a small mark"}]),
+            "a small mark")
+
+    def test_an_entry_with_neither_is_dropped(self):
+        self.assertIsNone(_joined_modifications(
+            [{"location": None, "description": None}]))
+
+    def test_no_entries_is_none(self):
+        self.assertIsNone(_joined_modifications([]))
+        self.assertIsNone(_joined_modifications(None))
+
+    def test_multiple_entries_are_joined_with_a_separator(self):
+        self.assertEqual(
+            _joined_modifications([
+                {"location": "forearm", "description": "a wren"},
+                {"location": "ankle", "description": "a small star"}]),
+            "forearm: a wren; ankle: a small star")
+
+
+class CareerLength(unittest.TestCase):
+    def test_a_start_and_end_year(self):
+        self.assertEqual(_career_length(2015, 2020), "2015-2020")
+
+    def test_a_start_year_with_no_end(self):
+        self.assertEqual(_career_length(2015, None), "2015-")
+
+    def test_no_start_year_is_none_even_with_an_end(self):
+        # An end year with no start is not a career length this can state --
+        # see `_career_length`'s own docstring.
+        self.assertIsNone(_career_length(None, 2020))
+        self.assertIsNone(_career_length(None, None))
 
 
 if __name__ == "__main__":
