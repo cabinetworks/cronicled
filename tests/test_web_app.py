@@ -1641,8 +1641,18 @@ class TheTagsPageComposesEverySectionTheCombinedPageDoes(unittest.TestCase):
                       merges=lambda: to_merge_rows(
                           [_merge_item(state="dismissed")]))
         body = sent["body"].decode()
+        # Widened by the return-address ticket: a per-inbox page's own forms
+        # now carry where they were shown (see web/app.py's `_return_pages`
+        # and inbox.html's `return_fields`), so the control is pinned as
+        # this whole, closed shape rather than the narrower one before it.
         self.assertIn('<form method="post" action="/undismiss">'
                       '<input type="hidden" name="fp" value="fp-merge">'
+                      '<input type="hidden" name="return_inbox" '
+                      'value="tags">'
+                      '<input type="hidden" name="return_state" value="">'
+                      '<input type="hidden" name="return_page_key" '
+                      'value="merges_page">'
+                      '<input type="hidden" name="return_page" value="1">'
                       '<button>Undismiss</button></form>', body)
 
     def test_a_muted_unused_tag_still_carries_its_unmute_on_the_tags_page(self):
@@ -1650,10 +1660,17 @@ class TheTagsPageComposesEverySectionTheCombinedPageDoes(unittest.TestCase):
                       unused=lambda: to_unused_groups(
                           [_unused_item(state="muted")]))
         body = sent["body"].decode()
+        # Same widening as above, applied to Unmute's own subject pair.
         self.assertIn('<form method="post" action="/unmute">'
                       '<input type="hidden" name="subject_type" '
                       'value="tag-unused">'
                       '<input type="hidden" name="subject_id" value="55">'
+                      '<input type="hidden" name="return_inbox" '
+                      'value="tags">'
+                      '<input type="hidden" name="return_state" value="">'
+                      '<input type="hidden" name="return_page_key" '
+                      'value="unused_page">'
+                      '<input type="hidden" name="return_page" value="1">'
                       '<button>Stop keeping</button></form>', body)
 
 
