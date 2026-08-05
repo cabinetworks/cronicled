@@ -88,13 +88,14 @@ _SCENE_SUBJECT_TYPES = tuple(t for t in inboxes.ALL_SUBJECT_TYPES
                             if t not in _OWN_SECTION_SUBJECTS)
 
 # Which heading on the summary page each producer's proposals are counted
-# under, and what that heading is called. SIX subject types across three
+# under, and what that heading is called. SEVEN subject types across three
 # headings: a reviewer thinks in terms of the thing being changed -- a scene, a
 # tag, a performer -- and not in terms of which pass proposed it, so the four
-# tag-shaped producers are one number.
+# tag-shaped producers are one number, and so are the two performer-shaped ones
+# (a description rewrite and a blank-field enrichment).
 #
 # Derived from `web.inboxes.INBOXES` rather than declared a second time here.
-# The two used to be independent, exhaustive maps over the same six subject
+# The two used to be independent, exhaustive maps over the same set of subject
 # types -- this one, and the inbox each subject type's page belongs to -- and
 # two maps over one set of values drift silently: the summary would count one
 # grouping while the sidebar and routes used another, with nothing to say so.
