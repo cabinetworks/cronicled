@@ -98,6 +98,146 @@ query($input: TagQueryInput!) {
 # thing that can notice a transposed pair.
 FINGERPRINT_ALGORITHMS = ("MD5", "OSHASH", "PHASH")
 
+# A performer's own profile, read by the source's own id -- the strongest
+# link this module can ask with, and the one `cronicled.enrichment` reaches
+# for first (see that module's docstring for why the id path is built even
+# though a real library measured zero performers carrying one today).
+#
+# NOT VERIFIED against a live stash-box schema: this project's other queries
+# in this file (`PERFORMER_SCENES`, `BOX_TAGS`) were shaped against a real,
+# reachable instance; this one and `PERFORMER_SEARCH` below were not -- the
+# live instance this project otherwise checks schemas against
+# (`docs/superpowers` notes one) answered every request here with 401, and
+# nothing in this repository's own fixtures encodes a profile read. The field
+# names are this module's best understanding of stash-box's own schema, kept
+# in ONE place (`_performer_from_box`, below) so a wrong name is a one-line
+# fix rather than a search-and-replace, and every test against this query
+# exercises that same contract rather than a live server -- see
+# `cronicled.enrichment`'s own docstring for the caveat this carries forward.
+PERFORMER_PROFILE = """
+query($id: ID!) {
+  findPerformer(id: $id) {
+    id name disambiguation aliases gender ethnicity country eyeColor
+    height birthDate careerStartYear careerEndYear
+    tattoos { location description }
+    piercings { location description }
+    urls { url }
+    images { url }
+  }
+}
+"""
+
+# A performer's profile, by NAME rather than by id -- the path
+# `cronicled.enrichment` measured as the one that actually reaches a library's
+# performers with no box id at all. Same unverified-schema caveat as
+# `PERFORMER_PROFILE` above, and the same one place (`_performer_from_box`)
+# both queries are read through.
+#
+# Shaped like `PERFORMER_SCENES`'s own paging, on the same reasoning: a name
+# search can answer more than one performer (two different people who share a
+# name, or one person entered twice by two contributors), and
+# `cronicled.enrichment` is the layer that decides what multiple answers mean
+# -- this module hands back everything the source offered for the name,
+# unfiltered and unranked.
+PERFORMER_SEARCH = """
+query($input: PerformerQueryInput!) {
+  queryPerformers(input: $input) {
+    count
+    performers {
+      id name disambiguation aliases gender ethnicity country eyeColor
+      height birthDate careerStartYear careerEndYear
+      tattoos { location description }
+      piercings { location description }
+      urls { url }
+      images { url }
+    }
+  }
+}
+"""
+
+
+def _joined_modifications(entries):
+    """A list of stash-box `BodyModification` objects (`location`,
+    `description`), reduced to the single free-text string the media
+    server's own `tattoos`/`piercings` fields hold.
+
+    Neither field an entry carries is required: `location` alone, or
+    `description` alone, is written as itself rather than padded with a
+    separator it has nothing to join to. An entry with neither is dropped --
+    an empty parenthetical is not a fact about the performer.
+
+    A GUESS, and a mild one, stated here rather than left implicit: the media
+    server's own field is free text with no fixed grammar, so there is no
+    canonical rendering of a structured entry into it to be right or wrong
+    about. `cronicled.enrichment` treats the result as ordinary evidence, not
+    as ground truth.
+    """
+    parts = []
+    for entry in entries or ():
+        location = (entry or {}).get("location") or ""
+        description = (entry or {}).get("description") or ""
+        if location and description:
+            parts.append("%s: %s" % (location, description))
+        elif location or description:
+            parts.append(location or description)
+    return "; ".join(parts) if parts else None
+
+
+def _career_length(start, end):
+    """`careerStartYear`/`careerEndYear` (each an int or `None`) rendered as
+    the single string the media server's own `career_length` field holds.
+
+    `None` when there is no start year at all -- an end year with no start is
+    not a career length this can state. An end year present alongside a start
+    is `"START-END"`; a start with no end is `"START-"`, read the same way an
+    open-ended range is written elsewhere on the media server's own pages.
+    """
+    if start is None:
+        return None
+    return "%s-%s" % (start, end) if end is not None else "%s-" % (start,)
+
+
+def _performer_from_box(raw):
+    """One `findPerformer`/`queryPerformers` row -> the fields
+    `cronicled.enrichment` can propose, plus the name/aliases it matches a
+    library performer's name against.
+
+    The ONE place this module's understanding of stash-box's performer schema
+    is spelled out -- see `PERFORMER_PROFILE`'s own docstring for why that
+    understanding is not verified against a live instance, and keep it that
+    way: a second, independent reading of the same raw dict is a second
+    chance for the two to quietly disagree about what a field means.
+
+    Two fields this project's own measurement named are deliberately absent
+    from what comes back: `details` (a library's own free-text bio field,
+    which nothing about a source's catalogue entry for a performer
+    corresponds to) and `measurements` (stash-box's own shape for it was not
+    confidently known and guessing at a nested structure risked writing a
+    fabricated-looking string over a blank field). Both stay missing from
+    every candidate this builds, which `cronicled.enrichment.merge_candidates`
+    reads exactly like any other field no source happened to offer.
+    """
+    urls = [u["url"] for u in (raw.get("urls") or []) if u.get("url")]
+    images = [i["url"] for i in (raw.get("images") or []) if i.get("url")]
+    fields = {
+        "disambiguation": raw.get("disambiguation") or None,
+        "gender": raw.get("gender") or None,
+        "ethnicity": raw.get("ethnicity") or None,
+        "country": raw.get("country") or None,
+        "eye_color": raw.get("eyeColor") or None,
+        "height_cm": raw.get("height"),
+        "birthdate": raw.get("birthDate") or None,
+        "career_length": _career_length(raw.get("careerStartYear"),
+                                        raw.get("careerEndYear")),
+        "tattoos": _joined_modifications(raw.get("tattoos")),
+        "piercings": _joined_modifications(raw.get("piercings")),
+        "alias_list": list(raw.get("aliases") or []),
+        "urls": urls,
+        "image": images[0] if images else None,
+    }
+    return {"id": raw.get("id"), "name": raw.get("name"),
+            "aliases": list(raw.get("aliases") or []), "fields": fields}
+
 
 def _checked_fingerprint(fingerprint):
     """`(algorithm, hash)`, or `ValueError`.
@@ -674,3 +814,38 @@ class StashBox:
         return {(algorithm, value): [FingerprintHit(scene, algorithm, value)
                                      for scene in block]
                 for (algorithm, value), block in zip(unique, blocks)}
+
+    def performer_profile(self, performer_id, timeout=DEFAULT_TIMEOUT):
+        """One performer's profile, read by THIS SOURCE'S OWN id, or `None`
+        when the source holds no such performer.
+
+        The strongest of `cronicled.enrichment`'s three sources: an id is
+        exact, unlike a name, which can name two different people or miss the
+        one it is asked about entirely. See `PERFORMER_PROFILE`'s own
+        docstring for the schema caveat every field here carries.
+        """
+        found = self._client.gql(
+            PERFORMER_PROFILE, {"id": performer_id}, timeout=timeout
+        ).get("findPerformer")
+        return _performer_from_box(found) if found else None
+
+    def search_performers(self, name, per_page=PER_PAGE,
+                          timeout=DEFAULT_TIMEOUT):
+        """Every performer THIS SOURCE offers for `name`, unfiltered.
+
+        A single page only -- `per_page` performers sharing very close to one
+        name is not a real population any library needs to page through, and
+        this is a search for a candidate to confirm, not a whole-listing read
+        `performer_listing`/`all_tags` exist to be exhaustive about.
+
+        Returns every row the source offered, exactly as it ranked them. This
+        method does not decide which (if any) of them actually names the
+        performer being enriched -- `cronicled.enrichment` is the one place
+        that exact-match discipline lives, because it is a decision about
+        library evidence, not about what this client fetched.
+        """
+        result = self._client.gql(
+            PERFORMER_SEARCH, {"input": {"name": name, "page": 1,
+                                        "per_page": per_page}},
+            timeout=timeout)["queryPerformers"]
+        return [_performer_from_box(row) for row in result["performers"]]

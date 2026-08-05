@@ -5,8 +5,9 @@ from cronicled.artist import Resolution
 from cronicled.scoring import Decision, Match, decide
 from cronicled.stash import StashError
 from cronicled.stashbox import (
-    BOX_TAGS, PERFORMER_SCENES, SCENES_BY_FINGERPRINT, SourceListing, StashBox,
-    base_url, check, listing_verdict)
+    BOX_TAGS, PERFORMER_PROFILE, PERFORMER_SCENES, PERFORMER_SEARCH,
+    SCENES_BY_FINGERPRINT, SourceListing, StashBox, _career_length,
+    _joined_modifications, base_url, check, listing_verdict)
 
 
 def _transport(responses):
@@ -547,17 +548,22 @@ class RequestShape(unittest.TestCase):
             _page(3, [{"id": "s3"}]),
             _blocks([[{"id": "s4"}]]),
             _tag_page(1, [_box_tag("velvet crane")]),
+            _profile_reply(_box_performer(id="p1")),
+            _search_reply(0, []),
         ])
         box = StashBox("https://box.test", "k", transport=t)
 
         surface = sorted(name for name in dir(box)
                          if not name.startswith("_") and callable(getattr(box, name)))
         self.assertEqual(surface,
-                         ["all_tags", "known_by_fingerprint", "performer_listing"],
+                         ["all_tags", "known_by_fingerprint", "performer_listing",
+                          "performer_profile", "search_performers"],
                          "a new call on this client must be exercised here too")
         box.performer_listing("p1", per_page=2)
         box.known_by_fingerprint([("PHASH", "aaaa1111")])
         box.all_tags(per_page=100)
+        box.performer_profile("p1")
+        box.search_performers("Wren Alderly")
 
         self.assertTrue(t.calls, "the surface was actually exercised")
         for body, _ in t.calls:
@@ -1387,6 +1393,186 @@ class Check(unittest.TestCase):
                         "Velvet Crane", Resolution(name="Velvet Crane"))
 
         self.assertIs(verdict.unlisted, False)
+
+
+def _profile_reply(row):
+    return {"data": {"findPerformer": row}}
+
+
+def _search_reply(count, rows):
+    return {"data": {"queryPerformers": {"count": count, "performers": rows}}}
+
+
+def _box_performer(id="pf-1", name="Wren Alderly", disambiguation=None,
+                   aliases=(), gender="FEMALE", ethnicity=None, country=None,
+                   eye_color=None, height=None, birth_date=None,
+                   career_start=None, career_end=None, tattoos=(),
+                   piercings=(), urls=(), images=()):
+    """One `findPerformer`/`queryPerformers` row, shaped the way
+    `PERFORMER_PROFILE`/`PERFORMER_SEARCH` shape it -- every fixture here is
+    invented; the names belong to nobody."""
+    return {
+        "id": id, "name": name, "disambiguation": disambiguation,
+        "aliases": list(aliases), "gender": gender, "ethnicity": ethnicity,
+        "country": country, "eyeColor": eye_color, "height": height,
+        "birthDate": birth_date, "careerStartYear": career_start,
+        "careerEndYear": career_end,
+        "tattoos": [dict(location=l, description=d) for l, d in tattoos],
+        "piercings": [dict(location=l, description=d) for l, d in piercings],
+        "urls": [{"url": u} for u in urls],
+        "images": [{"url": u} for u in images],
+    }
+
+
+class PerformerProfile(unittest.TestCase):
+    def test_a_known_id_maps_every_field_this_module_can_read(self):
+        row = _box_performer(
+            id="pf-1", name="Wren Alderly", disambiguation="the elder",
+            aliases=["Wren A."], gender="FEMALE", ethnicity="not stated",
+            country="not stated", eye_color="not stated", height=170,
+            birth_date="1990-01-01", career_start=2015, career_end=2020,
+            tattoos=[("forearm", "a wren in flight")],
+            piercings=[("ear", "single lobe")],
+            urls=["https://example.test/wren"],
+            images=["https://example.test/wren.jpg"])
+        t = _transport([_profile_reply(row)])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        profile = box.performer_profile("pf-1")
+
+        self.assertEqual(profile["id"], "pf-1")
+        self.assertEqual(profile["name"], "Wren Alderly")
+        self.assertEqual(profile["aliases"], ["Wren A."])
+        self.assertEqual(profile["fields"], {
+            "disambiguation": "the elder",
+            "gender": "FEMALE",
+            "ethnicity": "not stated",
+            "country": "not stated",
+            "eye_color": "not stated",
+            "height_cm": 170,
+            "birthdate": "1990-01-01",
+            "career_length": "2015-2020",
+            "tattoos": "forearm: a wren in flight",
+            "piercings": "ear: single lobe",
+            "alias_list": ["Wren A."],
+            "urls": ["https://example.test/wren"],
+            "image": "https://example.test/wren.jpg",
+        })
+        self.assertEqual(t.calls[0][0]["query"], PERFORMER_PROFILE)
+        self.assertEqual(t.calls[0][0]["variables"], {"id": "pf-1"})
+
+    def test_details_and_measurements_are_never_offered(self):
+        # The two fields this module's own docstring names as deliberately
+        # absent -- see `_performer_from_box`. Asserted on the whole shape,
+        # not by checking their VALUES are None: a `None` value and an absent
+        # key both read as "nothing offered" to `cronicled.enrichment`'s
+        # merge, but only the absent key is the claim this test makes.
+        row = _box_performer()
+        t = _transport([_profile_reply(row)])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        profile = box.performer_profile("pf-1")
+
+        self.assertNotIn("details", profile["fields"])
+        self.assertNotIn("measurements", profile["fields"])
+
+    def test_an_unknown_id_answers_none(self):
+        t = _transport([_profile_reply(None)])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        self.assertIsNone(box.performer_profile("pf-missing"))
+
+    def test_an_absent_optional_field_is_none_or_empty_never_missing(self):
+        row = _box_performer(aliases=[], urls=[], images=[], tattoos=[],
+                             piercings=[], career_start=None)
+        t = _transport([_profile_reply(row)])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        profile = box.performer_profile("pf-1")
+
+        self.assertEqual(profile["fields"]["alias_list"], [])
+        self.assertEqual(profile["fields"]["urls"], [])
+        self.assertIsNone(profile["fields"]["image"])
+        self.assertIsNone(profile["fields"]["tattoos"])
+        self.assertIsNone(profile["fields"]["piercings"])
+        self.assertIsNone(profile["fields"]["career_length"])
+
+
+class PerformerSearch(unittest.TestCase):
+    def test_the_request_names_the_search_term(self):
+        t = _transport([_search_reply(0, [])])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        box.search_performers("Wren Alderly")
+
+        self.assertEqual(t.calls[0][0]["query"], PERFORMER_SEARCH)
+        self.assertEqual(t.calls[0][0]["variables"]["input"]["name"],
+                         "Wren Alderly")
+
+    def test_every_row_the_source_offers_comes_back_mapped(self):
+        rows = [_box_performer(id="pf-1", name="Wren Alderly"),
+               _box_performer(id="pf-2", name="Wren Alderly Jr")]
+        t = _transport([_search_reply(2, rows)])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        got = box.search_performers("Wren")
+
+        self.assertEqual([p["id"] for p in got], ["pf-1", "pf-2"])
+
+    def test_no_matches_is_an_empty_list_not_an_error(self):
+        t = _transport([_search_reply(0, [])])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        self.assertEqual(box.search_performers("Nobody Like This"), [])
+
+
+class JoinedModifications(unittest.TestCase):
+    def test_location_and_description_are_joined(self):
+        self.assertEqual(
+            _joined_modifications([{"location": "forearm",
+                                   "description": "a wren in flight"}]),
+            "forearm: a wren in flight")
+
+    def test_location_alone_is_kept(self):
+        self.assertEqual(
+            _joined_modifications([{"location": "forearm",
+                                   "description": None}]),
+            "forearm")
+
+    def test_description_alone_is_kept(self):
+        self.assertEqual(
+            _joined_modifications([{"location": None,
+                                   "description": "a small mark"}]),
+            "a small mark")
+
+    def test_an_entry_with_neither_is_dropped(self):
+        self.assertIsNone(_joined_modifications(
+            [{"location": None, "description": None}]))
+
+    def test_no_entries_is_none(self):
+        self.assertIsNone(_joined_modifications([]))
+        self.assertIsNone(_joined_modifications(None))
+
+    def test_multiple_entries_are_joined_with_a_separator(self):
+        self.assertEqual(
+            _joined_modifications([
+                {"location": "forearm", "description": "a wren"},
+                {"location": "ankle", "description": "a small star"}]),
+            "forearm: a wren; ankle: a small star")
+
+
+class CareerLength(unittest.TestCase):
+    def test_a_start_and_end_year(self):
+        self.assertEqual(_career_length(2015, 2020), "2015-2020")
+
+    def test_a_start_year_with_no_end(self):
+        self.assertEqual(_career_length(2015, None), "2015-")
+
+    def test_no_start_year_is_none_even_with_an_end(self):
+        # An end year with no start is not a career length this can state --
+        # see `_career_length`'s own docstring.
+        self.assertIsNone(_career_length(None, 2020))
+        self.assertIsNone(_career_length(None, None))
 
 
 if __name__ == "__main__":
