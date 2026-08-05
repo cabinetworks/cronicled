@@ -127,6 +127,16 @@ PERFORMER_FIELDS = frozenset({
     "created", "updated",
 })
 
+# `searchPerformers`'s own reply type, `QueryPerformersResultType`, also
+# introspected against the live instance on 2026-08-04 -- the SAME wrapper
+# `queryScenes`/`queryTags`/`queryPerformers` use (`count` plus the list),
+# confirmed here rather than assumed after an earlier version of
+# `PERFORMER_SEARCH` guessed a bare list instead and was corrected. `facets`
+# is real and is deliberately NOT selected below: nothing in this module
+# reads it, and an unused field in a selection is a request cost with no
+# reader.
+QUERY_PERFORMERS_RESULT_FIELDS = frozenset({"count", "performers", "facets"})
+
 # A performer's own profile, read by the source's own id -- the strongest
 # link this module can ask with, and the one `cronicled.enrichment` reaches
 # for first (see that module's docstring for why the id path is built even
@@ -172,25 +182,37 @@ query($id: ID!) {
 # separate cap this module has no use for alongside `per_page`, and `filter`'s
 # shape is unconfirmed and unneeded for an exact-name search.
 #
-# THE RETURN SHAPE IS NOT CONFIRMED. `queryScenes`/`queryTags`/`queryPerformers`
-# all wrap their list in `{count, <items>}`; nothing here confirms whether
-# `searchPerformers` does the same or answers a bare list -- only the
-# ARGUMENTS were checked against the live schema, not a real reply's shape,
-# because doing that needed a stash-box instance that actually held a
-# performer to search for. This module assumes a bare list (`search_performers`
-# reads `result["searchPerformers"]` directly), on the reasoning that a
-# `limit`-bearing "search" entry point commonly returns a plain truncated
-# list rather than a paginated count -- but that is a guess, stated here
-# rather than left implicit, and it is the next thing to verify.
+# THE REPLY SHAPE IS CONFIRMED, as of 2026-08-04: `searchPerformers` returns
+# `QueryPerformersResultType` (`count`, `performers`, `facets`), the SAME
+# `{count, <items>}` wrapper `queryScenes`/`queryTags`/`queryPerformers` use --
+# checked two ways, against the type's own introspection and against a real
+# reply (`per_page: 2` against a real library returned `count: 1903` with
+# exactly 2 `performers`). An earlier version of this query assumed a bare
+# list instead, on the reasoning that a `limit`-bearing "search" entry point
+# commonly skips the count wrapper; that reasoning did not hold here.
+#
+# `facets` is real and is NOT selected: nothing in this module reads it, and
+# an unused field in a selection is a request cost with no reader.
+#
+# `count` IS THE SEARCH'S TOTAL MATCH COUNT, never the number of rows this
+# page actually carries -- confirmed by the same real reply (1903 with 2
+# rows back). `StashBox.search_performers` does not read it at all: this
+# module only ever wants the ONE PAGE of candidates to name-match against
+# (see that method's own docstring), never a claim about how many total
+# performers share a search term, so `count` is deliberately left on the
+# reply, unread.
 PERFORMER_SEARCH = """
 query($term: String, $page: Int, $per_page: Int) {
   searchPerformers(term: $term, page: $page, per_page: $per_page) {
-    id name disambiguation aliases gender ethnicity country eye_color
-    height birth_date career_start_year career_end_year
-    tattoos { location description }
-    piercings { location description }
-    urls { url }
-    images { url }
+    count
+    performers {
+      id name disambiguation aliases gender ethnicity country eye_color
+      height birth_date career_start_year career_end_year
+      tattoos { location description }
+      piercings { location description }
+      urls { url }
+      images { url }
+    }
   }
 }
 """
@@ -890,18 +912,18 @@ class StashBox:
         this is a search for a candidate to confirm, not a whole-listing read
         `performer_listing`/`all_tags` exist to be exhaustive about.
 
-        Returns every row the source offered, exactly as it ranked them. This
-        method does not decide which (if any) of them actually names the
+        Returns every row THIS PAGE carries, exactly as the source ranked
+        them -- never the total `count` the source reports alongside it (see
+        `PERFORMER_SEARCH`'s own docstring: `count` is the search's total
+        match count, not this page's size, and this method has no use for
+        either number -- it returns candidates to name-match, not a claim
+        about how many performers in total share the term). This method does
+        not decide which (if any) of the rows it returns actually names the
         performer being enriched -- `cronicled.enrichment` is the one place
         that exact-match discipline lives, because it is a decision about
         library evidence, not about what this client fetched.
-
-        Reads `result["searchPerformers"]` as a BARE LIST -- see
-        `PERFORMER_SEARCH`'s own docstring for why that is a stated
-        assumption and not a confirmed fact: the entry point's ARGUMENTS were
-        checked against a live schema, its REPLY shape was not.
         """
         result = self._client.gql(
             PERFORMER_SEARCH, {"term": name, "page": 1, "per_page": per_page},
-            timeout=timeout)
-        return [_performer_from_box(row) for row in result["searchPerformers"]]
+            timeout=timeout)["searchPerformers"]
+        return [_performer_from_box(row) for row in result["performers"]]

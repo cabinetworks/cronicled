@@ -6,8 +6,9 @@ from cronicled.scoring import Decision, Match, decide
 from cronicled.stash import StashError
 from cronicled.stashbox import (
     BOX_TAGS, PERFORMER_FIELDS, PERFORMER_PROFILE, PERFORMER_SCENES,
-    PERFORMER_SEARCH, SCENES_BY_FINGERPRINT, SourceListing, StashBox,
-    _career_length, _joined_modifications, base_url, check, listing_verdict)
+    PERFORMER_SEARCH, QUERY_PERFORMERS_RESULT_FIELDS, SCENES_BY_FINGERPRINT,
+    SourceListing, StashBox, _career_length, _joined_modifications, base_url,
+    check, listing_verdict)
 
 
 def _transport(responses):
@@ -1399,12 +1400,16 @@ def _profile_reply(row):
     return {"data": {"findPerformer": row}}
 
 
-def _search_reply(rows):
-    # A bare list -- see `PERFORMER_SEARCH`'s own docstring for why that is
-    # a stated assumption about `searchPerformers`'s reply shape, not a
-    # confirmed fact, and `StashBox.search_performers`'s own docstring for
-    # where it is read.
-    return {"data": {"searchPerformers": rows}}
+def _search_reply(rows, count=None):
+    # `{count, performers}` -- confirmed against a live instance, see
+    # `PERFORMER_SEARCH`'s own docstring. `count` defaults to `len(rows)`,
+    # which is deliberately the ORDINARY case for a fixture and NOT what a
+    # real reply commonly looks like (`count` is the search's total match
+    # count, `rows` is one page of it, and a real reply routinely disagrees
+    # between the two -- see `SearchReplyShape` below, which drives them
+    # apart on purpose).
+    return {"data": {"searchPerformers": {
+        "count": len(rows) if count is None else count, "performers": rows}}}
 
 
 def _box_performer(id="pf-1", name="Wren Alderly", disambiguation=None,
@@ -1537,6 +1542,52 @@ class PerformerSearch(unittest.TestCase):
         self.assertEqual(box.search_performers("Nobody Like This"), [])
 
 
+class SearchReplyShapeDistinguishesCountFromPageSize(unittest.TestCase):
+    """`count` is the search's TOTAL match count; `performers` is one PAGE
+    of it, and a real reply routinely disagrees between the two -- a live
+    call at `per_page: 2` returned `count: 1903` alongside exactly 2
+    `performers`. Every fixture elsewhere in this file defaults `count` to
+    `len(rows)` for convenience, which is exactly the shape that could hide
+    a client silently deriving one number from the other; this class drives
+    them apart on purpose, the way a real reply would.
+    """
+
+    def test_the_returned_candidates_are_this_pages_rows_never_derived_from_count(self):
+        rows = [_box_performer(id="pf-1", name="Wren Alderly"),
+               _box_performer(id="pf-2", name="Wren Alderly Jr")]
+        t = _transport([_search_reply(rows, count=1903)])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        got = box.search_performers("Wren Alderly", per_page=2)
+
+        # Exactly the two rows this page carried, never a count of 1903 and
+        # never zero rows because a large `count` was misread as "unread".
+        self.assertEqual([p["id"] for p in got], ["pf-1", "pf-2"])
+        self.assertEqual(len(got), 2)
+
+    def test_a_page_of_zero_rows_with_a_nonzero_count_is_still_empty(self):
+        # The other direction: a `count` that says matches exist, with no
+        # `performers` on THIS page, must never be read as "there must be
+        # rows here somewhere" -- there is nothing to map.
+        t = _transport([_search_reply([], count=1903)])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        self.assertEqual(box.search_performers("Wren Alderly"), [])
+
+    def test_a_reply_shaped_as_a_bare_list_is_no_longer_accepted(self):
+        # The shape an earlier version of this module assumed, corrected
+        # after being checked against a live instance. `search_performers`
+        # must read `result["searchPerformers"]["performers"]`, not
+        # `result["searchPerformers"]` directly -- a bare list has no
+        # `["performers"]` key, so this raises rather than silently
+        # iterating something unrelated.
+        t = _transport([{"data": {"searchPerformers": []}}])
+        box = StashBox("https://box.test", "k", transport=t)
+
+        with self.assertRaises(TypeError):
+            box.search_performers("Wren Alderly")
+
+
 _BRACE_BLOCK_RE = re.compile(r"\{[^{}]*\}")
 
 
@@ -1588,11 +1639,19 @@ class PerformerQueriesSelectOnlyRealFields(unittest.TestCase):
     `careerEndYear` ship with every OTHER test in this file green: a fake
     transport only ever echoes back whatever a test scripted, so it cannot
     tell a well-formed selection from one asking for a field the type does
-    not have. `PERFORMER_FIELDS` is the real schema, recorded from a live
-    stash-box instance (see `PERFORMER_PROFILE`'s own docstring for when) --
-    an INDEPENDENT source of truth from the query text itself, so the two
-    can genuinely disagree, unlike a test that builds its expectation from
-    the same constant the code sends.
+    not have. `PERFORMER_FIELDS`/`QUERY_PERFORMERS_RESULT_FIELDS` are the
+    real schema, recorded from a live stash-box instance (see
+    `PERFORMER_PROFILE`'s own docstring for when) -- an INDEPENDENT source of
+    truth from the query text itself, so the two can genuinely disagree,
+    unlike a test that builds its expectation from the same constant the
+    code sends.
+
+    Covers both LEVELS a query can get wrong: the leaf fields on `Performer`
+    itself (checked below against `PERFORMER_FIELDS`), and the WRAPPER
+    `searchPerformers` replies with, `QueryPerformersResultType` (checked
+    against `QUERY_PERFORMERS_RESULT_FIELDS`) -- the level an earlier version
+    of `PERFORMER_SEARCH` got wrong in a different way, by assuming no
+    wrapper existed at all.
     """
 
     def test_every_field_the_profile_query_selects_on_performer_is_real(self):
@@ -1604,9 +1663,13 @@ class PerformerQueriesSelectOnlyRealFields(unittest.TestCase):
         self.assertGreaterEqual(len(selected), 10)
 
     def test_every_field_the_search_query_selects_on_performer_is_real(self):
-        selected = _selected_top_level_fields(_selection_between(
-            PERFORMER_SEARCH,
-            "searchPerformers(term: $term, page: $page, per_page: $per_page)"))
+        # One level deeper than `searchPerformers` itself: the Performer
+        # selection now sits inside `performers { ... }`, nested under the
+        # `QueryPerformersResultType` wrapper -- see
+        # `test_the_search_query_selects_only_real_wrapper_fields` for that
+        # outer level.
+        selected = _selected_top_level_fields(
+            _selection_between(PERFORMER_SEARCH, "performers"))
         self.assertTrue(selected.issubset(PERFORMER_FIELDS),
                         selected - PERFORMER_FIELDS)
         self.assertGreaterEqual(len(selected), 10)
@@ -1615,12 +1678,36 @@ class PerformerQueriesSelectOnlyRealFields(unittest.TestCase):
         # The two are meant to carry an identical Performer selection --
         # see both queries' own docstrings. A change to one that forgot the
         # other would otherwise ship silently.
-        profile_fields = _selected_top_level_fields(_selection_between(
-            PERFORMER_PROFILE, "findPerformer(id: $id)"))
-        search_fields = _selected_top_level_fields(_selection_between(
+        profile_fields = _selected_top_level_fields(
+            _selection_between(PERFORMER_PROFILE, "findPerformer(id: $id)"))
+        search_fields = _selected_top_level_fields(
+            _selection_between(PERFORMER_SEARCH, "performers"))
+        self.assertEqual(profile_fields, search_fields)
+
+    def test_the_search_query_selects_only_real_wrapper_fields(self):
+        # The OUTER level: what `searchPerformers` itself is asked for,
+        # before descending into its own `performers { ... }` block. Stripping
+        # nested braces leaves exactly the wrapper-level field names --
+        # `count` and `performers`, the field name introducing the nested
+        # block -- never the fields nested inside it.
+        selected = _selected_top_level_fields(_selection_between(
             PERFORMER_SEARCH,
             "searchPerformers(term: $term, page: $page, per_page: $per_page)"))
-        self.assertEqual(profile_fields, search_fields)
+        self.assertTrue(selected.issubset(QUERY_PERFORMERS_RESULT_FIELDS),
+                        selected - QUERY_PERFORMERS_RESULT_FIELDS)
+        self.assertEqual(selected, {"count", "performers"})
+
+    def test_facets_is_a_real_field_but_is_not_selected(self):
+        # The explicit instruction, not merely an absence: `facets` is a
+        # genuine field on `QueryPerformersResultType` (hence its place in
+        # `QUERY_PERFORMERS_RESULT_FIELDS`), and this pins that the query
+        # does not ask for it -- an unused field in a selection is a request
+        # cost with no reader.
+        self.assertIn("facets", QUERY_PERFORMERS_RESULT_FIELDS)
+        selected = _selected_top_level_fields(_selection_between(
+            PERFORMER_SEARCH,
+            "searchPerformers(term: $term, page: $page, per_page: $per_page)"))
+        self.assertNotIn("facets", selected)
 
 
 class JoinedModifications(unittest.TestCase):
