@@ -2320,5 +2320,306 @@ class TheBatchCheckboxSelectionIsBoundToThePage(unittest.TestCase):
         self.assertEqual(set(fps), set(self.fingerprints[PAGE_SIZE:]))
 
 
+class AWriteReturnsToThePerInboxPageItWasShownOn(unittest.TestCase):
+    """Acceptance: acting on a row from a per-inbox page returns to THAT
+    page, including its terminal-state variant -- never to the combined
+    inbox, which is what every write did before this ticket.
+    """
+
+    _APPROVE_FORM_RE = re.compile(
+        r'<form method="post" action="/approve">(?P<body>.*?)</form>',
+        re.DOTALL)
+    _HIDDEN_RE = re.compile(
+        r'<input type="hidden" name="([^"]+)" value="([^"]*)">')
+
+    def test_the_rendered_forms_own_fields_return_to_the_per_inbox_page(self):
+        # End to end: render `/scenes`, take the row's own Approve form
+        # exactly as a browser would submit it, and confirm the round trip
+        # lands back on `/scenes` -- not a hand-built POST body asserting
+        # the same thing about `_return_path` in isolation.
+        store = _FakeStore([_scene_item("fp-1", state="new")])
+        body = _drive("GET", "/scenes", store=store)["body"].decode()
+        match = self._APPROVE_FORM_RE.search(body)
+        self.assertIsNotNone(match, "no Approve form found on /scenes")
+        fields = dict(self._HIDDEN_RE.findall(match.group("body")))
+        self.assertEqual(fields.get("return_inbox"), "scenes")
+        post_body = "&".join("%s=%s" % (k, v) for k, v in fields.items())
+        sent = _drive("POST", "/approve", post_body.encode(),
+                      store=_FakeStore([]))
+        self.assertEqual(sent["headers"]["Location"], "/scenes?applied=fp-1")
+
+    def test_dismiss_from_the_tags_page_returns_to_tags(self):
+        sent = _drive(
+            "POST", "/dismiss",
+            b"fp=fp-1&return_inbox=tags&return_state=&"
+            b"return_page_key=page&return_page=1",
+            store=_FakeStore([]))
+        self.assertEqual(sent["headers"]["Location"], "/tags")
+
+    def test_a_terminal_state_variant_is_preserved(self):
+        sent = _drive(
+            "POST", "/undismiss",
+            b"fp=fp-1&return_inbox=tags&return_state=dismissed&"
+            b"return_page_key=page&return_page=1",
+            store=_FakeStore([]))
+        self.assertEqual(sent["headers"]["Location"],
+                         "/tags/dismissed?opened=dismissed")
+
+    def test_it_must_not_return_to_the_combined_inbox(self):
+        # A test must fail if this returns to the combined inbox: asserted
+        # both ways, not merely that the per-inbox path is a substring of
+        # something that could also contain "/inbox".
+        sent = _drive(
+            "POST", "/mute",
+            b"fp=fp-1&return_inbox=performers&return_state=&"
+            b"return_page_key=page&return_page=1",
+            store=_FakeStore([]))
+        self.assertNotEqual(sent["headers"]["Location"], "/inbox")
+        self.assertEqual(sent["headers"]["Location"], "/performers")
+
+    def test_row_three_of_page_seven_returns_to_page_seven(self):
+        # The chosen answer to "same page, or first page": the same page,
+        # bounded by the ordinary page-number sanitiser (see `_return_path`'s
+        # own docstring) -- landing back on page 1 after acting on page 7
+        # is nearly as disorienting as landing on the combined inbox.
+        sent = _drive(
+            "POST", "/mute",
+            b"fp=fp-1&return_inbox=scenes&return_state=&"
+            b"return_page_key=page&return_page=7",
+            store=_FakeStore([]))
+        self.assertEqual(sent["headers"]["Location"], "/scenes?page=7")
+
+    def test_undo_from_the_applied_state_route_returns_there(self):
+        sent = _drive(
+            "POST", "/undo",
+            b"fp=fp-1&return_inbox=scenes&return_state=applied&"
+            b"return_page_key=page&return_page=1",
+            store=_FakeStore([]))
+        self.assertEqual(sent["headers"]["Location"], "/scenes/applied")
+
+
+class ActingFromTheCombinedInboxStillReturnsThere(unittest.TestCase):
+    """Acceptance: pinning only the new per-inbox behaviour must not break
+    the more common, ordinary case -- every write from the combined inbox
+    keeps landing back on it, exactly as before this ticket.
+    """
+
+    def test_the_rendered_combined_inbox_form_carries_no_new_field_at_all(self):
+        # `return_fields` renders NOTHING when `return_inbox` is empty and
+        # the page is 1 -- the combined inbox's ordinary case -- so the
+        # row's own Approve form is byte-identical to what it was before
+        # this ticket, not merely equivalent once harmless-valued fields
+        # are stripped out. A real `Store` (via `_drive_paginated`) is used
+        # so the generic row list is genuinely populated, the same reason
+        # `TheGenericListIsBounded` and neighbours use one instead of
+        # `_FakeStore`'s hand-fed list.
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        fp = _record_scene(store, 1)
+        body = _drive_paginated("GET", "/inbox", store)["body"].decode()
+        match = re.search(
+            r'<form method="post" action="/approve">.*?</form>', body)
+        self.assertIsNotNone(match)
+        # The exact, closed shape this form had before this ticket -- one
+        # hidden `fp` field, nothing else, right up against the button.
+        self.assertEqual(
+            match.group(0),
+            '<form method="post" action="/approve">'
+            '<input type="hidden" name="fp" value="%s">'
+            '<button>Approve</button></form>' % fp)
+
+    def test_posting_that_form_returns_to_the_combined_inbox(self):
+        sent = _drive("POST", "/approve", b"fp=fp-1", store=_FakeStore([]))
+        self.assertEqual(sent["headers"]["Location"], "/inbox?applied=fp-1")
+
+    def test_dismiss_with_no_return_fields_still_returns_to_the_inbox(self):
+        sent = _drive("POST", "/dismiss", b"fp=fp-1", store=_FakeStore([]))
+        self.assertEqual(sent["headers"]["Location"], "/inbox")
+
+    def test_undismiss_with_no_return_fields_still_reopens_on_the_inbox(self):
+        sent = _drive("POST", "/undismiss", b"fp=fp-1", store=_FakeStore([]))
+        self.assertEqual(sent["headers"]["Location"],
+                         "/inbox?opened=dismissed")
+
+
+class ReturnTargetValidation(unittest.TestCase):
+    """Acceptance: a return target that is not a known page must not reach
+    the `Location` header. The whole header value is asserted for each
+    hostile target -- a containment check would also pass for a header
+    carrying the safe `/inbox` prefix with a hostile remainder appended
+    after it, which is precisely the open-redirect shape this guards
+    against.
+    """
+
+    def test_an_absolute_url_to_another_host_does_not_reach_location(self):
+        sent = _drive(
+            "POST", "/dismiss",
+            b"fp=fp-1&return_inbox=http%3A%2F%2Fevil.example%2F&"
+            b"return_state=&return_page_key=page&return_page=1",
+            store=_FakeStore([]))
+        self.assertEqual(sent["headers"]["Location"], "/inbox")
+
+    def test_a_scheme_relative_target_does_not_reach_location(self):
+        sent = _drive(
+            "POST", "/dismiss",
+            b"fp=fp-1&return_inbox=%2F%2Fevil.example&"
+            b"return_state=&return_page_key=page&return_page=1",
+            store=_FakeStore([]))
+        self.assertEqual(sent["headers"]["Location"], "/inbox")
+
+    def test_a_path_with_traversal_does_not_reach_location(self):
+        sent = _drive(
+            "POST", "/dismiss",
+            b"fp=fp-1&return_inbox=..%2F..%2Fetc%2Fpasswd&"
+            b"return_state=&return_page_key=page&return_page=1",
+            store=_FakeStore([]))
+        self.assertEqual(sent["headers"]["Location"], "/inbox")
+
+    def test_a_hostile_target_on_approve_still_only_carries_applied(self):
+        # The same guard, exercised on the one action whose redirect
+        # carries a SECOND query parameter -- proving the hostile inbox
+        # name is dropped before that parameter is appended, not merely
+        # before an otherwise-bare redirect.
+        sent = _drive(
+            "POST", "/approve",
+            b"fp=fp-1&return_inbox=http%3A%2F%2Fevil.example%2F&"
+            b"return_state=&return_page_key=page&return_page=1",
+            store=_FakeStore([]))
+        self.assertEqual(sent["headers"]["Location"], "/inbox?applied=fp-1")
+
+    def test_a_hostile_return_state_drops_only_the_state(self):
+        # `return_inbox` is a real, known name here -- only `return_state`
+        # is hostile -- so this pins that the two are validated
+        # independently: a bad state must not also void a good inbox name.
+        sent = _drive(
+            "POST", "/dismiss",
+            b"fp=fp-1&return_inbox=scenes&"
+            b"return_state=http%3A%2F%2Fevil.example%2F&"
+            b"return_page_key=page&return_page=1",
+            store=_FakeStore([]))
+        self.assertEqual(sent["headers"]["Location"], "/scenes")
+
+    def test_an_unrecognised_page_key_falls_back_to_the_generic_one(self):
+        sent = _drive(
+            "POST", "/dismiss",
+            b"fp=fp-1&return_inbox=scenes&return_state=&"
+            b"return_page_key=not-a-real-key&return_page=4",
+            store=_FakeStore([]))
+        self.assertEqual(sent["headers"]["Location"], "/scenes?page=4")
+
+
+class ConfirmationAndReopeningWorkOnAPerInboxPage(unittest.TestCase):
+    """Acceptance: the `?applied=` confirmation and the `?opened=` section
+    reopening must still work once a write returns to a per-inbox page --
+    asserted against the rendered result, not against whether the
+    parameter merely arrived.
+    """
+
+    def test_the_confirmation_banner_renders_on_a_per_inbox_working_queue_page(self):
+        # The just-approved row is excluded from `/scenes`'s own working
+        # queue -- `_inbox_page`'s bounded, by-fingerprint fallback read is
+        # what has to find it, not a search over an `applied` bucket this
+        # page never fetches for `state is None`.
+        store = _FakeStore([_scene_item("fp-1", state="new"),
+                           _scene_item("fp-2", state="applied")])
+        body = _drive("GET", "/scenes?applied=fp-2",
+                      store=store)["body"].decode()
+        self.assertIn("Just applied:", body)
+        self.assertIn("fp-2", body)
+
+    def test_a_stale_applied_value_shows_no_banner_on_a_per_inbox_page(self):
+        store = _FakeStore([_scene_item("fp-1", state="new")])
+        body = _drive("GET", "/scenes?applied=fp-not-there",
+                      store=store)["body"].decode()
+        self.assertNotIn("Just applied:", body)
+
+    def test_the_confirmation_banner_also_renders_on_the_applied_route_itself(self):
+        store = _FakeStore([_scene_item("fp-2", state="applied")])
+        body = _drive("GET", "/scenes/applied?applied=fp-2",
+                      store=store)["body"].decode()
+        self.assertIn("Just applied:", body)
+
+    def test_opened_reopens_the_muted_section_on_a_per_inbox_terminal_page(self):
+        store = _FakeStore([_scene_item("fp-1", state="muted")])
+        body = _drive("GET", "/scenes/muted?opened=muted",
+                      store=store)["body"].decode()
+        self.assertIn('<details class="section" open', body)
+
+    def test_no_opened_value_leaves_the_section_collapsed_on_that_page(self):
+        store = _FakeStore([_scene_item("fp-1", state="muted")])
+        body = _drive("GET", "/scenes/muted",
+                      store=store)["body"].decode()
+        self.assertNotIn('<details class="section" open', body)
+
+
+class BatchAndBulkGetTheSameReturnTreatment(unittest.TestCase):
+    """`/batch` and `/bulk_apply_tag_descriptions` return to the page that
+    showed them too. Their existing "this page only" scoping -- pinned in
+    `TheBatchCheckboxSelectionIsBoundToThePage` and
+    `BulkApplySubmitsExactlyThePagesOwnFingerprints` above, both still
+    green -- must not be weakened by adding this.
+    """
+
+    def test_a_dismiss_verdict_batch_from_a_per_inbox_page_returns_there(self):
+        sent = _drive(
+            "POST", "/batch",
+            b"fp=fp-1&fp=fp-2&verdict=dismiss&"
+            b"return_inbox=tags&return_state=&"
+            b"return_page_key=page&return_page=1",
+            store=_FakeStore([]))
+        self.assertEqual(sent["status"], 303)
+        self.assertEqual(sent["headers"]["Location"],
+                         "/tags?batch_verdict=dismiss&batch_requested=2&"
+                         "batch_applied=2")
+
+    def test_bulk_apply_from_a_per_inbox_page_returns_there(self):
+        sent = _drive(
+            "POST", "/bulk_apply_tag_descriptions",
+            b"fp=fp-1&return_inbox=tags&return_state=&"
+            b"return_page_key=page&return_page=1",
+            store=_FakeStore([]))
+        self.assertEqual(sent["headers"]["Location"],
+                         "/tags?bulk_requested=1&bulk_applied=1")
+
+    def test_an_approve_verdict_batch_confirmation_carries_the_return_identity_forward(self):
+        # Not a redirect -- the confirmation page itself -- so this pins
+        # that its OWN resubmit form and Cancel link both carry the same
+        # validated return identity, not just the final redirect.
+        sent = _drive(
+            "POST", "/batch",
+            b"fp=fp-1&verdict=approve&"
+            b"return_inbox=scenes&return_state=&"
+            b"return_page_key=page&return_page=3",
+            store=_FakeStore([]))
+        self.assertEqual(sent["status"], 200)
+        body = sent["body"].decode()
+        self.assertIn(
+            '<input type="hidden" name="return_inbox" value="scenes">', body)
+        self.assertIn(
+            '<input type="hidden" name="return_page" value="3">', body)
+        self.assertIn('<a href="/scenes?page=3">Cancel', body)
+
+    def test_confirming_that_batch_returns_to_the_per_inbox_page(self):
+        sent = _drive(
+            "POST", "/batch",
+            b"fp=fp-1&verdict=approve&confirmed=1&"
+            b"return_inbox=scenes&return_state=&"
+            b"return_page_key=page&return_page=3",
+            store=_FakeStore([]))
+        self.assertEqual(sent["headers"]["Location"],
+                         "/scenes?page=3&batch_verdict=approve&"
+                         "batch_requested=1&batch_applied=1")
+
+    def test_a_hostile_return_target_on_the_batch_confirmation_is_dropped(self):
+        sent = _drive(
+            "POST", "/batch",
+            b"fp=fp-1&verdict=approve&"
+            b"return_inbox=http%3A%2F%2Fevil.example%2F&return_state=&"
+            b"return_page_key=page&return_page=1",
+            store=_FakeStore([]))
+        body = sent["body"].decode()
+        self.assertIn('<a href="/inbox">Cancel', body)
+
+
 if __name__ == "__main__":
     unittest.main()
