@@ -237,6 +237,45 @@ class MergeCandidates(unittest.TestCase):
                                         offers=(("box-a", "FEMALE"),
                                                 ("box-b", "NON_BINARY"))),))
 
+    def test_two_sources_offering_the_same_image_is_agreement(self):
+        # The ticket's own acceptance wording, exercised on the literal
+        # field it names rather than only on a stand-in like gender.
+        a = _box_candidate(label="box-a",
+                           image="https://example.test/wren.jpg")
+        b = _box_candidate(label="box-b",
+                           image="https://example.test/wren.jpg")
+        fields, conflicts = merge_candidates([a, b], ("image",))
+        self.assertEqual(fields, {"image": "https://example.test/wren.jpg"})
+        self.assertEqual(conflicts, ())
+
+    def test_two_sources_offering_different_images_is_a_refusal_naming_both(self):
+        a = _box_candidate(label="box-a",
+                           image="https://example.test/wren-a.jpg")
+        b = _box_candidate(label="box-b",
+                           image="https://example.test/wren-b.jpg")
+        fields, conflicts = merge_candidates([a, b], ("image",))
+        self.assertNotIn("image", fields)
+        self.assertEqual(
+            conflicts,
+            (FieldConflict(
+                field="image",
+                offers=(("box-a", "https://example.test/wren-a.jpg"),
+                       ("box-b", "https://example.test/wren-b.jpg"))),))
+
+    def test_the_conflict_verdict_does_not_depend_on_candidate_order(self):
+        # "decided by iteration order" is exactly the failure mode the
+        # ticket's acceptance list names -- reversing the two candidates
+        # must not turn a refusal into an agreement, or change which value
+        # would have quietly won one.
+        a = _box_candidate(label="box-a", gender="FEMALE")
+        b = _box_candidate(label="box-b", gender="NON_BINARY")
+
+        forward = merge_candidates([a, b], ("gender",))
+        reversed_ = merge_candidates([b, a], ("gender",))
+
+        self.assertNotIn("gender", forward[0])
+        self.assertNotIn("gender", reversed_[0])
+
     def test_a_field_only_one_candidate_offers_is_still_proposed(self):
         a = _box_candidate(label="box-a", gender="FEMALE")
         b = _box_candidate(label="box-b")  # says nothing about gender
